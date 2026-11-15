@@ -694,25 +694,44 @@ static VkAttachmentStoreOp vg_store(MTLStoreAction a) {
         if (!t) {
             continue;
         }
-        if (![t isKindOfClass:[VGMTLTexture class]] || c.level || c.slice || c.depthPlane || c.resolveTexture) {
-            [self fail:@"color attachment: only level 0 / slice 0 of our own textures, no resolve, yet"];
+        if (![t isKindOfClass:[VGMTLTexture class]] || c.depthPlane || c.resolveTexture ||
+            ((c.level || c.slice) && t->_parent)) {
+            [self fail:[NSString stringWithFormat:@"color attachment %u: %@ level %lu slice %lu depth plane %lu resolve %@ "
+                                                  @"(only our own textures, levels and slices of a texture that is not a "
+                                                  @"view, no resolve, yet)",
+                                                  i, NSStringFromClass([t class]), (unsigned long)c.level,
+                                                  (unsigned long)c.slice, (unsigned long)c.depthPlane,
+                                                  c.resolveTexture ? @"yes" : @"no"]];
             return nil;
         }
         [_keep addObject:t];
+        // A level or slice (CoreDisplay renders its display pipe's LUTs into slices of a 1D array, 5b): a view of just
+        // that level and slice to render into; surface syncing still goes by the texture itself.
+        VGMTLTexture *target = t;
+        if (c.level || c.slice) {
+            MTLTextureType vt = t->_type == MTLTextureType1D || t->_type == MTLTextureType1DArray ? MTLTextureType1D
+                                                                                                   : MTLTextureType2D;
+            target = (VGMTLTexture *)vg_texture_view(t, t->_pixelFormat, vt, NSMakeRange(c.level, 1), NSMakeRange(c.slice, 1));
+            if (!target) {
+                [self fail:@"color attachment: no view of that level and slice"];
+                return nil;
+            }
+            [_keep addObject:target];
+        }
         if (c.loadAction == MTLLoadActionLoad) {
             vg_surface_pull(t);
         }
         if (c.storeAction != MTLStoreActionDontCare) {
             vg_cmd_wrote(self, t);
         }
-        color[i].imageView = t->_view;
+        color[i].imageView = target->_view;
         color[i].loadOp = vg_load(c.loadAction);
         color[i].storeOp = vg_store(c.storeAction);
         MTLClearColor cc = c.clearColor;
         color[i].clearValue.color = (VkClearColorValue){{(float)cc.red, (float)cc.green, (float)cc.blue, (float)cc.alpha}};
         ncolor = i + 1;
-        w = MIN(w, (uint32_t)t->_width);
-        h = MIN(h, (uint32_t)t->_height);
+        w = MIN(w, (uint32_t)target->_width);
+        h = MIN(h, (uint32_t)target->_height);
     }
     VkRenderingAttachmentInfo depth = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     VGMTLTexture *dt = (VGMTLTexture *)d.depthAttachment.texture;

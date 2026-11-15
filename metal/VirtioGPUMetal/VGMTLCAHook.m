@@ -264,3 +264,29 @@ void vg_cahook_inline(const uint8_t *base) {
     }
     vglog("cahook: %d of %d inline hooks", installed, (int)kNIHooks);
 }
+
+// ---- CoreDisplay's IOPresentment switch (5b) ----------------------------------------------------------------
+// CoreDisplay::UseIOPresentment() (25G342, CoreDisplay+0xb6f0): a global bool at +0x3e78b94d, then once a required
+// mask (+0x3e790c84) that four flags must cover: +0x3e78b94e (x2), +0x3e78c261 (x8), +0x3e78c262 (x4), +0x3e78c263
+// (x16). If either fails, displays take the legacy display-surface path and WindowServer composites them with
+// CompositorSW. Logged from WindowServer a few seconds after the plugin loads. Only read: calling
+// CoreDisplay_UseIOPresentment() here would compute the mask early and clear the global for good when it fails.
+// The mask is the GPU vendors of the IOFramebuffer services, from their class names (GetGPUVendorForFramebufferService,
+// +0xdf3f9: "Intel" 2, "AMD" 4, "NVDA" 8, "AppleParavirt" 0x10, anything else 1, and bit 1 is dropped).
+void vg_coredisplay_report(void) {
+    const char *cd = "/System/Library/Frameworks/CoreDisplay.framework/Versions/A/CoreDisplay";
+    const uint8_t *base = NULL;
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        if (!strcmp(_dyld_get_image_name(i), cd)) {
+            base = (const uint8_t *)_dyld_get_image_header(i);
+        }
+    }
+    if (!base || base[0xb6f0] != 0x80 || base[0xb6f1] != 0x3d) {
+        vglog("coredisplay: not the 25G342 layout (or not loaded): no report");
+        return;
+    }
+    vglog("coredisplay: UseIOPresentment global %u, vendor mask 0x%x (once %s), flags b94e %u c261 %u c262 %u c263 %u",
+          base[0x3e78b94d], *(const uint32_t *)(base + 0x3e790c84),
+          *(const int64_t *)(base + 0x3e790c88) == -1 ? "done" : "not yet", base[0x3e78b94e], base[0x3e78c261],
+          base[0x3e78c262], base[0x3e78c263]);
+}

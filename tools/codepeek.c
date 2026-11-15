@@ -6,6 +6,8 @@
 //   codepeek LIBPATH callers OFFSET          the functions of the library that call (call rel32) the one at OFFSET
 //   codepeek LIBPATH vtable OFFSET           data words pointing at the function at OFFSET (vtable slots), and the
 //                                            named functions in the 80 words around the first one
+//   codepeek LIBPATH dref OFFSET             code with a RIP-relative operand at the data at OFFSET (brute force:
+//                                            every displacement position and immediate size; check by disassembly)
 //   codepeek LIBPATH xref STRING             the functions that load the address of a C string containing STRING
 // OFFSET is the image offset a crash report gives (imageOffset - symbolLocation = the function's start). Writes the raw
 // bytes to OUTFILE (disassemble on the Mac: llvm-objdump -D -b binary -m i386:x86-64 --adjust-vma=OFFSET) and prints
@@ -49,7 +51,7 @@ static const char *name_at(const void *p) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 4 || (argc < 5 && strcmp(argv[2], "find") && strcmp(argv[2], "sels") && strcmp(argv[2], "callers") && strcmp(argv[2], "xref") && strcmp(argv[2], "vtable"))) {
+    if (argc < 4 || (argc < 5 && strcmp(argv[2], "find") && strcmp(argv[2], "sels") && strcmp(argv[2], "callers") && strcmp(argv[2], "xref") && strcmp(argv[2], "vtable") && strcmp(argv[2], "dref"))) {
         fprintf(stderr, "usage: codepeek LIBPATH OFFSET LENGTH OUTFILE\n");
         return 2;
     }
@@ -68,6 +70,28 @@ int main(int argc, char **argv) {
         return 1;
     }
     gStubs = getsectiondata((const struct mach_header_64 *)mh, "__TEXT", "__objc_stubs", &gStubsSize);
+    if (!strcmp(argv[2], "dref")) {
+        unsigned long tsize = 0;
+        const uint8_t *text = getsectiondata((const struct mach_header_64 *)mh, "__TEXT", "__text", &tsize);
+        const uint8_t *want = (const uint8_t *)mh + strtoul(argv[3], NULL, 0);
+        for (unsigned long i = 0; text && i + 12 <= tsize; i++) {
+            for (int dispOff = 2; dispOff <= 4; dispOff++) {
+                const int imms[] = {0, 1, 4};
+                for (int k = 0; k < 3; k++) {
+                    int32_t d;
+                    memcpy(&d, text + i + dispOff, 4);
+                    const uint8_t *end = text + i + dispOff + 4 + imms[k];
+                    // the byte before the displacement must be a ModRM with mod 00 and rm 101 (RIP-relative)
+                    if (end + d == want && (text[i + dispOff - 1] & 0xc7) == 0x05) {
+                        const char *n = name_at(text + i);
+                        printf("+0x%lx (disp at +%d, imm %d) %s\n", (unsigned long)(text + i - (const uint8_t *)mh), dispOff,
+                               imms[k], n ? n : "?");
+                    }
+                }
+            }
+        }
+        return 0;
+    }
     if (!strcmp(argv[2], "vtable")) {
         const uint8_t *want = (const uint8_t *)mh + strtoul(argv[3], NULL, 0);
         const char *segs[] = {"__DATA_CONST", "__AUTH_CONST", "__DATA"};
@@ -108,11 +132,14 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!strcmp(argv[2], "xref")) {
-        unsigned long csize = 0, tsize = 0;
-        const char *cstr = (const char *)getsectiondata((const struct mach_header_64 *)mh, "__TEXT", "__cstring", &csize);
+        unsigned long tsize = 0;
         const uint8_t *text = getsectiondata((const struct mach_header_64 *)mh, "__TEXT", "__text", &tsize);
-        if (!cstr || !text) {
-            return 1;
+        const char *sects[] = {"__cstring", "__oslogstring"};
+        for (int sx = 0; sx < 2 && text; sx++) {
+        unsigned long csize = 0;
+        const char *cstr = (const char *)getsectiondata((const struct mach_header_64 *)mh, "__TEXT", sects[sx], &csize);
+        if (!cstr) {
+            continue;
         }
         for (const char *c = cstr; c < cstr + csize; c += strlen(c) + 1) {
             if (!strstr(c, argv[3])) {
@@ -131,6 +158,7 @@ int main(int argc, char **argv) {
                     }
                 }
             }
+        }
         }
         return 0;
     }

@@ -61,6 +61,7 @@
 #include "IOAccelVideoContext2.h"
 #include "vg_tahoe_fwd.h"
 #include "nv_iop_pixel.h"
+#include "nvres_fields.h"
 #include "../VirtioGPUAPI.h"
 #include "../VirtioGPUUserAPI.h"
 #include "accel_shared.h"
@@ -218,26 +219,34 @@ class VGResource : public IOAccelResource2 {
     NM_TAHOE_FWD(VGResource)
 public:
     void rebuildPagingBuffer() APPLE_KEXT_OVERRIDE {}
-    uint64_t getLevelOffset(unsigned char, unsigned char, int *pitch) APPLE_KEXT_OVERRIDE {
+    // The resource's geometry as NV answers it (nvres_fields.h): an IOSurface's video memory is sized by
+    // calculateIOSurfaceDeviceCacheVRAMBytes, so answering 0 made every displayable surface's video memory 0 bytes
+    // and its prepare() fail (5b).
+    uint64_t getLevelOffset(unsigned char face, unsigned char level, int *pitch) APPLE_KEXT_OVERRIDE {
+        const unsigned char *r = (const unsigned char *)this;
         if (pitch) {
-            *pitch = 0;
+            unsigned base = r[kNvResBaseLevel];
+            *pitch = (int)(nvResPitch(r) >> (level >= base ? (unsigned)(level - base) : 0u));
         }
-        return 0;
+        return (uint64_t)face * nvResFaceSize(r);
     }
-    uint64_t getBackingLevelOffset(unsigned char, unsigned char, int *pitch) APPLE_KEXT_OVERRIDE {
+    uint64_t getBackingLevelOffset(unsigned char face, unsigned char level, int *pitch) APPLE_KEXT_OVERRIDE {
+        const unsigned char *r = (const unsigned char *)this;
         if (pitch) {
-            *pitch = 0;
+            unsigned base = r[kNvResBaseLevel];
+            *pitch = (int)(nvResBackingPitch(r) >> (level >= base ? (unsigned)(level - base) : 0u));
         }
-        return 0;
+        return (uint64_t)face * nvResFaceSize(r);
     }
     uint64_t calculateIOSurfaceDeviceCacheVRAMBytes(unsigned long long *bytes, unsigned long long *count) APPLE_KEXT_OVERRIDE {
+        const uint64_t size = nvResFaceSize((const unsigned char *)this);
         if (bytes) {
-            *bytes = 0;
+            *bytes = size;
         }
         if (count) {
-            *count = 0;
+            *count = 1;
         }
-        return 0;
+        return size;
     }
     bool addToAperture() APPLE_KEXT_OVERRIDE { return false; }
     void removeFromAperture() APPLE_KEXT_OVERRIDE {}
@@ -257,19 +266,64 @@ class VGSysMemory : public IOAccelSysMemory {
 };
 OSDefineMetaClassAndStructors(VGSysMemory, IOAccelSysMemory)
 
-// No VRAM: every allocation is refused, so the family keeps resources in system memory.
+// "VRAM" in guest RAM (5b). The family puts displayable surfaces (CoreDisplay's display surfaces, the planes of display
+// pipe transactions) in video memory, and IOAccelResource2::prepare() fails with kIOReturnNoResources for a
+// transaction whose planes have none, so every transaction failed while this refused. Each allocation is physically
+// contiguous kernel memory: the family's own getPhysicalSegment reads one base at +0xc8 (Tahoe 25G342) for the length
+// at +0x40. Nothing reads it on the GPU side; frames still reach the screen by performTransaction's copies from the
+// IOSurfaces. -vgpunovidmem refuses again (the stage 5a behavior).
 class VGVidMemory : public IOAccelVidMemory {
     OSDeclareDefaultStructors(VGVidMemory)
     NM_TAHOE_FWD(VGVidMemory)
+    IOBufferMemoryDescriptor *buf_ = nullptr;
+    static constexpr unsigned kPhysOff = 0xc8, kLengthOff = 0x40;
 public:
-    bool allocPhysical() APPLE_KEXT_OVERRIDE { STUB_LOG("VidMemory allocPhysical -> false (no VRAM)"); return false; }
-    void deallocPhysical() APPLE_KEXT_OVERRIDE {}
-    void free() APPLE_KEXT_OVERRIDE { IOAccelVidMemory::free(); }
-    uint64_t getPhysicalSegment(unsigned long long, unsigned long long *len) APPLE_KEXT_OVERRIDE {
-        if (len) {
-            *len = 0;
+    bool allocPhysical() APPLE_KEXT_OVERRIDE {
+        static uint32_t logged = 0;
+        bool refuse = false;
+        PE_parse_boot_argn("-vgpunovidmem", &refuse, sizeof(refuse));
+        const uint64_t want = *(const volatile uint64_t *)((const uint8_t *)this + kLengthOff);
+        if (refuse || buf_ || !want) {
+            if (logged++ < 8) {
+                vgaccel_log("VidMemory allocPhysical(%llu bytes) -> false (%s)", (unsigned long long)want,
+                            refuse ? "-vgpunovidmem" : buf_ ? "already backed" : "no length");
+            }
+            return false;
         }
-        return 0;
+        buf_ = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+            kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous, round_page(want), 0xFFFFFFFFFFFFF000ULL);
+        if (!buf_) {
+            vgaccel_log("VidMemory allocPhysical(%llu bytes) -> false (no contiguous RAM)", (unsigned long long)want);
+            return false;
+        }
+        bzero(buf_->getBytesNoCopy(), buf_->getLength());
+        *(volatile uint64_t *)((uint8_t *)this + kPhysOff) = buf_->getPhysicalAddress();
+        if (logged++ < 8) {
+            vgaccel_log("VidMemory allocPhysical(%llu bytes) -> phys 0x%llx", (unsigned long long)want,
+                        (unsigned long long)buf_->getPhysicalAddress());
+        }
+        return true;
+    }
+    void deallocPhysical() APPLE_KEXT_OVERRIDE {
+        *(volatile uint64_t *)((uint8_t *)this + kPhysOff) = 0;
+        OSSafeReleaseNULL(buf_);
+    }
+    void free() APPLE_KEXT_OVERRIDE {
+        deallocPhysical();
+        IOAccelVidMemory::free();
+    }
+    uint64_t getPhysicalSegment(unsigned long long offset, unsigned long long *len) APPLE_KEXT_OVERRIDE {
+        const uint64_t total = buf_ ? buf_->getLength() : 0;
+        if (!buf_ || offset >= total) {
+            if (len) {
+                *len = 0;
+            }
+            return 0;
+        }
+        if (len) {
+            *len = total - offset;
+        }
+        return buf_->getPhysicalAddress() + offset;
     }
 };
 OSDefineMetaClassAndStructors(VGVidMemory, IOAccelVidMemory)
@@ -354,11 +408,13 @@ class VGDisplayPipe : public IOAccelLegacyDisplayPipe {
     OSDeclareDefaultStructors(VGDisplayPipe)
     NM_TAHOE_FWD(VGDisplayPipe)
 public:
-    // CPU-only scanout: no framebuffer resource, frames arrive through performTransaction (NV: another GPU's panel).
-    IOAccelMemory *initFramebufferResource(unsigned int index, IOAccelResource2 *) APPLE_KEXT_OVERRIDE {
-        STUB_LOG("pipe initFramebufferResource -> NULL (frames are copied)");
-        return nullptr;
-    }
+    // The framebuffer resource: the family's IOAccelDisplayPipe::init_framebuffer_resource asks for it when the
+    // framebuffer's mode is set, and only a pipe that got one is active (+0x298), which transaction_end requires
+    // (kIOReturnNotReady otherwise: CoreDisplay's "Fallback GPU Display Pipe transaction submission failed", 5b). The
+    // base class asks the display machine, whose base answers NULL; GPU drivers return their scanout memory. Ours is
+    // the framebuffer's VRAM as system memory (IOAccelSysMemory::withMemoryDescriptor, the family's own); frames still
+    // arrive by performTransaction's copies.
+    IOAccelMemory *initFramebufferResource(unsigned int index, IOAccelResource2 *res) APPLE_KEXT_OVERRIDE;
     IOReturn validateTransaction(IOAccelDisplayPipeTransaction2 *) APPLE_KEXT_OVERRIDE {
         return gIop ? kIOReturnSuccess : kIOReturnUnsupported;
     }
@@ -631,6 +687,7 @@ public:
     void holdTick(IOTimerEventSource *);
     void releaseHold(const char *why);
     bool registerFramebuffer();
+    void nameOnFramebuffer(bool on);
     IOService *findCore();
     void withdrawForWindowServer(const char *why);
     void armForWindowServer(const char *why);
@@ -851,6 +908,11 @@ bool VirtioGPUAccel::start(IOService *provider) {
             vlog("boot hold ON (adjustBusy +1, released when armed or after 20 s)");
         }
     }
+    if (gate_ >= 3) {
+        // The index the framebuffer names this accelerator by (IOAccelIndex); IOPresentment reads it on the
+        // accelerator, before it is registered, to match the display to this GPU (Reims' finding).
+        setProperty("IOAccelIndex", 0ULL, 32);
+    }
     if (gate_ >= 2) {
         registerService();
         vlog("registerService() (vgpuaccel=%u)", gate_);
@@ -906,6 +968,33 @@ void VirtioGPUAccel::releaseHold(const char *why) {
 
 // found_framebuffer: the family adds a framebuffer to the display machine and makes its display pipe (newDisplayPipe).
 // The machine's pipe count is at +0x108 and its pipes at +0x88 (NV, macOS 26.7.1); a pipe's framebuffer is at +0x98.
+// The framebuffer names its accelerator (5b): IOAccelTypes = this accelerator's service-plane path, IOAccelIndex = 0.
+// CoreDisplay pairs a display with a GPU through them (CDDisplay::compositor() is the Metal compositor only for a
+// display with an accelerator; without them it was CompositorSW beside a Metal device, and Core Animation aborted on
+// a surface of the other context). Only while WindowServer may have the device: a framebuffer naming a registered
+// accelerator with no Metal device aborts WindowServer (Reims measured it).
+void VirtioGPUAccel::nameOnFramebuffer(bool on) {
+    IOService *fb = fb_;
+    if (!fb) {
+        return;
+    }
+    if (!on) {
+        fb->removeProperty("IOAccelTypes");
+        fb->removeProperty("IOAccelIndex");
+        vlog("framebuffer no longer names the accelerator");
+        return;
+    }
+    char path[512];
+    int len = sizeof(path);
+    if (getPath(path, &len, gIOServicePlane)) {
+        fb->setProperty("IOAccelTypes", path);
+        fb->setProperty("IOAccelIndex", 0ULL, 32);
+        vlog("framebuffer names the accelerator: IOAccelTypes %s, IOAccelIndex 0", path);
+    } else {
+        vlog("framebuffer naming: no service-plane path for the accelerator");
+    }
+}
+
 bool VirtioGPUAccel::registerFramebuffer() {
     IOService *fb = fb_;
     if (!dm_ || !fb) {
@@ -957,6 +1046,9 @@ void VirtioGPUAccel::armTick(IOTimerEventSource *) {
         }
         return;
     }
+    if (gate_ >= 4) {
+        nameOnFramebuffer(true);   // before found_framebuffer, as a framebuffer that names its GPU at its start
+    }
     if (!registerFramebuffer()) {
         setProperty("VirtioGPUArmState", "framebuffer NOT registered: software compositor");
         releaseHold("framebuffer not registered");
@@ -992,6 +1084,7 @@ void VirtioGPUAccel::armTick(IOTimerEventSource *) {
 }
 
 void VirtioGPUAccel::armForWindowServer(const char *why) {
+    nameOnFramebuffer(true);
     if (!agdc_) {
         agdc_ = vgaccel_agdc_create(pci_, fb_);
     }
@@ -1034,6 +1127,7 @@ void VirtioGPUAccel::withdrawForWindowServer(const char *why) {
     removeProperty("MetalPluginClassName");
     setProperty("VirtioGPUWindowServer", kOSBooleanFalse);
     removeProperty("IOAccelDisplayPipeCapabilities");
+    nameOnFramebuffer(false);
     gIop = 0;
     // The AGDC stays: AppleGraphicsDeviceControl refuses terminate (measured: -> 0), and without the capabilities
     // WindowServer finds no display pipe and composites in software anyway (measured 2026-11-15).
@@ -1042,6 +1136,62 @@ void VirtioGPUAccel::withdrawForWindowServer(const char *why) {
     setProperty("VirtioGPUArmState", "withdrawn: no pipe capabilities, no Metal for WindowServer (software compositor)");
     vlog("WITHDRAWN (%s): MetalPluginName and pipe capabilities gone; the next WindowServer composites in software", why);
 }
+
+// ---- 5b probe: the display pipe's user client (IOAccelDisplayPipeUserClient2, the family's) ----------------------
+// CoreDisplay logs "Fallback GPU Display Pipe transaction submission failed" while no transaction reaches the pipe's
+// submitTransaction: the call fails in the family's user client first. Its externalMethod is wrapped (a copy of its
+// vtable with that one slot replaced) to log each selector's first calls, its arguments and every failure.
+namespace {
+using ExtFn = IOReturn (*)(IOUserClient *, uint32_t, IOExternalMethodArguments *, IOExternalMethodDispatch *, OSObject *,
+                           void *);
+ExtFn gPipeUCExt = nullptr;
+unsigned gPipeUCSlot = 0;
+uint32_t gPipeUCCalls[64];
+uint32_t gPipeUCFails = 0;
+constexpr unsigned kVtableCopySlots = 600;
+
+IOReturn vg_pipeuc_ext(IOUserClient *self, uint32_t sel, IOExternalMethodArguments *a, IOExternalMethodDispatch *d,
+                       OSObject *t, void *ref) {
+    IOReturn r = gPipeUCExt(self, sel, a, d, t, ref);
+    uint32_t n = sel < 64 ? __atomic_add_fetch(&gPipeUCCalls[sel], 1, __ATOMIC_RELAXED) : 0;
+    bool fail = r != kIOReturnSuccess && __atomic_add_fetch(&gPipeUCFails, 1, __ATOMIC_RELAXED) <= 40;
+    if (n <= 2 || fail) {
+        vgaccel_log("pipeuc sel %u #%u -> 0x%x (in %u scalars [0x%llx 0x%llx 0x%llx] %u bytes, out %u scalars %u bytes)", sel,
+                    n, r, a ? a->scalarInputCount : 0, a && a->scalarInputCount > 0 ? a->scalarInput[0] : 0,
+                    a && a->scalarInputCount > 1 ? a->scalarInput[1] : 0, a && a->scalarInputCount > 2 ? a->scalarInput[2] : 0,
+                    a ? a->structureInputSize : 0, a ? a->scalarOutputCount : 0, a ? a->structureOutputSize : 0);
+    }
+    return r;
+}
+
+void vg_pipeuc_wrap(IOUserClient *uc) {
+    auto mfp = static_cast<IOReturn (IOUserClient::*)(uint32_t, IOExternalMethodArguments *, IOExternalMethodDispatch *,
+                                                      OSObject *, void *)>(&IOUserClient::externalMethod);
+    uintptr_t raw[2];
+    memcpy(raw, &mfp, sizeof(raw));
+    if (!(raw[0] & 1)) {
+        vgaccel_log("pipeuc: externalMethod isn't virtual by its member pointer (0x%lx): no probe", (unsigned long)raw[0]);
+        return;
+    }
+    unsigned slot = (unsigned)((raw[0] - 1) / sizeof(void *));
+    void **vptr = *(void ***)uc;
+    if (gPipeUCExt && (ExtFn)vptr[slot] == vg_pipeuc_ext) {
+        return;
+    }
+    void **copy = (void **)IOMalloc((kVtableCopySlots + 2) * sizeof(void *));   // never freed: objects keep using it
+    if (!copy || slot >= kVtableCopySlots) {
+        return;
+    }
+    memcpy(copy, vptr - 2, (kVtableCopySlots + 2) * sizeof(void *));
+    if (!gPipeUCExt) {
+        gPipeUCExt = (ExtFn)vptr[slot];
+        gPipeUCSlot = slot;
+    }
+    copy[2 + slot] = (void *)vg_pipeuc_ext;
+    *(void ***)uc = copy + 2;
+    vgaccel_log("pipeuc: %s's externalMethod (slot %u) wrapped", uc->getMetaClass()->getClassName(), slot);
+}
+} // namespace
 
 IOReturn VirtioGPUAccel::newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) {
     char who[32] = "?";
@@ -1060,6 +1210,11 @@ IOReturn VirtioGPUAccel::newUserClient(task_t owningTask, void *securityID, UInt
             logged++;
             vlog("WindowServer opened family user client type %u -> 0x%x %s", (unsigned)type, r,
                  (r == kIOReturnSuccess && handler && *handler) ? (*handler)->getMetaClass()->getClassName() : "");
+        }
+        bool noProbe = false;
+        PE_parse_boot_argn("-vgpunopipeprobe", &noProbe, sizeof(noProbe));
+        if (type == 4 && r == kIOReturnSuccess && handler && *handler && !strcmp(who, "WindowServer") && !noProbe) {
+            vg_pipeuc_wrap(*handler);
         }
         return r;
     }
@@ -1225,4 +1380,26 @@ void VirtioGPUAccel::free() {
         }
     }
     IOGraphicsAccelerator2::free();
+}
+
+extern IOAccelSysMemory *vg_sysmem_with_descriptor(IOGraphicsAccelerator2 *, IOAccelResource2 *, IOMemoryDescriptor *) __asm(
+    "__ZN16IOAccelSysMemory20withMemoryDescriptorEP22IOGraphicsAccelerator2P16IOAccelResource2P18IOMemoryDescriptor");
+
+// After VirtioGPUAccel's definition: gAccel converts to IOGraphicsAccelerator2 here.
+IOAccelMemory *VGDisplayPipe::initFramebufferResource(unsigned int index, IOAccelResource2 *res) {
+    IOFramebuffer *fb = OSDynamicCast(IOFramebuffer, displayFramebuffer());
+    bool noResource = false;
+    PE_parse_boot_argn("-vgpunofbresource", &noResource, sizeof(noResource));
+    if (!gIop || !gAccel || !fb || noResource) {
+        vlog("pipe initFramebufferResource(%u) -> NULL (%s)", index,
+             noResource ? "-vgpunofbresource" : !gIop ? "not armed" : "no accelerator or framebuffer");
+        return nullptr;
+    }
+    IODeviceMemory *vram = fb->getVRAMRange();
+    IOAccelSysMemory *m = vram ? vg_sysmem_with_descriptor(gAccel, res, vram) : nullptr;
+    vlog("pipe initFramebufferResource(%u) -> %p (the framebuffer's VRAM, %llu bytes)", index, m,
+         vram ? (unsigned long long)vram->getLength() : 0ULL);
+    OSSafeReleaseNULL(vram);   // the memory retains it
+    gates("after initFramebufferResource");
+    return m;
 }

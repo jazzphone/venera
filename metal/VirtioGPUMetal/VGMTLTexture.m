@@ -29,6 +29,9 @@ static const vg_format kFormats[] = {
     {MTLPixelFormatR16Float, VK_FORMAT_R16_SFLOAT, 2, VK_IMAGE_ASPECT_COLOR_BIT},
     {MTLPixelFormatR16Unorm, VK_FORMAT_R16_UNORM, 2, VK_IMAGE_ASPECT_COLOR_BIT},
     {MTLPixelFormatRG16Float, VK_FORMAT_R16G16_SFLOAT, 4, VK_IMAGE_ASPECT_COLOR_BIT},
+    {MTLPixelFormatRG16Unorm, VK_FORMAT_R16G16_UNORM, 4, VK_IMAGE_ASPECT_COLOR_BIT},   // a WindowServer surface (5b)
+    {MTLPixelFormatRG16Snorm, VK_FORMAT_R16G16_SNORM, 4, VK_IMAGE_ASPECT_COLOR_BIT},
+    {MTLPixelFormatRG16Uint, VK_FORMAT_R16G16_UINT, 4, VK_IMAGE_ASPECT_COLOR_BIT},
     {MTLPixelFormatRGBA16Float, VK_FORMAT_R16G16B16A16_SFLOAT, 8, VK_IMAGE_ASPECT_COLOR_BIT},
     {MTLPixelFormatRGBA16Unorm, VK_FORMAT_R16G16B16A16_UNORM, 8, VK_IMAGE_ASPECT_COLOR_BIT},
     {MTLPixelFormatR32Float, VK_FORMAT_R32_SFLOAT, 4, VK_IMAGE_ASPECT_COLOR_BIT},
@@ -184,6 +187,9 @@ BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
     if (!f || !region.size.width || !region.size.height || !region.size.depth) {
         return NO;
     }
+    if (!bpr) {   // Metal allows 0 for 1D textures
+        bpr = region.size.width * f->bytes;
+    }
     if (bpr % f->bytes) {
         vglog("texture: bytesPerRow %lu isn't a whole number of %u-byte pixels", (unsigned long)bpr, f->bytes);
         return NO;
@@ -260,6 +266,7 @@ id<MTLTexture> vg_new_texture(id<MTLDevice> device, MTLTextureDescriptor *d) {
     VkImageViewType vtype;
     switch (d.textureType) {
     case MTLTextureType1D: itype = VK_IMAGE_TYPE_1D, vtype = VK_IMAGE_VIEW_TYPE_1D; break;
+    case MTLTextureType1DArray: itype = VK_IMAGE_TYPE_1D, vtype = VK_IMAGE_VIEW_TYPE_1D_ARRAY; break;   // CoreDisplay's LUTs
     case MTLTextureType2D: itype = VK_IMAGE_TYPE_2D, vtype = VK_IMAGE_VIEW_TYPE_2D; break;
     case MTLTextureType2DArray: itype = VK_IMAGE_TYPE_2D, vtype = VK_IMAGE_VIEW_TYPE_2D_ARRAY; break;
     case MTLTextureType3D: itype = VK_IMAGE_TYPE_3D, vtype = VK_IMAGE_VIEW_TYPE_3D; break;
@@ -297,10 +304,10 @@ id<MTLTexture> vg_new_texture(id<MTLDevice> device, MTLTextureDescriptor *d) {
     t->_aspect = f->aspect;
     t->_type = d.textureType;
     t->_width = MAX(d.width, 1);
-    t->_height = d.textureType == MTLTextureType1D ? 1 : MAX(d.height, 1);
+    t->_height = d.textureType == MTLTextureType1D || d.textureType == MTLTextureType1DArray ? 1 : MAX(d.height, 1);
     t->_depth = d.textureType == MTLTextureType3D ? MAX(d.depth, 1) : 1;
     t->_mips = MAX(d.mipmapLevelCount, 1);
-    t->_layers = d.textureType == MTLTextureType2DArray ? MAX(d.arrayLength, 1) : 1;
+    t->_layers = d.textureType == MTLTextureType2DArray || d.textureType == MTLTextureType1DArray ? MAX(d.arrayLength, 1) : 1;
     t->_usage = d.usage;
     t->_storage = d.storageMode;
     VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -467,6 +474,7 @@ id<MTLTexture> vg_texture_view(VGMTLTexture *p, MTLPixelFormat pf, MTLTextureTyp
     VkImageViewType vtype;
     switch (type) {
     case MTLTextureType1D: vtype = VK_IMAGE_VIEW_TYPE_1D; break;
+    case MTLTextureType1DArray: vtype = VK_IMAGE_VIEW_TYPE_1D_ARRAY; break;
     case MTLTextureType2D: vtype = VK_IMAGE_VIEW_TYPE_2D; break;
     case MTLTextureType2DArray: vtype = VK_IMAGE_VIEW_TYPE_2D_ARRAY; break;
     case MTLTextureType3D: vtype = VK_IMAGE_VIEW_TYPE_3D; break;

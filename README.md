@@ -24,7 +24,8 @@ Target: macOS 26.7.3 (25G342) on Proxmox VE 9.2 / pve-qemu 11.1, host GPU an Ald
    done; see `notes/PLAN.md`.
 5. **WindowServer** — IOSurface-backed accelerated compositing. 5a (WindowServer picks the Metal device: AGDC,
    display pipe, VBL, arming in the kext, Venus through the accelerator; "Metal compositor activated") done with
-   `vgpuaccel=4`; frames on screen (framebuffer fetch, display-pipe transactions) are 5b. VM 108 boots `vgpuaccel=2`.
+   `vgpuaccel=4`. 5b done: at `vgpuaccel=4` the desktop is composited with Metal on our device and shown through
+   display-pipe transactions (slow: CPU copies per frame; 5c is speed). VM 108 boots `vgpuaccel=2`.
 
 See `notes/PLAN.md` for the research behind this and what each stage needs.
 

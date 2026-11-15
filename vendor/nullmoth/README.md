@@ -22,3 +22,6 @@ it in Contents/Resources with its license (`libnvmtl_translate.LICENSE`) and loa
 - `plugin/nvmtl_fetch_copy.h` (stage 5b): NV's `plugin/nvmtl_fetch_copy.h`, the SPIR-V rewrite that turns `[[color(n)]]`
   subpass-input reads into texel fetches of a sampled image at the fragment's position (framebuffer fetch by copies).
   Copied unchanged.
+- `accel/nvres_fields.h` (stage 5b): NV's `kexts/NVRM/accel/nvres_fields.h`, where the family's resource object keeps
+  its width, height, pitches and face size per release (VGResource's level offsets and IOSurface video-memory size).
+  Copied unchanged.

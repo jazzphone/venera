@@ -15,6 +15,13 @@
 // AGDC name framebuffers by it), a VBL interrupt (a 60 Hz timer: the display pipe completes transactions and WindowServer
 // paces frames on it) and the scanout's RAM for the accelerator's display pipe to copy composited frames into
 // (kVGPUFBScanoutInfo / kVGPUFBPresent in ../VirtioGPUAPI.h).
+//
+// Stage 5b: CoreDisplay takes the IOPresentment path (and WindowServer composites with Metal) only when every
+// IOFramebuffer's class name names a GPU vendor it knows: "Intel", "AMD", "NVDA" or "AppleParavirt"
+// (GetGPUVendorForFramebufferService; any other name makes the vendor mask 0 and UseIOPresentment() false). So at
+// vgpuaccel>=4 the framebuffer is VirtioGPUFramebufferAppleParavirt, the same class under a name with Apple's
+// paravirtual GPU's vendor (the closest thing: a VM's GPU with a display pipe and no mux). Below 4, or with
+// -vgpunovendor, it is plain VirtioGPUFramebuffer and the software desktop is untouched.
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
@@ -132,6 +139,26 @@ private:
 };
 
 OSDefineMetaClassAndStructors(VirtioGPUFramebuffer, IOFramebuffer)
+
+// Matched first (higher IOProbeScore); declines unless the accelerator will arm WindowServer, and the plain class
+// matches instead.
+class VirtioGPUFramebufferAppleParavirt : public VirtioGPUFramebuffer {
+    OSDeclareDefaultStructors(VirtioGPUFramebufferAppleParavirt)
+
+public:
+    IOService *probe(IOService *provider, SInt32 *score) override {
+        uint32_t level = 0;
+        bool novendor = false;
+        PE_parse_boot_argn("vgpuaccel", &level, sizeof(level));
+        PE_parse_boot_argn("-vgpunovendor", &novendor, sizeof(novendor));
+        if (level < 4 || novendor) {
+            return nullptr;
+        }
+        return VirtioGPUFramebuffer::probe(provider, score);
+    }
+};
+
+OSDefineMetaClassAndStructors(VirtioGPUFramebufferAppleParavirt, VirtioGPUFramebuffer)
 
 void VirtioGPUFramebuffer::log(const char *fmt, ...) {
     char line[200];

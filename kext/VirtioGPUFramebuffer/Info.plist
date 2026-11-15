@@ -15,11 +15,24 @@
 	<key>CFBundlePackageType</key>
 	<string>KEXT</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.5.0</string>
+	<string>0.5.1</string>
 	<key>CFBundleVersion</key>
-	<string>0.5.0</string>
+	<string>0.5.1</string>
 	<key>IOKitPersonalities</key>
 	<dict>
+		<key>VirtioGPUFramebufferAppleParavirt</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>local.homelab.VirtioGPUFramebuffer</string>
+			<key>IOClass</key>
+			<string>VirtioGPUFramebufferAppleParavirt</string>
+			<key>IOMatchCategory</key>
+			<string>IOFramebuffer</string>
+			<key>IOProbeScore</key>
+			<integer>2000</integer>
+			<key>IOProviderClass</key>
+			<string>VirtioGPUDisplay</string>
+		</dict>
 		<key>VirtioGPUFramebuffer</key>
 		<dict>
 			<key>CFBundleIdentifier</key>

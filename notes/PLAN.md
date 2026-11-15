@@ -798,3 +798,61 @@ through IOPresentment. With the probes this is now directly observable: hook or 
 `CGXAccessDisplayDeviceSurface` (legacy) and the IOPresentment surface), and IOPresentment's interface creation
 ("Interface creation error: 0x2002" seen with the software WindowServer). The kernel side (pipe, AGDC, capabilities)
 is in place and waiting for transactions.
+
+### 5b, round 5 (2026-11-15): the desktop is composited with Metal and shown through the display pipe
+
+**Checkpoint met.** At `vgpuaccel=4` the first WindowServer of the boot stays up on the Metal compositor (our
+`VGMTLDevice` over Venus), CoreDisplay presents every frame as a display pipe transaction, and `VGDisplayPipe`'s
+`performTransaction` copies it into the scanout: `VirtioGPUPipeFrames` "calls 61 ok 61 fail 0" a minute after login,
+77 presents to the host. The tester on VM 108's console: "Desktop looks great! But it is slow". Five things stood between
+round 4 and this, found in this order:
+
+1. **CoreDisplay's IOPresentment switch is a GPU-vendor check on the framebuffer's class name.**
+   `CoreDisplay::UseIOPresentment()` (+0xb6f0) is true only when a once-computed vendor mask (+0x3e790c84) is non-zero
+   and covered by four allow flags (all 1). `__GetSystemGPUVendors_block_invoke` ORs `GetGPUVendorForFramebufferService`
+   over every `IOFramebuffer`: `IOObjectCopyClass` contains (case-insensitive) "Intel" -> 2, "AMD" -> 4, "NVDA" -> 8,
+   "AppleParavirt" -> 0x10, else 1, and bit 1 is dropped. "VirtioGPUFramebuffer" gave 0, so every display took the
+   legacy display surface and `CompositorSW` (round 4's mixed state). The framebuffer kext now has a subclass
+   `VirtioGPUFramebufferAppleParavirt` (IOProbeScore 2000) that only matches at `vgpuaccel>=4` without
+   `-vgpunovendor`; below that the plain class matches and the software desktop is as before. Found with the new
+   `codepeek dref` (RIP-relative references to a data address).
+2. **Plugin gaps the IOPresentment path uses**: CoreDisplay's display pipe (`RunFullDisplayPipe`) asserted on
+   `m_combinedLUTTexture` because `MTLTextureType1DArray` wasn't supported; it renders its LUTs into slices of that
+   array, so color attachments now take a level or slice (a one-level, one-slice view); `RG16Unorm/Snorm/Uint` added
+   (a WindowServer surface). The refused attachments had been failing command buffers (SkyLight: "Detected command
+   buffer completion failure. Error code = 0x1", "Flushing display space to aid GPU restart recovery").
+3. **The pipe was never active.** A kernel probe (accel 0.5.5, off with `-vgpunopipeprobe`) wraps
+   `IOAccelDisplayPipeUserClient2::externalMethod` (vtable copy, one slot replaced) and logs each selector. Selector 8
+   (`transaction_end`, 280-byte args) answered `kIOReturnNotReady`. Reading the family out of the guest's
+   `SystemKernelExtensions.kc` (new `tools/kcsyms.py` / `tools/kcdis.py`): `transactionEnd` requires accel+0xc78 bit 2,
+   pipe+0x282 == 0 and `IOAccelDisplayPipe::isActive()` (+0x298), which only `init_framebuffer_resource` sets, and only
+   when the pipe's `initFramebufferResource` returns memory and the resource then `prepare()`s. Ours returned NULL
+   ("frames are copied", NV's choice for another GPU's panel). Now it returns the framebuffer's VRAM wrapped by the
+   family's exported `IOAccelSysMemory::withMemoryDescriptor`; the pipe goes active at the first mode set.
+4. **Transactions then failed with `kIOReturnNoResources`** in `IOAccelDisplayPipeTransaction2::prepare()`: the planes'
+   resources (CoreDisplay's display surfaces) live in video memory and `VGVidMemory::allocPhysical` refused. It now
+   backs each allocation with contiguous kernel RAM (phys at +0xc8, length at +0x40, the family's own
+   `getPhysicalSegment`); `-vgpunovidmem` refuses again. Nothing GPU-side reads it; frames still reach the screen by
+   copies from the IOSurfaces.
+5. **The video memory was 0 bytes**: `VGResource::calculateIOSurfaceDeviceCacheVRAMBytes` answered 0. It and the level
+   offsets now read the resource's pitch and face size as NV does (`vendor/nullmoth/accel/nvres_fields.h`, vendored).
+
+Also: `vg_coredisplay_report` (plugin, WindowServer) only reads CoreDisplay's switch now; calling
+`CoreDisplay_UseIOPresentment()` itself computed the mask early and cleared the switch for good.
+
+**Known issues, for 5c**
+- **Slow.** Every frame is a full 1280x800 CPU copy in `performTransaction` plus the plugin's IOSurface sync (CPU copies
+  between the IOSurface and its Venus image on each pull and write-back), and CA's first pipelines translate in ~4 s.
+- **The guard at `vgpuaccel=4` no longer gives a software desktop.** With the AppleParavirt class name the vendor mask
+  is set whatever the arm state, so a withdrawn WindowServer finds "System set to use IOP but no display pipes are
+  present" and sets the main display offline (seen once this round, before the 1D-array fix). A withdraw should also
+  stop the framebuffer naming a vendor, or the guard should leave the pipe capabilities in place.
+- CoreDisplay still logs "Attempting to get capabilities from plane with no gamma" per frame and its first few
+  transactions fail before the pipe is active; several AGDC attributes are still answered unsupported (0xe00002c7).
+- First boot after an install: the first ~6 transactions are refused (pipe not yet active).
+
+**Recommendation for 5c**: speed. Measure first (per-frame time in `performTransaction`, plugin pull/write-back
+counts and bytes per frame), then: present through a host-side blit instead of a CPU copy (the scanout as a Venus
+image, or the virtio-gpu resource the IOSurface already is), and keep IOSurfaces resident on the Venus side so a frame
+isn't pulled from and written back to guest RAM. Fix the withdraw path before anything that could crash WindowServer
+in a loop.

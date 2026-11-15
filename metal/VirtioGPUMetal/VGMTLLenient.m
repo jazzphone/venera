@@ -64,6 +64,11 @@ void vg_cahook_install(void);
 __attribute__((constructor)) static void vg_lenient_install(void) {
     if (!strcmp(getprogname(), "WindowServer")) {
         vg_cahook_install();   // only with /Library/GPUBundles/VirtioGPUMetal-cahook present
+        void vg_coredisplay_report(void);
+        vg_coredisplay_report();   // now, and again once the displays are up
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 6 * NSEC_PER_SEC), dispatch_get_global_queue(0, 0), ^{
+            vg_coredisplay_report();
+        });
     }
     if (!vg_lenient()) {
         return;
