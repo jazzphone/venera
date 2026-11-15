@@ -177,6 +177,30 @@ struct CmdUpdateCursor {
     uint32_t padding;
 };
 
+// capability sets (GET_CAPSET_INFO)
+enum CapsetID : uint32_t {
+    kCapsetVirgl = 1,
+    kCapsetVirgl2 = 2,
+    kCapsetGfxstreamVulkan = 3,
+    kCapsetVenus = 4,
+    kCapsetCrossDomain = 5,
+    kCapsetDRM = 6,
+};
+
+struct CmdGetCapsetInfo {
+    CtrlHdr hdr;
+    uint32_t capsetIndex;
+    uint32_t padding;
+};
+
+struct RespCapsetInfo {
+    CtrlHdr hdr;
+    uint32_t capsetID;
+    uint32_t capsetMaxVersion;
+    uint32_t capsetMaxSize;
+    uint32_t padding;
+};
+
 // struct virtio_gpu_config (device config space)
 struct Config {
     uint32_t eventsRead;

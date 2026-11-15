@@ -56,6 +56,7 @@ private:
     uint32_t simple(uint32_t requestLength);
     void getDisplayInfo();
     void getEDID(uint32_t scanout);
+    void getCapsets();
     bool attachBacking(uint32_t resource, IOBufferMemoryDescriptor *memory, uint32_t bytes);
     void dropResource(uint32_t resource);
 
@@ -90,6 +91,13 @@ private:
     uint32_t scanoutStride_ = 0;
     uint32_t flushes_ = 0;
     IOService *display_ = nullptr; // VirtioGPUDisplay nub
+    // Stage 3: host-visible memory window (VIRTIO_PCI_CAP_SHARED_MEMORY_CFG) and capsets
+    uint32_t numCapsets_ = 0;
+    bool venusCapset_ = false;
+    uint8_t hostmemID_ = 0;
+    uint8_t hostmemBar_ = 0;
+    uint64_t hostmemOffset_ = 0;
+    uint64_t hostmemLength_ = 0;
 };
 
 // The nub VirtioGPUFramebuffer.kext matches on. Forwards callPlatformFunction to the core.

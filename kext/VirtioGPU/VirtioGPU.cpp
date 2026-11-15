@@ -71,6 +71,18 @@ const char *respName(uint32_t type) {
     }
 }
 
+const char *capsetName(uint32_t id) {
+    switch (id) {
+    case vgpu::kCapsetVirgl: return "virgl";
+    case vgpu::kCapsetVirgl2: return "virgl2";
+    case vgpu::kCapsetGfxstreamVulkan: return "gfxstream-vulkan";
+    case vgpu::kCapsetVenus: return "venus";
+    case vgpu::kCapsetCrossDomain: return "cross-domain";
+    case vgpu::kCapsetDRM: return "drm";
+    default: return "?";
+    }
+}
+
 constexpr uint16_t kQueueControl = 0;
 constexpr uint16_t kQueueCursor = 1;
 constexpr uint16_t kMaxQueueSize = 64;
@@ -132,6 +144,7 @@ bool VirtioGPU::start(IOService *provider) {
         if (features_ & (1ULL << vgpu::kFeatureEDID)) {
             getEDID(0);
         }
+        getCapsets();
         LOG("core ready: %ux%u preferred, interrupts %u", width_, height_, interrupts_);
         VirtioGPUDisplay *nub = OSTypeAlloc(VirtioGPUDisplay);
         if (nub && nub->init() && nub->attach(this)) {
@@ -231,6 +244,16 @@ bool VirtioGPU::findRegions(virtio::Region regions[9], uint32_t *notifyMultiplie
             if (type == kCapNotify) {
                 *notifyMultiplier = pci_->configRead32(ptr + 16);
             }
+            if (type == 8 && pci_->configRead8(ptr + 2) >= 24) { // VIRTIO_PCI_CAP_SHARED_MEMORY_CFG
+                uint8_t bar = pci_->configRead8(ptr + 4);
+                hostmemID_ = pci_->configRead8(ptr + 5);
+                hostmemBar_ = bar;
+                hostmemOffset_ = ((uint64_t)pci_->configRead32(ptr + 16) << 32) | pci_->configRead32(ptr + 8);
+                hostmemLength_ = ((uint64_t)pci_->configRead32(ptr + 20) << 32) | pci_->configRead32(ptr + 12);
+                LOG("shared memory id %u: BAR%u offset 0x%llx length 0x%llx (%llu MB)", hostmemID_, bar,
+                    (unsigned long long)hostmemOffset_, (unsigned long long)hostmemLength_,
+                    (unsigned long long)(hostmemLength_ >> 20));
+            }
             if (type < 9 && !regions[type].present) {
                 regions[type].present = true;
                 regions[type].bar = pci_->configRead8(ptr + 4);
@@ -298,16 +321,25 @@ bool VirtioGPU::bringUp() {
     transport_.addStatus(virtio::kAcknowledge);
     transport_.addStatus(virtio::kDriver);
 
-    uint64_t wanted = (1ULL << virtio::kFeatureVersion1) | (1ULL << vgpu::kFeatureEDID);
+    uint64_t offered = transport_.deviceFeatures();
+    uint64_t wanted = (1ULL << virtio::kFeatureVersion1) | (1ULL << vgpu::kFeatureEDID) |
+                      (1ULL << vgpu::kFeatureVirgl) | (1ULL << vgpu::kFeatureResourceBlob) |
+                      (1ULL << vgpu::kFeatureContextInit);
     if (!transport_.negotiate(wanted, &features_) ||
         !(features_ & (1ULL << virtio::kFeatureVersion1))) {
         LOG("feature negotiation failed (0x%llx)", (unsigned long long)features_);
         return false;
     }
-    LOG("features accepted 0x%llx", (unsigned long long)features_);
+    LOG("features offered 0x%llx accepted 0x%llx:%s%s%s%s", (unsigned long long)offered,
+        (unsigned long long)features_, (features_ & (1ULL << vgpu::kFeatureVirgl)) ? " VIRGL" : "",
+        (features_ & (1ULL << vgpu::kFeatureEDID)) ? " EDID" : "",
+        (features_ & (1ULL << vgpu::kFeatureResourceBlob)) ? " RESOURCE_BLOB" : "",
+        (features_ & (1ULL << vgpu::kFeatureContextInit)) ? " CONTEXT_INIT" : "");
 
     volatile vgpu::Config *config = reinterpret_cast<volatile vgpu::Config *>(transport_.deviceConfig());
     numScanouts_ = config->numScanouts;
+    numCapsets_ = config->numCapsets;
+    LOG("config: scanouts %u capsets %u", numScanouts_, numCapsets_);
 
     uint16_t vector = msix_ ? 0 : kNoVector;
     if (msix_ && !transport_.setConfigVector(0)) {
@@ -440,6 +472,29 @@ void VirtioGPU::getEDID(uint32_t scanout) {
     edid_ = OSData::withBytes(resp->edid, size);
     if (edid_) {
         setProperty("EDID", edid_);
+    }
+}
+
+void VirtioGPU::getCapsets() {
+    for (uint32_t i = 0; i < numCapsets_ && i < 8; i++) {
+        auto *req = reinterpret_cast<vgpu::CmdGetCapsetInfo *>(commandBytes_);
+        bzero(req, sizeof(*req));
+        req->hdr.type = vgpu::kCmdGetCapsetInfo;
+        req->capsetIndex = i;
+        if (command(sizeof(*req), sizeof(vgpu::RespCapsetInfo)) != vgpu::kRespOkCapsetInfo) {
+            LOG("GET_CAPSET_INFO %u failed", i);
+            continue;
+        }
+        auto *info = reinterpret_cast<vgpu::RespCapsetInfo *>(commandBytes_ + kReplyOffset);
+        LOG("capset %u: id %u (%s) max version %u max size %u", i, info->capsetID,
+            capsetName(info->capsetID), info->capsetMaxVersion, info->capsetMaxSize);
+        if (info->capsetID == vgpu::kCapsetVenus) {
+            venusCapset_ = true;
+        }
+    }
+    if (OSNumber *n = OSNumber::withNumber(venusCapset_ ? 1 : 0, 32)) {
+        setProperty("Venus", n);
+        n->release();
     }
 }
 
