@@ -353,16 +353,25 @@ bool VirtioGPU::bringUp() {
     numScanouts_ = config->numScanouts;
     numCapsets_ = config->numCapsets;
     LOG("config: scanouts %u capsets %u", numScanouts_, numCapsets_);
-    if (hostmemLength_) {
-        IODeviceMemory *bar = pci_->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0 + hostmemBar_ * 4);
-        if (bar && bar->getLength() >= hostmemOffset_ + hostmemLength_) {
-            hostmemMemory_ = IODeviceMemory::withSubRange(bar, hostmemOffset_, hostmemLength_);
+    if (hostmemLength_ && hostmemBar_ < 5) {
+        // IOPCIFamily lists this 64-bit BAR as an IOSubMemoryDescriptor, which
+        // getDeviceMemoryWithRegister doesn't hand back as device memory: read the BAR itself.
+        uint8_t reg = kIOPCIConfigBaseAddress0 + hostmemBar_ * 4;
+        uint32_t low = pci_->configRead32(reg);
+        uint64_t base = low & ~0xfULL;
+        if ((low & 0x6) == 0x4) {
+            base |= (uint64_t)pci_->configRead32(reg + 4) << 32;
+        }
+        if (base && !(low & 1)) {
+            hostmemMemory_ = IODeviceMemory::withRange(base + hostmemOffset_, hostmemLength_);
+        }
+        if (hostmemMemory_) {
             hostmemLock_ = IOLockAlloc();
             hostmemRanges_ = static_cast<HostmemRange *>(IOMallocZero(kMaxHostmemRanges * sizeof(HostmemRange)));
             LOG("hostmem window at phys 0x%llx, %llu MB", (unsigned long long)hostmemMemory_->getPhysicalAddress(),
                 (unsigned long long)(hostmemLength_ >> 20));
         } else {
-            LOG("hostmem BAR%u not usable", hostmemBar_);
+            LOG("hostmem BAR%u not usable (raw 0x%08x)", hostmemBar_, low);
         }
     }
 

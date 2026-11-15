@@ -196,7 +196,8 @@ IOReturn VirtioGPUUserClient::createBlob(IOExternalMethodArguments *args) {
         resources_[resourceCount_++] = {id, req.size, false, 0, 0};
         args->scalarOutput[0] = id;
     } else {
-        LOG("CREATE_BLOB mem %u flags 0x%x size %llu id %llu -> 0x%x", req.blobMem, req.blobFlags,
+        LOG("CREATE_BLOB res %u ctx %u mem %u flags 0x%x size %llu id %llu -> 0x%x", id, ctx_, req.blobMem,
+            req.blobFlags,
             (unsigned long long)req.size, (unsigned long long)req.blobID, type);
     }
     IOLockUnlock(lock_);
