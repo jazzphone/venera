@@ -44,15 +44,17 @@ test) # build tools/vgputest.c, copy it into the VM, run it as the console user
   "${SCP[@]}" build/vgputest $HOST:/root/vgpu/
   "${SSH[@]}" $HOST "bash /root/vgpu/vm-remote.sh push /root/vgpu/vgputest /tmp/vgputest >/dev/null && bash /root/vgpu/vm-remote.sh run 'chmod +x /tmp/vgputest && sudo -u dev /tmp/vgputest; echo exit \$?'"
   ;;
-share) # tools/deploy.sh share FILE...: copy into the VM's virtiofs share (/Volumes/vgpu)
+xfer) # tools/deploy.sh xfer FILE...: onto the VM's transfer disk (/Volumes/VGPU)
   shift
-  "${SCP[@]}" -r "$@" $HOST:/root/vgpu-share/
-  "${SSH[@]}" $HOST 'bash /root/vgpu/vm-remote.sh mount'
+  "${SSH[@]}" $HOST 'mkdir -p /root/vgpu/xfer && rm -rf /root/vgpu/xfer/*'
+  "${SCP[@]}" -r "$@" $HOST:/root/vgpu/xfer/
+  "${SSH[@]}" $HOST 'bash /root/vgpu/vm-remote.sh xfer /root/vgpu/xfer/*'
   ;;
-vk) # Venus: Mesa's ICD + vkprobe through the share, run as the console user
+vk) # Venus: Mesa's ICD + vkprobe over the transfer disk, run as the console user
   tools/build-tools.sh >/dev/null
-  "${SCP[@]}" mesa/out/libvulkan_virtio.dylib build/vkprobe build/vgputest $HOST:/root/vgpu-share/
-  "${SSH[@]}" $HOST "bash /root/vgpu/vm-remote.sh mount >/dev/null; bash /root/vgpu/vm-remote.sh run 'cd /tmp && sudo -u dev env VN_DEBUG=${VN_DEBUG:-init,result} /Volumes/vgpu/vkprobe /Volumes/vgpu/libvulkan_virtio.dylib 2>&1 | tail -60; echo exit \$?' 180"
+  "${SSH[@]}" $HOST 'mkdir -p /root/vgpu/xfer && rm -rf /root/vgpu/xfer/*'
+  "${SCP[@]}" mesa/out/libvulkan_virtio.dylib build/vkprobe build/vgputest $HOST:/root/vgpu/xfer/
+  "${SSH[@]}" $HOST "bash /root/vgpu/vm-remote.sh xfer /root/vgpu/xfer/* >/dev/null; bash /root/vgpu/vm-remote.sh run 'mkdir -p /tmp/vk && cp /Volumes/VGPU/libvulkan_virtio.dylib /Volumes/VGPU/vkprobe /Volumes/VGPU/vgputest /tmp/vk/ && chmod +x /tmp/vk/vkprobe /tmp/vk/vgputest && cd /tmp/vk && sudo -u dev env VN_DEBUG=${VN_DEBUG:-init,result} ./vkprobe ./libvulkan_virtio.dylib 2>&1 | tail -70; echo exit \$?' 240"
   ;;
 shots) # tools/deploy.sh shots COUNT INTERVAL -> build/shots/NN.png
   "${SSH[@]}" $HOST "bash /root/vgpu/vm-remote.sh shots ${2:-20} ${3:-3}"

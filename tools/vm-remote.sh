@@ -112,8 +112,14 @@ aux) # aux TGZ NAME: install into /Library/Extensions + AuxKC, then reboot
   aux_install "$2" "$3"
   reboot_vm
   ;;
-mount) # mount the virtiofs share (the Proxmox host /root/vgpu-share, tag vgpu) at /Volumes/vgpu
-  agent 'mkdir -p /Volumes/vgpu; mount | grep -q " /Volumes/vgpu " || mount_virtiofs vgpu /Volumes/vgpu; ls -la /Volumes/vgpu | head -20' 60
+xfer) # xfer FILE...: copy files onto the transfer disk (virtio1, FAT "VGPU", /Volumes/VGPU in macOS)
+  # (virtiofs hung OpenCore at startup, so files go over a disk: unmount in the guest, write here, remount.)
+  shift
+  XDISK=/dev/pve/$(qm config $VM | grep ^virtio1 | sed -E "s/.*local-lvm:(vm-108-disk-[0-9]+).*/\1/")
+  agent 'diskutil unmount force /Volumes/VGPU >/dev/null 2>&1; true' 60 || true
+  mkdir -p /mnt/vgpuxfer && lvchange -ay "$XDISK" 2>/dev/null
+  mount "$XDISK" /mnt/vgpuxfer && cp -r "$@" /mnt/vgpuxfer/ && sync && umount /mnt/vgpuxfer
+  agent 'diskutil mount $(diskutil list | awk "/VGPU/{print \$NF; exit}") >/dev/null; ls -la /Volumes/VGPU | tail -n +2' 60
   ;;
 push) # push LOCAL REMOTE: copy a file into the VM over the guest agent
   push_file "$2" "$3"
