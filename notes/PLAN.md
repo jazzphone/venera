@@ -158,3 +158,30 @@ tiles, or zero-copy blob scanout) before stage 3.
 Next: a user client in the core (context, blob create/map in hostmem, SUBMIT_3D with ring_idx,
 fences/wait) and Mesa's Venus for x86_64 macOS with `vn_renderer_macos.c`; goal: `vulkaninfo` in
 the VM listing the Iris Xe.
+
+## Stage 3: the user client works (2026-11-15)
+
+`tools/deploy.sh test` (tools/vgputest.c, run as dev in the VM): getInfo, Venus capset, contextInit
+(ctx 2), createBlob HOST3D 1 MB blob id 0, mapBlob (cached), IOConnectMapMemory64 + 1 MB write/read
+in 1.6 ms with 0 mismatches, fenced empty submit on ring 0 signaled in 4.1 ms, destroy: PASS.
+
+What it took:
+- **virgl-server** on the Proxmox host (`/usr/libexec/virgl_render_server`). Without it virglrenderer
+  still advertises the Venus capset and QEMU still answers CTX_CREATE with OK_NODATA (it ignores
+  `virgl_renderer_context_create_with_flags`'s result), but the context doesn't exist and blob
+  creation fails with EINVAL.
+- QEMU's `qemu_log_mask` output is lost when daemonized: `qm monitor 108` -> `logfile /tmp/qemu108.log`,
+  `log guest_errors,unimp`.
+- **XNU can't address physical memory >= 2^44** (32-bit ppnum_t): OVMF put the hostmem BAR at
+  0x3840_0000_0000 (top of 46-bit space) and no IOMemoryDescriptor could be made for it. VM 108's
+  args now have `-cpu host,host-phys-bits-limit=40,...`: BAR4 lands at 0xe0_0000_0000.
+- IOPCIFamily mis-parses 64-bit BARs above 4 GB (lists BAR4 as an IOSubMemoryDescriptor with
+  address = upper dword, length 4); the core reads BAR4 from config space and makes an
+  IODeviceMemory per mapping.
+- hostmem is 2 GB now (`hostmem=2G`); 4 GB wasn't the problem but 2 GB is plenty for now.
+- The control queue is asynchronous: requests indexed by descriptor head, drained in the
+  interrupt action; fenced SUBMIT_3D completes when the host signals the fence.
+
+Next: `vn_renderer_macos.c` on this API (mesa/NOTES.md lists the ops; sim-syncobj logic with
+kVGUCWaitFence in place of sync_file fds), install the dylib + ICD json in the VM, Vulkan loader,
+`vulkaninfo`.
