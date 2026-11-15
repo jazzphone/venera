@@ -50,6 +50,13 @@ id<MTLBuffer> vg_new_buffer_nocopy(id<MTLDevice> device, void *pointer, NSUInteg
     uint32_t _syncedSeed;   // the surface seed the image matches (after a pull or our own copy-out)
     BOOL _neverSynced;
     vg_buffer _staging;
+    // A texture over a buffer's memory (newTextureWithDescriptor:offset:bytesPerRow: and the tiled/linear SPI): Venus
+    // can't alias the two, so the image is refreshed from the buffer each time it is bound or read (5b).
+    id _srcBuffer;
+    NSUInteger _srcOffset, _srcBpr;
+    // A texture view (newTextureViewWithPixelFormat:...): shares _parent's image, has its own VkImageView.
+    VGMTLTexture *_parent;
+    VkImageUsageFlags _imageUsage;
 }
 @property(readonly) id<MTLDevice> device;
 @property(copy, atomic) NSString *label;
@@ -60,6 +67,8 @@ void vg_surface_pull(VGMTLTexture *t);
 // Records that `cmd` writes texture `t`: a surface texture is copied back to its IOSurface when `cmd` completes.
 void vg_cmd_wrote(id cmd, VGMTLTexture *t);
 id<MTLTexture> vg_new_surface_texture(id<MTLDevice> device, MTLTextureDescriptor *d, IOSurfaceRef surface, NSUInteger plane);
+id<MTLTexture> vg_texture_view(VGMTLTexture *p, MTLPixelFormat pf, MTLTextureType type, NSRange levels, NSRange slices);
+id<MTLTexture> vg_new_buffer_texture(id<MTLBuffer> buffer, MTLTextureDescriptor *d, NSUInteger offset, NSUInteger bpr);
 
 @interface VGMTLSamplerState : NSObject <MTLSamplerState> {
 @public

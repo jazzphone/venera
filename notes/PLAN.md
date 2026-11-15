@@ -722,3 +722,32 @@ refused to an armed WindowServer unless `-vgpulegacy` or `acceltest legacy on`.
   `CARenderer` (`+rendererWithMTLTexture:options:`) runs `CA::OGL::MetalContext` in-process; a test app with a
   vibrancy/material layer over an image should reach `calculate_average_luma`. Then log every message our objects
   receive there (an `instrumentObjcMessageSends`-style trace works outside the sandbox) and find the failing branch.
+
+### 5b, round 3 (2026-11-15): a Core Animation test app; the abort isn't the luma pass alone
+
+- **`tools/carender.m`**: Core Animation's own Metal renderer (`CARenderer`, i.e. `CA::OGL::MetalContext`) in an ordinary
+  process on our device: a gradient image, a translucent rounded panel and a luma-tracking `CABackdropLayer`, rendered
+  into a texture and read back (`VGMTL_ENABLE=1 carender [FRAMES] [notrack]`). It renders correctly with framebuffer
+  fetch by copies and no lenient fallbacks. It does not reach `calculate_average_luma` (`update_backdrop_luma` needs
+  WindowServer's backdrop groups), so it doesn't reproduce the abort. It is the quick check for CA rendering from now on.
+- **`codepeek LIB callers OFFSET`** lists direct callers of a function.
+- **Call trace** (plugin): with `/Library/GPUBundles/VirtioGPUMetal-calls` present (WindowServer can read it), the
+  plugin logs command buffers, encoders, dispatches, commits, completions, heap buffers and texture views as `CALL …`,
+  and `STACK …` lines (caller frames) for blit-encoder creation, `endEncoding` and `commit`. Remove the file afterwards.
+  Under load os_log drops some of it.
+- Plugin additions: buffer-backed textures (`newTextureWithDescriptor:offset:bytesPerRow:` and CA's tiled/linear SPI,
+  refreshed from the buffer at each bind), texture views (`newTextureViewWithPixelFormat:…`, images made with
+  MUTABLE_FORMAT), protection options / responsible process kept per object, explicit capability answers (no tile
+  shaders, memoryless targets, framebuffer reads, raster order groups; logged when asked).
+- **What the trace showed in WindowServer's luma pass**: compute encoder, `sum_rgba_columns` and `sum_rgba_rows` dispatched,
+  `endEncoding`, a blit encoder created and at once ended and the command buffer committed. CA's context then has no
+  command buffer, takes the fallback, and the fallback's `push_surface` asserts. In `new_metal_context`, bit 1 of
+  ctx+0xe37 (the luma fallback's tile branch) is `supportsTileShaders`. We now answer NO explicitly, and WindowServer
+  asks and gets NO, yet it still aborts on "transient surface … not found".
+- **The abort isn't the luma pass alone**: the post-autologin WindowServer of the previous boot, which looked
+  stable, also aborted on it after 284 s from CA's normal end-of-frame flush (`MetalContext::Flush` via `EndUpdate`).
+  So Core Animation loses track of one of its transient surfaces in ordinary rendering on our device.
+- **Next**: transient surfaces are created by `CA::OGL::MetalContext::create_surface_with_properties` and tracked by
+  `CA::OGL::Context` (`slist`). Read `create_surface_with_properties` and the surface release/volatile paths
+  (`set_surface_volatile` -> `setPurgeableState:`, `purge_iosurface_cache`, heap aliasing) with codepeek, and make
+  carender exercise transient surfaces (blur filter, shadow, masks) so the loss reproduces outside WindowServer.

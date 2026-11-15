@@ -23,6 +23,17 @@
     }
 }
 - (void *)contents { return _host ? _host : _b.map; }
+// Textures over the buffer's memory (public, and Core Animation's tiled / linear SPI).
+- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)bpr {
+    return vg_new_buffer_texture(self, d, offset, bpr);
+}
+- (id<MTLTexture>)newTiledTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)bpr {
+    return vg_new_buffer_texture(self, d, offset, bpr);
+}
+- (id<MTLTexture>)newLinearTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset
+                                      bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi {
+    return vg_new_buffer_texture(self, d, offset, bpr);
+}
 // Metal's own no-copy path makes [[buffer class] alloc] and sends this (seen from WindowServer, 5b).
 - (instancetype)initStandinWithDevice:(id<MTLDevice>)device bytesNoCopy:(void *)pointer length:(NSUInteger)length
                           deallocator:(void (^)(void *, NSUInteger))deallocator {
@@ -532,6 +543,7 @@ id<MTLComputePipelineState> vg_new_compute_pipeline(id<MTLDevice> device, id<MTL
     VGMTLCommandBuffer *c = [VGMTLCommandBuffer new];
     [c setValue:_device forKey:@"device"];
     [c setValue:self forKey:@"commandQueue"];
+    VGCALL("queue %p commandBuffer -> %p", self, c);
     return c;
 }
 - (id<MTLCommandBuffer>)commandBufferWithUnretainedReferences { return [self commandBuffer]; }
@@ -552,7 +564,10 @@ id<MTLCommandQueue> vg_new_queue(id<MTLDevice> device) {
     }
     return self;
 }
-- (void)endEncoding { }
+- (void)endEncoding {
+    VGCALL("encoder %p (%s) endEncoding", self, object_getClassName(self));
+    vg_callstack("endEncoding");
+}
 - (uint64_t)globalTraceObjectID { return 0; }
 - (void)insertDebugSignpost:(NSString *)s { }
 - (void)pushDebugGroup:(NSString *)s { }
@@ -646,6 +661,9 @@ VkBuffer vg_vkbuffer(id<MTLBuffer> b) {
 
 // The translator's KernelDispatch::plan, here: per dimension the full groups, then the tail as one smaller group.
 - (void)dispatchGrid:(MTLSize)threads local:(MTLSize)tptg {
+    VGCALL("cb %p dispatch %s %lux%lux%lu local %lux%lux%lu", _owner, _pso ? _pso->_name.UTF8String : "(no pipeline)",
+           (unsigned long)threads.width, (unsigned long)threads.height, (unsigned long)threads.depth,
+           (unsigned long)tptg.width, (unsigned long)tptg.height, (unsigned long)tptg.depth);
     if (!_pso) {
         [_owner fail:@"dispatch without a compute pipeline"];
         return;
@@ -760,7 +778,7 @@ VkBuffer vg_vkbuffer(id<MTLBuffer> b) {
         [_owner barrier];
     }
 }
-- (void)synchronizeResource:(id<MTLResource>)r { }   // coherent memory
+- (void)synchronizeResource:(id<MTLResource>)r { VGCALL("cb %p synchronizeResource %p", _owner, r); }   // coherent memory
 - (void)synchronizeTexture:(id<MTLTexture>)t slice:(NSUInteger)s level:(NSUInteger)l { }
 - (void)generateMipmapsForTexture:(id<MTLTexture>)t {
     static int logged = 0;
@@ -966,6 +984,7 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
 }
 
 - (id<MTLComputeCommandEncoder>)computeCommandEncoder {
+    VGCALL("cb %p computeCommandEncoder", self);
     return [[VGComputeEncoder alloc] initWithCommandBuffer:self];
 }
 - (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDispatchType:(MTLDispatchType)t {
@@ -974,12 +993,17 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
 - (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDescriptor:(MTLComputePassDescriptor *)d {
     return [self computeCommandEncoder];
 }
-- (id<MTLBlitCommandEncoder>)blitCommandEncoder { return [[VGBlitEncoder alloc] initWithCommandBuffer:self]; }
+- (id<MTLBlitCommandEncoder>)blitCommandEncoder {
+    VGCALL("cb %p blitCommandEncoder", self);
+    vg_callstack("blitCommandEncoder");
+    return [[VGBlitEncoder alloc] initWithCommandBuffer:self];
+}
 - (id<MTLBlitCommandEncoder>)blitCommandEncoderWithDescriptor:(MTLBlitPassDescriptor *)d {
     return [self blitCommandEncoder];
 }
 
 - (void)addCompletedHandler:(MTLCommandBufferHandler)block {
+    VGCALL("cb %p addCompletedHandler (status %lu)", self, (unsigned long)_status);
     @synchronized(self) {
         [_handlers addObject:[block copy]];
     }
@@ -1016,6 +1040,7 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
 - (void)popDebugGroup { }
 
 - (void)finishWith:(MTLCommandBufferStatus)status fence:(VkFence)fence {
+    VGCALL("cb %p completing, status %lu", self, (unsigned long)status);
     if (fence) {
         gVk.vkWaitForFences(gVk.device, 1, &fence, VK_TRUE, UINT64_MAX);
         gVk.vkDestroyFence(gVk.device, fence, NULL);
@@ -1075,6 +1100,9 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
 }
 
 - (void)commit {
+    VGCALL("cb %p commit (%lu completed, %lu scheduled handlers, error %s)", self, (unsigned long)_handlers.count,
+           (unsigned long)_scheduledHandlers.count, _error ? _error.localizedDescription.UTF8String : "none");
+    vg_callstack("commit");
     [self enqueue];
     _status = MTLCommandBufferStatusCommitted;
     dispatch_group_enter(_done);
@@ -1147,6 +1175,9 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
 @end
 
 void vg_cmd_wrote(id cmd, VGMTLTexture *t) {
+    while (t && t->_parent) {
+        t = t->_parent;   // a view writes its texture
+    }
     if (t && t->_surface) {
         [((VGMTLCommandBuffer *)cmd)->_surfacesWritten addObject:t];
     }

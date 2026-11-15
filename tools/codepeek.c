@@ -3,6 +3,7 @@
 //   codepeek LIBPATH OFFSET LENGTH OUTFILE
 //   codepeek LIBPATH find SUBSTRING          functions of the library whose (mangled) name contains SUBSTRING
 //   codepeek LIBPATH sels SUBSTRING          every selector those functions load (unique), with the function
+//   codepeek LIBPATH callers OFFSET          the functions of the library that call (call rel32) the one at OFFSET
 // OFFSET is the image offset a crash report gives (imageOffset - symbolLocation = the function's start). Writes the raw
 // bytes to OUTFILE (disassemble on the Mac: llvm-objdump -D -b binary -m i386:x86-64 --adjust-vma=OFFSET) and prints
 // every RIP-relative load whose target holds a selector (mov reg, [rip+d] of a selref) and every call's target name.
@@ -45,7 +46,7 @@ static const char *name_at(const void *p) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 4 || (argc < 5 && strcmp(argv[2], "find") && strcmp(argv[2], "sels"))) {
+    if (argc < 4 || (argc < 5 && strcmp(argv[2], "find") && strcmp(argv[2], "sels") && strcmp(argv[2], "callers"))) {
         fprintf(stderr, "usage: codepeek LIBPATH OFFSET LENGTH OUTFILE\n");
         return 2;
     }
@@ -64,6 +65,24 @@ int main(int argc, char **argv) {
         return 1;
     }
     gStubs = getsectiondata((const struct mach_header_64 *)mh, "__TEXT", "__objc_stubs", &gStubsSize);
+    if (!strcmp(argv[2], "callers")) {
+        unsigned long tsize = 0;
+        const uint8_t *text = getsectiondata((const struct mach_header_64 *)mh, "__TEXT", "__text", &tsize);
+        const uint8_t *want = (const uint8_t *)mh + strtoul(argv[3], NULL, 0);
+        for (unsigned long i = 0; text && i + 5 <= tsize; i++) {
+            const uint8_t *q = text + i;
+            if (q[0] != 0xe8) {
+                continue;
+            }
+            int32_t d;
+            memcpy(&d, q + 1, 4);
+            if (q + 5 + d == want) {
+                const char *n = name_at(q);
+                printf("+0x%lx %s\n", (unsigned long)(q - (const uint8_t *)mh), n ? n : "?");
+            }
+        }
+        return 0;
+    }
     if (!strcmp(argv[2], "find") || !strcmp(argv[2], "sels")) {
         unsigned long tsize = 0;
         const uint8_t *text = getsectiondata((const struct mach_header_64 *)mh, "__TEXT", "__text", &tsize);

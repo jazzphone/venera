@@ -679,6 +679,7 @@ static VkAttachmentStoreOp vg_store(MTLStoreAction a) {
 }
 
 - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
+    VGCALL("cb %p renderCommandEncoder (%lux%lu)", self, (unsigned long)d.colorAttachments[0].texture.width, (unsigned long)d.colorAttachments[0].texture.height);
     if (![self begin]) {
         [self fail:@"no command buffer"];
         return nil;

@@ -71,6 +71,7 @@ MTLSizeAndAlign vg_heap_buffer_size(NSUInteger length) {
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { return MTLPurgeableStateNonVolatile; }
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
     id<MTLBuffer> b = vg_new_buffer(_dev, length, options, NULL);
+    VGCALL("heap %p newBufferWithLength:%lu -> %p", self, (unsigned long)length, b);
     if (b) {
         @synchronized(self) {
             vg_heap_adopt(b, self, _used);

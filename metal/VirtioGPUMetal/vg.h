@@ -7,6 +7,16 @@
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan_core.h>
 
+// Call trace (5b): VGMTL_CALLS=1, or the file /Library/GPUBundles/VirtioGPUMetal-calls (WindowServer reads it; its
+// environment can't be set). VGCALL lines go to the log with the object they're about.
+BOOL vg_calltrace(void);
+void vg_callstack(const char *what);   // with the call trace on: the caller's frames, compacted
+#define VGCALL(fmt, ...)                                                                                           \
+    do {                                                                                                           \
+        if (vg_calltrace()) {                                                                                      \
+            vglog("CALL " fmt, ##__VA_ARGS__);                                                                     \
+        }                                                                                                          \
+    } while (0)
 void vglog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 // VGMTL_TRACE=1: step-by-step lines for bisecting a host-side failure (the log is written before each step).
 BOOL vg_tracing(void);

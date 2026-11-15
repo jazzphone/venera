@@ -123,6 +123,9 @@ BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
     if (_view) {
         gVk.vkDestroyImageView(gVk.device, _view, NULL);
     }
+    if (_parent) {
+        return;   // a view: the image and its memory are the parent's
+    }
     if (_image) {
         gVk.vkDestroyImage(gVk.device, _image, NULL);
     }
@@ -131,6 +134,16 @@ BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
     }
 }
 - (MTLTextureType)textureType { return _type; }
+- (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)pf {
+    return vg_texture_view(self, pf, _type, NSMakeRange(0, _mips), NSMakeRange(0, _layers));
+}
+- (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)pf textureType:(MTLTextureType)type levels:(NSRange)levels
+                                         slices:(NSRange)slices {
+    return vg_texture_view(self, pf, type, levels, slices);
+}
+- (id<MTLTexture>)parentTexture { return _parent; }
+- (NSUInteger)parentRelativeLevel { return 0; }
+- (NSUInteger)parentRelativeSlice { return 0; }
 - (MTLPixelFormat)pixelFormat { return _pixelFormat; }
 - (NSUInteger)width { return _width; }
 - (NSUInteger)height { return _height; }
@@ -146,11 +159,12 @@ BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
 - (BOOL)isFramebufferOnly { return NO; }
 - (BOOL)allowGPUOptimizedContents { return YES; }
 - (BOOL)isShareable { return NO; }
-- (IOSurfaceRef)iosurface { return _surface; }
-- (NSUInteger)iosurfacePlane { return _plane; }
-- (id<MTLTexture>)parentTexture { return nil; }
+- (IOSurfaceRef)iosurface { return _parent ? _parent->_surface : _surface; }
+- (NSUInteger)iosurfacePlane { return _parent ? _parent->_plane : _plane; }
 - (id<MTLTexture>)rootResource { return nil; }
-- (id<MTLBuffer>)buffer { return nil; }
+- (id<MTLBuffer>)buffer { return _srcBuffer; }
+- (NSUInteger)bufferOffset { return _srcOffset; }
+- (NSUInteger)bufferBytesPerRow { return _srcBpr; }
 - (NSUInteger)allocatedSize { return _width * _height * _depth * _layers * MAX(vg_format_of(_pixelFormat)->bytes, 1); }
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { return MTLPurgeableStateNonVolatile; }
 - (BOOL)isAliasable { return vg_heap_aliasable(self); }
@@ -298,6 +312,10 @@ id<MTLTexture> vg_new_texture(id<MTLDevice> device, MTLTextureDescriptor *d) {
     ici.samples = VK_SAMPLE_COUNT_1_BIT;
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
     ici.usage = usage;
+    if (f->aspect == VK_IMAGE_ASPECT_COLOR_BIT) {
+        ici.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;   // texture views may reinterpret the format (5b)
+    }
+    t->_imageUsage = usage;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     vgtrace("texture: vkCreateImage %lux%lu format %d usage 0x%x", (unsigned long)t->_width, (unsigned long)t->_height, f->vk, usage);
     VkResult r = gVk.vkCreateImage(gVk.device, &ici, NULL, &t->_image);
@@ -439,7 +457,93 @@ id<MTLDepthStencilState> vg_new_depth_stencil(id<MTLDevice> device, MTLDepthSten
 // buffer wrote the texture, the image is copied to the staging buffer at the end of it and into the surface when it
 // completes (VGMTLCompute.m), and the seed after that write is remembered as ours.
 
+// A view of another texture: same VkImage, its own VkImageView (format, type, levels, slices). Core Animation makes
+// them in its compute passes (calculate_average_luma) and blur chains.
+id<MTLTexture> vg_texture_view(VGMTLTexture *p, MTLPixelFormat pf, MTLTextureType type, NSRange levels, NSRange slices) {
+    while (p->_parent) {
+        p = p->_parent;
+    }
+    const vg_format *f = vg_format_of(pf);
+    VkImageViewType vtype;
+    switch (type) {
+    case MTLTextureType1D: vtype = VK_IMAGE_VIEW_TYPE_1D; break;
+    case MTLTextureType2D: vtype = VK_IMAGE_VIEW_TYPE_2D; break;
+    case MTLTextureType2DArray: vtype = VK_IMAGE_VIEW_TYPE_2D_ARRAY; break;
+    case MTLTextureType3D: vtype = VK_IMAGE_VIEW_TYPE_3D; break;
+    default: vtype = VK_IMAGE_VIEW_TYPE_MAX_ENUM; break;
+    }
+    if (!f || vtype == VK_IMAGE_VIEW_TYPE_MAX_ENUM || levels.location + levels.length > p->_mips ||
+        slices.location + slices.length > p->_layers || !levels.length || !slices.length) {
+        vglog("texture view: format %lu type %lu levels %lu+%lu slices %lu+%lu of a %lu-level %lu-layer texture: not supported",
+              (unsigned long)pf, (unsigned long)type, (unsigned long)levels.location, (unsigned long)levels.length,
+              (unsigned long)slices.location, (unsigned long)slices.length, (unsigned long)p->_mips, (unsigned long)p->_layers);
+        return nil;
+    }
+    VkFormatProperties fp;
+    gVk.vkGetPhysicalDeviceFormatProperties(gVk.physical, f->vk, &fp);
+    VkImageUsageFlags usage = p->_imageUsage & (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) {
+        usage |= p->_imageUsage & VK_IMAGE_USAGE_SAMPLED_BIT;
+    }
+    if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) {
+        usage |= p->_imageUsage & VK_IMAGE_USAGE_STORAGE_BIT;
+    }
+    if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) {
+        usage |= p->_imageUsage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    }
+    VkImageViewUsageCreateInfo uci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, NULL, usage};
+    const BOOL alpha8 = pf == MTLPixelFormatA8Unorm;
+    VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &uci, 0, p->_image, vtype, f->vk,
+                                 {alpha8 ? VK_COMPONENT_SWIZZLE_ZERO : VK_COMPONENT_SWIZZLE_IDENTITY,
+                                  alpha8 ? VK_COMPONENT_SWIZZLE_ZERO : VK_COMPONENT_SWIZZLE_IDENTITY,
+                                  alpha8 ? VK_COMPONENT_SWIZZLE_ZERO : VK_COMPONENT_SWIZZLE_IDENTITY,
+                                  alpha8 ? VK_COMPONENT_SWIZZLE_R : VK_COMPONENT_SWIZZLE_IDENTITY},
+                                 {f->aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT, (uint32_t)levels.location, (uint32_t)levels.length,
+                                  (uint32_t)slices.location, (uint32_t)slices.length}};
+    VGMTLTexture *t = [VGMTLTexture new];
+    if (gVk.vkCreateImageView(gVk.device, &vci, NULL, &t->_view) != VK_SUCCESS) {
+        vglog("texture view: vkCreateImageView failed (format %lu)", (unsigned long)pf);
+        return nil;
+    }
+    VGCALL("texture view of %p: format %lu type %lu -> %p", p, (unsigned long)pf, (unsigned long)type, t);
+    t->_parent = p;
+    t->_dev = p->_dev;
+    t->_image = p->_image;
+    t->_imageUsage = p->_imageUsage;
+    t->_pixelFormat = pf;
+    t->_format = f->vk;
+    t->_aspect = f->aspect;
+    t->_type = type;
+    t->_width = MAX(p->_width >> levels.location, 1u);
+    t->_height = MAX(p->_height >> levels.location, 1u);
+    t->_depth = MAX(p->_depth >> levels.location, 1u);
+    t->_mips = levels.length;
+    t->_layers = slices.length;
+    t->_usage = p->_usage;
+    t->_storage = p->_storage;
+    return t;
+}
+
 void vg_surface_pull(VGMTLTexture *t) {
+    if (t && t->_parent) {
+        t = t->_parent;   // a view reads what its texture's surface or buffer holds
+    }
+    if (t && t->_srcBuffer) {
+        // a buffer-backed texture: what the buffer holds now -> the image (synchronous, every time)
+        const vg_format *bf = vg_format_of(t->_pixelFormat);
+        VkBuffer buf = vg_vkbuffer(t->_srcBuffer);   // also brings a no-copy buffer's CPU writes over
+        if (!bf || !buf) {
+            return;
+        }
+        VkBufferImageCopy c = {t->_srcOffset, (uint32_t)(t->_srcBpr / bf->bytes), (uint32_t)t->_height,
+                               {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
+                               {(uint32_t)t->_width, (uint32_t)t->_height, 1}};
+        VkImage image = t->_image;
+        vg_one_shot(^(VkCommandBuffer cb) {
+            gVk.vkCmdCopyBufferToImage(cb, buf, image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+        });
+        return;
+    }
     if (!t || !t->_surface) {
         return;
     }
@@ -463,6 +567,24 @@ void vg_surface_pull(VGMTLTexture *t) {
     });
     t->_syncedSeed = seed;
     t->_neverSynced = NO;
+}
+
+id<MTLTexture> vg_new_buffer_texture(id<MTLBuffer> buffer, MTLTextureDescriptor *d, NSUInteger offset, NSUInteger bpr) {
+    const vg_format *f = vg_format_of(d.pixelFormat);
+    if (!f || (f->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT) || d.textureType != MTLTextureType2D || d.mipmapLevelCount > 1 ||
+        !bpr || bpr % f->bytes || offset + bpr * (d.height - 1) + d.width * f->bytes > buffer.length) {
+        vglog("buffer texture: %lux%lu format %lu at %lu, %lu bytes per row doesn't fit a %lu-byte buffer (2D color only)",
+              (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.pixelFormat, (unsigned long)offset,
+              (unsigned long)bpr, (unsigned long)buffer.length);
+        return nil;
+    }
+    VGMTLTexture *t = (VGMTLTexture *)vg_new_texture(buffer.device, d);
+    if (t) {
+        t->_srcBuffer = buffer;
+        t->_srcOffset = offset;
+        t->_srcBpr = bpr;
+    }
+    return t;
 }
 
 id<MTLTexture> vg_new_surface_texture(id<MTLDevice> device, MTLTextureDescriptor *d, IOSurfaceRef surface, NSUInteger plane) {

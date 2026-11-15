@@ -60,6 +60,37 @@ void vglog(const char *fmt, ...) {
     }
 }
 
+BOOL vg_calltrace(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("VGMTL_CALLS");
+        on = (e && e[0] == '1') || access("/Library/GPUBundles/VirtioGPUMetal-calls", R_OK) == 0;
+    }
+    return on;
+}
+
+void vg_callstack(const char *what) {
+    if (!vg_calltrace()) {
+        return;
+    }
+    NSArray<NSString *> *frames = [NSThread callStackSymbols];
+    NSMutableString *line = [NSMutableString stringWithFormat:@"STACK %s:", what];
+    for (NSUInteger i = 2; i < frames.count && i < 10; i++) {
+        // "N  Image  0xaddr  symbol + off" -> "symbol+off"
+        NSArray *parts = [frames[i] componentsSeparatedByString:@" "];
+        NSMutableArray *words = [NSMutableArray array];
+        for (NSString *p in parts) {
+            if (p.length) {
+                [words addObject:p];
+            }
+        }
+        if (words.count >= 6) {
+            [line appendFormat:@" | %@+%@", words[3], words[5]];
+        }
+    }
+    vglog("%s", line.UTF8String);
+}
+
 BOOL vg_tracing(void) {
     static int on = -1;
     if (on < 0) {
@@ -272,6 +303,31 @@ static id vg_refuse_before_init(id obj) {
 
 // What -[_MTLDevice initLimits] and the base class ask a vendor device (the values NV's NVMTLDevice_contract.m gives).
 - (NSUInteger)featureProfile { return 10002; }
+// Core Animation's capability questions (CA::OGL::new_metal_context), answered here rather than by the base class:
+// in WindowServer the base class claimed tile shaders, and CA's calculate_average_luma took its Apple-GPU tile path and
+// aborted (5b). We are a Mac2 / Metal3 GPU without tile shading, memoryless targets, framebuffer reads (fetch is
+// emulated by copies, slowly) or raster order groups.
+static void vg_cap_asked(const char *what, BOOL answer) {
+    static NSMutableSet *asked;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ asked = [NSMutableSet set]; });
+    @synchronized(asked) {
+        NSString *k = @(what);
+        if ([asked containsObject:k]) {
+            return;
+        }
+        [asked addObject:k];
+    }
+    vglog("capability %s asked: %s", what, answer ? "YES" : "NO");
+}
+- (BOOL)supportsTileShaders { vg_cap_asked("supportsTileShaders", NO); return NO; }
+- (BOOL)supportsMemorylessRenderTargets { vg_cap_asked("supportsMemorylessRenderTargets", NO); return NO; }
+- (BOOL)isFramebufferReadSupported { vg_cap_asked("isFramebufferReadSupported", NO); return NO; }
+- (BOOL)supportsRasterOrderGroups { vg_cap_asked("supportsRasterOrderGroups", NO); return NO; }
+- (BOOL)areRasterOrderGroupsSupported { return NO; }
+- (BOOL)supportsSIMDShuffleAndFill { return NO; }
+- (BOOL)supportsYCBCRFormats12 { return NO; }
+- (BOOL)supportsYCBCRPackedFormats12 { return NO; }
 - (NSUInteger)doubleFPConfig { return 0; }
 - (NSUInteger)halfFPConfig { return 0; }
 - (NSUInteger)singleFPConfig { return 0; }
