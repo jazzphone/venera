@@ -13,8 +13,8 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/graphics/IOFramebuffer.h>
-#include <kern/thread_call.h>
-#include <pexpert/pexpert.h>
+#include <IOKit/IOTimerEventSource.h>
+#include <IOKit/IOWorkLoop.h>
 
 #include "../VirtioGPUAPI.h"
 
@@ -80,8 +80,7 @@ private:
                     (void *)(uintptr_t)stride) == kIOReturnSuccess;
     }
     void publish() { call(kVGPULog, nullptr, (void *)1); }
-    static void flushThunk(thread_call_param_t self, thread_call_param_t);
-    void flushTick();
+    void flushTick(IOTimerEventSource *timer);
 
     IOService *nub_ = nullptr;
     OSData *edid_ = nullptr;
@@ -92,7 +91,9 @@ private:
     unsigned modeCount_ = 0;
     IODisplayModeID preferredMode_ = 0;
     IODisplayModeID currentMode_ = 0;
-    thread_call_t flushCall_ = nullptr;
+    // Own work loop: a flush waits ~4 ms on the host, which shouldn't hold IOFramebuffer's.
+    IOWorkLoop *flushLoop_ = nullptr;
+    IOTimerEventSource *flushTimer_ = nullptr;
     volatile bool flushing_ = false;
     uint32_t ticks_ = 0;
 };
@@ -125,10 +126,7 @@ IOReturn VirtioGPUFramebuffer::call(const char *function, void *p1, void *p2, vo
 }
 
 IOService *VirtioGPUFramebuffer::probe(IOService *provider, SInt32 *score) {
-    char arg[8];
-    if (PE_parse_boot_argn("-vgpuoff", arg, sizeof(arg))) {
-        return nullptr;
-    }
+    // -vgpuoff is handled by the core: without it there's no VirtioGPUDisplay nub to match.
     return IOFramebuffer::probe(provider, score);
 }
 
@@ -173,7 +171,13 @@ bool VirtioGPUFramebuffer::start(IOService *provider) {
         modes_[preferredMode_ - 1].width, modes_[preferredMode_ - 1].height, vramBytes_,
         (unsigned long long)vramPhys_);
 
-    flushCall_ = thread_call_allocate(&VirtioGPUFramebuffer::flushThunk, this);
+    flushLoop_ = IOWorkLoop::workLoop();
+    flushTimer_ = IOTimerEventSource::timerEventSource(
+        this, OSMemberFunctionCast(IOTimerEventSource::Action, this, &VirtioGPUFramebuffer::flushTick));
+    if (!flushLoop_ || !flushTimer_ || flushLoop_->addEventSource(flushTimer_) != kIOReturnSuccess) {
+        log("flush timer setup failed");
+        return false;
+    }
     if (!IOFramebuffer::start(provider)) {
         log("IOFramebuffer::start failed");
         return false;
@@ -184,11 +188,14 @@ bool VirtioGPUFramebuffer::start(IOService *provider) {
 
 void VirtioGPUFramebuffer::stop(IOService *provider) {
     flushing_ = false;
-    if (flushCall_) {
-        thread_call_cancel_wait(flushCall_);
-        thread_call_free(flushCall_);
-        flushCall_ = nullptr;
+    if (flushTimer_) {
+        flushTimer_->cancelTimeout();
+        if (flushLoop_) {
+            flushLoop_->removeEventSource(flushTimer_);
+        }
+        OSSafeReleaseNULL(flushTimer_);
     }
+    OSSafeReleaseNULL(flushLoop_);
     if (nub_) {
         call(kVGPUDisableScanout);
         nub_ = nullptr;
@@ -211,22 +218,16 @@ bool VirtioGPUFramebuffer::applyMode(IODisplayModeID id) {
     log("mode %d %ux%u -> %s", id, m->width, m->height, ok ? "on screen" : "FAILED");
     if (ok) {
         currentMode_ = id;
-        if (!flushing_ && flushCall_) {
+        if (!flushing_ && flushTimer_) {
             flushing_ = true;
-            uint64_t deadline = 0;
-            clock_interval_to_deadline(kFlushIntervalMs, kMillisecondScale, &deadline);
-            thread_call_enter_delayed(flushCall_, deadline);
+            flushTimer_->setTimeoutMS(kFlushIntervalMs);
         }
     }
     publish();
     return ok;
 }
 
-void VirtioGPUFramebuffer::flushThunk(thread_call_param_t self, thread_call_param_t) {
-    static_cast<VirtioGPUFramebuffer *>(self)->flushTick();
-}
-
-void VirtioGPUFramebuffer::flushTick() {
+void VirtioGPUFramebuffer::flushTick(IOTimerEventSource *) {
     if (!flushing_) {
         return;
     }
@@ -236,9 +237,7 @@ void VirtioGPUFramebuffer::flushTick() {
     if (++ticks_ % 300 == 0) { // every ~10 s
         publish();
     }
-    uint64_t deadline = 0;
-    clock_interval_to_deadline(kFlushIntervalMs, kMillisecondScale, &deadline);
-    thread_call_enter_delayed(flushCall_, deadline);
+    flushTimer_->setTimeoutMS(kFlushIntervalMs);
 }
 
 IOReturn VirtioGPUFramebuffer::enableController() {

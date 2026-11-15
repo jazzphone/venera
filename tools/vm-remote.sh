@@ -47,26 +47,42 @@ inject() {
   rm -rf "$MNT/EFI/OC/Kexts/$name" && cp -r "$src" "$MNT/EFI/OC/Kexts/$name" &&
     python3 -I "$HERE/oc_kext.py" "$MNT/EFI/OC/config.plist" "$name" enable &&
     python3 -I "$HERE/oc_kext.py" "$MNT/EFI/OC/config.plist" - nopicker &&
-    python3 -I "$HERE/oc_kext.py" "$MNT/EFI/OC/config.plist" - csr 0x201 # + unapproved kexts (AuxKC)
+    python3 -I "$HERE/oc_kext.py" "$MNT/EFI/OC/config.plist" - csr 0x203 # + unapproved kexts, unrestricted fs (AuxKC in /Library/KernelCollections)
 }
 
-# Installs a kext into /Library/Extensions over the guest agent (tarball on stdin, no network)
-# and builds it into the Auxiliary kernel collection.
+# Installs a kext into /Library/Extensions and builds it into the Auxiliary kernel collection.
+# This guest agent (mac-guest-agent) takes neither Proxmox's --pass-stdin (MIME base64) nor
+# file-write, so the tarball goes in as base64 text, 1 KB per exec argument (4 KB hangs the agent). No network involved.
+push_file() { # push_file LOCAL REMOTE
+  local b64 i n chunk
+  b64=$(base64 -w0 "$1")
+  n=${#b64}
+  qm guest exec $VM --timeout 20 -- /bin/sh -c "rm -f '$2.b64'" >/dev/null || return 1
+  for ((i = 0; i < n; i += 1024)); do
+    chunk=${b64:i:1024}
+    qm guest exec $VM --timeout 20 -- /bin/sh -c "printf %s '$chunk' >> '$2.b64'" >/dev/null || return 1
+  done
+  qm guest exec $VM --timeout 20 -- /bin/sh -c "base64 -D -i '$2.b64' -o '$2' && rm '$2.b64'" >/dev/null || return 1
+  echo "pushed $1 ($n base64 bytes) to $2"
+}
+
 aux_install() {
   local tgz=$1 name=$2
-  qm guest exec $VM --timeout 300 --pass-stdin 1 -- /bin/sh -c "
-    set -e
+  push_file "$tgz" /tmp/vgpu-aux.tgz || { echo "push failed"; return 1; }
+  agent "set -e
     rm -rf /Library/Extensions/$name /tmp/vgpu-aux && mkdir -p /tmp/vgpu-aux
-    tar -xzf - -C /tmp/vgpu-aux
+    tar -xzf /tmp/vgpu-aux.tgz -C /tmp/vgpu-aux
     mv /tmp/vgpu-aux/$name /Library/Extensions/$name
     chown -R root:wheel /Library/Extensions/$name && chmod -R 755 /Library/Extensions/$name
-    csrutil status | head -1
-    kmutil load -p /Library/Extensions/$name 2>&1 | tail -15 || true
-    kmutil showloaded --collection aux 2>/dev/null | grep -i homelab || echo 'not in the loaded aux collection yet'
-  " < "$tgz" | python3 -I -c '
-import json, sys
-r = json.load(sys.stdin)
-print(r.get("out-data", ""), end=""); print(r.get("err-data", ""), end="", file=sys.stderr)'
+    # Build the Auxiliary KC directly (as nvidia-macos-driver's installer does); kernelmanagerd
+    # loads it at the next boot. SIP 0x203 lets the unsigned, unapproved kext in and the KC be replaced.
+    KC=/Library/KernelCollections/AuxiliaryKernelExtensions.kc
+    kmutil create -n aux --volume-root / --allow-missing-kdk --kernel /System/Library/Kernels/kernel \\
+      -B /System/Library/KernelCollections/BootKernelExtensions.kc \\
+      -S /System/Library/KernelCollections/SystemKernelExtensions.kc \\
+      --repository /Library/Extensions -A \$KC.vgpu-new -z > /tmp/vgpu-kmutil.log 2>&1 || { tail -15 /tmp/vgpu-kmutil.log; exit 1; }
+    kmutil inspect -a x86_64 -A \$KC.vgpu-new 2>/dev/null | grep -i homelab || { echo 'kmutil left the kext out:'; tail -15 /tmp/vgpu-kmutil.log; exit 1; }
+    mv -f \$KC.vgpu-new \$KC && echo \"aux collection rebuilt; loads at next boot\"" 300
 }
 
 reboot_vm() {

@@ -20,7 +20,7 @@ deploy)
   "${SSH[@]}" $HOST 'rm -rf /root/vgpu/VirtioGPU.kext'
   "${SCP[@]}" -r build/VirtioGPU.kext build/VirtioGPUFramebuffer.tgz $HOST:/root/vgpu/
   "${SSH[@]}" $HOST 'bash /root/vgpu/vm-remote.sh deploy /root/vgpu/VirtioGPU.kext'
-  sleep 10
+  sleep 45 # let the boot settle: the agent times out on big work right after login
   "${SSH[@]}" $HOST 'bash /root/vgpu/vm-remote.sh aux /root/vgpu/VirtioGPUFramebuffer.tgz VirtioGPUFramebuffer.kext'
   sleep 20
   "${SSH[@]}" $HOST 'bash /root/vgpu/vm-remote.sh logs'

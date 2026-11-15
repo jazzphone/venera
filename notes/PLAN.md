@@ -102,3 +102,38 @@ Next (stage 2): MSI-X interrupts instead of polling, then the IOFramebuffer
   (590 frames in 10 s with a 16 ms sleep between).
 - Screenshots (`tools/deploy.sh shots`) started too late to catch the test; the desktop was back
   afterward.
+
+## Stage 2c result (2026-11-15): the desktop runs on our framebuffer
+
+Two kexts, because IOGraphicsFamily and IONDRVSupport are in the System KC and OpenCore only
+injects into (and links against) the Boot KC:
+
+- `VirtioGPU.kext` (OpenCore, Boot KC): the core; `VirtioGPUFramebufferSlot` holds the
+  IOFramebuffer category on the PCI device (score 30000 > IONDRVFramebuffer's 20000), so no
+  firmware framebuffer appears; publishes a `VirtioGPUDisplay` nub; serves `../VirtioGPUAPI.h`
+  over callPlatformFunction.
+- `VirtioGPUFramebuffer.kext` (/Library/Extensions, Auxiliary KC): IOFramebuffer on the nub;
+  9.2 MB contiguous VRAM; modes 1024x768, 1280x800 (host preferred), 1440x900, 1680x1050,
+  1920x1080; full-frame transfer + flush at 30 Hz on its own work loop; EDID via getDDCBlock;
+  software cursor.
+
+Result: the only IOFramebuffer in the system; WindowServer draws the desktop through the virtio
+scanout; System Information shows "QEMU Monitor" 1280x800 @ 60 Hz, 8 MB VRAM, 0x1af4/0x1050.
+~30 flushes/s, 4,213 of 4,214 commands completed by interrupt.
+
+Getting the AuxKC in (each cost a round):
+- kmutil wants IOGraphicsFamily >= its OSBundleCompatibleVersion `1.0.0b1` (`1.0.0d1` sorts lower).
+- `thread_call_*` aren't exported to AuxKC kexts: use IOTimerEventSource; `kernel_task` needs
+  `com.apple.kpi.unsupported`.
+- `kmutil load` says "not approved" even with consent off; build the KC like nvidia-macos-driver:
+  `kmutil create -n aux --volume-root / --allow-missing-kdk --kernel /System/Library/Kernels/kernel
+  -B .../BootKernelExtensions.kc -S .../SystemKernelExtensions.kc --repository /Library/Extensions
+  -A <new> -z`, then move it to /Library/KernelCollections/AuxiliaryKernelExtensions.kc.
+- That move needs SIP filesystem protection off: VM 108 runs SIP 0x203 (kext signing,
+  unrestricted fs, unapproved kexts), set by `vm-remote.sh` through OpenCore.
+- File transfer without network: mac-guest-agent takes neither `--pass-stdin` nor file-write
+  (file-write crashed it); the deploy pushes base64 in 1 KB exec arguments (4 KB hangs it).
+- Right after boot the agent drops out; the deploy waits 45 s and the aux step retries.
+
+Next: hardware cursor (cursor queue), measure flush cost at idle, then smarter updates (dirty
+tiles, or zero-copy blob scanout) before stage 3.
