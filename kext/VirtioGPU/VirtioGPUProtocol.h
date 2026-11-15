@@ -32,6 +32,18 @@ enum CtrlType : uint32_t {
     kCmdResourceCreateBlob,
     kCmdSetScanoutBlob,
 
+    // 3D commands
+    kCmdCtxCreate = 0x0200,
+    kCmdCtxDestroy,
+    kCmdCtxAttachResource,
+    kCmdCtxDetachResource,
+    kCmdResourceCreate3D,
+    kCmdTransferToHost3D,
+    kCmdTransferFromHost3D,
+    kCmdSubmit3D,
+    kCmdResourceMapBlob,
+    kCmdResourceUnmapBlob,
+
     // cursor commands
     kCmdUpdateCursor = 0x0300,
     kCmdMoveCursor,
@@ -199,6 +211,37 @@ struct RespCapsetInfo {
     uint32_t capsetMaxVersion;
     uint32_t capsetMaxSize;
     uint32_t padding;
+};
+
+struct CmdGetCapset {
+    CtrlHdr hdr;
+    uint32_t capsetID;
+    uint32_t capsetVersion;
+};
+
+// struct virtio_gpu_ctx_create; hdr.ctxID names the context
+constexpr uint32_t kContextInitCapsetIDMask = 0xff;
+struct CmdCtxCreate {
+    CtrlHdr hdr;
+    uint32_t nlen;
+    uint32_t contextInit; // capset id (CONTEXT_INIT feature)
+    char debugName[64];
+};
+
+struct CmdCtxDestroy {
+    CtrlHdr hdr;
+};
+
+// struct virgl_renderer_capset_venus (virglrenderer venus_hw.h), the leading fields
+struct CapsetVenus {
+    uint32_t wireFormatVersion;
+    uint32_t vkXMLVersion;
+    uint32_t vkExtCommandSerializationSpecVersion;
+    uint32_t vkMesaVenusProtocolSpecVersion;
+    uint32_t supportsBlobID0;
+    uint32_t allowVkWaitSyncs;
+    uint32_t supportsMultipleTimelines;
+    uint32_t useGuestVram;
 };
 
 // struct virtio_gpu_config (device config space)

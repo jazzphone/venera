@@ -57,6 +57,7 @@ private:
     void getDisplayInfo();
     void getEDID(uint32_t scanout);
     void getCapsets();
+    void venusProbe();
     bool attachBacking(uint32_t resource, IOBufferMemoryDescriptor *memory, uint32_t bytes);
     void dropResource(uint32_t resource);
 

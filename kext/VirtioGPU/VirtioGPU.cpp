@@ -61,6 +61,9 @@ const char *respName(uint32_t type) {
     case vgpu::kRespOkNoData: return "OK_NODATA";
     case vgpu::kRespOkDisplayInfo: return "OK_DISPLAY_INFO";
     case vgpu::kRespOkEDID: return "OK_EDID";
+    case vgpu::kRespOkCapsetInfo: return "OK_CAPSET_INFO";
+    case vgpu::kRespOkCapset: return "OK_CAPSET";
+    case vgpu::kRespErrInvalidContextID: return "ERR_INVALID_CONTEXT_ID";
     case vgpu::kRespErrUnspec: return "ERR_UNSPEC";
     case vgpu::kRespErrOutOfMemory: return "ERR_OUT_OF_MEMORY";
     case vgpu::kRespErrInvalidScanoutID: return "ERR_INVALID_SCANOUT_ID";
@@ -145,6 +148,9 @@ bool VirtioGPU::start(IOService *provider) {
             getEDID(0);
         }
         getCapsets();
+        if (venusCapset_) {
+            venusProbe();
+        }
         LOG("core ready: %ux%u preferred, interrupts %u", width_, height_, interrupts_);
         VirtioGPUDisplay *nub = OSTypeAlloc(VirtioGPUDisplay);
         if (nub && nub->init() && nub->attach(this)) {
@@ -496,6 +502,45 @@ void VirtioGPU::getCapsets() {
         setProperty("Venus", n);
         n->release();
     }
+}
+
+// Stage 3: read the Venus capset, then create and destroy a Venus context on the host.
+void VirtioGPU::venusProbe() {
+    auto *get = reinterpret_cast<vgpu::CmdGetCapset *>(commandBytes_);
+    bzero(get, sizeof(*get));
+    get->hdr.type = vgpu::kCmdGetCapset;
+    get->capsetID = vgpu::kCapsetVenus;
+    get->capsetVersion = 0;
+    uint32_t type = command(sizeof(*get), sizeof(vgpu::CtrlHdr) + 160);
+    LOG("GET_CAPSET venus -> %s", respName(type));
+    if (type == vgpu::kRespOkCapset) {
+        auto *v = reinterpret_cast<vgpu::CapsetVenus *>(commandBytes_ + kReplyOffset + sizeof(vgpu::CtrlHdr));
+        LOG("venus: wire format %u, vk.xml %u.%u.%u, command serialization spec %u, mesa venus protocol "
+            "spec %u, blob id 0 %u, wait syncs %u, multiple timelines %u, guest vram %u",
+            v->wireFormatVersion, (v->vkXMLVersion >> 22) & 0x7f, (v->vkXMLVersion >> 12) & 0x3ff,
+            v->vkXMLVersion & 0xfff, v->vkExtCommandSerializationSpecVersion,
+            v->vkMesaVenusProtocolSpecVersion, v->supportsBlobID0, v->allowVkWaitSyncs,
+            v->supportsMultipleTimelines, v->useGuestVram);
+    }
+
+    constexpr uint32_t kProbeContext = 1;
+    auto *create = reinterpret_cast<vgpu::CmdCtxCreate *>(commandBytes_);
+    bzero(create, sizeof(*create));
+    create->hdr.type = vgpu::kCmdCtxCreate;
+    create->hdr.ctxID = kProbeContext;
+    create->contextInit = vgpu::kCapsetVenus & vgpu::kContextInitCapsetIDMask;
+    strlcpy(create->debugName, "macos-virtio-gpu probe", sizeof(create->debugName));
+    create->nlen = (uint32_t)strlen(create->debugName);
+    type = simple(sizeof(*create));
+    LOG("CTX_CREATE venus ctx %u -> %s", kProbeContext, respName(type));
+    if (type != vgpu::kRespOkNoData) {
+        return;
+    }
+    auto *destroy = reinterpret_cast<vgpu::CmdCtxDestroy *>(commandBytes_);
+    bzero(destroy, sizeof(*destroy));
+    destroy->hdr.type = vgpu::kCmdCtxDestroy;
+    destroy->hdr.ctxID = kProbeContext;
+    LOG("CTX_DESTROY ctx %u -> %s", kProbeContext, respName(simple(sizeof(*destroy))));
 }
 
 bool VirtioGPU::attachBacking(uint32_t resource, IOBufferMemoryDescriptor *memory, uint32_t bytes) {
