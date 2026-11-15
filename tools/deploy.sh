@@ -44,6 +44,16 @@ test) # build tools/vgputest.c, copy it into the VM, run it as the console user
   "${SCP[@]}" build/vgputest $HOST:/root/vgpu/
   "${SSH[@]}" $HOST "bash /root/vgpu/vm-remote.sh push /root/vgpu/vgputest /tmp/vgputest >/dev/null && bash /root/vgpu/vm-remote.sh run 'chmod +x /tmp/vgputest && sudo -u dev /tmp/vgputest; echo exit \$?'"
   ;;
+share) # tools/deploy.sh share FILE...: copy into the VM's virtiofs share (/Volumes/vgpu)
+  shift
+  "${SCP[@]}" -r "$@" $HOST:/root/vgpu-share/
+  "${SSH[@]}" $HOST 'bash /root/vgpu/vm-remote.sh mount'
+  ;;
+vk) # Venus: Mesa's ICD + vkprobe through the share, run as the console user
+  tools/build-tools.sh >/dev/null
+  "${SCP[@]}" mesa/out/libvulkan_virtio.dylib build/vkprobe build/vgputest $HOST:/root/vgpu-share/
+  "${SSH[@]}" $HOST "bash /root/vgpu/vm-remote.sh mount >/dev/null; bash /root/vgpu/vm-remote.sh run 'cd /tmp && sudo -u dev env VN_DEBUG=${VN_DEBUG:-init,result} /Volumes/vgpu/vkprobe /Volumes/vgpu/libvulkan_virtio.dylib 2>&1 | tail -60; echo exit \$?' 180"
+  ;;
 shots) # tools/deploy.sh shots COUNT INTERVAL -> build/shots/NN.png
   "${SSH[@]}" $HOST "bash /root/vgpu/vm-remote.sh shots ${2:-20} ${3:-3}"
   rm -rf build/shots && mkdir -p build/shots

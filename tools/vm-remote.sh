@@ -112,6 +112,9 @@ aux) # aux TGZ NAME: install into /Library/Extensions + AuxKC, then reboot
   aux_install "$2" "$3"
   reboot_vm
   ;;
+mount) # mount the virtiofs share (the Proxmox host /root/vgpu-share, tag vgpu) at /Volumes/vgpu
+  agent 'mkdir -p /Volumes/vgpu; mount | grep -q " /Volumes/vgpu " || mount_virtiofs vgpu /Volumes/vgpu; ls -la /Volumes/vgpu | head -20' 60
+  ;;
 push) # push LOCAL REMOTE: copy a file into the VM over the guest agent
   push_file "$2" "$3"
   ;;
