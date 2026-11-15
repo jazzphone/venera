@@ -266,10 +266,27 @@ IOReturn VirtioGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *opt
     } else if (mapInfo == vgpu::kMapCacheUncached) {
         cache = kIOMapInhibitCache;
     }
+    // IOPCIFamily's descriptor for the BAR when it parsed it right (BARs >= 4 GB it doesn't);
+    // otherwise a device-memory range of our own for just this mapping.
     IOMemoryDescriptor *bar = core_->hostmemDescriptor();
-    IOMemoryDescriptor *md = bar ? IOSubMemoryDescriptor::withSubRange(bar, core_->hostmemDescriptorOffset() + r_offset,
-                                                                         size, kIODirectionInOut)
-                                 : nullptr;
+    IOMemoryDescriptor *md = nullptr;
+    const char *how = "none";
+    if (bar) {
+        md = IOSubMemoryDescriptor::withSubRange(bar, core_->hostmemDescriptorOffset() + r_offset, size,
+                                                 kIODirectionInOut);
+        how = "BAR sub-range";
+    }
+    if (!md) {
+        md = IODeviceMemory::withRange(phys, size);
+        how = "device range";
+    }
+    if (!md) {
+        md = IOMemoryDescriptor::withPhysicalAddress(phys, size, kIODirectionInOut);
+        how = "physical";
+    }
+    if (md && mapProbe_ < 1) {
+        LOG("map: descriptor via %s", how);
+    }
     if (!md) {
         LOG("map: no descriptor for phys 0x%llx size %llu", (unsigned long long)phys, (unsigned long long)size);
         return kIOReturnNoMemory;
