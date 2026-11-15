@@ -2,6 +2,7 @@
 # Build the kexts into build/<Name>.kext (x86_64, macOS 26 target):
 #   VirtioGPU.kext            - the core, injected by OpenCore (Boot kernel collection)
 #   VirtioGPUFramebuffer.kext - the IOFramebuffer, loaded from /Library/Extensions (Auxiliary KC)
+#   VirtioGPUAccel.kext       - the IOAccelerator (stage 4), Auxiliary KC; NV's reconstructed IOAccel headers
 set -euo pipefail
 cd "${0:A:h}/.."
 SDK=$(xcrun --sdk macosx --show-sdk-path)
@@ -13,13 +14,15 @@ CXXFLAGS=($COMMON -std=gnu++17 -fno-rtti -fno-exceptions -fapple-kext)
 CFLAGS=($COMMON -std=gnu11)
 
 rm -rf build && mkdir -p build
-for NAME in VirtioGPU VirtioGPUFramebuffer; do
+for NAME in VirtioGPU VirtioGPUFramebuffer VirtioGPUAccel; do
   SRC=kext/$NAME
+  EXTRA=()
+  [[ $NAME == VirtioGPUAccel ]] && EXTRA=(-DNM_TAHOE -Ivendor/nullmoth/accel -Ivendor/nullmoth/accel/re -Ivendor/nullmoth/accel/iofam)
   OUT=build/$NAME.kext
   OBJ=build/obj/$NAME
   mkdir -p $OBJ "$OUT/Contents/MacOS"
   for f in $SRC/*.cpp; do
-    xcrun clang++ "${CXXFLAGS[@]}" -c "$f" -o "$OBJ/${f:t:r}.o"
+    xcrun clang++ "${CXXFLAGS[@]}" "${EXTRA[@]}" -c "$f" -o "$OBJ/${f:t:r}.o"
   done
   for f in $SRC/*.c; do
     xcrun clang -x c "${CFLAGS[@]}" -c "$f" -o "$OBJ/${f:t:r}.o"

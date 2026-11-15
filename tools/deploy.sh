@@ -36,6 +36,20 @@ core) # only the OpenCore-injected core, no AuxKC step
 logs)
   "${SSH[@]}" $HOST 'bash /root/vgpu/vm-remote.sh logs'
   ;;
+accel) # stage 4: VirtioGPUAccel into /Library/Extensions + the AuxKC (beside the framebuffer), reboot, its log
+  tools/build.sh >/dev/null
+  tar -czf build/VirtioGPUAccel.tgz -C build VirtioGPUAccel.kext
+  "${SCP[@]}" build/VirtioGPUAccel.tgz $HOST:/root/vgpu/
+  "${SSH[@]}" $HOST 'bash /root/vgpu/vm-remote.sh aux /root/vgpu/VirtioGPUAccel.tgz VirtioGPUAccel.kext'
+  sleep 20
+  "${SSH[@]}" $HOST 'bash /root/vgpu/vm-remote.sh accel-logs'
+  ;;
+accel-logs)
+  "${SSH[@]}" $HOST 'bash /root/vgpu/vm-remote.sh accel-logs'
+  ;;
+bootarg) # tools/deploy.sh bootarg set vgpuaccel=1 | del vgpuaccel | show
+  "${SSH[@]}" $HOST "bash /root/vgpu/vm-remote.sh bootarg $2 ${3:-}"
+  ;;
 disable)
   "${SSH[@]}" $HOST 'bash /root/vgpu/vm-remote.sh disable VirtioGPU.kext'
   ;;

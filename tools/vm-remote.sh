@@ -105,6 +105,15 @@ disable)
 logs)
   agent 'echo "== probe"; ioreg -w0 -r -c VirtioGPU -a | plutil -extract 0.ProbeLog xml1 -o - - 2>/dev/null | sed -n "s/.*<string>\\(.*\\)<\/string>.*/  \\1/p" | sed "s/&quot;/\\\"/g"; echo "== tree"; ioreg -w0 -r -n S08@1 | grep -E "\\+-o" | head -8 | cut -c1-110; echo "== aux"; kmutil showloaded --collection aux 2>/dev/null | grep -i homelab | cut -c1-110; echo "== framebuffers"; ioreg -w0 -r -c IOFramebuffer | grep -E "\\+-o" | head -6 | cut -c1-110' 120
   ;;
+bootarg) # bootarg {set NAME=VALUE | del NAME | show}: OpenCore boot-args; set/del stop the VM, edit, start it
+  if [ "$2" = show ]; then with_oc python3 -I "$HERE/oc_kext.py" "$MNT/EFI/OC/config.plist" - bootargs; exit; fi
+  stop_vm
+  with_oc python3 -I "$HERE/oc_kext.py" "$MNT/EFI/OC/config.plist" - "bootarg-$2" "$3" || exit 1
+  qm start $VM && wait_agent
+  ;;
+accel-logs) # the accelerator: its log on the PCI device, the family, the registry
+  agent 'echo "== accel log"; ioreg -w0 -r -n S08@1 -d1 -a | plutil -extract 0.VirtioGPUAccelLog xml1 -o - - 2>/dev/null | sed -n "s/.*<string>\\(.*\\)<\/string>.*/  \\1/p"; echo "== loaded"; kmutil showloaded --list-only 2>/dev/null | grep -iE "IOAccel|IOGPU|IOSurface|homelab" | cut -c1-130; echo "== IOAccelerator"; ioreg -w0 -rc IOAccelerator -d2 | cut -c1-150 | head -40; echo "== boot-args"; nvram boot-args' 120
+  ;;
 logs-raw)
   agent 'ioreg -w0 -r -c VirtioGPU -l' 90
   ;;

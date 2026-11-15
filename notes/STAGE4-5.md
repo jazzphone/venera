@@ -572,6 +572,8 @@ Effort is focused-engineer days for the stage, excluding VM reboot waits, assumi
 
 ### Stage 4.0: accelerator spike (no Metal yet)
 
+**Done 2026-11-15: the family starts and our subclass attaches (PLAN.md, "Stage 4.0 result").**
+
 - **Do:** `VirtioGPUAccel.kext` in AuxKC: class `VirtioGPUAccel : IOGraphicsAccelerator2`, category `IOAccelerator`, matches `0x10501af4`, all pure virtuals stubbed
   (generate with the same approach as `gen_stubs.py`/`gen_tahoe_fwd.py`), `configureDevice`/`teardownDevice` trivial, `populateAccelConfig` copying NV's offsets, `enableAccelerator()`,
   `IOAccelRevision`, **no `MetalPluginName`**, boot-arg gate. Header set: vendor NV's `re/` and `iofam/` headers.

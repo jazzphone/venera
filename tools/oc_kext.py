@@ -2,6 +2,7 @@
 """Add, enable or disable a kext in an OpenCore config.plist (runs on the Proxmox host).
 
 Usage: oc_kext.py CONFIG BUNDLE {enable|disable|status} [EXECUTABLE]
+       oc_kext.py CONFIG - {csr HEX | nopicker | picker | bootarg-set NAME=VALUE | bootarg-del NAME | bootargs}
 """
 import plistlib
 import sys
@@ -25,6 +26,27 @@ if action == 'csr':
     import os
     os.replace(path + '.new', path)
     print('csr-active-config', hex(value))
+    sys.exit(0)
+
+if action in ('bootarg-set', 'bootarg-del', 'bootargs'):
+    # oc_kext.py CONFIG - bootarg-set vgpuaccel=1 | bootarg-del vgpuaccel | bootargs: OpenCore's boot-args, re-applied each boot
+    guid = '7C436110-AB2A-4BBB-A880-FE41995C9F82'
+    add = cfg['NVRAM']['Add'][guid]
+    args = add.get('boot-args', '').split()
+    if action != 'bootargs':
+        name = sys.argv[4].split('=')[0]
+        args = [a for a in args if a.split('=')[0] != name]
+        if action == 'bootarg-set':
+            args.append(sys.argv[4])
+        add['boot-args'] = ' '.join(args)
+        deletes = cfg['NVRAM'].setdefault('Delete', {}).setdefault(guid, [])
+        if 'boot-args' not in deletes:
+            deletes.append('boot-args')
+        with open(path + '.new', 'wb') as f:
+            plistlib.dump(cfg, f)
+        import os
+        os.replace(path + '.new', path)
+    print('boot-args', ' '.join(args))
     sys.exit(0)
 
 if action in ('nopicker', 'picker'):

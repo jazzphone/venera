@@ -219,3 +219,93 @@ allocate+map ~2 ms each; vkCmdFillBuffer 64 MB + vkCmdCopyBuffer 64 MB + fence w
 
 Nothing in macOS's UI is accelerated yet: WindowServer uses Metal, which needs an IOAccelerator
 (stage 5) and a Metal driver bundle (stage 4). notes/STAGE4-5.md has the plan.
+
+## Stage 4.0 result (2026-11-15): YES, IOAcceleratorFamily2 starts in the guest and our subclass attaches
+
+**Answer to STAGE4-5.md risk 1: the family starts, our `IOGraphicsAccelerator2` subclass starts, registers and serves
+every family user client, with no panic, and WindowServer keeps running (software compositor) beside it.** The
+Reims concern ("IOAccel2 cannot start where IOGPU runs") doesn't apply here: IOGPUFamily is on disk but nothing in
+this guest loads it (AppleParavirtGPU matches only Apple's `106b:eeee`). The plan's route (NV-style IOAccel2 kext
+in the AuxKC, Metal plugin over Venus) stands; go to 4a.
+
+`kext/VirtioGPUAccel/` (`VirtioGPUAccel.kext` 0.4.0, Auxiliary KC beside the framebuffer): class `VirtioGPUAccel :
+IOGraphicsAccelerator2` on the `IOPCIDevice` (`IOPCIPrimaryMatch 0x10501af4`, category `IOAccelerator`, score 100),
+stubs for all 17 pure virtuals and the helper classes (event machine, legacy display machine, task with a bump VA
+allocator, memory map, resource, sys/vid memory with no VRAM, legacy surface, display pipe (unused), GL/2D/CL/video
+contexts), NV's `populateAccelConfig` values renamed ("VirtioGPUAccelerator", one framebuffer).
+**Unarmed: no `MetalPluginName`** anywhere. Headers: NV's reconstructed `re/` and `iofam/` (vendored unchanged in
+`vendor/nullmoth/`, PolyForm NC) and NV's 26.7.1 `tahoe_fwd.h` renamed to our classes (`vg_tahoe_fwd.h`: 68 slots
+forwarded through Apple's exported vtables, built with `-DNM_TAHOE`).
+
+Gates (boot-args, set with `tools/deploy.sh bootarg set|del|show`, which edits OpenCore's config offline):
+`vgpuaccel` absent = kext + family load, start refuses; `vgpuaccel=1` = family start, not registered;
+`vgpuaccel=2` = also `registerService()`; `-vgpuaccoff` = probe refuses. Log: `VirtioGPUAccelLog` on the PCI device
+and the core's ProbeLog; `tools/deploy.sh accel-logs`. Install: `tools/deploy.sh accel` (AuxKC rebuild + reboot).
+VM 108 now runs with `vgpuaccel=2`. Snapshot before any of this: `pre-accel-4-0`.
+
+Evidence, VM 108 (26.7.3 25G342):
+
+- Probes (section 9, probe 1): SIP 0x203 (kext signing + FS protections off, NVRAM protections on), boot-args
+  `keepsyms=1 amfi_get_out_of_my_way=1 -v msgbuf=1048576`, Lilu 1.7.2 loaded. System KC has
+  `IOAcceleratorFamily2` 487.4.4, `IOGPUFamily` 130.16.5, `AppleParavirtGPU` 15.0.0,
+  `AppleGraphicsDeviceControl` 8.1.12 (loaded), Intel ICL/KBL and AMD drivers; before 4.0 no IOAccelerator
+  existed and IOAccelerator2/IOGPU weren't loaded. Kext executables aren't on disk (only in the KCs).
+- Link: `kmutil create` resolved all 801 imports of VirtioGPUAccel against 26.7.3's System KC on the first try
+  (dry run into /tmp first): NV's 26.7.1 forwarding list holds on 26.7.3 for this class set.
+- Boot, gate off: `com.apple.iokit.IOAcceleratorFamily2 (487.4.4)` loaded as our dependency; probe ran.
+- Boot, `vgpuaccel=1`: `IOGraphicsAccelerator2::start -> 1`. The family called, in order: configureDevice,
+  populateAccelConfig (pre-filled `cfg+0x28 = 0x0000000100000001`, `+0x30 = 0x0000400010001000`),
+  newEventMachine, newDisplayMachine, createKernelGPUTask. It published AccelCaps 15, AGCInfo,
+  PerformanceStatistics, IOReportLegend, IOCFPlugInTypes (IOAccelerator2D.plugin).
+- `enableAccelerator()` from start: flags dword at ivar +0xc78 went 0x0 -> 0x2 (the bit
+  `acceleratorWaitEnabled` waits on), so family allocations won't hang.
+- Boot, `vgpuaccel=2`: `registered, matched, active`. `tools/acceltest.c` (root) opens each user-client type;
+  the family makes:
+
+  | type | user client |
+  |---|---|
+  | 0 | unsupported (legacy IOAccelSurface; its surfaceStart fails "failed to get the vram descriptors") |
+  | 1 | VGGLContext (our class) |
+  | 2 | unsupported (2D context) |
+  | 3 | VGVideoContext |
+  | 4 | IOAccelDisplayPipeUserClient2 |
+  | 5 | IOAccelDevice2: get_config 0 -> 64 bytes, get_name -> "VirtioGPUAccelerator" |
+  | 6 | IOAccelSharedUserClient2 |
+  | 7 | VGCLContext |
+  | 8 | IOAccelCommandQueue |
+  | 9 | IOAccelGLDrawableUserClient |
+  | 10-12 | unsupported |
+
+  Opening them made the family call getStampMemory (16 KB, 4096 stamps), createUserGPUTask and our context
+  factories. `get_config` bytes: `00 43 00 00 ...; +0x18 01; +0x20 00 b0 aa aa; +0x28 00 00 00 80`.
+- WindowServer: one pid all boot (no restart loop). It opens legacy surfaces on the accelerator once at
+  start (12 x `IOAccelSurface::surfaceStart(): failed to get the vram descriptors`, our newSurface x3), then
+  "Software compositor activated". CoreDisplay's "Unable to find display pipe for IOFB service" was already
+  logged before the accelerator existed (no AGDC/pipe yet, as expected; 5a's job).
+- IOAcceleratorFamily2's own kernel messages do reach the unified log (`log show --predicate 'sender ==
+  "IOAcceleratorFamily2"'`), unlike IOLog from our kexts.
+- Venus user client still passes beside it (`tools/deploy.sh test`: PASS).
+
+Other section-9 probes:
+
+- Probe 2 (KDK): Apple's KDK for 26.7.3 **25G342 exists** (dortania/KdkSupportPkg release `25G342`,
+  `Kernel_Debug_Kit_26.7.3_build_25G342.dmg`). Not downloaded: kmutil's link in the guest already checks every
+  import. Get it when 4a/5a needs vtable verification for a class NV's list doesn't cover.
+- Probe 4: the guest's `GPUCompiler.framework/Versions/32023/Libraries/libLLVM.dylib` (dyld shared cache, no file
+  on disk) dlopens and exports `LLVMParseBitcodeInContext2`, `LLVMPrintModuleToString`, `LLVMContextCreate`,
+  `LLVMCreateMemoryBufferWithMemoryRange` (`tools/llvmprobe.c`): the AIR reader can use Apple's own LLVM, no
+  LLVM build needed (whether it parses every AIR module is 4b's test).
+- Probe 5: the build Mac has the Metal toolchain (`xcrun metal`: metal 32023.922, MobileAsset MetalToolchain
+  v27.2); it targets darwin27 by default, so pass a macOS 26 AIR target.
+- Probes 3 (Venus feature dump) and 6 (QEMU SET_SCANOUT_BLOB) are 4a/5c work, not run.
+
+Recommendation: proceed to **4a** as planned. Changes to the plan from what 4.0 showed:
+- The ordering worry about a registered accelerator aborting WindowServer is gone for the unarmed case:
+  registered without `MetalPluginName`, WindowServer starts once and composites in software. Keep late-arm
+  for MetalPluginName (4a) exactly as planned; that's the remaining WindowServer hazard.
+- User-client type map above replaces guesses; Metal's `MTLIOAccelDevice` will open 5/6/8 (device, shared,
+  command queue) itself.
+- First 4a step: the `debug.vgpuaccel` late-arm sysctl that sets MetalPluginName/MetalPluginClassName on the
+  registered accelerator, then the bundle and `mtlprobe` with the allow-list.
+- Legacy surfaces (type 0) need VRAM descriptors (a framebuffer registered with the display machine); that is
+  5a's `found_framebuffer` work and doesn't affect Metal on IOSurfaces.
