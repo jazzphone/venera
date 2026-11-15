@@ -10,6 +10,11 @@
 // the device's cursor queue, so pointer motion doesn't depend on the frame flush. The core's
 // VirtioGPUFramebufferSlot keeps IONDRVFramebuffer off the PCI device, so this is the only
 // framebuffer.
+//
+// Stage 5a: what WindowServer's accelerated path needs from a framebuffer: IOFBDependentIndex (the display machine and
+// AGDC name framebuffers by it), a VBL interrupt (a 60 Hz timer: the display pipe completes transactions and WindowServer
+// paces frames on it) and the scanout's RAM for the accelerator's display pipe to copy composited frames into
+// (kVGPUFBScanoutInfo / kVGPUFBPresent in ../VirtioGPUAPI.h).
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
@@ -32,6 +37,8 @@ constexpr unsigned kMaxModes = 8;
 constexpr uint32_t kMaxWidth = 1920;
 constexpr uint32_t kMaxHeight = 1200;
 constexpr uint32_t kFlushIntervalMs = 33;
+constexpr uint32_t kVblIntervalUs = 16667; // 60 Hz, the rate the modes advertise
+constexpr unsigned kMaxVblClients = 4;
 
 const char kPixelFormats[] = IO32BitDirectPixels "\0";
 
@@ -69,6 +76,12 @@ public:
     IOReturn setCursorState(SInt32 x, SInt32 y, bool visible) override;
     IOReturn getDDCBlock(IOIndex index, UInt32 blockNumber, IOSelect blockType, IOOptionBits options,
                          UInt8 *data, IOByteCount *length) override;
+    IOReturn registerForInterruptType(IOSelect type, IOFBInterruptProc proc, OSObject *target, void *ref,
+                                      void **interruptRef) override;
+    IOReturn unregisterInterrupt(void *interruptRef) override;
+    IOReturn setInterruptState(void *interruptRef, UInt32 state) override;
+    IOReturn callPlatformFunction(const OSSymbol *function, bool wait, void *p1, void *p2, void *p3,
+                                  void *p4) override;
 
 private:
     const Mode *modeFor(IODisplayModeID id) const {
@@ -84,6 +97,7 @@ private:
     }
     void publish() { call(kVGPULog, nullptr, (void *)1); }
     void flushTick(IOTimerEventSource *timer);
+    void vblTick(IOTimerEventSource *timer);
 
     IOService *nub_ = nullptr;
     OSData *edid_ = nullptr;
@@ -103,6 +117,18 @@ private:
     bool cursorReady_ = false;
     uint32_t cursorImages_ = 0, cursorMoves_ = 0;
     uint32_t ticks_ = 0;
+    // VBL: registered handlers and the timer that calls them (own work loop: a handler may take IOFramebuffer's locks).
+    struct VblClient {
+        IOFBInterruptProc proc;
+        OSObject *target;
+        void *ref;
+        volatile bool enabled;
+    };
+    VblClient vbl_[kMaxVblClients] = {};
+    IOWorkLoop *vblLoop_ = nullptr;
+    IOTimerEventSource *vblTimer_ = nullptr;
+    uint64_t vblCount_ = 0;
+    uint32_t presents_ = 0;
 };
 
 OSDefineMetaClassAndStructors(VirtioGPUFramebuffer, IOFramebuffer)
@@ -185,6 +211,18 @@ bool VirtioGPUFramebuffer::start(IOService *provider) {
         log("flush timer setup failed");
         return false;
     }
+    // The accelerator's display machine and AGDC's 0x980 answer find framebuffers by these (NV's NVRMFB sets both);
+    // they must be there before IOFramebuffer::start registers the service.
+    setProperty("IOFBDependentID", 0x5647505500000001ULL, 64);
+    setProperty("IOFBDependentIndex", 0ULL, 32);
+    vblLoop_ = IOWorkLoop::workLoop();
+    vblTimer_ = IOTimerEventSource::timerEventSource(
+        this, OSMemberFunctionCast(IOTimerEventSource::Action, this, &VirtioGPUFramebuffer::vblTick));
+    if (!vblLoop_ || !vblTimer_ || vblLoop_->addEventSource(vblTimer_) != kIOReturnSuccess) {
+        log("VBL timer setup failed");
+        return false;
+    }
+    vblTimer_->setTimeoutUS(kVblIntervalUs);
     if (!IOFramebuffer::start(provider)) {
         log("IOFramebuffer::start failed");
         return false;
@@ -195,6 +233,14 @@ bool VirtioGPUFramebuffer::start(IOService *provider) {
 
 void VirtioGPUFramebuffer::stop(IOService *provider) {
     flushing_ = false;
+    if (vblTimer_) {
+        vblTimer_->cancelTimeout();
+        if (vblLoop_) {
+            vblLoop_->removeEventSource(vblTimer_);
+        }
+        OSSafeReleaseNULL(vblTimer_);
+    }
+    OSSafeReleaseNULL(vblLoop_);
     if (flushTimer_) {
         flushTimer_->cancelTimeout();
         if (flushLoop_) {
@@ -473,4 +519,95 @@ IOReturn VirtioGPUFramebuffer::setCursorState(SInt32 x, SInt32 y, bool visible) 
         log("first cursor move to %d,%d visible %d", (int)hx, (int)hy, visible);
     }
     return kIOReturnSuccess;
+}
+
+// ---- VBL (stage 5a) ----
+// No hardware vblank: a 60 Hz timer calls every registered handler. IOFramebuffer registers its own (it times frames
+// for WindowServer) and the accelerator's display pipe may register another, so a few are kept.
+
+IOReturn VirtioGPUFramebuffer::registerForInterruptType(IOSelect type, IOFBInterruptProc proc, OSObject *target,
+                                                        void *ref, void **interruptRef) {
+    if (type != kIOFBVBLInterruptType) {
+        return IOFramebuffer::registerForInterruptType(type, proc, target, ref, interruptRef);
+    }
+    for (unsigned i = 0; i < kMaxVblClients; i++) {
+        if (!vbl_[i].proc) {
+            vbl_[i].target = target;
+            vbl_[i].ref = ref;
+            vbl_[i].enabled = true;
+            __asm__ __volatile__("" ::: "memory");
+            vbl_[i].proc = proc;
+            if (interruptRef) {
+                *interruptRef = &vbl_[i];
+            }
+            log("VBL handler %u registered (timer, 60 Hz)", i);
+            return kIOReturnSuccess;
+        }
+    }
+    log("VBL: no free handler slot");
+    return kIOReturnNoResources;
+}
+
+IOReturn VirtioGPUFramebuffer::unregisterInterrupt(void *interruptRef) {
+    for (unsigned i = 0; i < kMaxVblClients; i++) {
+        if (interruptRef == &vbl_[i]) {
+            vbl_[i].proc = nullptr;
+            vbl_[i].enabled = false;
+            log("VBL handler %u unregistered", i);
+            return kIOReturnSuccess;
+        }
+    }
+    return IOFramebuffer::unregisterInterrupt(interruptRef);
+}
+
+IOReturn VirtioGPUFramebuffer::setInterruptState(void *interruptRef, UInt32 state) {
+    for (unsigned i = 0; i < kMaxVblClients; i++) {
+        if (interruptRef == &vbl_[i]) {
+            vbl_[i].enabled = state != kDisabledInterruptState;
+            return kIOReturnSuccess;
+        }
+    }
+    return IOFramebuffer::setInterruptState(interruptRef, state);
+}
+
+void VirtioGPUFramebuffer::vblTick(IOTimerEventSource *) {
+    vblCount_++;
+    for (unsigned i = 0; i < kMaxVblClients; i++) {
+        IOFBInterruptProc proc = vbl_[i].proc;
+        if (proc && vbl_[i].enabled) {
+            proc(vbl_[i].target, vbl_[i].ref);
+        }
+    }
+    if (vblCount_ % 600 == 0) { // every ~10 s
+        setProperty("VirtioGPUVBLCount", vblCount_, 64);
+        setProperty("VirtioGPUPipePresents", presents_, 32);
+    }
+    vblTimer_->setTimeoutUS(kVblIntervalUs);
+}
+
+// ---- the accelerator's display pipe (stage 5a) ----
+
+IOReturn VirtioGPUFramebuffer::callPlatformFunction(const OSSymbol *function, bool wait, void *p1, void *p2,
+                                                    void *p3, void *p4) {
+    if (function && function->isEqualTo(kVGPUFBScanoutInfo)) {
+        auto *info = static_cast<VGPUScanoutInfo *>(p1);
+        const Mode *m = modeFor(currentMode_);
+        if (!info || !m || !vram_) {
+            return kIOReturnNotReady;
+        }
+        info->kva = vram_->getBytesNoCopy();
+        info->pitch = m->width * 4;
+        info->width = m->width;
+        info->height = m->height;
+        info->bytes = vramBytes_;
+        return kIOReturnSuccess;
+    }
+    if (function && function->isEqualTo(kVGPUFBPresent)) {
+        // The 30 Hz flush timer carries the frame to the host; count it here.
+        if (presents_++ == 0) {
+            log("first display-pipe frame in the scanout");
+        }
+        return kIOReturnSuccess;
+    }
+    return IOFramebuffer::callPlatformFunction(function, wait, p1, p2, p3, p4);
 }

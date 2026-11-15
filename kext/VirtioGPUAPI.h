@@ -25,3 +25,20 @@
 #define kVGPULog "vgpu.log"
 
 #define kVGPUDisplayClass "VirtioGPUDisplay"
+
+// ---- stage 5a: VirtioGPUAccel (Auxiliary KC) <-> VirtioGPUFramebuffer and the core ----
+// Asked of the framebuffer itself (callPlatformFunction on the VirtioGPUFramebuffer service).
+// param1: VGPUScanoutInfo * (filled): the RAM the host scans out, as the accelerator's display pipe copies into it
+#define kVGPUFBScanoutInfo "vgpu.fb.scanoutInfo"
+// no params: a display-pipe frame was written into the scanout RAM; flush it to the host now
+#define kVGPUFBPresent "vgpu.fb.present"
+struct VGPUScanoutInfo {
+    void *kva;          // kernel address of the scanout's first pixel (X8R8G8B8, little endian = BGRX bytes)
+    unsigned pitch;     // bytes per row
+    unsigned width;
+    unsigned height;
+    unsigned long long bytes;   // mapped length from kva
+};
+// Asked of the core (VirtioGPU, the PCI device's client): a Venus user client not yet attached to anything.
+// param1: task_t owner, param2: IOUserClient ** (retained; the caller attaches and starts it under its own service)
+#define kVGPUNewClient "vgpu.newClient"

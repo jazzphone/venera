@@ -22,7 +22,9 @@ Target: macOS 26.7.3 (25G342) on Proxmox VE 9.2 / pve-qemu 11.1, host GPU an Ald
    (Metal compute kernels and blits run on the host GPU) 4c (rendering to textures: pipelines, textures,
    samplers, blending, vertex descriptors) and 4d (IOSurface textures; a CAMetalLayer app animates in a window)
    done; see `notes/PLAN.md`.
-5. **WindowServer** — IOSurface-backed accelerated compositing.
+5. **WindowServer** — IOSurface-backed accelerated compositing. 5a (WindowServer picks the Metal device: AGDC,
+   display pipe, VBL, arming in the kext, Venus through the accelerator; "Metal compositor activated") done with
+   `vgpuaccel=4`; frames on screen (framebuffer fetch, display-pipe transactions) are 5b. VM 108 boots `vgpuaccel=2`.
 
 See `notes/PLAN.md` for the research behind this and what each stage needs.
 

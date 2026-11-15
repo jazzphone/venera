@@ -19,6 +19,10 @@ public:
                             IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) override;
     IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) override;
 
+    // Stage 5a: a client the accelerator attaches under its own service (WindowServer's sandbox allows the accelerator's
+    // user clients, not the core's). Set before start(); start() then takes any provider.
+    void setCore(VirtioGPU *core) { core_ = core; }
+
     // Called by the core (its command lock held) when an async request of ours completes.
     void requestCompleted(uint32_t ring, uint64_t fence);
 

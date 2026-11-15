@@ -252,6 +252,7 @@ VkDescriptorSet vg_write_set(VGMTLCommandBuffer *cmd, VkDescriptorSetLayout dsl,
 @interface VGMTLComputePipelineState : NSObject <MTLComputePipelineState> {
 @public
     NSString *_ll;
+    NSDictionary<NSNumber *, NSData *> *_fc;
     NSString *_name;
     BOOL _dynamic;          // ThreadsDynamic: the 48-byte region block at _pushOffset; otherwise Workgroups
     uint32_t _pushOffset;
@@ -287,7 +288,7 @@ VkDescriptorSet vg_write_set(VGMTLCommandBuffer *cmd, VkDescriptorSetLayout dsl,
             return v;
         }
         uint64_t t0 = mach_absolute_time();
-        NSData *spv = vg_translate(_ll, "kernel", tg, kVGMaxThreadgroupSlots, error);
+        NSData *spv = vg_translate(_ll, "kernel", _fc, tg, kVGMaxThreadgroupSlots, error);
         if (!spv) {
             return nil;
         }
@@ -356,6 +357,9 @@ VkDescriptorSet vg_write_set(VGMTLCommandBuffer *cmd, VkDescriptorSetLayout dsl,
 @end
 
 id<MTLComputePipelineState> vg_new_compute_pipeline(id<MTLDevice> device, id<MTLFunction> function, NSError **error) {
+    if (error) {
+        *error = nil;
+    }
     NSString *why = nil;
     NSDictionary *refl = nil;
     if (![(NSObject *)function respondsToSelector:@selector(vgLL)] || ![[(NSObject *)function vgStage] isEqual:@"kernel"]) {
@@ -363,7 +367,7 @@ id<MTLComputePipelineState> vg_new_compute_pipeline(id<MTLDevice> device, id<MTL
     } else if (vg_vulkan_init()) {
         why = @"Venus is down";
     } else {
-        refl = vg_reflect([(NSObject *)function vgLL], "kernel", &why);
+        refl = vg_reflect([(NSObject *)function vgLL], "kernel", [(NSObject *)function vgFC], &why);
     }
     VGMTLComputePipelineState *p = nil;
     if (refl) {
@@ -371,6 +375,7 @@ id<MTLComputePipelineState> vg_new_compute_pipeline(id<MTLDevice> device, id<MTL
         p->_dev = device;
         p->_name = function.name;
         p->_ll = [(NSObject *)function vgLL];
+        p->_fc = [(NSObject *)function vgFC];
         p->_variants = [NSMutableDictionary dictionary];
         p->_lock = [NSObject new];
         id kd = refl[@"kernel_dispatch"];

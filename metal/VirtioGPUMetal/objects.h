@@ -135,6 +135,10 @@ VkDescriptorSet vg_write_set(VGMTLCommandBuffer *cmd, VkDescriptorSetLayout dsl,
 
 VkBuffer vg_vkbuffer(id<MTLBuffer> b);
 id<MTLTexture> vg_new_texture(id<MTLDevice> device, MTLTextureDescriptor *d);
+// VGMTLHeap.m
+id<MTLHeap> vg_new_heap(id<MTLDevice> device, MTLHeapDescriptor *d);
+MTLSizeAndAlign vg_heap_texture_size(MTLTextureDescriptor *d);
+MTLSizeAndAlign vg_heap_buffer_size(NSUInteger length);
 id<MTLSamplerState> vg_new_sampler(id<MTLDevice> device, MTLSamplerDescriptor *d);
 id<MTLDepthStencilState> vg_new_depth_stencil(id<MTLDevice> device, MTLDepthStencilDescriptor *d);
 id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRenderPipelineDescriptor *d, NSError **error);

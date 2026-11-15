@@ -75,8 +75,10 @@ void vg_buffer_destroy(vg_buffer *b);
 
 // The translator (NV's metal2vulkan wrapper, Contents/Resources/libnvmtl_translate.dylib) and Apple's LLVM.
 NSString *vg_air_to_text(NSData *air);   // AIR bitcode -> LLVM IR text, nil on failure
-NSData *vg_translate(NSString *ll, const char *stage, const uint32_t *tgLengths, uint32_t tgCount, NSString **error);
-NSDictionary *vg_reflect(NSString *ll, const char *stage, NSString **error);
+// fc: function-constant values (index -> bytes) the module is specialized with first; nil or empty for none.
+NSData *vg_translate(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc, const uint32_t *tgLengths,
+                     uint32_t tgCount, NSString **error);
+NSDictionary *vg_reflect(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc, NSString **error);
 NSString *vg_resource_path(const char *name);   // .../VirtioGPUMetal.bundle/Contents/Resources/<name>
 
 // Objects the device hands out (VGMTLCompute.m).
@@ -89,4 +91,5 @@ id<MTLComputePipelineState> vg_new_compute_pipeline(id<MTLDevice> device, id<MTL
 @interface NSObject (VGFunction)
 - (NSString *)vgLL;      // the entry's LLVM IR text
 - (NSString *)vgStage;   // "kernel" | "vertex" | "fragment"
+- (NSDictionary<NSNumber *, NSData *> *)vgFC;   // function-constant values, nil if none were given
 @end

@@ -1,4 +1,4 @@
-// VirtioGPUAccel: stage 4.0, the accelerator spike.
+// VirtioGPUAccel: the accelerator (stage 4.0), the Metal arm (4a) and the display (5a).
 //
 // An IOGraphicsAccelerator2 (Apple's IOAcceleratorFamily2) on the virtio-gpu PCI device, in the IOAccelerator match
 // category beside the core (default category) and the framebuffer slot (IOFramebuffer category). It answers the
@@ -14,6 +14,20 @@
 // made some inherited methods unlinkable, and vg_tahoe_fwd.h forwards those slots through Apple's exported vtables.
 // The overrides below mirror the set NV's classes override, which is what that forwarding list was generated for.
 //
+// Stage 5a (vgpuaccel=3 and 4): the display. The accelerator watches for VirtioGPUFramebuffer, registers it with its
+// display machine (found_framebuffer, which makes the family call newDisplayPipe), delivers a mode change, publishes
+// IOAccelDisplayPipeCapabilities, creates the AppleGraphicsDeviceControl on the PCI device (VGDeviceControl.cpp) and,
+// at 4, publishes MetalPluginName with VirtioGPUWindowServer = true, the plugin's sign that WindowServer may have the
+// device. A boot hold (adjustBusy) keeps the registry busy until then, capped at 20 s. VGDisplayPipe::performTransaction
+// copies each composited IOSurface into the framebuffer's scanout RAM (option A of notes/STAGE4-5.md). The Venus user
+// client is also served from here (type kVGUCAccelType, attached under IOAccelVirtioCarrier services), because
+// WindowServer's sandbox allows the accelerator's user clients and not the core's.
+// Guard: a third WindowServer process that opens the Venus client since the last arm (the first two died) withdraws
+// the display: MetalPluginName, VirtioGPUWindowServer and the pipe capabilities go (the AGDC can't be terminated and
+// needn't be), so the next WindowServer finds no display pipe and composites in software (a pipe without a Metal device is an abort loop, "Failed to create
+// MetalDevice"). A root process re-arms with {"VirtioGPUArmWindowServer": true} (acceltest wsarm) or withdraws with
+// {"VirtioGPUWithdraw": true} (acceltest withdraw), without a reboot.
+//
 // IOLog doesn't reach the log on Tahoe: lines go to the core's ProbeLog (kVGPULog) and to "VirtioGPUAccelLog" on the
 // PCI device (kept even when start fails and this object is gone).
 #include <IOKit/IOService.h>
@@ -25,6 +39,10 @@
 #include <IOKit/IORangeAllocator.h>
 #include <libkern/c++/OSSymbol.h>
 #include <pexpert/pexpert.h>
+#include <IOKit/IOWorkLoop.h>
+#include <IOKit/IOTimerEventSource.h>
+#include <IOKit/graphics/IOFramebuffer.h>
+#include <sys/proc.h>
 #include <stdarg.h>
 #include "IOAccelerator.h"
 #include "IOGraphicsAccelerator2.h"
@@ -42,7 +60,10 @@
 #include "IOAccelCLContext2.h"
 #include "IOAccelVideoContext2.h"
 #include "vg_tahoe_fwd.h"
+#include "nv_iop_pixel.h"
 #include "../VirtioGPUAPI.h"
+#include "../VirtioGPUUserAPI.h"
+#include "accel_shared.h"
 
 extern "C" kern_return_t _start(kmod_info_t *ki, void *d);
 extern "C" kern_return_t _stop(kmod_info_t *ki, void *d);
@@ -55,8 +76,8 @@ static IOService *gLogPci = nullptr;   // the PCI device: where VirtioGPUAccelLo
 static OSArray *gLogLines = nullptr;
 static IOLock *gLogLock = nullptr;
 
-static void vlog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-static void vlog(const char *fmt, ...) {
+#define vlog vgaccel_log
+void vgaccel_log(const char *fmt, ...) {
     char line[200];
     va_list ap;
     va_start(ap, fmt);
@@ -77,7 +98,10 @@ static void vlog(const char *fmt, ...) {
     if (!gLogLines) {
         gLogLines = OSArray::withCapacity(32);
     }
-    if (gLogLines && gLogLines->getCount() < 200) {
+    if (gLogLines) {
+        if (gLogLines->getCount() >= 200) {
+            gLogLines->removeObject(0);   // keep the newest 200 (the first 200 used to be all there was)
+        }
         if (OSString *s = OSString::withCString(line)) {
             gLogLines->setObject(s);
             s->release();
@@ -274,18 +298,199 @@ public:
 };
 OSDefineMetaClassAndStructors(VGSurface, IOAccelLegacySurface)
 
-// Not handed out yet (newDisplayPipe keeps the family's default): defined so the forwarding list and a later stage have it.
+// ---- the display pipe (stage 5a) ---------------------------------------------------------------------------------
+// The family makes one per framebuffer found_framebuffer registers (newDisplayPipe). WindowServer's IOPresentment hands
+// it a transaction per composited frame; ours has no scanout engine, so performTransaction copies the frame's IOSurface
+// into the framebuffer's scanout RAM, which the framebuffer flushes to the host (NV's copy path, nvrm-accel.cpp
+// performTransaction). Transactions are refused (0xe00002c7, as the base class) until IOAccelDisplayPipeCapabilities
+// is published.
+
+// IOSurface's kernel accessors (com.apple.iokit.IOSurface exports them), and the transaction's plane accessors
+// (IOAcceleratorFamily2): declarations only, as NV's.
+class IOSurface {
+public:
+    IOMemoryDescriptor *getMemoryDescriptor() const;
+    unsigned long long getWidth() const;
+    unsigned long long getHeight() const;
+    unsigned long long getBytesPerRow() const;
+    unsigned int getPixelFormat() const;
+    unsigned int getSurfaceID() const;
+};
+class IOAccelDisplayPipeTransaction2 {
+public:
+    IOSurface *getPlaneIOSurface(unsigned int, unsigned int) const;
+    OSObject *getPlaneResource(unsigned int, unsigned int) const;
+};
+
+static volatile SInt32 gIop = 0;   // 1 once the capabilities are published
+static SInt64 gIopOk = 0, gIopFail = 0, gIopEmpty = 0, gIopRefused = 0;
+static unsigned gIopLogs = 0;
+#define IOPLOG(fmt, ...)                                                                                           \
+    do {                                                                                                           \
+        if (gIopLogs < 40) {                                                                                       \
+            gIopLogs++;                                                                                            \
+            vlog("iop: " fmt, ##__VA_ARGS__);                                                                      \
+        }                                                                                                          \
+    } while (0)
+#define IOPFAIL(rc, fmt, ...)                                                                                      \
+    do {                                                                                                           \
+        OSAddAtomic64(1, &gIopFail);                                                                               \
+        IOPLOG(fmt, ##__VA_ARGS__);                                                                                \
+        return (rc);                                                                                               \
+    } while (0)
+static IOService *displayFramebuffer();
+static const OSSymbol *gSymScanoutInfo, *gSymPresent, *gSymNewClient;   // made in start()
+static void iopPublishCounts();
+
 class VGDisplayPipe : public IOAccelLegacyDisplayPipe {
     OSDeclareDefaultStructors(VGDisplayPipe)
     NM_TAHOE_FWD(VGDisplayPipe)
 public:
-    IOAccelMemory *initFramebufferResource(unsigned int, IOAccelResource2 *) APPLE_KEXT_OVERRIDE { return nullptr; }
-    IOReturn validateTransaction(IOAccelDisplayPipeTransaction2 *) APPLE_KEXT_OVERRIDE { return kIOReturnUnsupported; }
-    IOReturn performTransaction(IOAccelDisplayPipeTransaction2 *) APPLE_KEXT_OVERRIDE { return kIOReturnUnsupported; }
-    bool isTransactionComplete(IOAccelDisplayPipeTransaction2 *) APPLE_KEXT_OVERRIDE { return true; }
-    void free() APPLE_KEXT_OVERRIDE { IOAccelLegacyDisplayPipe::free(); }
+    // CPU-only scanout: no framebuffer resource, frames arrive through performTransaction (NV: another GPU's panel).
+    IOAccelMemory *initFramebufferResource(unsigned int index, IOAccelResource2 *) APPLE_KEXT_OVERRIDE {
+        STUB_LOG("pipe initFramebufferResource -> NULL (frames are copied)");
+        return nullptr;
+    }
+    IOReturn validateTransaction(IOAccelDisplayPipeTransaction2 *) APPLE_KEXT_OVERRIDE {
+        return gIop ? kIOReturnSuccess : kIOReturnUnsupported;
+    }
+    IOReturn performTransaction(IOAccelDisplayPipeTransaction2 *txn) APPLE_KEXT_OVERRIDE;
+    bool isTransactionComplete(IOAccelDisplayPipeTransaction2 *) APPLE_KEXT_OVERRIDE { return true; }   // copied synchronously
+    void free() APPLE_KEXT_OVERRIDE {
+        dropSources();
+        IOAccelLegacyDisplayPipe::free();
+    }
+
+private:
+    enum { kSrcSlots = 4 };
+    struct Src {
+        unsigned id;
+        IOMemoryDescriptor *md;
+        IOMemoryMap *map;
+    } src_[kSrcSlots] = {};
+    unsigned srcNext_ = 0;
+    const void *mapSurface(unsigned id, IOMemoryDescriptor *md, unsigned long long need);
+    void dropSources() {
+        for (unsigned i = 0; i < kSrcSlots; i++) {
+            if (src_[i].map) {
+                src_[i].map->release();
+            }
+            if (src_[i].md) {
+                src_[i].md->complete();
+                src_[i].md->release();
+            }
+            src_[i] = {};
+        }
+    }
 };
 OSDefineMetaClassAndStructors(VGDisplayPipe, IOAccelLegacyDisplayPipe)
+
+// Keeps the last few source surfaces mapped (WindowServer cycles through ~3 per display).
+const void *VGDisplayPipe::mapSurface(unsigned id, IOMemoryDescriptor *md, unsigned long long need) {
+    for (unsigned i = 0; i < kSrcSlots; i++) {
+        if (src_[i].md == md && src_[i].id == id && src_[i].map) {
+            return src_[i].map->getLength() >= need ? (const void *)src_[i].map->getVirtualAddress() : nullptr;
+        }
+    }
+    if (md->getLength() < need) {
+        return nullptr;
+    }
+    Src *e = &src_[srcNext_++ % kSrcSlots];
+    if (e->map) {
+        e->map->release();
+    }
+    if (e->md) {
+        e->md->complete();
+        e->md->release();
+    }
+    *e = {};
+    if (md->prepare() != kIOReturnSuccess) {
+        return nullptr;
+    }
+    IOMemoryMap *m = md->map(kIOMapReadOnly);
+    if (!m) {
+        md->complete();
+        return nullptr;
+    }
+    md->retain();
+    e->md = md;
+    e->map = m;
+    e->id = id;
+    IOPLOG("mapped source surface 0x%x (%llu bytes)", id, (unsigned long long)m->getLength());
+    return (const void *)m->getVirtualAddress();
+}
+
+static SInt64 gIopCalls = 0;
+IOReturn VGDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn) {
+    if (OSAddAtomic64(1, &gIopCalls) % 60 == 0) {
+        iopPublishCounts();
+    }
+    if (!gIop) {
+        OSAddAtomic64(1, &gIopRefused);
+        return (IOReturn)0xe00002c7;
+    }
+    if (!txn) {
+        IOPFAIL(kIOReturnBadArgument, "performTransaction(NULL)");
+    }
+    IOService *fb = *(IOService *const volatile *)((const uint8_t *)this + 0x98);
+    if (!fb || fb != displayFramebuffer()) {
+        IOPFAIL(kIOReturnNotAttached, "pipe %p drives %p, not our framebuffer %p", this, fb, displayFramebuffer());
+    }
+    IOSurface *s = txn->getPlaneIOSurface(0, 0);
+    if (!s) {
+        OSObject *ro = txn->getPlaneResource(0, 0);
+        if (OSAddAtomic64(1, &gIopEmpty) < 3) {
+            IOPLOG("transaction without a plane-0 IOSurface (resource %s)", ro ? ro->getMetaClass()->getClassName() : "none");
+        }
+        return kIOReturnSuccess;
+    }
+    const unsigned fmt = s->getPixelFormat();
+    if (fmt != NV_IOP_FMT_BGRA && fmt != NV_IOP_FMT_L10R && fmt != NV_IOP_FMT_RGHA) {
+        IOPFAIL(kIOReturnUnsupported, "surface 0x%x format '%c%c%c%c' (0x%08x) is not BGRA, l10r or RGhA", s->getSurfaceID(),
+                (char)(fmt >> 24), (char)(fmt >> 16), (char)(fmt >> 8), (char)fmt, fmt);
+    }
+    const unsigned long long W = s->getWidth(), H = s->getHeight(), P = s->getBytesPerRow();
+    const unsigned long long bpp = NV_IOP_BYTES_PER_PIXEL(fmt);
+    if (!W || !H || W > 16384 || H > 16384 || P < bpp * W || (P & 3)) {
+        IOPFAIL(kIOReturnBadArgument, "surface 0x%x geometry %llux%llu pitch %llu", s->getSurfaceID(), W, H, P);
+    }
+    IOMemoryDescriptor *md = s->getMemoryDescriptor();
+    if (!md) {
+        IOPFAIL(kIOReturnNoMemory, "surface 0x%x has no memory descriptor", s->getSurfaceID());
+    }
+    const volatile unsigned *src = (const volatile unsigned *)mapSurface(s->getSurfaceID(), md, H * P);
+    if (!src) {
+        IOPFAIL(kIOReturnVMError, "surface 0x%x would not prepare/map %llu bytes", s->getSurfaceID(), H * P);
+    }
+    VGPUScanoutInfo q = {};
+    IOReturn r = fb->callPlatformFunction(gSymScanoutInfo, false, &q, nullptr, nullptr, nullptr);
+    if (r != kIOReturnSuccess || !q.kva || q.pitch < 4 || !q.height) {
+        IOPFAIL(kIOReturnNotReady, "framebuffer would not describe its scanout (0x%x)", r);
+    }
+    // The copy covers what both have; NV refuses a size mismatch, we log it once and copy the overlap.
+    unsigned w = (unsigned)(W < q.width ? W : q.width), h = (unsigned)(H < q.height ? H : q.height);
+    if ((W != q.width || H != q.height)) {
+        IOPLOG("surface %llux%llu is not the scanout's %ux%u: copying %ux%u", W, H, q.width, q.height, w, h);
+    }
+    if ((unsigned long long)(h - 1) * q.pitch + 4ULL * w > q.bytes) {
+        IOPFAIL(kIOReturnOverrun, "scanout %u rows of pitch %u exceed its %llu bytes", h, q.pitch, q.bytes);
+    }
+    const unsigned spr = (unsigned)(P / 4), dpr = q.pitch / 4;
+    volatile unsigned *d = (volatile unsigned *)q.kva;
+    for (unsigned y = 0; y < h; y++) {
+        nv_iop_convert_row(d + (unsigned long)y * dpr, src + (unsigned long)y * spr, w, fmt, 0);
+    }
+    fb->callPlatformFunction(gSymPresent, false, nullptr, nullptr, nullptr, nullptr);
+    SInt64 n = OSAddAtomic64(1, &gIopOk);
+    if (n < 3 || n % 300 == 0) {
+        IOPLOG("frame #%lld: %ux%u '%c%c%c%c' surface 0x%x -> scanout", (long long)n + 1, w, h, (char)(fmt >> 24),
+               (char)(fmt >> 16), (char)(fmt >> 8), (char)fmt, s->getSurfaceID());
+    }
+    if (n % 60 == 0) {
+        iopPublishCounts();
+    }
+    return kIOReturnSuccess;
+}
 
 class VGGLContext : public IOAccelGLContext2 {
     OSDeclareDefaultStructors(VGGLContext)
@@ -319,6 +524,14 @@ class VGVideoContext : public IOAccelVideoContext2 {
 };
 OSDefineMetaClassAndStructors(VGVideoContext, IOAccelVideoContext2)
 
+// Parents for the Venus user clients served through the accelerator: IOService::attach sleeps once a service has
+// ~1019 children (NV), and the name keeps the sandbox's IOAccel prefix rules happy whichever entry they look at.
+#define VG_CARRIERS 8
+class IOAccelVirtioCarrier : public IOService {
+    OSDeclareDefaultStructors(IOAccelVirtioCarrier)
+};
+OSDefineMetaClassAndStructors(IOAccelVirtioCarrier, IOService)
+
 // ---- the accelerator ---------------------------------------------------------------------------------------------
 
 class VirtioGPUAccel : public IOGraphicsAccelerator2 {
@@ -329,11 +542,49 @@ public:
     IOBufferMemoryDescriptor *stamps_ = nullptr;
     IORangeAllocator *ranges_[32] = {};
     unsigned enables_ = 0;
+    // stage 5a
+    uint32_t gate_ = 0;                       // the vgpuaccel boot-arg
+    IOPCIDevice *pci_ = nullptr;
+    VGDisplayMachine *dm_ = nullptr;          // the family keeps it; not retained here (NV does the same)
+    IOService *volatile fb_ = nullptr;        // VirtioGPUFramebuffer, retained
+    IONotifier *fbNote_ = nullptr;
+    IOWorkLoop *armLoop_ = nullptr;           // our own: found_framebuffer must not run on the family's or IOKit's
+    IOTimerEventSource *armTimer_ = nullptr;
+    IOTimerEventSource *holdTimer_ = nullptr;
+    volatile SInt32 hold_ = 0;                // 1 while the boot hold (adjustBusy(1)) is on
+    volatile SInt32 armed_ = 0;               // 1 registered + pipe; 2 + AGDC + capabilities; 3 + MetalPluginName
+    IOService *agdc_ = nullptr;
+    IOService *carriers_[VG_CARRIERS] = {};
+    unsigned carrierNext_ = 0;
+    int wsPids_[4] = {};                      // WindowServer pids that opened the Venus client since the last arm
+    unsigned wsCount_ = 0;
+    volatile SInt32 request_ = 0;             // for armTick after the first arm: 1 withdraw, 2 arm for WindowServer
 
     IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;
     bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+    void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
     void free() APPLE_KEXT_OVERRIDE;
     IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+    IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
+    OSObject *newDisplayPipe() APPLE_KEXT_OVERRIDE {
+        VGDisplayPipe *p = OSTypeAlloc(VGDisplayPipe);
+        vlog("newDisplayPipe -> %p", p);
+        return p;
+    }
+    static bool fbPublished(void *target, void *ref, IOService *service, IONotifier *note);
+    void armTick(IOTimerEventSource *);
+    void holdTick(IOTimerEventSource *);
+    void releaseHold(const char *why);
+    bool registerFramebuffer();
+    IOService *findCore();
+    void withdrawForWindowServer(const char *why);
+    void armForWindowServer(const char *why);
+    void request(SInt32 what) {
+        request_ = what;
+        if (armTimer_) {
+            armTimer_->setTimeoutMS(1);
+        }
+    }
 
     uint64_t getStampMemory(unsigned int *count) APPLE_KEXT_OVERRIDE {
         if (!stamps_) {
@@ -383,7 +634,11 @@ public:
         return true;
     }
     void teardownDevice(IOPCIDevice *) APPLE_KEXT_OVERRIDE { vlog("teardownDevice"); }
-    OSObject *newDisplayMachine() APPLE_KEXT_OVERRIDE { vlog("newDisplayMachine"); return OSTypeAlloc(VGDisplayMachine); }
+    OSObject *newDisplayMachine() APPLE_KEXT_OVERRIDE {
+        dm_ = OSTypeAlloc(VGDisplayMachine);
+        vlog("newDisplayMachine -> %p", dm_);
+        return dm_;
+    }
     OSObject *newGLContext() APPLE_KEXT_OVERRIDE { STUB_LOG("newGLContext"); return OSTypeAlloc(VGGLContext); }
     OSObject *newCLContext() APPLE_KEXT_OVERRIDE { STUB_LOG("newCLContext"); return OSTypeAlloc(VGCLContext); }
     OSObject *newSurface() APPLE_KEXT_OVERRIDE { STUB_LOG("newSurface"); return OSTypeAlloc(VGSurface); }
@@ -420,6 +675,20 @@ static void enableFrom(const char *why) {
     if (gAccel) {
         gAccel->enableNow(why);
     }
+}
+
+static IOService *displayFramebuffer() {
+    return gAccel ? gAccel->fb_ : nullptr;
+}
+
+static void iopPublishCounts() {
+    if (!gAccel) {
+        return;
+    }
+    char line[160];
+    snprintf(line, sizeof(line), "calls %lld ok %lld fail %lld empty %lld refused %lld", (long long)gIopCalls,
+             (long long)gIopOk, (long long)gIopFail, (long long)gIopEmpty, (long long)gIopRefused);
+    gAccel->setProperty("VirtioGPUPipeFrames", line);
 }
 
 void VirtioGPUAccel::populateAccelConfig(IOAccelConfig *c) {
@@ -484,17 +753,319 @@ bool VirtioGPUAccel::start(IOService *provider) {
         gAccel = nullptr;
         return false;
     }
+    gate_ = gate;
+    gSymScanoutInfo = OSSymbol::withCStringNoCopy(kVGPUFBScanoutInfo);
+    gSymPresent = OSSymbol::withCStringNoCopy(kVGPUFBPresent);
+    gSymNewClient = OSSymbol::withCStringNoCopy(kVGPUNewClient);
+    pci_ = OSDynamicCast(IOPCIDevice, provider);
     setProperty("IOAccelRevision", 2ULL, 32);
     setProperty("IOVARendererID", 0x01020000ULL, 32);
-    setProperty("VirtioGPUAccelUnarmed", kOSBooleanTrue);   // no MetalPluginName until a later stage arms it
-    if (gate >= 2) {
+    setProperty("VirtioGPUAccelUnarmed", kOSBooleanTrue);   // no MetalPluginName until armed
+    for (unsigned i = 0; i < VG_CARRIERS; i++) {
+        IOAccelVirtioCarrier *c = OSTypeAlloc(IOAccelVirtioCarrier);
+        if (!c || !c->init() || !c->attach(this)) {
+            OSSafeReleaseNULL(c);
+            break;
+        }
+        if (!c->start(this)) {
+            c->detach(this);
+            c->release();
+            break;
+        }
+        carriers_[i] = c;
+    }
+    if (gate >= 3) {
+        // The display (5a): hold the registry busy (WindowServer waits for quiet) until the arm finishes or 20 s pass.
+        armLoop_ = IOWorkLoop::workLoop();
+        armTimer_ = IOTimerEventSource::timerEventSource(
+            this, OSMemberFunctionCast(IOTimerEventSource::Action, this, &VirtioGPUAccel::armTick));
+        holdTimer_ = IOTimerEventSource::timerEventSource(
+            this, OSMemberFunctionCast(IOTimerEventSource::Action, this, &VirtioGPUAccel::holdTick));
+        if (!armLoop_ || !armTimer_ || !holdTimer_ || armLoop_->addEventSource(armTimer_) != kIOReturnSuccess ||
+            armLoop_->addEventSource(holdTimer_) != kIOReturnSuccess) {
+            vlog("start: arm work loop setup FAILED: the display stays unarmed (software compositor)");
+            gate_ = 2;
+        } else if (int nohold = 0; !PE_parse_boot_argn("-vgpunohold", &nohold, sizeof(nohold))) {
+            hold_ = 1;
+            adjustBusy(1);
+            holdTimer_->setTimeoutMS(20000);
+            setProperty("VirtioGPUBootHold", "holding");
+            vlog("boot hold ON (adjustBusy +1, released when armed or after 20 s)");
+        }
+    }
+    if (gate_ >= 2) {
         registerService();
-        vlog("registerService() (vgpuaccel=%u)", gate);
+        vlog("registerService() (vgpuaccel=%u)", gate_);
     } else {
         vlog("not registered (vgpuaccel=1); vgpuaccel=2 registers");
     }
     enableNow("start");
+    if (gate_ >= 3) {
+        if (OSDictionary *m = serviceMatching("VirtioGPUFramebuffer")) {
+            fbNote_ = addMatchingNotification(gIOFirstPublishNotification, m, &VirtioGPUAccel::fbPublished, this, nullptr, 0);
+            m->release();
+        }
+        vlog("display arm (vgpuaccel=%u): watching for VirtioGPUFramebuffer -> %p", gate_, fbNote_);
+        if (!fbNote_) {
+            releaseHold("no framebuffer notifier");
+        }
+    }
     return true;
+}
+
+bool VirtioGPUAccel::fbPublished(void *target, void *, IOService *service, IONotifier *) {
+    VirtioGPUAccel *me = (VirtioGPUAccel *)target;
+    if (!me || !service) {
+        return true;
+    }
+    service->retain();
+    if (!OSCompareAndSwapPtr(nullptr, service, (void *volatile *)&me->fb_)) {
+        service->release();
+        vlog("a second VirtioGPUFramebuffer published: ignored (one display)");
+        return true;
+    }
+    OSNumber *idx = OSDynamicCast(OSNumber, service->getProperty("IOFBDependentIndex"));
+    vlog("VirtioGPUFramebuffer published (IOFBDependentIndex %d): arming from the arm work loop", idx ? (int)idx->unsigned32BitValue() : -1);
+    // Not here: found_framebuffer from inside a matching notification is NV's documented don't.
+    me->armTimer_->setTimeoutMS(50);
+    return true;
+}
+
+void VirtioGPUAccel::holdTick(IOTimerEventSource *) {
+    if (hold_) {
+        vlog("boot hold: 20 s passed, armed level %d: releasing", (int)armed_);
+        releaseHold("cap (20 s)");
+    }
+}
+
+void VirtioGPUAccel::releaseHold(const char *why) {
+    if (OSCompareAndSwap(1, 0, &hold_)) {
+        adjustBusy(-1);
+        setProperty("VirtioGPUBootHold", why);
+        vlog("boot hold released (%s)", why);
+    }
+}
+
+// found_framebuffer: the family adds a framebuffer to the display machine and makes its display pipe (newDisplayPipe).
+// The machine's pipe count is at +0x108 and its pipes at +0x88 (NV, macOS 26.7.1); a pipe's framebuffer is at +0x98.
+bool VirtioGPUAccel::registerFramebuffer() {
+    IOService *fb = fb_;
+    if (!dm_ || !fb) {
+        vlog("register: no display machine (%p) or framebuffer (%p)", dm_, fb);
+        return false;
+    }
+    uint8_t *dm = (uint8_t *)dm_;
+    uint32_t before = *(volatile uint32_t *)(dm + 0x108);
+    if (before > 8) {
+        vlog("register: implausible pipe count %u at dm+0x108: layout differs, not touching it", before);
+        return false;
+    }
+    for (uint32_t i = 0; i < before; i++) {
+        uint8_t *p = *(uint8_t *volatile *)(dm + 0x88 + 8 * i);
+        if (p && *(IOService *volatile *)(p + 0x98) == fb) {
+            vlog("register: the family already has our framebuffer (pipe %u = %p)", i, p);
+            return true;
+        }
+    }
+    vlog("register: found_framebuffer(%p), pipes before %u", fb, before);
+    dm_->found_framebuffer((IOFramebuffer *)fb);
+    uint32_t after = *(volatile uint32_t *)(dm + 0x108);
+    if (after != before + 1) {
+        vlog("register: pipe count %u -> %u: the family did not add it", before, after);
+        return false;
+    }
+    uint8_t *pipe = *(uint8_t *volatile *)(dm + 0x88 + 8 * before);
+    if (!pipe) {
+        *(volatile uint32_t *)(dm + 0x108) = before;   // NV: the family stores a NULL pipe unchecked; never broadcast to it
+        vlog("register: the family stored a NULL pipe; count put back to %u", before);
+        return false;
+    }
+    IOService *pfb = *(IOService *volatile *)(pipe + 0x98);
+    vlog("register: pipe %u = %p (%s), drives %p%s", before, pipe, ((OSObject *)pipe)->getMetaClass()->getClassName(), pfb,
+         pfb == fb ? " = ours" : " -- NOT ours");
+    return pfb == fb;
+}
+
+// The arm (5a), NV's order (NVRM.cpp auto-go): framebuffer registered + mode change, then AGDC, then the pipe
+// capabilities, then (level 4) the plugin name, then the hold goes.
+void VirtioGPUAccel::armTick(IOTimerEventSource *) {
+    if (armed_) {
+        SInt32 r = request_;
+        request_ = 0;
+        if (r == 1) {
+            withdrawForWindowServer(getProperty("VirtioGPUGuardWhy") ? "the guard" : "a root request");
+        } else if (r == 2) {
+            armForWindowServer("a root request");
+        }
+        return;
+    }
+    if (!registerFramebuffer()) {
+        setProperty("VirtioGPUArmState", "framebuffer NOT registered: software compositor");
+        releaseHold("framebuffer not registered");
+        return;
+    }
+    armed_ = 1;
+    uint8_t *dm = (uint8_t *)dm_;
+    vlog("arm: display_mode_will_change/did_change (pipes %u)", *(volatile uint32_t *)(dm + 0x108));
+    dm_->display_mode_will_change(0);
+    dm_->display_mode_did_change(0);
+    vlog("arm: flags +0xc78 = 0x%x", enableFlags());
+    int off = 0;
+    if (!PE_parse_boot_argn("-vgpunoagdc", &off, sizeof(off))) {
+        agdc_ = vgaccel_agdc_create(pci_, fb_);
+    } else {
+        vlog("arm: -vgpunoagdc: no AGDC");
+    }
+    if (OSDictionary *caps = OSDictionary::withCapacity(2)) {
+        caps->setObject("DisplayPipeSupported", kOSBooleanTrue);
+        caps->setObject("TransactionsSupported", kOSBooleanTrue);
+        setProperty("IOAccelDisplayPipeCapabilities", caps);
+        caps->release();
+        gIop = 1;
+    }
+    armed_ = 2;
+    vlog("arm: IOAccelDisplayPipeCapabilities published, transactions open (AGDC %s)", agdc_ ? "up" : "NOT up");
+    if (gate_ >= 4) {
+        armForWindowServer("vgpuaccel=4");
+    } else {
+        setProperty("VirtioGPUArmState", "display only (no MetalPluginName)");
+    }
+    releaseHold("armed");
+}
+
+void VirtioGPUAccel::armForWindowServer(const char *why) {
+    if (!agdc_) {
+        agdc_ = vgaccel_agdc_create(pci_, fb_);
+    }
+    if (OSDictionary *caps = OSDictionary::withCapacity(2)) {
+        caps->setObject("DisplayPipeSupported", kOSBooleanTrue);
+        caps->setObject("TransactionsSupported", kOSBooleanTrue);
+        setProperty("IOAccelDisplayPipeCapabilities", caps);
+        caps->release();
+    }
+    gIop = 1;
+    wsCount_ = 0;
+    setProperty("MetalPluginName", "VirtioGPUMetal");
+    setProperty("MetalPluginClassName", "VGMTLDevice");
+    setProperty("VirtioGPUWindowServer", kOSBooleanTrue);
+    removeProperty("VirtioGPUAccelUnarmed");
+    removeProperty("VirtioGPUGuard");
+    removeProperty("VirtioGPUGuardWhy");
+    armed_ = 3;
+    setProperty("VirtioGPUArmState", "display + Metal for WindowServer");
+    vlog("arm: MetalPluginName published, WindowServer allowed (%s; AGDC %s)", why, agdc_ ? "up" : "NOT up");
+}
+
+IOService *VirtioGPUAccel::findCore() {
+    IOService *core = nullptr;
+    if (OSIterator *it = pci_ ? pci_->getClientIterator() : nullptr) {
+        while (OSObject *o = it->getNextObject()) {
+            if (o->metaCast("VirtioGPU")) {
+                core = (IOService *)o;
+                break;
+            }
+        }
+        it->release();
+    }
+    return core;
+}
+
+// From the arm work loop only (it terminates the AGDC synchronously).
+void VirtioGPUAccel::withdrawForWindowServer(const char *why) {
+    removeProperty("MetalPluginName");
+    removeProperty("MetalPluginClassName");
+    setProperty("VirtioGPUWindowServer", kOSBooleanFalse);
+    removeProperty("IOAccelDisplayPipeCapabilities");
+    gIop = 0;
+    // The AGDC stays: AppleGraphicsDeviceControl refuses terminate (measured: -> 0), and without the capabilities
+    // WindowServer finds no display pipe and composites in software anyway (measured 2026-11-15).
+    armed_ = 1;
+    setProperty("VirtioGPUGuard", why);
+    setProperty("VirtioGPUArmState", "withdrawn: no pipe capabilities, no Metal for WindowServer (software compositor)");
+    vlog("WITHDRAWN (%s): MetalPluginName and pipe capabilities gone; the next WindowServer composites in software", why);
+}
+
+IOReturn VirtioGPUAccel::newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) {
+    char who[32] = "?";
+    proc_selfname(who, sizeof(who));
+    if (type != kVGUCAccelType) {
+        IOReturn r = IOGraphicsAccelerator2::newUserClient(owningTask, securityID, type, handler);
+        static int logged = 0;
+        if (logged < 30 && !strcmp(who, "WindowServer")) {
+            logged++;
+            vlog("WindowServer opened family user client type %u -> 0x%x %s", (unsigned)type, r,
+                 (r == kIOReturnSuccess && handler && *handler) ? (*handler)->getMetaClass()->getClassName() : "");
+        }
+        return r;
+    }
+    if (!strcmp(who, "WindowServer")) {
+        int pid = proc_selfpid();
+        bool seen = false;
+        for (unsigned i = 0; i < wsCount_ && i < 4; i++) {
+            seen |= wsPids_[i] == pid;
+        }
+        if (!seen) {
+            if (wsCount_ < 4) {
+                wsPids_[wsCount_] = pid;
+            }
+            wsCount_++;
+            vlog("WindowServer pid %d opens the Venus client (WindowServer #%u this boot)", pid, wsCount_);
+            if (wsCount_ >= 3 && armed_ == 3) {
+                setProperty("VirtioGPUGuardWhy", "a third WindowServer since the arm");
+                vlog("GUARD: a third WindowServer since the arm: withdrawing");
+                request(1);
+            }
+        }
+    }
+    IOService *core = findCore();
+    if (!core) {
+        vlog("Venus client for %s: no core service", who);
+        return kIOReturnNotAttached;
+    }
+    IOUserClient *uc = nullptr;
+    IOReturn r = core->callPlatformFunction(gSymNewClient, false, (void *)owningTask, &uc, securityID, nullptr);
+    if (r != kIOReturnSuccess || !uc) {
+        vlog("Venus client for %s: the core refused (0x%x)", who, r);
+        return r ? r : kIOReturnNoResources;
+    }
+    IOService *carrier = nullptr;
+    for (unsigned i = 0; i < VG_CARRIERS && !carrier; i++) {
+        carrier = carriers_[(carrierNext_ + i) % VG_CARRIERS];
+    }
+    carrierNext_++;
+    if (!carrier || !uc->attach(carrier)) {
+        vlog("Venus client for %s: no carrier to attach to", who);
+        uc->release();
+        return kIOReturnNoResources;
+    }
+    if (!uc->start(carrier)) {
+        vlog("Venus client for %s: start failed", who);
+        uc->detach(carrier);
+        uc->release();
+        return kIOReturnInternalError;
+    }
+    static int logged = 0;
+    if (logged++ < 20) {
+        vlog("Venus client for %s (pid %d) through the accelerator", who, proc_selfpid());
+    }
+    *handler = uc;
+    return kIOReturnSuccess;
+}
+
+void VirtioGPUAccel::stop(IOService *provider) {
+    gIop = 0;
+    if (fbNote_) {
+        fbNote_->remove();
+        fbNote_ = nullptr;
+    }
+    if (armTimer_) {
+        armTimer_->cancelTimeout();
+    }
+    if (holdTimer_) {
+        holdTimer_->cancelTimeout();
+    }
+    releaseHold("stop");
+    IOGraphicsAccelerator2::stop(provider);
 }
 
 // The late arm (stage 4a). A root process sets, through IORegistryEntrySetCFProperties on this service:
@@ -504,14 +1075,25 @@ bool VirtioGPUAccel::start(IOService *provider) {
 // sees it). Nothing persists: every boot starts unarmed. Anything else goes to the family's own setProperties.
 IOReturn VirtioGPUAccel::setProperties(OSObject *properties) {
     OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
-    if (dict && (dict->getObject("VirtioGPUArm") || dict->getObject("VirtioGPUDisarm"))) {
+    if (dict && (dict->getObject("VirtioGPUArm") || dict->getObject("VirtioGPUDisarm") ||
+                 dict->getObject("VirtioGPUArmWindowServer") || dict->getObject("VirtioGPUWithdraw"))) {
         if (IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator) != kIOReturnSuccess) {
             vlog("arm: refused, the caller isn't root");
             return kIOReturnNotPrivileged;
         }
+        if (dict->getObject("VirtioGPUArmWindowServer") || dict->getObject("VirtioGPUWithdraw")) {
+            if (armed_ < 1 || !armTimer_) {
+                vlog("display request refused: the display isn't registered (vgpuaccel=3 or 4 needed)");
+                return kIOReturnNotReady;
+            }
+            removeProperty("VirtioGPUGuardWhy");
+            request(dict->getObject("VirtioGPUWithdraw") ? 1 : 2);
+            return kIOReturnSuccess;
+        }
         if (dict->getObject("VirtioGPUDisarm")) {
             removeProperty("MetalPluginName");
             removeProperty("MetalPluginClassName");
+            setProperty("VirtioGPUWindowServer", kOSBooleanFalse);
             setProperty("VirtioGPUAccelUnarmed", kOSBooleanTrue);
             vlog("disarmed: MetalPluginName withdrawn");
             return kIOReturnSuccess;
@@ -535,6 +1117,25 @@ IOReturn VirtioGPUAccel::setProperties(OSObject *properties) {
 void VirtioGPUAccel::free() {
     if (gAccel == this) {
         gAccel = nullptr;
+    }
+    if (armLoop_) {
+        if (armTimer_) {
+            armLoop_->removeEventSource(armTimer_);
+        }
+        if (holdTimer_) {
+            armLoop_->removeEventSource(holdTimer_);
+        }
+    }
+    OSSafeReleaseNULL(armTimer_);
+    OSSafeReleaseNULL(holdTimer_);
+    OSSafeReleaseNULL(armLoop_);
+    OSSafeReleaseNULL(agdc_);
+    if (fb_) {
+        fb_->release();
+        fb_ = nullptr;
+    }
+    for (unsigned i = 0; i < VG_CARRIERS; i++) {
+        OSSafeReleaseNULL(carriers_[i]);
     }
     if (stamps_) {
         stamps_->complete();

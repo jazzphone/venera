@@ -44,6 +44,23 @@ accel) # stage 4: VirtioGPUAccel into /Library/Extensions + the AuxKC (beside th
   sleep 20
   "${SSH[@]}" $HOST 'bash /root/vgpu/vm-remote.sh accel-logs'
   ;;
+stage5) # stage 5a: the bundle (no reboot), framebuffer + accelerator into the AuxKC (no reboot), then the core into
+  # OpenCore with one stop/start; then the accelerator's log
+  tools/build.sh >/dev/null
+  tools/build-metal.sh >/dev/null && tools/build-tools.sh >/dev/null
+  tar -czf build/vgmetal.tgz -C build VirtioGPUMetal.bundle mtlprobe mtlcompute mtlrender mtlsurface mtlwindow compute.metallib render.metallib acceltest
+  "${SSH[@]}" $HOST 'mkdir -p /root/vgpu/xfer && rm -rf /root/vgpu/xfer/*'
+  "${SCP[@]}" build/vgmetal.tgz tools/metal-vm.sh $HOST:/root/vgpu/xfer/
+  "${SSH[@]}" $HOST "bash /root/vgpu/vm-remote.sh xfer /root/vgpu/xfer/* >/dev/null; bash /root/vgpu/vm-remote.sh run 'sh /Volumes/VGPU/metal-vm.sh install' 120"
+  tar -czf build/VirtioGPUAux.tgz -C build VirtioGPUFramebuffer.kext VirtioGPUAccel.kext
+  "${SCP[@]}" build/VirtioGPUAux.tgz $HOST:/root/vgpu/
+  "${SSH[@]}" $HOST "bash /root/vgpu/vm-remote.sh aux-only /root/vgpu/VirtioGPUAux.tgz 'VirtioGPUFramebuffer.kext VirtioGPUAccel.kext'"
+  "${SSH[@]}" $HOST 'rm -rf /root/vgpu/VirtioGPU.kext'
+  "${SCP[@]}" -r build/VirtioGPU.kext $HOST:/root/vgpu/
+  "${SSH[@]}" $HOST 'bash /root/vgpu/vm-remote.sh deploy /root/vgpu/VirtioGPU.kext'
+  sleep 30
+  "${SSH[@]}" $HOST 'bash /root/vgpu/vm-remote.sh accel-logs'
+  ;;
 accel-logs)
   "${SSH[@]}" $HOST 'bash /root/vgpu/vm-remote.sh accel-logs'
   ;;

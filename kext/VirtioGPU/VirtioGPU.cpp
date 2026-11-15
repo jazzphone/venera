@@ -1018,6 +1018,25 @@ IOReturn VirtioGPU::callPlatformFunction(const OSSymbol *name, bool wait, void *
         disableScanout();
         return kIOReturnSuccess;
     }
+    if (name->isEqualTo(kVGPUNewClient)) {
+        // Stage 5a: a Venus client for the accelerator to attach under itself (kVGUCAccelType).
+        auto **out = static_cast<IOUserClient **>(p2);
+        if (!out) {
+            return kIOReturnBadArgument;
+        }
+        *out = nullptr;
+        if (!ready() || !venusCapset_) {
+            return kIOReturnNotReady;
+        }
+        VirtioGPUUserClient *client = OSTypeAlloc(VirtioGPUUserClient);
+        if (!client || !client->initWithTask(static_cast<task_t>(p1), p3, 0)) {
+            OSSafeReleaseNULL(client);
+            return kIOReturnNoMemory;
+        }
+        client->setCore(this);
+        *out = client;
+        return kIOReturnSuccess;
+    }
     if (name->isEqualTo(kVGPULog)) {
         if (p1) {
             probeLog("%s", static_cast<const char *>(p1));

@@ -522,3 +522,118 @@ Frame rate isn't tuned (25-30 fps for a trivial frame): measure where the time g
 
 Stage 4 is done: an app-only Metal device on Venus (compute, render, IOSurfaces, CAMetalLayer). Next is 5a
 (WindowServer picks the device: AGDC, display pipe, framebuffer registration, VBL, the arming moved into the kext).
+
+## Stage 5a result (2026-11-15): WindowServer picks our Metal device ("Metal compositor activated"); no frames through the pipe yet
+
+**Checkpoint met except frames on screen.** With `vgpuaccel=4` the armed WindowServer loads VirtioGPUMetal, brings up
+Venus through the accelerator, builds CoreDisplay's pipelines and logs **"Metal compositor activated"** (instead of
+"Software compositor activated"). The registry shows our AppleGraphicsDeviceControl (`VGDeviceControl`) and display
+pipe (`VGDisplayPipe`) on the PCI device. No sandbox denial touched IOKit. `system_profiler SPDisplaysDataType` says
+**"Metal: Supported"** (vendor 0x1af4, device 0x1050). The screen does not show the desktop yet: the first
+WindowServer aborts inside Core Animation once it draws real UI, because CA's pipelines use **framebuffer fetch**,
+and composited frames never reach our display pipe (see "What's left" below). The guard then gives the next
+WindowServer a software desktop. VM 108 is left on `vgpuaccel=2` (software compositor, all the new code loaded,
+WindowServer never armed). `vgpuaccel=4` reproduces everything below. Snapshot before 5a: `pre-5a`.
+
+### What was built
+
+Kernel (VirtioGPUAccel 0.5.2, VirtioGPUFramebuffer 0.5.0, VirtioGPU core 0.5.0):
+
+- **Framebuffer** (`VirtioGPUFramebuffer.cpp`): `IOFBDependentID`/`IOFBDependentIndex 0` before `IOFramebuffer::start`;
+  **a 60 Hz timer VBL** (`registerForInterruptType(kIOFBVBLInterruptType)` with 4 handler slots, `setInterruptState`,
+  own work loop; IOFramebuffer registers its handler at open); `callPlatformFunction` answers `vgpu.fb.scanoutInfo` (kva,
+  pitch, size of the scanout RAM) and `vgpu.fb.present` for the display pipe (`kext/VirtioGPUAPI.h`).
+- **Display machine registration** (`VirtioGPUAccel.cpp`): first-publish notification on `VirtioGPUFramebuffer`, then from
+  our own arm work loop `found_framebuffer` (pipe count at dm+0x108, pipes at dm+0x88, a pipe's framebuffer at +0x98, NV's
+  26.7.1 offsets, all held on 26.7.3), `display_mode_will_change/did_change`, enable bit stays set. The family called
+  our `newDisplayPipe` and the pipe's framebuffer is ours.
+- **`VGDisplayPipe`**: `initFramebufferResource` returns NULL (CPU-only scanout); `performTransaction` copies the plane-0
+  IOSurface (BGRA / l10r / RGhA through NV's `nv_iop_pixel.h`, vendored) into the scanout RAM, keeps 4 sources mapped,
+  copies the overlap if sizes differ; refused (0xe00002c7) until `IOAccelDisplayPipeCapabilities` is published.
+  Counters in `VirtioGPUPipeFrames` on the accelerator. IOSurface and transaction accessors linked by name (kmutil
+  resolved them on 26.7.3).
+- **AGDC** (`VGDeviceControl.cpp`, `com.apple.AppleGraphicsDeviceControl` library, NV's reconstructed base class in
+  `vendor/nullmoth/agdc`): created, attached and started by hand on the PCI device. Answers 0x1 (description: version
+  0x30000, "VirtioGPU", vendor half-word 0x106b as Reims measured, device 0x1050, kind 2; `vgpuagdcvendor=` /
+  `vgpuagdcversion=` override), 0x3 (get: framebuffers|accelerator; set: InitFlags), 0x980 (one port, one framebuffer,
+  the PCI device), 0x921 (NV's K5 link config from the current mode's timing), 0x711 type 0x10 (plane scaler), 0x925
+  (connected). Seen asked and unanswered: 0x941 (48 B), 0x988 (36 B), 0x2001 (4 B in), 0x711 types other than 0x10.
+  WindowServer accepts it as is.
+- **Venus through the accelerator** (WindowServer's sandbox): private user-client type `kVGUCAccelType` 0x56470001 on
+  `VirtioGPUAccel` asks the core for an unattached `VirtioGPUUserClient` (`vgpu.newClient`) and attaches it under one
+  of 8 `IOAccelVirtioCarrier`s. Mesa patch 0005 opens the accelerator first, the core as fallback. Apps use it too now.
+- **Arming moved into the kext**, levels by boot-arg: `vgpuaccel=2` as before (late arm only); `=3` registers the
+  framebuffer, pipe, AGDC and capabilities but publishes no MetalPluginName; `=4` also publishes MetalPluginName and
+  `VirtioGPUWindowServer = true` (the plugin's permission for WindowServer; the late arm never sets it). A boot hold
+  (`adjustBusy`, 20 s cap, `-vgpunohold`) keeps the registry busy until armed; armed in ~0.1 s after the framebuffer
+  published. `-vgpunoagdc` skips the AGDC.
+- **Guard**: a third WindowServer (counted by pid on the Venus client) since the last arm withdraws MetalPluginName,
+  `VirtioGPUWindowServer` and the pipe capabilities. The next WindowServer finds no display pipe and composites in
+  software (measured twice). Root re-arms or withdraws at run time, no reboot: `tools/deploy.sh mtl wsarm|withdraw`
+  (then `killall -9 WindowServer`); `tools/deploy.sh mtl ws` prints WindowServer's state. AGDC can't be terminated
+  (`terminate` -> 0), so it stays.
+
+Plugin (VirtioGPUMetal):
+
+- Allow-list: WindowServer only when the accelerator says `VirtioGPUWindowServer` and the list has no `-WindowServer`;
+  `-name` lines deny any process.
+- **Every `NSError **` is written** (nil on success). CoreDisplay, C++ without ARC, passes an uninitialized `NSError *`
+  and sends it `-description` if non-nil: that was the first armed crash (`GetGPUPassRenderPipelineState`).
+- **Function constants**: `newFunctionWithName:constantValues:error:` reads `MTLFunctionConstantValues` (indexed:
+  `_index/_dataType/_data`; named: `_name`, index from the module's `MTL_FC_INIT` metadata, NV's method) and the
+  translator specializes with `nvmtl_translate_fc` / `nvmtl_reflect_fc`. CoreDisplay's GPUPass (2 constants) and CA's
+  `fixed_*` (60 + 5 named) specialize.
+- `MTLHeap` (`VGMTLHeap.m`): no sub-allocation, resources are plain device allocations; heap size queries on the device.
+- **Lenient mode** (`VGMTLLenient.m`, WindowServer or `VGMTL_LENIENT=1`): a message none of our objects answers is
+  logged once ("LENIENT: -[Class selector]") and answered with nil/0 by a sink, instead of aborting. Seen so far:
+  `-[VGMTLCommandQueue setCompletionQueue:/setSubmissionQueue:/setGPUPriority:]`,
+  `-[VGMTLTexture setResponsibleProcess:/protectionOptions]`, `-[VGMTLCommandBuffer protectionOptions]`,
+  `-[VGMTLDevice newBufferWithBytesNoCopy:length:options:deallocator:]` (needs a real implementation).
+
+Tools: `tools/codepeek.c` reads a function out of a loaded system library in the guest (no developer tools there) and
+resolves its selector refs and call targets; the bytes disassemble on the Mac (wrap them in `.byte` lines, assemble,
+`llvm-objdump -d`). `vm-remote.sh aux` takes several kexts in one AuxKC rebuild; `deploy.sh stage5` = bundle + AuxKC +
+core in one reboot. `tools/build.sh` no longer deletes all of `build/` (it took the translator with it).
+
+### What happened, in order (each a boot or a WindowServer restart)
+
+1. `vgpuaccel=2` with the new code: desktop unchanged (software), VBL registered, Metal tests pass through the
+   accelerator-routed Venus client.
+2. `vgpuaccel=3`: AGDC up, WindowServer asks it 0x1/0x980/0x921/0x925/0x711, opens the display pipe user client, then
+   **asserts "Failed to create MetalDevice"** every 10 s: a display pipe without a Metal device is an abort loop (the
+   owner saw a black screen). Level 3 is only a probe, never a state to boot.
+3. `vgpuaccel=4`: the plugin loads in WindowServer, Venus up, no sandbox denial; SIGSEGV in CoreDisplay
+   (`[error description]` on an uninitialized error, after `newFunctionWithName:constantValues:error:`). Found with
+   codepeek. Fixed (error out-params, function constants).
+4. `-[MTLDevice newHeapWithDescriptor:]` -> abort. Added the heap. The guard (first version) withdrew after 3 and
+   WindowServer came back in software.
+5. Run-time re-arm: `-[VGMTLCommandQueue setCompletionQueue:]` abort inside `CompositorMetal::new_compositor`. Added lenient
+   mode. Next start: **"Metal compositor activated."** WindowServer stays up; CoreDisplay loads its shader libraries
+   (180 + 31 entry points). The console shows the login window mostly black, with only the regions redrawn since the
+   start visible (the owner's screenshot): CoreDisplay's legacy display-surface path (`CGXAccessDisplayDeviceSurface`,
+   `IOAccelSetSurfaceFramebufferShape`, `copy_forward_region` failing 0xe00002bc against our stub `VGSurface`) copied
+   damaged regions to the framebuffer on the CPU; nothing went through `performTransaction` (0 calls).
+6. When the UI drew (typing at the login window, or the desktop after autologin): Core Animation inside WindowServer
+   (`CA::OGL::MetalContext::create_pipeline_state`) aborted, because `fixed_vert_lpf_spc+fixed_frag_lpf_cpf` was refused:
+   its fragment shader reads set 3 binding 192, the translator's `[[color(n)]]` framebuffer-fetch input. Named constants
+   (added) didn't fold it away. Another start died with an assertion in `CA::OGL::Context::push_surface` (likely a
+   follow-on of a refused pipeline).
+
+### What's left (5b), in order
+
+1. **Framebuffer fetch** in render pipelines: bind the current color attachment's contents at set 3 binding 192 + n.
+   NV's `fetch_copy` copies the attachment to a texture before a draw that reads it; with dynamic rendering, a
+   `VK_EXT_rasterization_order_attachment_access`-free version is "end rendering, copy, begin rendering". Venus/ANV
+   exposes `dynamicRenderingLocalRead`? Check with vkprobe first. Then CA's pipelines build.
+2. **Why no transactions**: WindowServer opens the display pipe user client and AGDC is accepted, yet presents via
+   the legacy surface path. Candidates: the pipe's "active" byte (+0x298) and wsaa defer (+0x282) NV logs in
+   `reportPipeGates`; `framebuffer_did_power_on` never delivered; the 0x941/0x988/0x2001 AGDC attributes; legacy surface
+   type 0 opens (`VGSurface` stubs) taking precedence. Log the pipe gates after arm and at each WindowServer start, then
+   compare with NV's working log.
+3. Real `newBufferWithBytesNoCopy:...deallocator:` (copy + deallocator call), stencil, the queue/texture SPI the lenient
+   log lists.
+4. Then 5b proper: surface pending/ready marks, pixel formats, pacing.
+
+Recommendation for 5b: start with (2) because it decides the whole present path, and it's kernel-side and cheap to
+probe at run time (`wsarm` + WindowServer restart, no reboot), then (1), which unblocks Core Animation. Keep lenient
+mode on in WindowServer while bringing up, and keep the guard.

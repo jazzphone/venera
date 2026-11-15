@@ -1,0 +1,87 @@
+From 0db438233b0f029866675782456b69639e55b528 Mon Sep 17 00:00:00 2001
+From: build <build@localhost>
+Date: Sun, 15 Nov 2026 14:01:33 -0500
+Subject: [PATCH] venus: macOS: open the Venus user client through
+ VirtioGPUAccel first (WindowServer's sandbox)
+
+---
+ src/virtio/vulkan/VirtioGPUUserAPI.h  |  6 ++++
+ src/virtio/vulkan/vn_renderer_macos.c | 42 ++++++++++++++++++---------
+ 2 files changed, 35 insertions(+), 13 deletions(-)
+
+diff --git a/src/virtio/vulkan/VirtioGPUUserAPI.h b/src/virtio/vulkan/VirtioGPUUserAPI.h
+index db0ae74..c9eb28a 100644
+--- a/src/virtio/vulkan/VirtioGPUUserAPI.h
++++ b/src/virtio/vulkan/VirtioGPUUserAPI.h
+@@ -18,6 +18,12 @@
+ 
+ #define kVGUCServiceClass "VirtioGPU"
+ 
++/* Stage 5a: the same user client, reached through the accelerator so a sandboxed WindowServer may open it
++ * (its sandbox allows the graphics accelerator's user clients, not the core's). IOServiceOpen on class
++ * kVGUCAccelClass with type kVGUCAccelType; same selectors. Unsandboxed tools may still open the core. */
++#define kVGUCAccelClass "VirtioGPUAccel"
++#define kVGUCAccelType 0x56470001u /* 'VG' + 1 */
++
+ enum {
+     /* struct out: struct vgpu_info */
+     kVGUCGetInfo = 0,
+diff --git a/src/virtio/vulkan/vn_renderer_macos.c b/src/virtio/vulkan/vn_renderer_macos.c
+index b59b27e..dcf47a7 100644
+--- a/src/virtio/vulkan/vn_renderer_macos.c
++++ b/src/virtio/vulkan/vn_renderer_macos.c
+@@ -1097,22 +1097,38 @@ virtgpu_init_capset(struct virtgpu *gpu, size_t max_size)
+ static VkResult
+ virtgpu_open(struct virtgpu *gpu, size_t *venus_capset_size)
+ {
++   /* Through the accelerator first: a sandboxed WindowServer may open the
++    * graphics accelerator's user clients but not the core's. The core is the
++    * fallback for an accelerator that isn't running. */
++   kern_return_t kr = KERN_FAILURE;
+    io_service_t service = IOServiceGetMatchingService(
+-      kIOMainPortDefault, IOServiceMatching(kVGUCServiceClass));
+-   if (service == IO_OBJECT_NULL) {
+-      /* the usual answer outside a VM, so quiet unless asked */
+-      if (VN_DEBUG(INIT))
+-         vn_log(gpu->instance, "no %s service", kVGUCServiceClass);
+-      return VK_ERROR_INITIALIZATION_FAILED;
++      kIOMainPortDefault, IOServiceMatching(kVGUCAccelClass));
++   if (service != IO_OBJECT_NULL) {
++      kr = IOServiceOpen(service, mach_task_self(), kVGUCAccelType, &gpu->conn);
++      IOObjectRelease(service);
++      if (kr != KERN_SUCCESS) {
++         gpu->conn = IO_OBJECT_NULL;
++         if (VN_DEBUG(INIT))
++            vn_log(gpu->instance, "failed to open %s type 0x%x: 0x%x",
++                   kVGUCAccelClass, kVGUCAccelType, kr);
++      }
+    }
+-
+-   const kern_return_t kr =
+-      IOServiceOpen(service, mach_task_self(), 0, &gpu->conn);
+-   IOObjectRelease(service);
+    if (kr != KERN_SUCCESS) {
+-      gpu->conn = IO_OBJECT_NULL;
+-      vn_log(gpu->instance, "failed to open %s: 0x%x", kVGUCServiceClass, kr);
+-      return VK_ERROR_INITIALIZATION_FAILED;
++      service = IOServiceGetMatchingService(
++         kIOMainPortDefault, IOServiceMatching(kVGUCServiceClass));
++      if (service == IO_OBJECT_NULL) {
++         /* the usual answer outside a VM, so quiet unless asked */
++         if (VN_DEBUG(INIT))
++            vn_log(gpu->instance, "no %s service", kVGUCServiceClass);
++         return VK_ERROR_INITIALIZATION_FAILED;
++      }
++      kr = IOServiceOpen(service, mach_task_self(), 0, &gpu->conn);
++      IOObjectRelease(service);
++      if (kr != KERN_SUCCESS) {
++         gpu->conn = IO_OBJECT_NULL;
++         vn_log(gpu->instance, "failed to open %s: 0x%x", kVGUCServiceClass, kr);
++         return VK_ERROR_INITIALIZATION_FAILED;
++      }
+    }
+ 
+    struct vgpu_info vinfo;
+-- 
+2.54.0 (Apple Git-157)
+

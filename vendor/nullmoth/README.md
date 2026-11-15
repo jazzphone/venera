@@ -15,3 +15,7 @@ published, these files and anything built from them stay under that license.
 Not vendored, built from the same checkout: the translator (`translator/`, metal2vulkan + NV's `wrapper/`,
 LGPL-3.0-or-later). `tools/build-translator.sh` builds `libnvmtl_translate.dylib` for x86_64; the plugin bundle carries
 it in Contents/Resources with its license (`libnvmtl_translate.LICENSE`) and loads it with dlopen, as NV's does.
+- `accel/nv_iop_pixel.h` (stage 5a): NV's `kexts/NVRM/accel/nv_iop_pixel.h`, the display pipe's row converters (BGRA, l10r,
+  RGhA into an 8-bit or 30-bit scanout). Copied unchanged.
+- `agdc/AppleGraphicsDeviceControl_re.h` (stage 5a): NV's `kexts/NVRMAGDC/AppleGraphicsDeviceControl_re.h`, the
+  reconstructed AppleGraphicsDeviceControl base class (0x110 bytes, one pure `vendor_doDeviceAttribute`). Copied unchanged.

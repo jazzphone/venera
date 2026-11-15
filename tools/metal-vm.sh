@@ -18,8 +18,15 @@ install)
   sudo -u _windowserver test -r /Library/GPUBundles/VirtioGPUMetal.bundle/Contents/MacOS/VirtioGPUMetal && echo "readable by _windowserver"
   ls -la /Library/GPUBundles /Library/GPUBundles/VirtioGPUMetal.bundle/Contents/*
   ;;
-arm | disarm)
+arm | disarm | wsarm | withdraw)
   $T/acceltest "$@"
+  ;;
+ws) # stage 5a: WindowServer's state: its pid, the accelerator's arm state, the plugin's and CoreDisplay's last lines
+  pgrep -l WindowServer || echo "no WindowServer"
+  ioreg -w0 -rc VirtioGPUAccel -d1 | grep -E '"(VirtioGPU|MetalPlugin|IOAccelDisplayPipe)' | cut -c1-160
+  ioreg -w0 -rc VirtioGPUFramebuffer -d1 | grep -E '"VirtioGPU' | cut -c1-160
+  ls -t /Library/Logs/DiagnosticReports/ | grep -m5 WindowServer
+  log show --last "${2:-2m}" --predicate 'subsystem == "local.homelab.VirtioGPUMetal" OR (process == "WindowServer" AND (eventMessage CONTAINS[c] "compositor" OR eventMessage CONTAINS "display pipe" OR eventMessage CONTAINS "MetalDevice")) OR (process == "ReportCrash" AND eventMessage CONTAINS "ASI found [libsystem_c")' 2>/dev/null | cut -c1-260 | tail -${3:-40}
   ;;
 compute) # stage 4b: mtlcompute (allow-listed by VGMTL_ENABLE), then the plugin's log
   rm -f /var/tmp/VirtioGPUMetal.log

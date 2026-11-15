@@ -4,6 +4,8 @@
 // the !air.kernel / !air.vertex / !air.fragment metadata.
 #import "vg.h"
 #import <dlfcn.h>
+#import <objc/message.h>
+#import <objc/runtime.h>
 
 // ---- Apple's LLVM ----------------------------------------------------------------------------------------------
 
@@ -69,7 +71,10 @@ NSString *vg_air_to_text(NSData *air) {
 // ---- the translator ------------------------------------------------------------------------------------------------
 
 typedef int (*xl_fn)(const char *, const char *, uint8_t **, size_t *, char *, size_t);
+typedef int (*xl_fc_fn)(const char *, const char *, const uint32_t *, const uint32_t *, const uint8_t *const *, size_t,
+                        uint8_t **, size_t *, char *, size_t);
 static xl_fn pTranslate, pReflect;
+static xl_fc_fn pTranslateFC, pReflectFC;
 static void (*pTranslateFree)(uint8_t *, size_t);
 static void (*pSetTgLengths)(const uint32_t *, uint32_t);
 
@@ -89,9 +94,11 @@ static BOOL vg_translator_ready(void) {
         pTranslate = (xl_fn)dlsym(h, "nvmtl_translate");
         pReflect = (xl_fn)dlsym(h, "nvmtl_reflect");
         pTranslateFree = dlsym(h, "nvmtl_translate_free");
+        pTranslateFC = (xl_fc_fn)dlsym(h, "nvmtl_translate_fc");
+        pReflectFC = (xl_fc_fn)dlsym(h, "nvmtl_reflect_fc");
         pSetTgLengths = dlsym(h, "nvmtl_translate_set_threadgroup_lengths");
         void (*setCaps)(uint32_t) = dlsym(h, "nvmtl_translate_set_caps");
-        ready = pTranslate && pReflect && pTranslateFree && pSetTgLengths && setCaps;
+        ready = pTranslate && pReflect && pTranslateFree && pSetTgLengths && setCaps && pTranslateFC && pReflectFC;
         // bits 0/1: the device reads/writes storage images without a declared format, so a typeless Metal
         // texture's storage image is declared Unknown instead of R32f (the wrapper's formatless_options)
         if (setCaps && gVk.formatlessStorage) {
@@ -104,7 +111,27 @@ static BOOL vg_translator_ready(void) {
     return ready;
 }
 
-NSData *vg_translate(NSString *ll, const char *stage, const uint32_t *tgLengths, uint32_t tgCount, NSString **error) {
+// Function constants as the translator's _fc entry points take them: parallel index / size / payload arrays.
+typedef struct {
+    size_t n;
+    uint32_t idx[64], sz[64];
+    const uint8_t *pay[64];
+} vg_fc_args;
+static void vg_fc_unpack(NSDictionary<NSNumber *, NSData *> *fc, vg_fc_args *a) {
+    a->n = 0;
+    for (NSNumber *k in fc) {
+        if (a->n == 64) {
+            break;
+        }
+        a->idx[a->n] = k.unsignedIntValue;
+        a->sz[a->n] = (uint32_t)fc[k].length;
+        a->pay[a->n] = fc[k].bytes;
+        a->n++;
+    }
+}
+
+NSData *vg_translate(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc, const uint32_t *tgLengths,
+                     uint32_t tgCount, NSString **error) {
     if (!vg_translator_ready()) {
         if (error) {
             *error = @"no translator";
@@ -115,7 +142,14 @@ NSData *vg_translate(NSString *ll, const char *stage, const uint32_t *tgLengths,
     size_t len = 0;
     char err[2048] = "";
     pSetTgLengths(tgLengths, tgCount);   // per thread, read by the next translation on this thread
-    int r = pTranslate(ll.UTF8String, stage, &out, &len, err, sizeof(err));
+    int r;
+    if (fc.count) {
+        vg_fc_args a;
+        vg_fc_unpack(fc, &a);
+        r = pTranslateFC(ll.UTF8String, stage, a.idx, a.sz, a.pay, a.n, &out, &len, err, sizeof(err));
+    } else {
+        r = pTranslate(ll.UTF8String, stage, &out, &len, err, sizeof(err));
+    }
     pSetTgLengths(NULL, 0);
     if (r || !out) {
         if (error) {
@@ -128,7 +162,7 @@ NSData *vg_translate(NSString *ll, const char *stage, const uint32_t *tgLengths,
     return spv;
 }
 
-NSDictionary *vg_reflect(NSString *ll, const char *stage, NSString **error) {
+NSDictionary *vg_reflect(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc, NSString **error) {
     if (!vg_translator_ready()) {
         if (error) {
             *error = @"no translator";
@@ -138,7 +172,14 @@ NSDictionary *vg_reflect(NSString *ll, const char *stage, NSString **error) {
     uint8_t *out = NULL;
     size_t len = 0;
     char err[2048] = "";
-    int r = pReflect(ll.UTF8String, stage, &out, &len, err, sizeof(err));
+    int r;
+    if (fc.count) {
+        vg_fc_args a;
+        vg_fc_unpack(fc, &a);
+        r = pReflectFC(ll.UTF8String, stage, a.idx, a.sz, a.pay, a.n, &out, &len, err, sizeof(err));
+    } else {
+        r = pReflect(ll.UTF8String, stage, &out, &len, err, sizeof(err));
+    }
     if (r || !out) {
         if (error) {
             *error = [NSString stringWithFormat:@"reflection failed: %s", err];
@@ -160,6 +201,7 @@ NSDictionary *vg_reflect(NSString *ll, const char *stage, NSString **error) {
 @public
     NSString *_ll;      // LLVM IR text of this entry's module
     NSString *_stage;   // "kernel" | "vertex" | "fragment"
+    NSDictionary<NSNumber *, NSData *> *_fc;   // function-constant values (newFunctionWithName:constantValues:)
 }
 @property(readonly) id<MTLDevice> device;
 @property(readonly) NSString *name;
@@ -187,7 +229,34 @@ NSDictionary *vg_reflect(NSString *ll, const char *stage, NSString **error) {
 - (NSString *)description { return [NSString stringWithFormat:@"<VGMTLFunction %@ (%@)>", _name, _stage]; }
 - (NSString *)vgLL { return _ll; }
 - (NSString *)vgStage { return _stage; }
+- (NSDictionary<NSNumber *, NSData *> *)vgFC { return _fc; }
+- (VGMTLFunction *)specializedWith:(NSDictionary<NSNumber *, NSData *> *)fc {
+    VGMTLFunction *f = [[VGMTLFunction alloc] initWithDevice:_device name:_name stage:_stage ll:_ll];
+    f->_fc = [fc copy];
+    return f;
+}
 @end
+
+// Bytes per value of a Metal data type (scalars and their 2-4 vectors), 0 for one we don't encode. NV's table.
+static size_t vg_fc_width(NSUInteger t) {
+    const struct {
+        NSUInteger base;
+        size_t bytes;
+    } fam[] = {{MTLDataTypeFloat, 4}, {MTLDataTypeHalf, 2},  {MTLDataTypeInt, 4},   {MTLDataTypeUInt, 4},
+               {MTLDataTypeShort, 2}, {MTLDataTypeUShort, 2}, {MTLDataTypeChar, 1},  {MTLDataTypeUChar, 1},
+               {MTLDataTypeBool, 1},  {MTLDataTypeLong, 8},   {MTLDataTypeULong, 8}};
+    for (size_t i = 0; i < sizeof(fam) / sizeof(fam[0]); i++) {
+        if (t >= fam[i].base && t <= fam[i].base + 3) {
+            return fam[i].bytes * (t - fam[i].base + 1);
+        }
+    }
+    return 0;
+}
+
+static NSError *vg_lib_error(NSString *what) {
+    return [NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorUnsupported
+                           userInfo:@{NSLocalizedDescriptionKey : what}];
+}
 
 @interface VGMTLLibrary : NSObject <MTLLibrary> {
     NSDictionary<NSString *, VGMTLFunction *> *_functions;
@@ -248,16 +317,119 @@ static BOOL vg_entry_of(NSString *ll, NSString **name, NSString **stage) {
     }
     return f;
 }
+// Callers may hand an uninitialized NSError * and test it afterwards (CoreDisplay does): *error is always written.
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values
                                  error:(NSError **)error {
-    return [self newFunctionWithName:name];
+    if (error) {
+        *error = nil;
+    }
+    VGMTLFunction *f = _functions[name];
+    if (!f) {
+        vglog("library: no function %s", name.UTF8String);
+        if (error) {
+            *error = vg_lib_error([NSString stringWithFormat:@"no function %@", name]);
+        }
+        return nil;
+    }
+    // MTLFunctionConstantValues keeps MTLIndexedConstantValue objects (_index, _dataType, _data), as NV reads them.
+    NSMutableDictionary<NSNumber *, NSData *> *fc = [NSMutableDictionary dictionary];
+    SEL idxSel = NSSelectorFromString(@"newIndexedConstantArray"), namedSel = NSSelectorFromString(@"newNamedConstantArray");
+    NSArray *indexed = [values respondsToSelector:idxSel] ? ((id(*)(id, SEL))objc_msgSend)(values, idxSel) : nil;
+    NSArray *named = [values respondsToSelector:namedSel] ? ((id(*)(id, SEL))objc_msgSend)(values, namedSel) : nil;
+    for (id v in indexed) {
+        Ivar ii = class_getInstanceVariable([v class], "_index"), ti = class_getInstanceVariable([v class], "_dataType"),
+             di = class_getInstanceVariable([v class], "_data");
+        if (!ii || !ti || !di) {
+            if (error) {
+                *error = vg_lib_error(@"unrecognized MTLFunctionConstantValues representation");
+            }
+            return nil;
+        }
+        const uint8_t *base = (const uint8_t *)(__bridge void *)v;
+        NSUInteger index = *(const NSUInteger *)(base + ivar_getOffset(ii));
+        NSUInteger type = *(const NSUInteger *)(base + ivar_getOffset(ti));
+        const void *data = *(const void *const *)(base + ivar_getOffset(di));
+        size_t w = vg_fc_width(type);
+        if (!w || !data) {
+            if (error) {
+                *error = vg_lib_error([NSString stringWithFormat:@"function constant %lu: data type %lu isn't supported",
+                                                                 (unsigned long)index, (unsigned long)type]);
+            }
+            return nil;
+        }
+        fc[@(index)] = [NSData dataWithBytes:data length:w];
+    }
+    if (named.count) {
+        // Named constants (MTLNamedConstantValue: _name, _dataType, _data) go by the index the module's own metadata
+        // gives each name: "!N = !{ptr @...MTL_FC_INIT_..., !\"type\", !\"name\", i32 INDEX, i1 ...}" (NV's reading).
+        static NSRegularExpression *re;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            re = [NSRegularExpression
+                regularExpressionWithPattern:@"^![0-9]+ = !\\{[^\\n]*\\.MTL_FC_INIT_[^\\n]*, !\"[^\"]+\", !\"([^\"]+)\", i32 ([0-9]+), i1 (?:true|false)\\}$"
+                                     options:NSRegularExpressionAnchorsMatchLines
+                                       error:NULL];
+        });
+        NSString *ll = [f vgLL];
+        NSMutableDictionary<NSString *, NSNumber *> *indices = [NSMutableDictionary dictionary];
+        for (NSTextCheckingResult *m in [re matchesInString:ll options:0 range:NSMakeRange(0, ll.length)]) {
+            indices[[ll substringWithRange:[m rangeAtIndex:1]]] = @([[ll substringWithRange:[m rangeAtIndex:2]] longLongValue]);
+        }
+        NSUInteger applied = 0;
+        for (id v in named) {
+            Ivar ni = class_getInstanceVariable([v class], "_name"), ti = class_getInstanceVariable([v class], "_dataType"),
+                 di = class_getInstanceVariable([v class], "_data");
+            if (!ni || !ti || !di) {
+                if (error) {
+                    *error = vg_lib_error(@"unrecognized named function constant representation");
+                }
+                return nil;
+            }
+            NSNumber *index = indices[object_getIvar(v, ni)];
+            if (!index) {
+                continue;   // a name this function doesn't declare
+            }
+            const uint8_t *base = (const uint8_t *)(__bridge void *)v;
+            NSUInteger type = *(const NSUInteger *)(base + ivar_getOffset(ti));
+            const void *data = *(const void *const *)(base + ivar_getOffset(di));
+            size_t w = vg_fc_width(type);
+            if (!w || !data) {
+                if (error) {
+                    *error = vg_lib_error([NSString stringWithFormat:@"function constant %@: data type %lu isn't supported",
+                                                                     object_getIvar(v, ni), (unsigned long)type]);
+                }
+                return nil;
+            }
+            if (!fc[index]) {   // an indexed value for the same constant wins, as in Metal
+                fc[index] = [NSData dataWithBytes:data length:w];
+            }
+            applied++;
+        }
+        vglog("library: %s: %lu of %lu named function constants apply (%lu declared)", name.UTF8String,
+              (unsigned long)applied, (unsigned long)named.count, (unsigned long)indices.count);
+    }
+    vglog("library: %s with %lu function constants", name.UTF8String, (unsigned long)fc.count);
+    return fc.count ? [f specializedWith:fc] : f;
 }
 - (id<MTLFunction>)newFunctionWithDescriptor:(MTLFunctionDescriptor *)d error:(NSError **)error {
-    return [self newFunctionWithName:d.name];
+    if (d.constantValues) {
+        return [self newFunctionWithName:d.name constantValues:d.constantValues error:error];
+    }
+    if (error) {
+        *error = nil;
+    }
+    id<MTLFunction> f = [self newFunctionWithName:d.name];
+    if (!f && error) {
+        *error = vg_lib_error([NSString stringWithFormat:@"no function %@", d.name]);
+    }
+    return f;
 }
 @end
 
 id<MTLLibrary> vg_new_library(id<MTLDevice> device, NSData *lib, NSError **error) {
+    if (error) {
+        *error = nil;
+    }
     NSMutableDictionary *fns = [NSMutableDictionary dictionary];
     const uint8_t *b = lib.bytes;
     NSUInteger n = lib.length;

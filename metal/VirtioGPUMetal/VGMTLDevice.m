@@ -5,9 +5,11 @@
 // private base class) opens the family's user clients itself. We add the Vulkan side: Mesa's Venus ICD
 // (Contents/Resources/libvulkan_virtio.dylib, loaded directly, no Vulkan loader) on the host's GPU.
 //
-// Allow-list: only listed processes get a device; everyone else gets none, as before the arm. WindowServer is always
-// refused until stage 5a. /Library/GPUBundles/VirtioGPUMetal-allow.txt: one process name per line, `*` = all;
-// mtlprobe is always allowed; VGMTL_ENABLE=1 in the environment allows the process.
+// Allow-list: only listed processes get a device; everyone else gets none, as before the arm. WindowServer gets it only
+// when the accelerator says so (VirtioGPUWindowServer = true, published by the kext's own arm at vgpuaccel=4, never by
+// the late arm) and the list has no "-WindowServer" line. /Library/GPUBundles/VirtioGPUMetal-allow.txt: one process
+// name per line, `*` = all, `-name` = never; mtlprobe is always allowed; VGMTL_ENABLE=1 in the environment allows the
+// process.
 //
 // Shape after nullmoth/nvidia-macos-driver's NVMTLDevice (plugin/NVMTLDevice.m): the refusal before super's init and
 // the initLimits call are theirs.
@@ -69,18 +71,8 @@ BOOL vg_tracing(void) {
 
 // ---- allow-list ------------------------------------------------------------------------------------------------
 
-static BOOL vg_process_allowed(void) {
-    const char *me = getprogname();
-    if (!strcmp(me, "WindowServer")) {
-        return NO;   // until stage 5a: a refused WindowServer composites in software, as today
-    }
-    if (!strcmp(me, "mtlprobe")) {
-        return YES;
-    }
-    const char *e = getenv("VGMTL_ENABLE");
-    if (e && e[0] == '1') {
-        return YES;
-    }
+// One line of the allow-list file is exactly `line` (or `*` when star is YES).
+static BOOL vg_allow_file_has(const char *name, BOOL star) {
     FILE *f = fopen("/Library/GPUBundles/VirtioGPUMetal-allow.txt", "r");
     if (!f) {
         return NO;
@@ -89,10 +81,39 @@ static BOOL vg_process_allowed(void) {
     BOOL ok = NO;
     while (!ok && fgets(line, sizeof(line), f)) {
         line[strcspn(line, "\r\n")] = 0;
-        ok = !strcmp(line, "*") || !strcmp(line, me);
+        ok = (star && !strcmp(line, "*")) || !strcmp(line, name);
     }
     fclose(f);
     return ok;
+}
+
+static BOOL vg_accel_allows_windowserver(mach_port_t port) {
+    CFTypeRef v = IORegistryEntryCreateCFProperty(port, CFSTR("VirtioGPUWindowServer"), kCFAllocatorDefault, 0);
+    BOOL yes = v && CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue((CFBooleanRef)v);
+    if (v) {
+        CFRelease(v);
+    }
+    return yes;
+}
+
+static BOOL vg_process_allowed(mach_port_t port) {
+    const char *me = getprogname();
+    if (!strcmp(me, "WindowServer")) {
+        BOOL accel = vg_accel_allows_windowserver(port), denied = vg_allow_file_has("-WindowServer", NO);
+        vglog("WindowServer asks: accelerator %s, allow-list %s", accel ? "allows it (vgpuaccel=4)" : "does not allow it",
+              denied ? "says -WindowServer" : "has no -WindowServer");
+        return accel && !denied;
+    }
+    if (!strcmp(me, "mtlprobe")) {
+        return YES;
+    }
+    const char *e = getenv("VGMTL_ENABLE");
+    if (e && e[0] == '1') {
+        return YES;
+    }
+    char deny[260];
+    snprintf(deny, sizeof(deny), "-%s", me);
+    return !vg_allow_file_has(deny, NO) && vg_allow_file_has(me, YES);
 }
 
 // A refusal before [super initWithAcceleratorPort:] must not free the object: under ARC returning nil releases self,
@@ -124,7 +145,7 @@ static id vg_refuse_before_init(id obj) {
         vglog("  not a VirtioGPUAccel: no device");
         return vg_refuse_before_init(self);
     }
-    if (!vg_process_allowed()) {
+    if (!vg_process_allowed(port)) {
         vglog("  not allow-listed: no device for %s", getprogname());
         return vg_refuse_before_init(self);
     }
@@ -212,6 +233,11 @@ static id vg_refuse_before_init(id obj) {
 - (id<MTLSamplerState>)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)d { return vg_new_sampler(self, d); }
 - (id<MTLDepthStencilState>)newDepthStencilStateWithDescriptor:(MTLDepthStencilDescriptor *)d {
     return vg_new_depth_stencil(self, d);
+}
+- (id<MTLHeap>)newHeapWithDescriptor:(MTLHeapDescriptor *)d { return vg_new_heap(self, d); }
+- (MTLSizeAndAlign)heapTextureSizeAndAlignWithDescriptor:(MTLTextureDescriptor *)d { return vg_heap_texture_size(d); }
+- (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)length options:(MTLResourceOptions)o {
+    return vg_heap_buffer_size(length);
 }
 - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)error {
     return vg_new_render_pipeline(self, d, error);

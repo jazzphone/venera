@@ -23,7 +23,9 @@ bool VirtioGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt
 }
 
 bool VirtioGPUUserClient::start(IOService *provider) {
-    core_ = OSDynamicCast(VirtioGPU, provider);
+    if (!core_) {
+        core_ = OSDynamicCast(VirtioGPU, provider);
+    }
     return core_ && IOUserClient::start(provider);
 }
 

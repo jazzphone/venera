@@ -66,14 +66,18 @@ push_file() { # push_file LOCAL REMOTE
   echo "pushed $1 ($n base64 bytes) to $2"
 }
 
-aux_install() {
-  local tgz=$1 name=$2
+aux_install() { # aux_install TGZ "NAME [NAME...]": every named kext in the tarball, one AuxKC rebuild
+  local tgz=$1 names=$2 mv=""
+  for n in $names; do
+    mv="$mv
+    rm -rf /Library/Extensions/$n && mv /tmp/vgpu-aux/$n /Library/Extensions/$n
+    chown -R root:wheel /Library/Extensions/$n && chmod -R 755 /Library/Extensions/$n"
+  done
   push_file "$tgz" /tmp/vgpu-aux.tgz || { echo "push failed"; return 1; }
   agent "set -e
-    rm -rf /Library/Extensions/$name /tmp/vgpu-aux && mkdir -p /tmp/vgpu-aux
+    rm -rf /tmp/vgpu-aux && mkdir -p /tmp/vgpu-aux
     tar -xzf /tmp/vgpu-aux.tgz -C /tmp/vgpu-aux
-    mv /tmp/vgpu-aux/$name /Library/Extensions/$name
-    chown -R root:wheel /Library/Extensions/$name && chmod -R 755 /Library/Extensions/$name
+    $mv
     # Build the Auxiliary KC directly (as nvidia-macos-driver's installer does); kernelmanagerd
     # loads it at the next boot. SIP 0x203 lets the unsigned, unapproved kext in and the KC be replaced.
     KC=/Library/KernelCollections/AuxiliaryKernelExtensions.kc
@@ -81,7 +85,7 @@ aux_install() {
       -B /System/Library/KernelCollections/BootKernelExtensions.kc \\
       -S /System/Library/KernelCollections/SystemKernelExtensions.kc \\
       --repository /Library/Extensions -A \$KC.vgpu-new -z > /tmp/vgpu-kmutil.log 2>&1 || { tail -15 /tmp/vgpu-kmutil.log; exit 1; }
-    kmutil inspect -a x86_64 -A \$KC.vgpu-new 2>/dev/null | grep -i homelab || { echo 'kmutil left the kext out:'; tail -15 /tmp/vgpu-kmutil.log; exit 1; }
+    for n in $names; do kmutil inspect -a x86_64 -A \$KC.vgpu-new 2>/dev/null | grep -i \"homelab.\${n%.kext}\" || { echo \"kmutil left \$n out:\"; tail -15 /tmp/vgpu-kmutil.log; exit 1; }; done
     mv -f \$KC.vgpu-new \$KC && echo \"aux collection rebuilt; loads at next boot\"" 300
 }
 
@@ -117,9 +121,11 @@ accel-logs) # the accelerator: its log on the PCI device, the family, the regist
 logs-raw)
   agent 'ioreg -w0 -r -c VirtioGPU -l' 90
   ;;
-aux) # aux TGZ NAME: install into /Library/Extensions + AuxKC, then reboot
+aux) # aux TGZ "NAME [NAME...]": install into /Library/Extensions + AuxKC, then reboot
+  aux_install "$2" "$3" && reboot_vm
+  ;;
+aux-only) # aux-only TGZ "NAME [NAME...]": the same, no reboot (the next boot loads it)
   aux_install "$2" "$3"
-  reboot_vm
   ;;
 xfer) # xfer FILE...: copy files onto the transfer disk (virtio1, FAT "VGPU", /Volumes/VGPU in macOS)
   # (virtiofs hung OpenCore at startup, so files go over a disk: unmount in the guest, write here, remount.)

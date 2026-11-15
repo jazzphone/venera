@@ -18,6 +18,12 @@
 
 #define kVGUCServiceClass "VirtioGPU"
 
+/* Stage 5a: the same user client, reached through the accelerator so a sandboxed WindowServer may open it
+ * (its sandbox allows the graphics accelerator's user clients, not the core's). IOServiceOpen on class
+ * kVGUCAccelClass with type kVGUCAccelType; same selectors. Unsandboxed tools may still open the core. */
+#define kVGUCAccelClass "VirtioGPUAccel"
+#define kVGUCAccelType 0x56470001u /* 'VG' + 1 */
+
 enum {
     /* struct out: struct vgpu_info */
     kVGUCGetInfo = 0,

@@ -13,11 +13,12 @@ COMMON=(-arch x86_64 -mmacosx-version-min=26.0 -O2 -Wall -Wno-unused-parameter -
 CXXFLAGS=($COMMON -std=gnu++17 -fno-rtti -fno-exceptions -fapple-kext)
 CFLAGS=($COMMON -std=gnu11)
 
-rm -rf build && mkdir -p build
+# only the kexts: build/ also holds the translator, the Metal bundle and the test tools
+rm -rf build/obj build/VirtioGPU.kext build/VirtioGPUFramebuffer.kext build/VirtioGPUAccel.kext && mkdir -p build
 for NAME in VirtioGPU VirtioGPUFramebuffer VirtioGPUAccel; do
   SRC=kext/$NAME
   EXTRA=()
-  [[ $NAME == VirtioGPUAccel ]] && EXTRA=(-DNM_TAHOE -Ivendor/nullmoth/accel -Ivendor/nullmoth/accel/re -Ivendor/nullmoth/accel/iofam)
+  [[ $NAME == VirtioGPUAccel ]] && EXTRA=(-DNM_TAHOE -Ivendor/nullmoth/accel -Ivendor/nullmoth/accel/re -Ivendor/nullmoth/accel/iofam -Ivendor/nullmoth/agdc)
   OUT=build/$NAME.kext
   OBJ=build/obj/$NAME
   mkdir -p $OBJ "$OUT/Contents/MacOS"

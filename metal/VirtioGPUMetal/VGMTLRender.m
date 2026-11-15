@@ -183,6 +183,9 @@ static VkShaderModule vg_module(NSData *spv) {
 }
 
 id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRenderPipelineDescriptor *d, NSError **error) {
+    if (error) {
+        *error = nil;
+    }
     NSString *why = nil;
     NSObject *vf = (NSObject *)d.vertexFunction, *ff = (NSObject *)d.fragmentFunction;
     VGMTLRenderPipelineState *p = nil;
@@ -198,8 +201,8 @@ id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRende
         p->_dev = device;
         p->_name = [NSString stringWithFormat:@"%@+%@", d.vertexFunction.name, d.fragmentFunction.name ?: @"-"];
         uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-        NSData *vs = vg_translate([vf vgLL], "vertex", NULL, 0, &why);
-        NSData *fs = ff && vs ? vg_translate([ff vgLL], "fragment", NULL, 0, &why) : nil;
+        NSData *vs = vg_translate([vf vgLL], "vertex", [vf vgFC], NULL, 0, &why);
+        NSData *fs = ff && vs ? vg_translate([ff vgLL], "fragment", [ff vgFC], NULL, 0, &why) : nil;
         if (fs) {
             fs = vg_spirv_retarget_set(fs, 1);
         }
