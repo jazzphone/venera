@@ -12,6 +12,9 @@
 
 #include "VirtioPCI.hpp"
 
+class VirtioGPUUserClient;
+struct vgpu_info;
+
 class VirtioGPU : public IOService {
     OSDeclareDefaultStructors(VirtioGPU)
 
@@ -42,6 +45,39 @@ public:
     void moveCursor(uint32_t x, uint32_t y, bool visible);
     void addLog(const char *line);
     void publishLog();
+    // ---- Stage 3: requests for the user client (Venus) ----
+    // A control queue request in flight, indexed by its descriptor head.
+    struct Request {
+        bool inUse;
+        volatile bool done;
+        bool async;                         // completes on its own: owned buffer released then
+        uint32_t usedLength;
+        IOBufferMemoryDescriptor *owned;    // request + reply memory, if the request owns it
+        VirtioGPUUserClient *fenceOwner;    // retained while in flight
+        uint32_t ring;
+        uint64_t fence;
+    };
+    // Sends `request` and waits for the reply (both copied through a private buffer).
+    // Returns the reply's type, 0 on timeout.
+    uint32_t transact(const void *request, uint32_t requestLength, void *reply, uint32_t replyLength,
+                      uint32_t timeoutMs = 2000);
+    // SUBMIT_3D of `cs` to (ctx, ring); with fence != 0 the request is fenced and completes when
+    // the host signals it (fenceOwner->fenceSignaled is called). Returns false if it couldn't queue.
+    bool submit3D(uint32_t ctx, uint32_t ring, uint64_t fence, const void *cs, uint32_t csLength,
+                  IOMemoryDescriptor *csDescriptor, VirtioGPUUserClient *fenceOwner);
+    // Waits until `done()` is true, the timeout passes, or nothing more can arrive.
+    bool waitUntil(bool (*done)(void *), void *context, uint64_t timeoutNs);
+    uint32_t allocateResourceID() { return OSIncrementAtomic(reinterpret_cast<volatile SInt32 *>(&nextResource_)); }
+    uint32_t allocateContextID() { return OSIncrementAtomic(reinterpret_cast<volatile SInt32 *>(&nextContext_)); }
+    bool hostmemAllocate(uint64_t size, uint64_t *offset);
+    void hostmemFree(uint64_t offset, uint64_t size);
+    IODeviceMemory *hostmem() const { return hostmemMemory_; }
+    uint64_t hostmemSize() const { return hostmemLength_; }
+    uint64_t features() const { return features_; }
+    uint32_t capsetCount() const { return numCapsets_; }
+    void fillInfo(struct vgpu_info *info);
+    IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) override;
+
     // Serves the selectors in VirtioGPUAPI.h (the nub forwards its calls here).
     IOReturn callPlatformFunction(const OSSymbol *functionName, bool waitForFunction, void *param1,
                                   void *param2, void *param3, void *param4) override;
@@ -61,6 +97,9 @@ private:
     void getEDID(uint32_t scanout);
     void getCapsets();
     void venusProbe();
+    int submitRequest(const virtio::Segment *segments, unsigned count, IOBufferMemoryDescriptor *owned,
+                      bool async, VirtioGPUUserClient *fenceOwner, uint32_t ring, uint64_t fence);
+    void drainControl(); // commandLock_ held
     bool cursorCommand(uint32_t type, uint32_t resource);
     bool attachBacking(uint32_t resource, IOBufferMemoryDescriptor *memory, uint32_t bytes);
     void dropResource(uint32_t resource);
@@ -90,7 +129,7 @@ private:
     uint32_t height_ = 0;
     OSData *edid_ = nullptr;
     uint32_t scanoutResource_ = 0;
-    uint32_t nextResource_ = 1;
+    volatile uint32_t nextResource_ = 1;
     uint32_t scanoutWidth_ = 0;
     uint32_t scanoutHeight_ = 0;
     uint32_t scanoutStride_ = 0;
@@ -99,10 +138,25 @@ private:
     // Stage 3: host-visible memory window (VIRTIO_PCI_CAP_SHARED_MEMORY_CFG) and capsets
     uint32_t numCapsets_ = 0;
     bool venusCapset_ = false;
+    uint32_t capsetID_[8] = {};
+    uint32_t capsetMaxVersion_[8] = {};
+    uint32_t capsetMaxSize_[8] = {};
     uint8_t hostmemID_ = 0;
     uint8_t hostmemBar_ = 0;
     uint64_t hostmemOffset_ = 0;
     uint64_t hostmemLength_ = 0;
+    IODeviceMemory *hostmemMemory_ = nullptr;
+    struct HostmemRange {
+        uint64_t offset;
+        uint64_t size;
+    };
+    static constexpr unsigned kMaxHostmemRanges = 2048;
+    HostmemRange *hostmemRanges_ = nullptr; // sorted by offset
+    unsigned hostmemRangeCount_ = 0;
+    IOLock *hostmemLock_ = nullptr;
+    Request requests_[256] = {};
+    volatile uint32_t nextContext_ = 1;
+    uint32_t asyncInFlight_ = 0;
     // Hardware cursor
     IOLock *cursorLock_ = nullptr;
     IOBufferMemoryDescriptor *cursorImage_ = nullptr;  // 64x64x4 backing of the cursor resource

@@ -21,6 +21,8 @@
 #include <pexpert/pexpert.h>
 
 #include "../VirtioGPUAPI.h"
+#include "../VirtioGPUUserAPI.h"
+#include "VirtioGPUUserClient.hpp"
 #include "VirtioGPUProtocol.h"
 
 // IOLog from an OpenCore-injected kext doesn't reach dmesg or the unified log on Tahoe, so every
@@ -88,7 +90,7 @@ const char *capsetName(uint32_t id) {
 
 constexpr uint16_t kQueueControl = 0;
 constexpr uint16_t kQueueCursor = 1;
-constexpr uint16_t kMaxQueueSize = 64;
+constexpr uint16_t kMaxQueueSize = 128;
 constexpr uint16_t kNoVector = 0xffff;
 // Command memory: the request (up to kRequestMax, room for ~1,790 backing entries) then the reply.
 constexpr uint32_t kCommandBytes = 32 * 1024;
@@ -314,7 +316,10 @@ bool VirtioGPU::filter(IOFilterInterruptEventSource *) {
 }
 
 void VirtioGPU::interruptOccurred(IOInterruptEventSource *, int) {
+    IOLockLock(commandLock_);
+    drainControl();
     IOLockWakeup(commandLock_, &wakeEvent_, false);
+    IOLockUnlock(commandLock_);
 }
 
 bool VirtioGPU::bringUp() {
@@ -348,6 +353,18 @@ bool VirtioGPU::bringUp() {
     numScanouts_ = config->numScanouts;
     numCapsets_ = config->numCapsets;
     LOG("config: scanouts %u capsets %u", numScanouts_, numCapsets_);
+    if (hostmemLength_) {
+        IODeviceMemory *bar = pci_->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0 + hostmemBar_ * 4);
+        if (bar && bar->getLength() >= hostmemOffset_ + hostmemLength_) {
+            hostmemMemory_ = IODeviceMemory::withSubRange(bar, hostmemOffset_, hostmemLength_);
+            hostmemLock_ = IOLockAlloc();
+            hostmemRanges_ = static_cast<HostmemRange *>(IOMallocZero(kMaxHostmemRanges * sizeof(HostmemRange)));
+            LOG("hostmem window at phys 0x%llx, %llu MB", (unsigned long long)hostmemMemory_->getPhysicalAddress(),
+                (unsigned long long)(hostmemLength_ >> 20));
+        } else {
+            LOG("hostmem BAR%u not usable", hostmemBar_);
+        }
+    }
 
     uint16_t vector = msix_ ? 0 : kNoVector;
     if (msix_ && !transport_.setConfigVector(0)) {
@@ -399,12 +416,9 @@ void VirtioGPU::tearDown() {
 }
 
 uint32_t VirtioGPU::command(uint32_t requestLength, uint32_t replyLength, uint32_t timeoutMs) {
-    if (requestLength > kRequestMax || replyLength > kCommandBytes - kReplyOffset) {
-        return 0;
-    }
-    IOLockLock(commandLock_);
-    if (!control_) {
-        IOLockUnlock(commandLock_);
+    // The shared command memory: callers built the request in commandBytes_ (scanoutLock_ held,
+    // or during start).
+    if (requestLength > kRequestMax || replyLength > kCommandBytes - kReplyOffset || !commandBytes_) {
         return 0;
     }
     bzero(commandBytes_ + kReplyOffset, replyLength);
@@ -412,35 +426,267 @@ uint32_t VirtioGPU::command(uint32_t requestLength, uint32_t replyLength, uint32
         {commandPhys_, requestLength, false},
         {commandPhys_ + kReplyOffset, replyLength, true},
     };
-    if (control_->submit(segments, 2) < 0) {
+    IOLockLock(commandLock_);
+    uint32_t before = interrupts_;
+    int slot = submitRequest(segments, 2, nullptr, false, nullptr, 0, 0);
+    if (slot < 0) {
         IOLockUnlock(commandLock_);
         LOG("control queue full");
         return 0;
     }
-    uint32_t before = interrupts_;
-    transport_.notify(control_);
-
     uint64_t limit = nowNs() + (uint64_t)timeoutMs * 1000000ULL;
-    uint32_t id = 0, length = 0;
-    bool done = false;
-    while (!(done = control_->takeUsed(&id, &length)) && nowNs() < limit) {
+    while (!requests_[slot].done && nowNs() < limit) {
         uint64_t deadline = 0;
         clock_interval_to_deadline(5, kMillisecondScale, &deadline);
         IOLockSleepDeadline(commandLock_, &wakeEvent_, deadline, THREAD_UNINT);
+        drainControl(); // polling fallback
     }
-    uint32_t type = done ? reinterpret_cast<vgpu::CtrlHdr *>(commandBytes_ + kReplyOffset)->type : 0;
+    bool done = requests_[slot].done;
     if (done) {
+        requests_[slot].inUse = false;
         if (interrupts_ != before) {
             commandsByInterrupt_++;
         } else {
             commandsByPolling_++;
         }
-    }
+    } // else: left in use, the device may still write the reply; leak the slot rather than race
     IOLockUnlock(commandLock_);
     if (!done) {
         LOG("command timed out after %u ms", timeoutMs);
+        return 0;
+    }
+    return reinterpret_cast<vgpu::CtrlHdr *>(commandBytes_ + kReplyOffset)->type;
+}
+
+int VirtioGPU::submitRequest(const virtio::Segment *segments, unsigned count, IOBufferMemoryDescriptor *owned,
+                             bool async, VirtioGPUUserClient *fenceOwner, uint32_t ring, uint64_t fence) {
+    if (!control_) {
+        return -1;
+    }
+    drainControl(); // free finished slots first
+    int head = control_->submit(segments, count);
+    if (head < 0 || head >= (int)(sizeof(requests_) / sizeof(requests_[0]))) {
+        return -1;
+    }
+    Request &r = requests_[head];
+    r.inUse = true;
+    r.done = false;
+    r.async = async;
+    r.usedLength = 0;
+    r.owned = owned;
+    r.fenceOwner = fenceOwner;
+    r.ring = ring;
+    r.fence = fence;
+    if (owned) {
+        owned->retain();
+    }
+    if (fenceOwner) {
+        fenceOwner->retain();
+    }
+    if (async) {
+        asyncInFlight_++;
+    }
+    transport_.notify(control_);
+    return head;
+}
+
+void VirtioGPU::drainControl() {
+    if (!control_) {
+        return;
+    }
+    uint32_t id = 0, length = 0;
+    bool any = false;
+    while (control_->takeUsed(&id, &length)) {
+        any = true;
+        if (id >= sizeof(requests_) / sizeof(requests_[0])) {
+            continue;
+        }
+        Request &r = requests_[id];
+        r.usedLength = length;
+        r.done = true;
+        if (r.async) {
+            if (r.fenceOwner) {
+                r.fenceOwner->requestCompleted(r.ring, r.fence);
+                r.fenceOwner->release();
+                r.fenceOwner = nullptr;
+            }
+            if (r.owned) {
+                r.owned->complete();
+                r.owned->release();
+                r.owned = nullptr;
+            }
+            r.inUse = false;
+            asyncInFlight_--;
+        }
+    }
+    if (any) {
+        IOLockWakeup(commandLock_, &wakeEvent_, false);
+    }
+}
+
+bool VirtioGPU::waitUntil(bool (*done)(void *), void *context, uint64_t timeoutNs) {
+    IOLockLock(commandLock_);
+    uint64_t limit = nowNs() + timeoutNs;
+    bool result;
+    while (!(result = done(context)) && nowNs() < limit) {
+        uint64_t deadline = 0;
+        clock_interval_to_deadline(5, kMillisecondScale, &deadline);
+        IOLockSleepDeadline(commandLock_, &wakeEvent_, deadline, THREAD_UNINT);
+        drainControl();
+    }
+    IOLockUnlock(commandLock_);
+    return result;
+}
+
+uint32_t VirtioGPU::transact(const void *request, uint32_t requestLength, void *reply, uint32_t replyLength,
+                             uint32_t timeoutMs) {
+    if (!ready() || requestLength == 0 || requestLength > 64 * 1024 || replyLength > 64 * 1024) {
+        return 0;
+    }
+    uint32_t replyOffset = (requestLength + 63) & ~63u;
+    IOBufferMemoryDescriptor *buffer = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+        kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous, replyOffset + replyLength,
+        0xFFFFFFFFFFFFF000ULL);
+    if (!buffer || buffer->prepare() != kIOReturnSuccess) {
+        OSSafeReleaseNULL(buffer);
+        return 0;
+    }
+    uint8_t *bytes = static_cast<uint8_t *>(buffer->getBytesNoCopy());
+    memcpy(bytes, request, requestLength);
+    bzero(bytes + replyOffset, replyLength);
+    uint64_t phys = buffer->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+    virtio::Segment segments[2] = {{phys, requestLength, false}, {phys + replyOffset, replyLength, true}};
+
+    IOLockLock(commandLock_);
+    int slot = submitRequest(segments, 2, nullptr, false, nullptr, 0, 0);
+    uint32_t type = 0;
+    if (slot >= 0) {
+        uint64_t limit = nowNs() + (uint64_t)timeoutMs * 1000000ULL;
+        while (!requests_[slot].done && nowNs() < limit) {
+            uint64_t deadline = 0;
+            clock_interval_to_deadline(5, kMillisecondScale, &deadline);
+            IOLockSleepDeadline(commandLock_, &wakeEvent_, deadline, THREAD_UNINT);
+            drainControl();
+        }
+        if (requests_[slot].done) {
+            requests_[slot].inUse = false;
+            type = reinterpret_cast<vgpu::CtrlHdr *>(bytes + replyOffset)->type;
+            if (reply) {
+                memcpy(reply, bytes + replyOffset, replyLength);
+            }
+        }
+    }
+    IOLockUnlock(commandLock_);
+    if (type) {
+        buffer->complete();
+        buffer->release();
+    } else {
+        LOG("transact: no reply (slot %d)", slot); // the buffer stays allocated: the device may still write it
     }
     return type;
+}
+
+bool VirtioGPU::submit3D(uint32_t ctx, uint32_t ring, uint64_t fence, const void *cs, uint32_t csLength,
+                         IOMemoryDescriptor *csDescriptor, VirtioGPUUserClient *fenceOwner) {
+    if (!ready()) {
+        return false;
+    }
+    uint32_t header = sizeof(vgpu::CmdSubmit3D);
+    uint32_t replyOffset = (header + csLength + 63) & ~63u;
+    IOBufferMemoryDescriptor *buffer = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+        kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous, replyOffset + sizeof(vgpu::CtrlHdr),
+        0xFFFFFFFFFFFFF000ULL);
+    if (!buffer || buffer->prepare() != kIOReturnSuccess) {
+        OSSafeReleaseNULL(buffer);
+        return false;
+    }
+    uint8_t *bytes = static_cast<uint8_t *>(buffer->getBytesNoCopy());
+    auto *cmd = reinterpret_cast<vgpu::CmdSubmit3D *>(bytes);
+    bzero(cmd, header);
+    cmd->hdr.type = vgpu::kCmdSubmit3D;
+    cmd->hdr.ctxID = ctx;
+    cmd->hdr.ringIdx = (uint8_t)ring;
+    if (fence) {
+        cmd->hdr.flags = vgpu::kFlagFence | vgpu::kFlagInfoRingIdx;
+        cmd->hdr.fenceID = fence;
+    }
+    cmd->size = csLength;
+    if (csLength) {
+        if (csDescriptor) {
+            csDescriptor->readBytes(0, bytes + header, csLength);
+        } else {
+            memcpy(bytes + header, cs, csLength);
+        }
+    }
+    uint64_t phys = buffer->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+    virtio::Segment segments[2] = {{phys, header + csLength, false},
+                                   {phys + replyOffset, (uint32_t)sizeof(vgpu::CtrlHdr), true}};
+    IOLockLock(commandLock_);
+    int slot = submitRequest(segments, 2, buffer, true, fenceOwner, ring, fence);
+    IOLockUnlock(commandLock_);
+    buffer->release(); // the request holds its own reference until it completes
+    return slot >= 0;
+}
+
+bool VirtioGPU::hostmemAllocate(uint64_t size, uint64_t *offset) {
+    size = (size + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+    if (!hostmemLock_ || !hostmemRanges_ || !size || size > hostmemLength_) {
+        return false;
+    }
+    IOLockLock(hostmemLock_);
+    bool ok = false;
+    uint64_t candidate = 0;
+    unsigned at = 0;
+    for (; at <= hostmemRangeCount_; at++) {
+        uint64_t limit = at < hostmemRangeCount_ ? hostmemRanges_[at].offset : hostmemLength_;
+        if (limit >= candidate && limit - candidate >= size) {
+            ok = hostmemRangeCount_ < kMaxHostmemRanges;
+            break;
+        }
+        if (at < hostmemRangeCount_) {
+            candidate = hostmemRanges_[at].offset + hostmemRanges_[at].size;
+        }
+    }
+    if (ok) {
+        memmove(&hostmemRanges_[at + 1], &hostmemRanges_[at], (hostmemRangeCount_ - at) * sizeof(HostmemRange));
+        hostmemRanges_[at] = {candidate, size};
+        hostmemRangeCount_++;
+        *offset = candidate;
+    }
+    IOLockUnlock(hostmemLock_);
+    return ok;
+}
+
+void VirtioGPU::hostmemFree(uint64_t offset, uint64_t size) {
+    if (!hostmemLock_ || !hostmemRanges_) {
+        return;
+    }
+    IOLockLock(hostmemLock_);
+    for (unsigned i = 0; i < hostmemRangeCount_; i++) {
+        if (hostmemRanges_[i].offset == offset) {
+            memmove(&hostmemRanges_[i], &hostmemRanges_[i + 1], (hostmemRangeCount_ - i - 1) * sizeof(HostmemRange));
+            hostmemRangeCount_--;
+            break;
+        }
+    }
+    IOLockUnlock(hostmemLock_);
+}
+
+IOReturn VirtioGPU::newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) {
+    if (!ready() || !venusCapset_) {
+        return kIOReturnNotReady;
+    }
+    VirtioGPUUserClient *client = OSTypeAlloc(VirtioGPUUserClient);
+    if (!client || !client->initWithTask(owningTask, securityID, type) || !client->attach(this) ||
+        !client->start(this)) {
+        if (client) {
+            client->detach(this);
+            client->release();
+        }
+        return kIOReturnNoMemory;
+    }
+    *handler = client;
+    return kIOReturnSuccess;
 }
 
 uint32_t VirtioGPU::simple(uint32_t requestLength) {
@@ -496,6 +742,9 @@ void VirtioGPU::getCapsets() {
         auto *info = reinterpret_cast<vgpu::RespCapsetInfo *>(commandBytes_ + kReplyOffset);
         LOG("capset %u: id %u (%s) max version %u max size %u", i, info->capsetID,
             capsetName(info->capsetID), info->capsetMaxVersion, info->capsetMaxSize);
+        capsetID_[i] = info->capsetID;
+        capsetMaxVersion_[i] = info->capsetMaxVersion;
+        capsetMaxSize_[i] = info->capsetMaxSize;
         if (info->capsetID == vgpu::kCapsetVenus) {
             venusCapset_ = true;
         }
@@ -894,5 +1143,19 @@ void VirtioGPU::moveCursor(uint32_t x, uint32_t y, bool visible) {
         cursorCommand(vgpu::kCmdUpdateCursor, visible ? cursorResource_ : 0); // 0 hides it
     } else if (visible) {
         cursorCommand(vgpu::kCmdMoveCursor, cursorResource_);
+    }
+}
+
+void VirtioGPU::fillInfo(struct vgpu_info *info) {
+    bzero(info, sizeof(*info));
+    info->features = features_;
+    info->hostmem_size = hostmemMemory_ ? hostmemLength_ : 0;
+    info->pci_vendor = pci_->configRead16(kIOPCIConfigVendorID);
+    info->pci_device = pci_->configRead16(kIOPCIConfigDeviceID);
+    info->num_capsets = numCapsets_ < VGPU_MAX_CAPSETS ? numCapsets_ : VGPU_MAX_CAPSETS;
+    for (uint32_t i = 0; i < info->num_capsets; i++) {
+        info->capset_id[i] = capsetID_[i];
+        info->capset_max_version[i] = capsetMaxVersion_[i];
+        info->capset_max_size[i] = capsetMaxSize_[i];
     }
 }

@@ -112,6 +112,12 @@ aux) # aux TGZ NAME: install into /Library/Extensions + AuxKC, then reboot
   aux_install "$2" "$3"
   reboot_vm
   ;;
+push) # push LOCAL REMOTE: copy a file into the VM over the guest agent
+  push_file "$2" "$3"
+  ;;
+run) # run 'command': run a shell command in the VM as root, print its output
+  agent "$2" "${3:-120}"
+  ;;
 shots) # shots COUNT INTERVAL: QEMU screenshots into /tmp/vgpu-shots/NN.png
   rm -rf /tmp/vgpu-shots && mkdir -p /tmp/vgpu-shots
   for i in $(seq -w 1 "${2:-20}"); do

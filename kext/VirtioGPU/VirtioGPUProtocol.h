@@ -67,6 +67,7 @@ enum CtrlType : uint32_t {
 };
 
 constexpr uint32_t kFlagFence = 1u << 0;
+constexpr uint32_t kFlagInfoRingIdx = 1u << 1; // CONTEXT_INIT: hdr.ringIdx is valid
 constexpr unsigned kMaxScanouts = 16;
 
 struct CtrlHdr {
@@ -217,6 +218,63 @@ struct CmdGetCapset {
     CtrlHdr hdr;
     uint32_t capsetID;
     uint32_t capsetVersion;
+};
+
+struct CmdSubmit3D {
+    CtrlHdr hdr;
+    uint32_t size;
+    uint32_t padding; // num_in_fences in newer specs; 0
+};
+
+struct CmdCtxResource {
+    CtrlHdr hdr;
+    uint32_t resourceID;
+    uint32_t padding;
+};
+
+enum BlobMem : uint32_t {
+    kBlobMemGuest = 1,
+    kBlobMemHost3D = 2,
+    kBlobMemHost3DGuest = 3,
+};
+enum BlobFlags : uint32_t {
+    kBlobFlagMappable = 1,
+    kBlobFlagShareable = 2,
+    kBlobFlagCrossDevice = 4,
+};
+
+struct CmdResourceCreateBlob {
+    CtrlHdr hdr;
+    uint32_t resourceID;
+    uint32_t blobMem;
+    uint32_t blobFlags;
+    uint32_t nrEntries;
+    uint64_t blobID;
+    uint64_t size;
+};
+
+struct CmdResourceMapBlob {
+    CtrlHdr hdr;
+    uint32_t resourceID;
+    uint32_t padding;
+    uint64_t offset; // in the host-visible shared memory region
+};
+
+struct RespMapInfo {
+    CtrlHdr hdr;
+    uint32_t mapInfo; // VIRTIO_GPU_MAP_CACHE_*
+    uint32_t padding;
+};
+enum MapCache : uint32_t {
+    kMapCacheCached = 1,
+    kMapCacheUncached = 2,
+    kMapCacheWC = 3,
+};
+
+struct CmdResourceUnmapBlob {
+    CtrlHdr hdr;
+    uint32_t resourceID;
+    uint32_t padding;
 };
 
 // struct virtio_gpu_ctx_create; hdr.ctxID names the context

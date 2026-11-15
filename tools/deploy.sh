@@ -39,6 +39,11 @@ logs)
 disable)
   "${SSH[@]}" $HOST 'bash /root/vgpu/vm-remote.sh disable VirtioGPU.kext'
   ;;
+test) # build tools/vgputest.c, copy it into the VM, run it as the console user
+  tools/build-tools.sh >/dev/null
+  "${SCP[@]}" build/vgputest $HOST:/root/vgpu/
+  "${SSH[@]}" $HOST "bash /root/vgpu/vm-remote.sh push /root/vgpu/vgputest /tmp/vgputest >/dev/null && bash /root/vgpu/vm-remote.sh run 'chmod +x /tmp/vgputest && sudo -u dev /tmp/vgputest; echo exit \$?'"
+  ;;
 shots) # tools/deploy.sh shots COUNT INTERVAL -> build/shots/NN.png
   "${SSH[@]}" $HOST "bash /root/vgpu/vm-remote.sh shots ${2:-20} ${3:-3}"
   rm -rf build/shots && mkdir -p build/shots
