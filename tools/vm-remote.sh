@@ -61,7 +61,7 @@ disable)
   qm start $VM && wait_agent
   ;;
 logs)
-  agent 'echo "== probe"; ioreg -w0 -r -c VirtioGPU -a | plutil -extract 0.ProbeLog json -o - - 2>/dev/null | tr "," "\n" | sed -E "s/^\[?\"/  /; s/\"\]?$//" || ioreg -w0 -r -c VirtioGPU -a | plutil -p - | sed -n "/ProbeLog/,/]/p"; echo "== tree"; ioreg -w0 -r -n S08@1 | grep -E "\+-o" | head -4 | cut -c1-110' 90
+  agent 'echo "== probe"; ioreg -w0 -r -c VirtioGPU -a | plutil -extract 0.ProbeLog xml1 -o - - 2>/dev/null | sed -n "s/.*<string>\\(.*\\)<\/string>.*/  \\1/p" | sed "s/&quot;/\\\"/g"; echo "== tree"; ioreg -w0 -r -n S08@1 | grep -E "\\+-o" | head -4 | cut -c1-110' 90
   ;;
 logs-raw)
   agent 'ioreg -w0 -r -c VirtioGPU -l' 90

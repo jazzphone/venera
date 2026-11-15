@@ -71,3 +71,20 @@ Lessons: a hand-built kext needs `kmod_info` (kmod_info.c) or OpenCore says "Pre
 ... Invalid Parameter"; IOLog from an injected kext doesn't reach dmesg/unified log on Tahoe, so
 the kext publishes a `ProbeLog` registry property (`tools/deploy.sh logs`). OpenCore `ShowPicker`
 is off on 108 (`oc_kext.py CONFIG - picker` turns it back on).
+
+## Stage 1 result (2026-11-15)
+
+Polling virtio core works on the first deploy; the screen stays on the VGA framebuffer.
+
+```
+features offered 0x10130000002 accepted 0x100000002 (VERSION_1, EDID)
+queue 0 (control): 64 entries (device max 64), notify_off 0
+queue 1 (cursor):  16 entries (device max 16), notify_off 1
+status after DRIVER_OK 0x0f
+GET_DISPLAY_INFO -> OK_DISPLAY_INFO in 78 us: scanout 0 1280x800 enabled
+GET_EDID         -> OK_EDID in 50 us: RHT 0x1234 "QEMU Monitor", preferred 1280x800 @ 107.3 MHz
+```
+
+Registry: `ProbeLog`, `DisplayModes`, `EDID`. Kill switch: boot-arg `-vgpuoff`.
+Next (stage 2): MSI-X interrupts instead of polling, then the IOFramebuffer
+(RESOURCE_CREATE_2D, ATTACH_BACKING, SET_SCANOUT, TRANSFER_TO_HOST_2D, RESOURCE_FLUSH, cursor).
