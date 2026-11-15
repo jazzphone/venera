@@ -185,3 +185,27 @@ What it took:
 Next: `vn_renderer_macos.c` on this API (mesa/NOTES.md lists the ops; sim-syncobj logic with
 kVGUCWaitFence in place of sync_file fds), install the dylib + ICD json in the VM, Vulkan loader,
 `vulkaninfo`.
+
+## Vulkan inside macOS (2026-11-15)
+
+`tools/deploy.sh vk` (Mesa's Venus ICD from mesa/out + tools/vkprobe.c, no Vulkan loader), in VM 108:
+
+```
+using VirtioGPU: 2048 MB host memory, pci 1af4:1050; venus capset 160 bytes; connected to renderer
+wire format 1, vk.xml 1.3.269, command serialization 1, Venus protocol 2, renderer instance 1.3.309
+vkCreateInstance 0; vkEnumeratePhysicalDevices 0, 2 devices
+[0] Virtio-GPU Venus (Intel(R) Iris(R) Xe Graphics (ADL GT2)): integrated GPU, API 1.3.269,
+    vendor 0x8086 device 0x46a6, heap 32013 MB device-local, 7 memory types (host-visible
+    coherent / cached), queue family 0: graphics compute transfer
+[1] Virtio-GPU Venus (llvmpipe): the host's CPU device
+```
+
+Path: vkprobe -> libvulkan_virtio.dylib (Mesa 25.0.7 + 4 patches, vn_renderer_macos.c) ->
+VirtioGPUUserClient -> VirtioGPU.kext -> virtio-gpu (QEMU 11.1, venus/blob/hostmem=2G) ->
+virglrenderer 1.1.0 render server -> ANV (Mesa 25.0.7) -> Iris Xe.
+
+Files reach the VM over a transfer disk (virtio1, 1 GB FAT "VGPU" at /Volumes/VGPU;
+`vm-remote.sh xfer`): virtiofs hung OpenCore at startup (with or without ScanPolicy), so it's off.
+
+Next: real GPU work (buffer copy + compute dispatch, check results and timing), Khronos loader +
+vulkaninfo, then stage 4 (Metal over Vulkan).
