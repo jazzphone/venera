@@ -209,3 +209,13 @@ Files reach the VM over a transfer disk (virtio1, 1 GB FAT "VGPU" at /Volumes/VG
 
 Next: real GPU work (buffer copy + compute dispatch, check results and timing), Khronos loader +
 vulkaninfo, then stage 4 (Metal over Vulkan).
+
+## The GPU executes work (2026-11-15)
+
+`VKTOOL=vkexec tools/deploy.sh vk` (tools/vkexec.c, no shaders): on the Iris Xe through Venus,
+vkCreateDevice 7.3 ms; two 64 MB buffers in memory type 2 (host-visible coherent cached),
+allocate+map ~2 ms each; vkCmdFillBuffer 64 MB + vkCmdCopyBuffer 64 MB + fence wait: 23 ms
+(2.9 GB/s); CPU check of all 16.7 M words in both buffers: 0 wrong. PASS.
+
+Nothing in macOS's UI is accelerated yet: WindowServer uses Metal, which needs an IOAccelerator
+(stage 5) and a Metal driver bundle (stage 4). notes/STAGE4-5.md has the plan.
