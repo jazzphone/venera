@@ -697,3 +697,28 @@ refused to an armed WindowServer unless `-vgpulegacy` or `acceltest legacy on`.
    that: shared events signaled at completion, `encodeSignalEvent:value:`, `addScheduledHandler:` timing.
 2. Then the present path: why CoreDisplay doesn't use IOPresentment transactions, or make the legacy path work
    (`VGSurface` shape/copy-forward backed by the framebuffer RAM).
+
+### 5b, round 2 (2026-11-15): Core Animation surveyed; completion order fixed; the abort narrowed to `calculate_average_luma`
+
+- **`tools/codepeek` reads Apple code by name now**: `codepeek LIB find SUBSTRING` lists a cached library's functions
+  (dladdr over `__text`), `codepeek LIB sels SUBSTRING` lists every selector those functions send. Selector stubs
+  (`objc_msgSend$sel` in `__objc_stubs`) and `__stubs` jumps are decoded. 16 s for QuartzCore in the guest.
+  `/var/tmp/ca-sels.txt` in VM 108 holds what `CA::OGL::MetalContext` sends (213 selectors); `tools/mtlcaps.m` prints
+  what our device answers to the capability questions `CA::OGL::new_metal_context` asks (tile shaders, memoryless,
+  framebuffer read, raster order groups, SIMD group/reduction: all as a non-Apple Mac2/Metal3 GPU, no Apple families).
+- **"timed out fence" is normal on this VM**: it shows on the plain software-compositor boot too. Not the cause.
+- **Completion order** (plugin): command buffers of a queue whose caller set `-setCompletionQueue:` (Core Animation does)
+  now complete in commit order on a serial queue, and their completed handlers run on that completion queue. Before,
+  they ran on a global concurrent queue, concurrently and out of order. `addScheduledHandler:` used to run the block at
+  once, even before commit; now it runs after submission. `setSubmissionQueue:`/`setGPUPriority:` are no-ops.
+- **The abort, narrowed**: the first armed WindowServer (login stage) always dies in
+  `CA::OGL::MetalContext::calculate_average_luma`. Its compute path (`sum_rgba_columns`/`rows`, then a blit) runs, then a
+  branch falls back to the render/tile path, which calls `push_surface` with a transient surface CA never tracked
+  (the assertion). The fallback is taken when `start_compute_encoder` fails, a `MetalBufferPool::create_external_buffer`
+  returns null (heap with `setProtectionOptions:` + `newHeapWithDescriptor:` + `newBufferWithLength:options:`), or the
+  context's command buffer (ctx+0xf00) is null after a block-taking message. Static reading didn't settle which.
+  The WindowServer started after autologin (dev has Reduce Transparency on) survives but draws nothing at all.
+- **Next**: reproduce CA's Metal renderer outside WindowServer, so one run takes seconds instead of a boot.
+  `CARenderer` (`+rendererWithMTLTexture:options:`) runs `CA::OGL::MetalContext` in-process; a test app with a
+  vibrancy/material layer over an image should reach `calculate_average_luma`. Then log every message our objects
+  receive there (an `instrumentObjcMessageSends`-style trace works outside the sandbox) and find the failing branch.

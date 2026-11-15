@@ -97,6 +97,7 @@ BOOL vg_spirv_has_push_constants(NSData *spv);   // DescriptorSet 0 -> newSet (N
     uint32_t _setsInPool;
     NSMutableArray *_keep;   // resources referenced until completion
     NSMutableArray *_handlers;
+    NSMutableArray *_scheduledHandlers;   // run once the command buffer is submitted
     dispatch_group_t _done;
     vg_buffer _arena[64];   // setBytes data
     int _narena;

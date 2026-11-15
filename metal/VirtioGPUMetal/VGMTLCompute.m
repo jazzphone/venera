@@ -503,7 +503,14 @@ id<MTLComputePipelineState> vg_new_compute_pipeline(id<MTLDevice> device, id<MTL
 
 @class VGMTLCommandQueue;
 
-@interface VGMTLCommandQueue : NSObject <MTLCommandQueue>
+// Command buffers of one queue complete in commit order on the queue's serial queue (one VkQueue runs them in that
+// order anyway), and their completed handlers run in that order on the caller's completion queue when it set one
+// (Core Animation does, -setCompletionQueue:, and keeps fence bookkeeping that isn't safe from concurrent handlers).
+@interface VGMTLCommandQueue : NSObject <MTLCommandQueue> {
+@public
+    dispatch_queue_t _serial;
+    dispatch_queue_t _userCompletion;
+}
 @property(readonly) id<MTLDevice> device;
 @property(copy, atomic) NSString *label;
 @end
@@ -513,9 +520,13 @@ id<MTLComputePipelineState> vg_new_compute_pipeline(id<MTLDevice> device, id<MTL
 - (instancetype)initWithDevice:(id<MTLDevice>)device {
     if ((self = [super init])) {
         _device = device;
+        _serial = dispatch_queue_create("local.homelab.VirtioGPUMetal.completion", DISPATCH_QUEUE_SERIAL);
     }
     return self;
 }
+- (void)setCompletionQueue:(dispatch_queue_t)q { _userCompletion = q; }
+- (void)setSubmissionQueue:(dispatch_queue_t)q { }
+- (void)setGPUPriority:(NSUInteger)p { }
 - (id<MTLCommandBuffer>)commandBuffer;
 {
     VGMTLCommandBuffer *c = [VGMTLCommandBuffer new];
@@ -858,6 +869,7 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
     if ((self = [super init])) {
         _keep = [NSMutableArray array];
         _handlers = [NSMutableArray array];
+        _scheduledHandlers = [NSMutableArray array];
         _done = dispatch_group_create();
         _status = MTLCommandBufferStatusNotEnqueued;
         _surfacesWritten = [NSMutableSet set];
@@ -973,7 +985,13 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
     }
 }
 - (void)addScheduledHandler:(MTLCommandBufferHandler)block {
-    block(self);   // scheduled as soon as it's submitted; good enough until something waits on the order
+    @synchronized(self) {
+        if (_status < MTLCommandBufferStatusScheduled) {
+            [_scheduledHandlers addObject:[block copy]];
+            return;
+        }
+    }
+    block(self);   // already scheduled
 }
 - (void)enqueue {
     if (_status == MTLCommandBufferStatusNotEnqueued) {
@@ -1038,6 +1056,18 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
         handlers = [_handlers copy];
         [_handlers removeAllObjects];
     }
+    VGMTLCommandQueue *q = [(NSObject *)self.commandQueue isKindOfClass:[VGMTLCommandQueue class]]
+                               ? (VGMTLCommandQueue *)self.commandQueue
+                               : nil;
+    if (q && q->_userCompletion) {
+        dispatch_async(q->_userCompletion, ^{
+            for (MTLCommandBufferHandler h in handlers) {
+                h(self);
+            }
+            [self->_keep removeAllObjects];
+        });
+        return;
+    }
     for (MTLCommandBufferHandler h in handlers) {
         h(self);
     }
@@ -1075,9 +1105,22 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
             fence = VK_NULL_HANDLE;
         }
     }
-    _status = MTLCommandBufferStatusScheduled;
+    NSArray *scheduled;
+    @synchronized(self) {
+        _status = MTLCommandBufferStatusScheduled;
+        scheduled = [_scheduledHandlers copy];
+        [_scheduledHandlers removeAllObjects];
+    }
+    for (MTLCommandBufferHandler h in scheduled) {
+        h(self);
+    }
     MTLCommandBufferStatus end = _error ? MTLCommandBufferStatusError : MTLCommandBufferStatusCompleted;
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    VGMTLCommandQueue *q = [(NSObject *)self.commandQueue isKindOfClass:[VGMTLCommandQueue class]]
+                               ? (VGMTLCommandQueue *)self.commandQueue
+                               : nil;
+    // In order on the queue's serial queue when the caller named a completion queue; otherwise as before (a handler
+    // that waits for a later command buffer of the same queue must not deadlock behind it).
+    dispatch_async(q && q->_userCompletion ? q->_serial : dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         [self finishWith:end fence:fence];
         dispatch_group_leave(self->_done);
     });
