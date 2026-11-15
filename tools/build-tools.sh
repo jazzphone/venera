@@ -1,5 +1,5 @@
 #!/bin/zsh
-# User-space tools for the VM (x86_64): build/vgputest, build/vkprobe, build/vkexec, build/acceltest, build/llvmprobe, build/mtlprobe, build/mtlcompute (+ build/compute.metallib)
+# User-space tools for the VM (x86_64): build/vgputest, build/vkprobe, build/vkexec, build/acceltest, build/llvmprobe, build/mtlprobe, build/mtlcompute, build/mtlrender (+ metallibs)
 set -euo pipefail
 cd "${0:A:h}/.."
 mkdir -p build
@@ -11,5 +11,8 @@ $CC -framework IOKit -framework CoreFoundation tools/acceltest.c -o build/accelt
 $CC tools/llvmprobe.c -o build/llvmprobe
 $CC -fobjc-arc -framework Foundation -framework Metal tools/mtlprobe.m -o build/mtlprobe
 $CC -fobjc-arc -framework Foundation -framework Metal tools/mtlcompute.m -o build/mtlcompute
-xcrun metal -target air64-apple-macos26.0 -c tools/shaders/compute.metal -o build/compute.air && xcrun metallib build/compute.air -o build/compute.metallib
+$CC -fobjc-arc -framework Foundation -framework Metal tools/mtlrender.m -o build/mtlrender
+for s in compute render; do
+  xcrun metal -target air64-apple-macos26.0 -c tools/shaders/$s.metal -o build/$s.air && xcrun metallib build/$s.air -o build/$s.metallib
+done
 file build/vgputest build/vkprobe build/vkexec build/acceltest build/llvmprobe build/mtlprobe build/mtlcompute

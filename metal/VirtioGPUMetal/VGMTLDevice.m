@@ -11,7 +11,7 @@
 //
 // Shape after nullmoth/nvidia-macos-driver's NVMTLDevice (plugin/NVMTLDevice.m): the refusal before super's init and
 // the initLimits call are theirs.
-#import "vg.h"
+#import "objects.h"
 #import <IOKit/IOKitLib.h>
 #import <dlfcn.h>
 #import <objc/message.h>
@@ -56,6 +56,15 @@ void vglog(const char *fmt, ...) {
         fprintf(f, "[%d %s] %s\n", getpid(), getprogname(), line);
         fclose(f);
     }
+}
+
+BOOL vg_tracing(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("VGMTL_TRACE");
+        on = e && e[0] == '1';
+    }
+    return on;
 }
 
 // ---- allow-list ------------------------------------------------------------------------------------------------
@@ -192,6 +201,26 @@ static id vg_refuse_before_init(id obj) {
         *r = nil;
     }
     return vg_new_compute_pipeline(self, d.computeFunction, error);
+}
+
+// ---- stage 4c: textures and rendering (VGMTLTexture.m, VGMTLRender.m) ----
+
+- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d { return vg_new_texture(self, d); }
+- (id<MTLSamplerState>)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)d { return vg_new_sampler(self, d); }
+- (id<MTLDepthStencilState>)newDepthStencilStateWithDescriptor:(MTLDepthStencilDescriptor *)d {
+    return vg_new_depth_stencil(self, d);
+}
+- (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)error {
+    return vg_new_render_pipeline(self, d, error);
+}
+- (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d
+                                                           options:(MTLPipelineOption)o
+                                                        reflection:(MTLAutoreleasedRenderPipelineReflection *)r
+                                                             error:(NSError **)error {
+    if (r) {
+        *r = nil;
+    }
+    return vg_new_render_pipeline(self, d, error);
 }
 
 - (NSString *)vendorName {

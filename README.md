@@ -18,8 +18,9 @@ Target: macOS 26.7.3 (25G342) on Proxmox VE 9.2 / pve-qemu 11.1, host GPU an Ald
    `SUBMIT_3D` + fences in the kext; Mesa's Venus built for macOS with a transport in place of
    `vn_renderer_virtgpu.c`.
 4. **Metal** — an IOAccelerator kext (IOAcceleratorFamily2) and a Metal driver bundle over Vulkan.
-   4.0 (the accelerator starts in the guest, unarmed), 4a (Metal lists the device, late arm, allow-list) and 4b
-   (Metal compute kernels and blits run on the host GPU) done; see `notes/PLAN.md`.
+   4.0 (the accelerator starts in the guest, unarmed), 4a (Metal lists the device, late arm, allow-list), 4b
+   (Metal compute kernels and blits run on the host GPU) and 4c (rendering to textures: pipelines, textures,
+   samplers, blending, vertex descriptors) done; see `notes/PLAN.md`.
 5. **WindowServer** — IOSurface-backed accelerated compositing.
 
 See `notes/PLAN.md` for the research behind this and what each stage needs.

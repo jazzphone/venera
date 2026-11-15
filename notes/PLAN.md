@@ -418,3 +418,69 @@ private storage still in host memory; one queue, serialized submits. Each MTLBuf
 
 Next (4c): textures (VkImage + views, samplers), render pipelines (vertex + fragment translation), render passes,
 `replaceRegion`/`getBytes`, a triangle and a textured quad read back and compared.
+
+## Stage 4c result (2026-11-15): Metal renders to textures on the host GPU
+
+**`tools/mtlrender.m` (plain Metal API, offscreen RGBA8 64x64 targets read back with getBytes) PASS in VM 108**,
+and mtlcompute still passes:
+
+```
+  clear                                            ok
+  pipeline tri_vertex + color_fragment: ok (40.7 ms)
+  triangle: top half, clockwise front face kept    ok   (y up as in Metal; back faces culled, it stays)
+  triangle: culled as a front face                 ok
+  indexed quad: bottom-right quarter               ok   (uint16 indices, setVertexBytes)
+  pipeline tri_vertex + texture_fragment: ok (7.9 ms)
+  replaceRegion + getBytes round trip              ok
+  textured quad: texel (0,0) at the top left       ok   (sampled texture + nearest sampler)
+  pipeline tri_vertex + color_fragment (blend): ok (5.0 ms)
+  blending: 50% red over gray                      ok
+  pipeline attr_vertex + color_fragment: ok (10.0 ms)
+  vertex descriptor: blue triangle, bottom half    ok   ([[stage_in]] attributes from an MTLVertexDescriptor)
+  pipeline pattern (compute, texture write): ok
+  compute: texture write pattern                   ok   (storage image, formatless write)
+PASS (0 failures)
+```
+
+New in the plugin (`metal/VirtioGPUMetal/`): `objects.h` (shared object interfaces), `VGMTLTexture.m` (textures,
+samplers, depth-stencil states, pixel formats, one-shot submits), `VGMTLRender.m` (render pipelines, render
+encoder, `renderCommandEncoderWithDescriptor:`); compute encoders take textures and samplers; one SPIR-V binding
+scanner and one descriptor writer serve both.
+
+How it maps:
+
+- **Textures**: VkImage, optimal tiling, device-local memory, kept in VK_IMAGE_LAYOUT_GENERAL for life (set once
+  at creation), so sampling, storage writes, rendering and copies need no layout tracking. replaceRegion /
+  getBytes are synchronous (staging buffer + one-shot command buffer), as Metal's are. 26 pixel formats mapped.
+- **Translation contract for graphics**: vertex and fragment functions are translated at pipeline creation; both
+  stages' resources come out in set 0 (buffer n -> n, texture n -> 32+n, sampler n -> 160+n, storage texture n
+  -> 480+n), so the fragment module is moved to set 1 (NV's `nvmtl_spirv_retarget_set`). Varyings and render
+  targets are matched by location; vertex attribute n -> location n, vertex buffer n -> binding n.
+- **Rendering**: Vulkan 1.3 dynamic rendering (no render-pass objects), attachments in GENERAL. Metal's +y-up clip
+  space / top-left framebuffer = a negative-height viewport (NV's choice); with it Metal's winding maps 1:1
+  (MTLWindingClockwise -> VK_FRONT_FACE_CLOCKWISE, verified by the cull test). Topology, cull, winding, depth
+  test/write/compare, primitive restart, viewport, scissor and blend color are dynamic state; one VkPipeline per
+  topology class, the triangle one built at creation so a bad combination fails there.
+- **Device features**: the VkDevice now enables every feature Venus reports except robustBufferAccess /
+  robustImageAccess (translated shaders declare descriptor indexing, Int8, the memory model, formatless storage
+  images...). The translator is told the device reads/writes storage images without a format
+  (`nvmtl_translate_set_caps(3)`), so a Metal texture's storage image is declared Unknown, not R32f.
+
+The bug that cost the most: **the translator's in-process path emits NV's bindless texture model by default**
+(textures from a heap of images at set 2 binding 0, indexed through a table buffer at binding 640), while
+`nvmtl_reflect` reports per-slot bindings (texture at 32). With no set 2 in our pipeline layout,
+**ANV segfaulted in the host's render server** (`vkr-ring-N: segfault at 0 ... in libvulkan_intel.so`, journal
+on the Proxmox host) and the guest process aborted with "MESA-VIRTIO: ... aborting on expired ring alive status". Only
+that context died; QEMU and the VM were fine. Fix: `NVMTL_NO_BINDLESS_ALL=1` (the translator's switch, read once)
+is set before the translator loads, and the binding scanner now refuses, with a message, any module that reaches
+outside its own set or uses the 640+ address table. Debug aid: `VGMTL_TRACE=1` logs each step and forces a host
+round trip (`vkDeviceWaitIdle`) after pipeline builds, since Venus runs most calls asynchronously and a host crash
+otherwise surfaces at a later call.
+
+Known gaps: MSAA and resolve, stencil, depth bias, line fill mode, render to mip levels / array slices / 3D
+planes, combined image-samplers and texture arrays, cube textures, texture views and swizzles, render stages with
+their own push constants, argument buffers, function constants; every draw writes fresh descriptor sets (no
+caching); pipelines and translation aren't cached across processes. Depth attachments are wired but not tested.
+
+Next (4d): IOSurface-backed textures (`newTextureWithDescriptor:iosurface:plane:`, copy in / out with seeds), a
+CAMetalLayer / MTKView app that animates in a window through the software compositor.

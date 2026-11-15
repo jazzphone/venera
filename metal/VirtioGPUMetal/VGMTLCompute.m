@@ -1,4 +1,4 @@
-// Stage 4b: Metal compute on Venus. Buffers, command queues and buffers, compute and blit encoders, compute
+// Stage 4b: Metal compute on Venus (and the command buffer the render encoder of 4c shares). Buffers, command queues and buffers, compute and blit encoders, compute
 // pipelines. Deliberately simple: every buffer is host-visible coherent memory (the host GPU is integrated), a command
 // buffer is one VkCommandBuffer submitted at commit, a full memory barrier follows every command, and completion is a
 // VkFence waited on a background queue.
@@ -7,23 +7,10 @@
 // `[[buffer(n)]]` is set 0 binding n, the local size is specialization constants 0..2, and a ThreadsDynamic kernel
 // reads a 48-byte push-constant block (thread grid, thread base, threadgroup base, threadgroup grid) per region of
 // KernelDispatch::plan (full groups, then the partial tail of each dimension with its own local size).
-#import "vg.h"
+#import "objects.h"
 #import <mach/mach_time.h>
 
-enum { kVGMaxBufferSlots = 31, kVGMaxThreadgroupSlots = 32 };
-
 // ---- MTLBuffer ---------------------------------------------------------------------------------------------------
-
-@interface VGMTLBuffer : NSObject <MTLBuffer> {
-@public
-    vg_buffer _b;
-    NSUInteger _length;
-    MTLResourceOptions _options;
-    id<MTLDevice> _dev;
-}
-@property(readonly) id<MTLDevice> device;
-@property(copy, atomic) NSString *label;
-@end
 
 @implementation VGMTLBuffer
 @synthesize label = _label;
@@ -62,17 +49,14 @@ id<MTLBuffer> vg_new_buffer(id<MTLDevice> device, NSUInteger length, MTLResource
     return b;
 }
 
-// ---- SPIR-V: what each set-0 binding is (storage or uniform buffer) ---------------------------------------------
+// ---- SPIR-V: what each binding of a set is ----------------------------------------------------------------------
 
-typedef struct {
-    uint32_t binding;
-    VkDescriptorType type;
-} vg_binding;
-
-// Reads OpDecorate DescriptorSet/Binding, OpTypePointer and OpVariable: StorageBuffer variables (and Uniform ones of
-// a BufferBlock struct) are storage buffers, other Uniform ones uniform buffers. Images and samplers aren't handled
-// yet (4c): their bindings make the pipeline fail with a message.
-static int vg_spirv_bindings(NSData *spv, vg_binding *out, int max, NSString **error) {
+// Reads OpDecorate DescriptorSet/Binding/Block/BufferBlock, the pointer and image types and OpVariable:
+// StorageBuffer (and Uniform+BufferBlock) -> storage buffer, Uniform -> uniform buffer, UniformConstant of
+// OpTypeImage -> sampled (Sampled 1) or storage (Sampled 2) image, OpTypeSampler -> sampler,
+// OpTypeSampledImage -> combined. Arrays of descriptors are refused with a message; push constants aren't
+// bindings (vg_spirv_has_push_constants).
+int vg_spirv_bindings(NSData *spv, uint32_t wantSet, vg_binding *out, int max, NSString **error) {
     const uint32_t *w = spv.bytes;
     size_t n = spv.length / 4;
     if (n < 5 || w[0] != 0x07230203) {
@@ -80,53 +64,75 @@ static int vg_spirv_bindings(NSData *spv, vg_binding *out, int max, NSString **e
         return -1;
     }
     size_t bound = w[3];
-    uint32_t *set = calloc(bound, 4), *bind = calloc(bound, 4), *ptrType = calloc(bound, 4), *ptrClass = calloc(bound, 4);
-    uint8_t *block = calloc(bound, 1), *hasBind = calloc(bound, 1);
+    uint32_t *set = calloc(bound, 4), *bind = calloc(bound, 4), *ptrType = calloc(bound, 4);
+    uint8_t *block = calloc(bound, 1), *hasBind = calloc(bound, 1), *kind = calloc(bound, 1);
     typedef struct { uint32_t id, type, cls; } var;
     var *vars = calloc(bound, sizeof(var));
     size_t nvars = 0;
+    enum { kImageSampled = 1, kImageStorage, kSampler, kSampledImage, kArray };
     for (size_t i = 5; i < n;) {
         uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
         if (!len || i + len > n) {
             break;
         }
-        if (op == 71 && len >= 4 && w[i + 1] < bound) {   // OpDecorate id decoration value
-            uint32_t id = w[i + 1], d = w[i + 2];
-            if (d == 34) {   // DescriptorSet
+        uint32_t id = len > 1 ? w[i + 1] : 0;
+        if (op == 71 && len >= 3 && id < bound) {   // OpDecorate id decoration [value]
+            uint32_t d = w[i + 2];
+            if (d == 34 && len >= 4) {
                 set[id] = w[i + 3];
-            } else if (d == 33) {   // Binding
+            } else if (d == 33 && len >= 4) {
                 bind[id] = w[i + 3];
                 hasBind[id] = 1;
+            } else if (d == 2) {
+                block[id] = 1;
+            } else if (d == 3) {
+                block[id] = 2;
             }
-        } else if (op == 71 && len >= 3 && w[i + 1] < bound) {
-            if (w[i + 2] == 2) {   // Block
-                block[w[i + 1]] = 1;
-            } else if (w[i + 2] == 3) {   // BufferBlock
-                block[w[i + 1]] = 2;
-            }
-        } else if (op == 32 && len >= 4 && w[i + 1] < bound) {   // OpTypePointer result class type
-            ptrClass[w[i + 1]] = w[i + 2];
-            ptrType[w[i + 1]] = w[i + 3];
+        } else if (op == 32 && len >= 4 && id < bound) {   // OpTypePointer result class type
+            ptrType[id] = w[i + 3];
+        } else if (op == 25 && len >= 9 && id < bound) {   // OpTypeImage result sampledType dim depth arrayed ms sampled format
+            kind[id] = w[i + 7] == 2 ? kImageStorage : kImageSampled;
+        } else if (op == 26 && id < bound) {
+            kind[id] = kSampler;
+        } else if (op == 27 && id < bound) {
+            kind[id] = kSampledImage;
+        } else if ((op == 28 || op == 29) && id < bound) {   // OpTypeArray / OpTypeRuntimeArray
+            kind[id] = kArray;
         } else if (op == 59 && len >= 4 && w[i + 2] < bound) {   // OpVariable type result class
             vars[nvars++] = (var){w[i + 2], w[i + 1], w[i + 3]};
         }
         i += len;
     }
-    int count = 0, rc = 0;
+    int count = 0, rc = *error ? -1 : 0;
     for (size_t v = 0; v < nvars && !rc; v++) {
         uint32_t id = vars[v].id;
-        if (!hasBind[id] || set[id] != 0) {
+        if (!hasBind[id]) {
             continue;
         }
+        if (set[id] != wantSet || bind[id] >= 640) {   // the bindless heap (set 2) or the buffer address table (640+)
+            *error = [NSString stringWithFormat:@"the module uses set %u binding %u (bindless heap / address table): "
+                                                @"not supported yet", set[id], bind[id]];
+            rc = -1;
+            break;
+        }
         uint32_t pointee = vars[v].type < bound ? ptrType[vars[v].type] : 0;
+        uint8_t k = pointee < bound ? kind[pointee] : 0;
         VkDescriptorType t;
         if (vars[v].cls == 12) {   // StorageBuffer
             t = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         } else if (vars[v].cls == 2) {   // Uniform
             t = (pointee < bound && block[pointee] == 2) ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        } else if (vars[v].cls == 0 && k == kImageSampled) {
+            t = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        } else if (vars[v].cls == 0 && k == kImageStorage) {
+            t = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        } else if (vars[v].cls == 0 && k == kSampler) {
+            t = VK_DESCRIPTOR_TYPE_SAMPLER;
+        } else if (vars[v].cls == 0 && k == kSampledImage) {
+            t = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         } else {
-            *error = [NSString stringWithFormat:@"binding %u is an image or sampler (storage class %u): not supported yet",
-                                                bind[id], vars[v].cls];
+            *error = [NSString stringWithFormat:@"binding %u (storage class %u, kind %u) not supported yet", bind[id],
+                                                vars[v].cls, k];
             rc = -1;
             break;
         }
@@ -134,8 +140,97 @@ static int vg_spirv_bindings(NSData *spv, vg_binding *out, int max, NSString **e
             out[count++] = (vg_binding){bind[id], t};
         }
     }
-    free(set), free(bind), free(ptrType), free(ptrClass), free(block), free(hasBind), free(vars);
+    free(set), free(bind), free(ptrType), free(block), free(hasBind), free(kind), free(vars);
     return rc ? -1 : count;
+}
+
+BOOL vg_spirv_has_push_constants(NSData *spv) {
+    const uint32_t *w = spv.bytes;
+    size_t n = spv.length / 4;
+    for (size_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) {
+            break;
+        }
+        if (op == 59 && len >= 4 && w[i + 3] == 9) {   // OpVariable ... PushConstant
+            return YES;
+        }
+        i += len;
+    }
+    return NO;
+}
+
+NSData *vg_spirv_retarget_set(NSData *spv, uint32_t newSet) {
+    NSMutableData *m = [spv mutableCopy];
+    uint32_t *w = m.mutableBytes;
+    size_t n = m.length / 4;
+    for (size_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) {
+            break;
+        }
+        if (op == 71 && len >= 4 && w[i + 2] == 34 && w[i + 3] == 0) {
+            w[i + 3] = newSet;
+        }
+        i += len;
+    }
+    return m;
+}
+
+// ---- descriptors from a stage's argument tables ------------------------------------------------------------------
+
+VkDescriptorSet vg_write_set(VGMTLCommandBuffer *cmd, VkDescriptorSetLayout dsl, const vg_binding *bindings, int n,
+                             const vg_stage_bindings *t, NSString *who) {
+    VkDescriptorSet set = [cmd allocSet:dsl];
+    if (!set) {
+        [cmd fail:@"no descriptor set"];
+        return VK_NULL_HANDLE;
+    }
+    VkDescriptorBufferInfo binfo[64];
+    VkDescriptorImageInfo iinfo[64];
+    VkWriteDescriptorSet writes[64];
+    for (int i = 0; i < n && i < 64; i++) {
+        uint32_t b = bindings[i].binding;
+        VkDescriptorType type = bindings[i].type;
+        writes[i] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, b, 0, 1, type, NULL, NULL, NULL};
+        if (type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
+            if (b >= kVGMaxBufferSlots || !t->buf[b]) {
+                [cmd fail:[NSString stringWithFormat:@"%@: nothing bound at buffer(%u)", who, b]];
+                return VK_NULL_HANDLE;
+            }
+            VkDeviceSize range = VK_WHOLE_SIZE;
+            if (type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
+                range = MIN((VkDeviceSize)gVk.props.limits.maxUniformBufferRange, 65536);
+            }
+            binfo[i] = (VkDescriptorBufferInfo){t->buf[b], t->off[b], range};
+            writes[i].pBufferInfo = &binfo[i];
+            continue;
+        }
+        uint32_t slot;
+        if (type == VK_DESCRIPTOR_TYPE_SAMPLER) {
+            slot = b - kVGSamplerBase;
+            if (b < kVGSamplerBase || slot >= kVGMaxSamplerSlots || !t->smp[slot]) {
+                [cmd fail:[NSString stringWithFormat:@"%@: nothing bound at sampler(%d)", who, (int)b - kVGSamplerBase]];
+                return VK_NULL_HANDLE;
+            }
+            iinfo[i] = (VkDescriptorImageInfo){t->smp[slot]->_sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+        } else {
+            uint32_t base = type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ? kVGStorageTextureBase : kVGTextureBase;
+            slot = b - base;
+            if (b < base || slot >= kVGMaxTextureSlots || !t->tex[slot]) {
+                [cmd fail:[NSString stringWithFormat:@"%@: nothing bound at texture(%d)", who, (int)b - (int)base]];
+                return VK_NULL_HANDLE;
+            }
+            iinfo[i] = (VkDescriptorImageInfo){VK_NULL_HANDLE, t->tex[slot]->_view, VK_IMAGE_LAYOUT_GENERAL};
+            if (type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+                [cmd fail:[NSString stringWithFormat:@"%@: combined image-samplers aren't supported yet", who]];
+                return VK_NULL_HANDLE;
+            }
+        }
+        writes[i].pImageInfo = &iinfo[i];
+    }
+    gVk.vkUpdateDescriptorSets(gVk.device, (uint32_t)MIN(n, 64), writes, 0, NULL);
+    return set;
 }
 
 // ---- MTLComputePipelineState -------------------------------------------------------------------------------------
@@ -198,7 +293,7 @@ static int vg_spirv_bindings(NSData *spv, vg_binding *out, int max, NSString **e
         }
         v = [VGComputeVariant new];
         v->pipelines = [NSMutableDictionary dictionary];
-        v->nbindings = vg_spirv_bindings(spv, v->bindings, 64, error);
+        v->nbindings = vg_spirv_bindings(spv, 0, v->bindings, 64, error);
         if (v->nbindings < 0) {
             return nil;
         }
@@ -294,7 +389,7 @@ id<MTLComputePipelineState> vg_new_compute_pipeline(id<MTLDevice> device, id<MTL
         }
         for (NSDictionary *b in refl[@"bindings"]) {
             NSString *kind = b[@"kind"];
-            if (p && ![kind isEqual:@"Buffer"] && ![kind isEqual:@"ThreadgroupBuffer"]) {
+            if (p && ![@[ @"Buffer", @"ThreadgroupBuffer", @"Texture", @"StorageImage", @"Sampler" ] containsObject:kind]) {
                 why = [NSString stringWithFormat:@"binding kind %@ not supported yet", kind];
                 p = nil;
             }
@@ -312,32 +407,6 @@ id<MTLComputePipelineState> vg_new_compute_pipeline(id<MTLDevice> device, id<MTL
 // ---- MTLCommandBuffer and encoders -----------------------------------------------------------------------------
 
 @class VGMTLCommandQueue;
-
-@interface VGMTLCommandBuffer : NSObject <MTLCommandBuffer> {
-@public
-    VkCommandBuffer _cb;
-    VkDescriptorPool _pools[64];
-    int _npools;
-    uint32_t _setsInPool;
-    NSMutableArray *_keep;   // resources referenced until completion
-    NSMutableArray *_handlers;
-    dispatch_group_t _done;
-    vg_buffer _arena[64];   // setBytes data
-    int _narena;
-    VkDeviceSize _arenaUsed;
-    MTLCommandBufferStatus _status;
-    NSError *_error;
-    uint64_t _submitted, _completed;
-}
-@property(readonly) id<MTLDevice> device;
-@property(readonly) id<MTLCommandQueue> commandQueue;
-@property(copy, atomic) NSString *label;
-- (BOOL)begin;
-- (void)fail:(NSString *)why;
-- (void)barrier;
-- (VkDescriptorSet)allocSet:(VkDescriptorSetLayout)dsl;
-- (BOOL)upload:(const void *)bytes length:(NSUInteger)len buffer:(VkBuffer *)buf offset:(VkDeviceSize *)off;
-@end
 
 @interface VGMTLCommandQueue : NSObject <MTLCommandQueue>
 @property(readonly) id<MTLDevice> device;
@@ -368,14 +437,6 @@ id<MTLCommandQueue> vg_new_queue(id<MTLDevice> device) {
     return vg_vulkan_init() ? nil : [[VGMTLCommandQueue alloc] initWithDevice:device];
 }
 
-// Common encoder plumbing.
-@interface VGEncoder : NSObject {
-@public
-    VGMTLCommandBuffer *_owner;
-}
-@property(readonly) id<MTLDevice> device;
-@property(copy, atomic) NSString *label;
-@end
 @implementation VGEncoder
 @synthesize device = _device, label = _label;
 - (instancetype)initWithCommandBuffer:(VGMTLCommandBuffer *)cmd {
@@ -391,15 +452,14 @@ id<MTLCommandQueue> vg_new_queue(id<MTLDevice> device) {
 - (void)popDebugGroup { }
 @end
 
-static VkBuffer vg_vkbuffer(id<MTLBuffer> b) {
+VkBuffer vg_vkbuffer(id<MTLBuffer> b) {
     return [(NSObject *)b isKindOfClass:[VGMTLBuffer class]] ? ((VGMTLBuffer *)b)->_b.buffer : VK_NULL_HANDLE;
 }
 
 @interface VGComputeEncoder : VGEncoder <MTLComputeCommandEncoder> {
 @public
     VGMTLComputePipelineState *_pso;
-    VkBuffer _buf[kVGMaxBufferSlots];
-    VkDeviceSize _off[kVGMaxBufferSlots];
+    vg_stage_bindings _t;
     uint32_t _tg[kVGMaxThreadgroupSlots];
 }
 @end
@@ -416,15 +476,31 @@ static VkBuffer vg_vkbuffer(id<MTLBuffer> b) {
     if (index >= kVGMaxBufferSlots) {
         return;
     }
-    _buf[index] = vg_vkbuffer(buffer);
-    _off[index] = offset;
+    _t.buf[index] = vg_vkbuffer(buffer);
+    _t.off[index] = offset;
     if (buffer) {
         [_owner->_keep addObject:buffer];
     }
 }
+- (void)setTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index {
+    if (index < kVGMaxTextureSlots) {
+        _t.tex[index] = [(NSObject *)texture isKindOfClass:[VGMTLTexture class]] ? (VGMTLTexture *)texture : nil;
+        if (texture) {
+            [_owner->_keep addObject:texture];
+        }
+    }
+}
+- (void)setSamplerState:(id<MTLSamplerState>)sampler atIndex:(NSUInteger)index {
+    if (index < kVGMaxSamplerSlots) {
+        _t.smp[index] = (VGMTLSamplerState *)sampler;
+        if (sampler) {
+            [_owner->_keep addObject:sampler];
+        }
+    }
+}
 - (void)setBufferOffset:(NSUInteger)offset atIndex:(NSUInteger)index {
     if (index < kVGMaxBufferSlots) {
-        _off[index] = offset;
+        _t.off[index] = offset;
     }
 }
 - (void)setBuffers:(const id<MTLBuffer> __unsafe_unretained[])buffers offsets:(const NSUInteger[])offsets withRange:(NSRange)range {
@@ -436,7 +512,7 @@ static VkBuffer vg_vkbuffer(id<MTLBuffer> b) {
     if (index >= kVGMaxBufferSlots) {
         return;
     }
-    if (![_owner upload:bytes length:length buffer:&_buf[index] offset:&_off[index]]) {
+    if (![_owner upload:bytes length:length buffer:&_t.buf[index] offset:&_t.off[index]]) {
         [_owner fail:@"setBytes: no upload memory"];
     }
 }
@@ -471,29 +547,11 @@ static VkBuffer vg_vkbuffer(id<MTLBuffer> b) {
         [_owner fail:why ?: @"no command buffer"];
         return;
     }
-    // One descriptor set for every region: the same buffers.
-    VkDescriptorSet set = [_owner allocSet:v->dsl];
+    // One descriptor set for every region: the same resources.
+    VkDescriptorSet set = vg_write_set(_owner, v->dsl, v->bindings, v->nbindings, &_t, _pso->_name);
     if (!set) {
-        [_owner fail:@"no descriptor set"];
         return;
     }
-    VkDescriptorBufferInfo infos[64];
-    VkWriteDescriptorSet writes[64];
-    for (int i = 0; i < v->nbindings; i++) {
-        uint32_t slot = v->bindings[i].binding;   // buffers: binding n = [[buffer(n)]]
-        if (slot >= kVGMaxBufferSlots || !_buf[slot]) {
-            [_owner fail:[NSString stringWithFormat:@"%@: nothing bound at buffer(%u)", _pso->_name, slot]];
-            return;
-        }
-        VkDeviceSize range = VK_WHOLE_SIZE;
-        if (v->bindings[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
-            range = MIN((VkDeviceSize)gVk.props.limits.maxUniformBufferRange, 65536);
-        }
-        infos[i] = (VkDescriptorBufferInfo){_buf[slot], _off[slot], range};
-        writes[i] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, slot, 0, 1,
-                                          v->bindings[i].type, NULL, &infos[i], NULL};
-    }
-    gVk.vkUpdateDescriptorSets(gVk.device, (uint32_t)v->nbindings, writes, 0, NULL);
     uint32_t groups[3];
     for (int d = 0; d < 3; d++) {
         groups[d] = (grid[d] + nominal[d] - 1) / nominal[d];
@@ -629,9 +687,14 @@ static VkBuffer vg_vkbuffer(id<MTLBuffer> b) {
 
 - (void)barrier {
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL,
-                          VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT,
+                          VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT |
+                              VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
-                              VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT};
+                              VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT |
+                              VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                              VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                              VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT |
+                              VK_ACCESS_INDIRECT_COMMAND_READ_BIT};
     gVk.vkCmdPipelineBarrier(_cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0,
                              NULL);
@@ -643,9 +706,12 @@ static VkBuffer vg_vkbuffer(id<MTLBuffer> b) {
         if (_npools == 64) {
             return VK_NULL_HANDLE;
         }
-        VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, perPool * 32},
-                                         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, perPool * 32}};
-        VkDescriptorPoolCreateInfo pci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, perPool, 2, sizes};
+        VkDescriptorPoolSize sizes[5] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, perPool * 32},
+                                         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, perPool * 32},
+                                         {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, perPool * 32},
+                                         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, perPool * 16},
+                                         {VK_DESCRIPTOR_TYPE_SAMPLER, perPool * 16}};
+        VkDescriptorPoolCreateInfo pci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, perPool, 5, sizes};
         if (gVk.vkCreateDescriptorPool(gVk.device, &pci, NULL, &_pools[_npools]) != VK_SUCCESS) {
             return VK_NULL_HANDLE;
         }

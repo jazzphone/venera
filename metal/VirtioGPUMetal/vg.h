@@ -8,6 +8,17 @@
 #include <vulkan/vulkan_core.h>
 
 void vglog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+// VGMTL_TRACE=1: step-by-step lines for bisecting a host-side failure (the log is written before each step).
+BOOL vg_tracing(void);
+#define vgtrace(...)                                                                                                \
+    do {                                                                                                            \
+        if (vg_tracing()) {                                                                                         \
+            vglog(__VA_ARGS__);                                                                                     \
+        }                                                                                                           \
+    } while (0)
+// In trace mode, waits for the host to finish everything queued so far (Venus runs most calls asynchronously, so a
+// host crash otherwise surfaces at some later call).
+void vg_trace_sync(const char *after);
 
 // Every Vulkan entry point the plugin calls, loaded from the Venus ICD (instance- or device-level).
 #define VG_VK_FUNCS(X)                                                                                              \
@@ -20,7 +31,15 @@ void vglog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
     X(vkCreateShaderModule) X(vkDestroyShaderModule) X(vkCreateDescriptorSetLayout) X(vkCreatePipelineLayout)      \
     X(vkCreateComputePipelines) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkAllocateDescriptorSets)   \
     X(vkUpdateDescriptorSets) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants)                \
-    X(vkCmdDispatch)
+    X(vkCmdDispatch) X(vkGetPhysicalDeviceFeatures2) X(vkGetPhysicalDeviceFormatProperties) X(vkCreateImage)       \
+    X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateImageView)                     \
+    X(vkDestroyImageView) X(vkCreateSampler) X(vkDestroySampler) X(vkCmdCopyBufferToImage)                         \
+    X(vkCmdCopyImageToBuffer) X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCreateGraphicsPipelines)              \
+    X(vkDestroyPipeline) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetPrimitiveTopology) X(vkCmdSetCullMode)    \
+    X(vkCmdSetFrontFace) X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp)           \
+    X(vkCmdSetBlendConstants) X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) X(vkCmdDraw) X(vkCmdDrawIndexed)   \
+    X(vkCmdSetStencilTestEnable) X(vkCmdSetDepthBiasEnable) X(vkCmdSetRasterizerDiscardEnable)                     \
+    X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetDepthBoundsTestEnable) X(vkDeviceWaitIdle)
 
 #define VG_DECLARE(name) PFN_##name name;
 struct vg_vulkan {
@@ -32,6 +51,8 @@ struct vg_vulkan {
     VkPhysicalDeviceProperties props;
     uint32_t queueFamily;
     uint32_t hostMemoryType;   // host-visible + coherent (cached when there is one): every buffer for now
+    VkPhysicalDeviceMemoryProperties memory;
+    BOOL formatlessStorage;    // shaderStorageImageRead/WriteWithoutFormat: typeless storage textures
     VkCommandPool pool;
     pthread_mutex_t lock;      // the queue and the command pool
     VG_VK_FUNCS(VG_DECLARE)
@@ -40,6 +61,7 @@ struct vg_vulkan {
 extern struct vg_vulkan gVk;
 
 int vg_vulkan_init(void);   // 0 = up
+uint32_t vg_memory_type(uint32_t bits, VkMemoryPropertyFlags want);   // first allowed type with `want`, else any
 
 // A Vulkan buffer in host-visible memory, mapped for its life.
 typedef struct {

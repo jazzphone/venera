@@ -1,0 +1,406 @@
+// Stage 4c: textures, samplers, depth-stencil states.
+//
+// A texture is a VkImage with optimal tiling, kept in VK_IMAGE_LAYOUT_GENERAL for its whole life (set once at
+// creation), so it can be sampled, written as storage, rendered to and copied without layout tracking; the price is
+// some bandwidth on GPUs that compress attachments. replaceRegion / getBytes are synchronous, as Metal's are: a
+// staging buffer and a one-shot command buffer each.
+#import "objects.h"
+
+// ---- formats -----------------------------------------------------------------------------------------------------
+
+typedef struct {
+    MTLPixelFormat mtl;
+    VkFormat vk;
+    uint8_t bytes;   // per pixel
+    VkImageAspectFlags aspect;
+} vg_format;
+
+static const vg_format kFormats[] = {
+    {MTLPixelFormatBGRA8Unorm, VK_FORMAT_B8G8R8A8_UNORM, 4, VK_IMAGE_ASPECT_COLOR_BIT},
+    {MTLPixelFormatBGRA8Unorm_sRGB, VK_FORMAT_B8G8R8A8_SRGB, 4, VK_IMAGE_ASPECT_COLOR_BIT},
+    {MTLPixelFormatRGBA8Unorm, VK_FORMAT_R8G8B8A8_UNORM, 4, VK_IMAGE_ASPECT_COLOR_BIT},
+    {MTLPixelFormatRGBA8Unorm_sRGB, VK_FORMAT_R8G8B8A8_SRGB, 4, VK_IMAGE_ASPECT_COLOR_BIT},
+    {MTLPixelFormatRGBA8Uint, VK_FORMAT_R8G8B8A8_UINT, 4, VK_IMAGE_ASPECT_COLOR_BIT},
+    {MTLPixelFormatRGBA8Snorm, VK_FORMAT_R8G8B8A8_SNORM, 4, VK_IMAGE_ASPECT_COLOR_BIT},
+    {MTLPixelFormatR8Unorm, VK_FORMAT_R8_UNORM, 1, VK_IMAGE_ASPECT_COLOR_BIT},
+    {MTLPixelFormatR8Uint, VK_FORMAT_R8_UINT, 1, VK_IMAGE_ASPECT_COLOR_BIT},
+    {MTLPixelFormatRG8Unorm, VK_FORMAT_R8G8_UNORM, 2, VK_IMAGE_ASPECT_COLOR_BIT},
+    {MTLPixelFormatR16Float, VK_FORMAT_R16_SFLOAT, 2, VK_IMAGE_ASPECT_COLOR_BIT},
+    {MTLPixelFormatR16Unorm, VK_FORMAT_R16_UNORM, 2, VK_IMAGE_ASPECT_COLOR_BIT},
+    {MTLPixelFormatRG16Float, VK_FORMAT_R16G16_SFLOAT, 4, VK_IMAGE_ASPECT_COLOR_BIT},
+    {MTLPixelFormatRGBA16Float, VK_FORMAT_R16G16B16A16_SFLOAT, 8, VK_IMAGE_ASPECT_COLOR_BIT},
+    {MTLPixelFormatRGBA16Unorm, VK_FORMAT_R16G16B16A16_UNORM, 8, VK_IMAGE_ASPECT_COLOR_BIT},
+    {MTLPixelFormatR32Float, VK_FORMAT_R32_SFLOAT, 4, VK_IMAGE_ASPECT_COLOR_BIT},
+    {MTLPixelFormatR32Uint, VK_FORMAT_R32_UINT, 4, VK_IMAGE_ASPECT_COLOR_BIT},
+    {MTLPixelFormatR32Sint, VK_FORMAT_R32_SINT, 4, VK_IMAGE_ASPECT_COLOR_BIT},
+    {MTLPixelFormatRG32Float, VK_FORMAT_R32G32_SFLOAT, 8, VK_IMAGE_ASPECT_COLOR_BIT},
+    {MTLPixelFormatRGBA32Float, VK_FORMAT_R32G32B32A32_SFLOAT, 16, VK_IMAGE_ASPECT_COLOR_BIT},
+    {MTLPixelFormatRGBA32Uint, VK_FORMAT_R32G32B32A32_UINT, 16, VK_IMAGE_ASPECT_COLOR_BIT},
+    {MTLPixelFormatRGB10A2Unorm, VK_FORMAT_A2B10G10R10_UNORM_PACK32, 4, VK_IMAGE_ASPECT_COLOR_BIT},
+    {MTLPixelFormatBGR10A2Unorm, VK_FORMAT_A2R10G10B10_UNORM_PACK32, 4, VK_IMAGE_ASPECT_COLOR_BIT},
+    {MTLPixelFormatRG11B10Float, VK_FORMAT_B10G11R11_UFLOAT_PACK32, 4, VK_IMAGE_ASPECT_COLOR_BIT},
+    {MTLPixelFormatDepth16Unorm, VK_FORMAT_D16_UNORM, 2, VK_IMAGE_ASPECT_DEPTH_BIT},
+    {MTLPixelFormatDepth32Float, VK_FORMAT_D32_SFLOAT, 4, VK_IMAGE_ASPECT_DEPTH_BIT},
+    {MTLPixelFormatDepth32Float_Stencil8, VK_FORMAT_D32_SFLOAT_S8_UINT, 8,
+     VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT},
+};
+
+static const vg_format *vg_format_of(MTLPixelFormat f) {
+    for (size_t i = 0; i < sizeof(kFormats) / sizeof(*kFormats); i++) {
+        if (kFormats[i].mtl == f) {
+            return &kFormats[i];
+        }
+    }
+    return NULL;
+}
+
+VkFormat vg_vk_format(MTLPixelFormat f) {
+    const vg_format *v = vg_format_of(f);
+    return v ? v->vk : VK_FORMAT_UNDEFINED;
+}
+
+// ---- one-shot command buffers ------------------------------------------------------------------------------------
+
+BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
+    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, gVk.pool,
+                                      VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    pthread_mutex_lock(&gVk.lock);
+    VkResult r = gVk.vkAllocateCommandBuffers(gVk.device, &ai, &cb);
+    pthread_mutex_unlock(&gVk.lock);
+    if (r != VK_SUCCESS) {
+        return NO;
+    }
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL,
+                                   VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
+    gVk.vkBeginCommandBuffer(cb, &bi);
+    // Whatever earlier command buffers did is visible to this one, and this one's writes to the host.
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT,
+                          VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
+    gVk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
+                             NULL, 0, NULL);
+    record(cb);
+    VkMemoryBarrier hb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT,
+                          VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_READ_BIT};
+    gVk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &hb, 0, NULL, 0, NULL);
+    gVk.vkEndCommandBuffer(cb);
+    vgtrace("one-shot: submit");
+    VkFence fence = VK_NULL_HANDLE;
+    VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    gVk.vkCreateFence(gVk.device, &fci, NULL, &fence);
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &cb, 0, NULL};
+    pthread_mutex_lock(&gVk.lock);
+    r = gVk.vkQueueSubmit(gVk.queue, 1, &si, fence);
+    pthread_mutex_unlock(&gVk.lock);
+    if (r == VK_SUCCESS) {
+        gVk.vkWaitForFences(gVk.device, 1, &fence, VK_TRUE, UINT64_MAX);
+    }
+    gVk.vkDestroyFence(gVk.device, fence, NULL);
+    vgtrace("one-shot: done (%d)", r);
+    pthread_mutex_lock(&gVk.lock);
+    gVk.vkFreeCommandBuffers(gVk.device, gVk.pool, 1, &cb);
+    pthread_mutex_unlock(&gVk.lock);
+    return r == VK_SUCCESS;
+}
+
+// ---- MTLTexture --------------------------------------------------------------------------------------------------
+
+@implementation VGMTLTexture
+@synthesize label = _label;
+- (id<MTLDevice>)device { return _dev; }
+- (void)dealloc {
+    if (_view) {
+        gVk.vkDestroyImageView(gVk.device, _view, NULL);
+    }
+    if (_image) {
+        gVk.vkDestroyImage(gVk.device, _image, NULL);
+    }
+    if (_memory) {
+        gVk.vkFreeMemory(gVk.device, _memory, NULL);
+    }
+}
+- (MTLTextureType)textureType { return _type; }
+- (MTLPixelFormat)pixelFormat { return _pixelFormat; }
+- (NSUInteger)width { return _width; }
+- (NSUInteger)height { return _height; }
+- (NSUInteger)depth { return _depth; }
+- (NSUInteger)mipmapLevelCount { return _mips; }
+- (NSUInteger)arrayLength { return _layers; }
+- (NSUInteger)sampleCount { return 1; }
+- (MTLTextureUsage)usage { return _usage; }
+- (MTLStorageMode)storageMode { return _storage; }
+- (MTLCPUCacheMode)cpuCacheMode { return MTLCPUCacheModeDefaultCache; }
+- (MTLHazardTrackingMode)hazardTrackingMode { return MTLHazardTrackingModeTracked; }
+- (MTLResourceOptions)resourceOptions { return (MTLResourceOptions)_storage << MTLResourceStorageModeShift; }
+- (BOOL)isFramebufferOnly { return NO; }
+- (BOOL)allowGPUOptimizedContents { return YES; }
+- (BOOL)isShareable { return NO; }
+- (IOSurfaceRef)iosurface { return NULL; }
+- (NSUInteger)iosurfacePlane { return 0; }
+- (id<MTLTexture>)parentTexture { return nil; }
+- (id<MTLTexture>)rootResource { return nil; }
+- (id<MTLBuffer>)buffer { return nil; }
+- (NSUInteger)allocatedSize { return _width * _height * _depth * _layers * MAX(vg_format_of(_pixelFormat)->bytes, 1); }
+- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { return MTLPurgeableStateNonVolatile; }
+- (BOOL)isAliasable { return NO; }
+- (void)makeAliasable { }
+- (id<MTLHeap>)heap { return nil; }
+- (NSUInteger)heapOffset { return 0; }
+- (MTLResourceID)gpuResourceID { return (MTLResourceID){0}; }
+- (MTLTextureSwizzleChannels)swizzle {
+    return MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue,
+                                         MTLTextureSwizzleAlpha);
+}
+
+// Copies between the image and a staging buffer laid out with Metal's bytesPerRow / bytesPerImage.
+- (BOOL)copyRegion:(MTLRegion)region level:(NSUInteger)level slice:(NSUInteger)slice bytes:(void *)bytes
+       bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi toImage:(BOOL)toImage {
+    const vg_format *f = vg_format_of(_pixelFormat);
+    if (!f || !region.size.width || !region.size.height || !region.size.depth) {
+        return NO;
+    }
+    if (bpr % f->bytes) {
+        vglog("texture: bytesPerRow %lu isn't a whole number of %u-byte pixels", (unsigned long)bpr, f->bytes);
+        return NO;
+    }
+    NSUInteger rows = region.size.height, depth = region.size.depth;
+    if (!bpi) {
+        bpi = bpr * rows;
+    }
+    NSUInteger size = bpi * (depth - 1) + bpr * (rows - 1) + region.size.width * f->bytes;
+    vg_buffer staging;
+    if (vg_buffer_create(size, &staging)) {
+        return NO;
+    }
+    if (toImage) {
+        memcpy(staging.map, bytes, size);
+    }
+    VkBufferImageCopy c = {0, (uint32_t)(bpr / f->bytes), (uint32_t)(bpi / bpr),
+                           {f->aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT, (uint32_t)level, (uint32_t)slice, 1},
+                           {(int32_t)region.origin.x, (int32_t)region.origin.y, (int32_t)region.origin.z},
+                           {(uint32_t)region.size.width, (uint32_t)rows, (uint32_t)depth}};
+    VkImage image = _image;
+    vgtrace("texture: %s %ux%u level %lu, row length %u, %lu staging bytes", toImage ? "upload" : "readback",
+            c.imageExtent.width, c.imageExtent.height, (unsigned long)level, c.bufferRowLength, (unsigned long)size);
+    BOOL ok = vg_one_shot(^(VkCommandBuffer cb) {
+        if (toImage) {
+            gVk.vkCmdCopyBufferToImage(cb, staging.buffer, image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+        } else {
+            gVk.vkCmdCopyImageToBuffer(cb, image, VK_IMAGE_LAYOUT_GENERAL, staging.buffer, 1, &c);
+        }
+    });
+    if (ok && !toImage) {
+        memcpy(bytes, staging.map, size);
+    }
+    vg_buffer_destroy(&staging);
+    return ok;
+}
+- (void)replaceRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes
+          bytesPerRow:(NSUInteger)bpr {
+    [self copyRegion:region level:level slice:0 bytes:(void *)bytes bytesPerRow:bpr bytesPerImage:0 toImage:YES];
+}
+- (void)replaceRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice
+            withBytes:(const void *)bytes bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi {
+    [self copyRegion:region level:level slice:slice bytes:(void *)bytes bytesPerRow:bpr bytesPerImage:bpi toImage:YES];
+}
+- (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)bpr fromRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level {
+    [self copyRegion:region level:level slice:0 bytes:bytes bytesPerRow:bpr bytesPerImage:0 toImage:NO];
+}
+- (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi fromRegion:(MTLRegion)region
+     mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice {
+    [self copyRegion:region level:level slice:slice bytes:bytes bytesPerRow:bpr bytesPerImage:bpi toImage:NO];
+}
+@end
+
+id<MTLTexture> vg_new_texture(id<MTLDevice> device, MTLTextureDescriptor *d) {
+    const vg_format *f = vg_format_of(d.pixelFormat);
+    if (vg_vulkan_init() || !f) {
+        vglog("texture: pixel format %lu not supported yet", (unsigned long)d.pixelFormat);
+        return nil;
+    }
+    VkImageType itype;
+    VkImageViewType vtype;
+    switch (d.textureType) {
+    case MTLTextureType1D: itype = VK_IMAGE_TYPE_1D, vtype = VK_IMAGE_VIEW_TYPE_1D; break;
+    case MTLTextureType2D: itype = VK_IMAGE_TYPE_2D, vtype = VK_IMAGE_VIEW_TYPE_2D; break;
+    case MTLTextureType2DArray: itype = VK_IMAGE_TYPE_2D, vtype = VK_IMAGE_VIEW_TYPE_2D_ARRAY; break;
+    case MTLTextureType3D: itype = VK_IMAGE_TYPE_3D, vtype = VK_IMAGE_VIEW_TYPE_3D; break;
+    default:
+        vglog("texture: type %lu not supported yet", (unsigned long)d.textureType);
+        return nil;
+    }
+    if (d.sampleCount > 1) {
+        vglog("texture: multisampling not supported yet");
+        return nil;
+    }
+    VkFormatProperties fp;
+    gVk.vkGetPhysicalDeviceFormatProperties(gVk.physical, f->vk, &fp);
+    VkFormatFeatureFlags ff = fp.optimalTilingFeatures;
+    VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (ff & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) {
+        usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+    }
+    if ((ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && (d.usage & (MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead))) {
+        usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+    }
+    if (ff & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) {
+        usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    }
+    if (ff & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) {
+        usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    }
+    if ((d.usage & MTLTextureUsageShaderWrite) && !(usage & VK_IMAGE_USAGE_STORAGE_BIT)) {
+        vglog("texture: pixel format %lu can't be a storage image here (shaderWrite will fail)", (unsigned long)d.pixelFormat);
+    }
+    VGMTLTexture *t = [VGMTLTexture new];
+    t->_dev = device;
+    t->_pixelFormat = d.pixelFormat;
+    t->_format = f->vk;
+    t->_aspect = f->aspect;
+    t->_type = d.textureType;
+    t->_width = MAX(d.width, 1);
+    t->_height = d.textureType == MTLTextureType1D ? 1 : MAX(d.height, 1);
+    t->_depth = d.textureType == MTLTextureType3D ? MAX(d.depth, 1) : 1;
+    t->_mips = MAX(d.mipmapLevelCount, 1);
+    t->_layers = d.textureType == MTLTextureType2DArray ? MAX(d.arrayLength, 1) : 1;
+    t->_usage = d.usage;
+    t->_storage = d.storageMode;
+    VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = itype;
+    ici.format = f->vk;
+    ici.extent = (VkExtent3D){(uint32_t)t->_width, (uint32_t)t->_height, (uint32_t)t->_depth};
+    ici.mipLevels = (uint32_t)t->_mips;
+    ici.arrayLayers = (uint32_t)t->_layers;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = usage;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    vgtrace("texture: vkCreateImage %lux%lu format %d usage 0x%x", (unsigned long)t->_width, (unsigned long)t->_height, f->vk, usage);
+    VkResult r = gVk.vkCreateImage(gVk.device, &ici, NULL, &t->_image);
+    if (r != VK_SUCCESS) {
+        vglog("texture: vkCreateImage %d", r);
+        return nil;
+    }
+    VkMemoryRequirements req;
+    gVk.vkGetImageMemoryRequirements(gVk.device, t->_image, &req);
+    VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size,
+                                vg_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
+    vgtrace("texture: %llu bytes, memory type bits 0x%x -> type %u", (unsigned long long)req.size, req.memoryTypeBits,
+            mai.memoryTypeIndex);
+    r = gVk.vkAllocateMemory(gVk.device, &mai, NULL, &t->_memory);
+    if (r == VK_SUCCESS) {
+        r = gVk.vkBindImageMemory(gVk.device, t->_image, t->_memory, 0);
+    }
+    VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, t->_image, vtype, f->vk,
+                                 {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+                                  VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY},
+                                 {f->aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT, 0, (uint32_t)t->_mips, 0, (uint32_t)t->_layers}};
+    if (r == VK_SUCCESS) {
+        vgtrace("texture: bound (%d), vkCreateImageView", r);
+        r = gVk.vkCreateImageView(gVk.device, &vci, NULL, &t->_view);
+    }
+    vgtrace("texture: view %d, layout transition", r);
+    if (r != VK_SUCCESS) {
+        vglog("texture: memory / view %d", r);
+        return nil;
+    }
+    VkImage image = t->_image;
+    VkImageAspectFlags aspect = f->aspect;
+    uint32_t mips = (uint32_t)t->_mips, layers = (uint32_t)t->_layers;
+    BOOL ok = vg_one_shot(^(VkCommandBuffer cb) {   // UNDEFINED -> GENERAL, for life
+        VkImageMemoryBarrier ib = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0,
+                                   VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                                   VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, image,
+                                   {aspect, 0, mips, 0, layers}};
+        gVk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0,
+                                 NULL, 1, &ib);
+    });
+    return ok ? t : nil;
+}
+
+// ---- MTLSamplerState ---------------------------------------------------------------------------------------------
+
+@implementation VGMTLSamplerState
+@synthesize label = _label;
+- (id<MTLDevice>)device { return _dev; }
+- (MTLResourceID)gpuResourceID { return (MTLResourceID){0}; }
+- (void)dealloc {
+    if (_sampler) {
+        gVk.vkDestroySampler(gVk.device, _sampler, NULL);
+    }
+}
+@end
+
+static VkSamplerAddressMode vg_address(MTLSamplerAddressMode m) {
+    switch (m) {
+    case MTLSamplerAddressModeRepeat: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    case MTLSamplerAddressModeMirrorRepeat: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+    case MTLSamplerAddressModeMirrorClampToEdge: return VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE;
+    case MTLSamplerAddressModeClampToZero:
+    case MTLSamplerAddressModeClampToBorderColor: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    default: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    }
+}
+
+static VkCompareOp vg_compare(MTLCompareFunction f) {
+    switch (f) {
+    case MTLCompareFunctionNever: return VK_COMPARE_OP_NEVER;
+    case MTLCompareFunctionLess: return VK_COMPARE_OP_LESS;
+    case MTLCompareFunctionEqual: return VK_COMPARE_OP_EQUAL;
+    case MTLCompareFunctionLessEqual: return VK_COMPARE_OP_LESS_OR_EQUAL;
+    case MTLCompareFunctionGreater: return VK_COMPARE_OP_GREATER;
+    case MTLCompareFunctionNotEqual: return VK_COMPARE_OP_NOT_EQUAL;
+    case MTLCompareFunctionGreaterEqual: return VK_COMPARE_OP_GREATER_OR_EQUAL;
+    default: return VK_COMPARE_OP_ALWAYS;
+    }
+}
+
+id<MTLSamplerState> vg_new_sampler(id<MTLDevice> device, MTLSamplerDescriptor *d) {
+    if (vg_vulkan_init()) {
+        return nil;
+    }
+    VkSamplerCreateInfo sci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    sci.magFilter = d.magFilter == MTLSamplerMinMagFilterLinear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    sci.minFilter = d.minFilter == MTLSamplerMinMagFilterLinear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    sci.mipmapMode = d.mipFilter == MTLSamplerMipFilterLinear ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sci.addressModeU = vg_address(d.sAddressMode);
+    sci.addressModeV = vg_address(d.tAddressMode);
+    sci.addressModeW = vg_address(d.rAddressMode);
+    sci.maxAnisotropy = (float)MAX(d.maxAnisotropy, 1);
+    sci.anisotropyEnable = d.maxAnisotropy > 1;
+    sci.compareEnable = d.compareFunction != MTLCompareFunctionNever;
+    sci.compareOp = vg_compare(d.compareFunction);
+    sci.minLod = d.lodMinClamp;
+    sci.maxLod = d.mipFilter == MTLSamplerMipFilterNotMipmapped ? 0.25f : d.lodMaxClamp;
+    sci.borderColor = d.borderColor == MTLSamplerBorderColorOpaqueWhite   ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE
+                      : d.borderColor == MTLSamplerBorderColorOpaqueBlack ? VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK
+                                                                          : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+    sci.unnormalizedCoordinates = !d.normalizedCoordinates;
+    VGMTLSamplerState *s = [VGMTLSamplerState new];
+    s->_dev = device;
+    if (gVk.vkCreateSampler(gVk.device, &sci, NULL, &s->_sampler) != VK_SUCCESS) {
+        return nil;
+    }
+    return s;
+}
+
+// ---- MTLDepthStencilState ----------------------------------------------------------------------------------------
+
+@implementation VGMTLDepthStencilState
+@synthesize label = _label;
+- (id<MTLDevice>)device { return _dev; }
+- (MTLResourceID)gpuResourceID { return (MTLResourceID){0}; }
+@end
+
+id<MTLDepthStencilState> vg_new_depth_stencil(id<MTLDevice> device, MTLDepthStencilDescriptor *d) {
+    VGMTLDepthStencilState *s = [VGMTLDepthStencilState new];
+    s->_dev = device;
+    s->_write = d.depthWriteEnabled;
+    s->_compare = vg_compare(d.depthCompareFunction);
+    s->_test = d.depthCompareFunction != MTLCompareFunctionAlways || d.depthWriteEnabled;
+    if (d.frontFaceStencil || d.backFaceStencil) {
+        vglog("depth-stencil: stencil isn't supported yet (ignored)");
+    }
+    return s;
+}

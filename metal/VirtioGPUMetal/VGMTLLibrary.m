@@ -77,6 +77,9 @@ static BOOL vg_translator_ready(void) {
     static dispatch_once_t once;
     static BOOL ready;
     dispatch_once(&once, ^{
+        // Per-slot descriptors (texture n at binding 32+n), not NV's bindless heap (set 2, indexed through a table at
+        // binding 640) the translator emits by default; the variable is read once, at its first translation.
+        setenv("NVMTL_NO_BINDLESS_ALL", "1", 1);
         NSString *path = vg_resource_path("libnvmtl_translate.dylib");
         void *h = path ? dlopen(path.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL) : NULL;
         if (!h) {
@@ -87,7 +90,13 @@ static BOOL vg_translator_ready(void) {
         pReflect = (xl_fn)dlsym(h, "nvmtl_reflect");
         pTranslateFree = dlsym(h, "nvmtl_translate_free");
         pSetTgLengths = dlsym(h, "nvmtl_translate_set_threadgroup_lengths");
-        ready = pTranslate && pReflect && pTranslateFree && pSetTgLengths;
+        void (*setCaps)(uint32_t) = dlsym(h, "nvmtl_translate_set_caps");
+        ready = pTranslate && pReflect && pTranslateFree && pSetTgLengths && setCaps;
+        // bits 0/1: the device reads/writes storage images without a declared format, so a typeless Metal
+        // texture's storage image is declared Unknown instead of R32f (the wrapper's formatless_options)
+        if (setCaps && gVk.formatlessStorage) {
+            setCaps(3);
+        }
         if (!ready) {
             vglog("library: the translator lacks an entry point");
         }

@@ -96,9 +96,21 @@ static int vg_vulkan_init_locked(void) {
         vglog("vulkan: no host-visible coherent memory type");
         return -1;
     }
+    gVk.memory = mp;
+    // Translated shaders declare what they use (descriptor indexing, formatless storage images, 8/16-bit types,
+    // the memory model...), and Vulkan needs each feature enabled: turn on everything the device has, except
+    // robustBufferAccess (bounds checks on every access, which Metal doesn't promise).
+    VkPhysicalDeviceVulkan13Features f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceVulkan12Features f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13};
+    VkPhysicalDeviceVulkan11Features f11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &f12};
+    VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f11};
+    gVk.vkGetPhysicalDeviceFeatures2(gVk.physical, &f2);
+    f2.features.robustBufferAccess = VK_FALSE;
+    f13.robustImageAccess = VK_FALSE;
+    gVk.formatlessStorage = f2.features.shaderStorageImageReadWithoutFormat && f2.features.shaderStorageImageWriteWithoutFormat;
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, gVk.queueFamily, 1, &prio};
-    VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, NULL, 0, 1, &qci, 0, NULL, 0, NULL, NULL};
+    VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2, 0, 1, &qci, 0, NULL, 0, NULL, NULL};
     r = gVk.vkCreateDevice(gVk.physical, &dci, NULL, &gVk.device);
     if (r != VK_SUCCESS) {
         vglog("vulkan: vkCreateDevice %d", r);
@@ -136,6 +148,20 @@ int vg_vulkan_init(void) {
     int up = gVk.state > 0;
     pthread_mutex_unlock(&gVk.lock);
     return up ? 0 : -1;
+}
+
+uint32_t vg_memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
+    for (uint32_t t = 0; t < gVk.memory.memoryTypeCount; t++) {
+        if ((bits & (1u << t)) && (gVk.memory.memoryTypes[t].propertyFlags & want) == want) {
+            return t;
+        }
+    }
+    for (uint32_t t = 0; t < gVk.memory.memoryTypeCount; t++) {
+        if (bits & (1u << t)) {
+            return t;
+        }
+    }
+    return UINT32_MAX;
 }
 
 int vg_buffer_create(VkDeviceSize size, vg_buffer *out) {
@@ -185,4 +211,12 @@ void vg_buffer_destroy(vg_buffer *b) {
         gVk.vkFreeMemory(gVk.device, b->memory, NULL);
     }
     memset(b, 0, sizeof(*b));
+}
+
+void vg_trace_sync(const char *after) {
+    if (vg_tracing() && gVk.device) {
+        vglog("sync after %s ...", after);
+        VkResult r = gVk.vkDeviceWaitIdle(gVk.device);
+        vglog("sync after %s: %d", after, r);
+    }
 }

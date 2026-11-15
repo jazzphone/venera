@@ -611,6 +611,8 @@ Effort is focused-engineer days for the stage, excluding VM reboot waits, assumi
 
 ### Stage 4c: render to a texture
 
+**Done 2026-11-15 (PLAN.md, "Stage 4c result").**
+
 - **Do:** render pipeline (vertex+fragment AIR), render pass descriptors, `MTLTexture` 2D (BGRA8, RGBA16F), samplers, depth if needed, blending, `drawPrimitives`, `replaceRegion`/`getBytes`, blit
   between textures, readback to a buffer. Enable argument buffers (`NVMTLEmbedded.m`).
 - **Checkpoint:** a triangle and a textured quad render into an offscreen texture and a CPU readback matches a reference within tolerance; clear + load/store actions; a Core Image or
