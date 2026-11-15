@@ -249,24 +249,44 @@ IOReturn VirtioGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *opt
     Resource *r = find(type);
     if (!r || !r->mapped || !core_->hostmemPhys()) {
         IOLockUnlock(lock_);
+        LOG("map: resource %u not mapped", type);
         return kIOReturnNotFound;
     }
     uint64_t phys = core_->hostmemPhys() + r->offset;
     uint32_t mapInfo = r->mapInfo;
     uint64_t size = r->size;
     IOLockUnlock(lock_);
-    IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(phys, size, kIODirectionInOut);
-    if (!md) {
-        return kIOReturnNoMemory;
-    }
-    IOOptionBits cache = kIOMapDefaultCache;
+    // The window is host memory behind a PCI BAR: describe it as physical, cacheable as the
+    // host says (VIRTIO_GPU_MAP_CACHE_*).
+    IOOptionBits cache = kIOMapCopybackCache;
     if (mapInfo == vgpu::kMapCacheWC) {
         cache = kIOMapWriteCombineCache;
     } else if (mapInfo == vgpu::kMapCacheUncached) {
         cache = kIOMapInhibitCache;
     }
+    IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(phys, size, kIODirectionInOut | kIOMemoryMapperNone,
+                                                                  TASK_NULL);
+    if (!md) {
+        LOG("map: no descriptor for phys 0x%llx size %llu", (unsigned long long)phys, (unsigned long long)size);
+        return kIOReturnNoMemory;
+    }
+    if (mapProbe_ < 2) { // once or twice: can the kernel itself map it?
+        mapProbe_++;
+        IOMemoryMap *k = md->createMappingInTask(kernel_task, 0, kIOMapAnywhere | cache);
+        if (k) {
+            volatile uint32_t *p = reinterpret_cast<volatile uint32_t *>(k->getVirtualAddress());
+            uint32_t before = p[0];
+            p[0] = 0x56475055; // 'VGPU'
+            LOG("map: kernel mapping of 0x%llx ok, word 0x%08x -> 0x%08x", (unsigned long long)phys, before, p[0]);
+            k->release();
+        } else {
+            LOG("map: kernel mapping of 0x%llx (cache 0x%x) FAILED", (unsigned long long)phys, cache);
+        }
+    }
     *options = (*options & ~kIOMapCacheMask) | cache;
     *memory = md; // IOUserClient releases it after mapping
+    LOG("map: resource %u phys 0x%llx size %llu cache 0x%x", type, (unsigned long long)phys,
+        (unsigned long long)size, cache);
     return kIOReturnSuccess;
 }
 

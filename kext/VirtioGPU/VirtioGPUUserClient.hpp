@@ -54,4 +54,5 @@ private:
     volatile uint64_t signaled_[kMaxRings] = {};
     volatile uint32_t pending_ = 0;
     bool closed_ = false;
+    uint32_t mapProbe_ = 0;
 };
