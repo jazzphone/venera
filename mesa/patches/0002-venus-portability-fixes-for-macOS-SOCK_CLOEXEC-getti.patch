@@ -1,7 +1,7 @@
 From eca256c7ded2b3b20e021eabfd85036ad83f2209 Mon Sep 17 00:00:00 2001
 From: jazzphone <4240091+jazzphone@users.noreply.github.com>
 Date: Sun, 15 Nov 2026 11:35:37 -0500
-Subject: [PATCH 2/3] venus: portability fixes for macOS (SOCK_CLOEXEC, gettid)
+Subject: [PATCH 2/4] venus: portability fixes for macOS (SOCK_CLOEXEC, gettid)
 
 Darwin has no SOCK_CLOEXEC (use fcntl FD_CLOEXEC) and no SYS_gettid
 (use pthread_threadid_np). vn_renderer_vtest.c otherwise builds as is.
@@ -56,3 +56,6 @@ index d932ea8..9d7f23d 100644
  
     memset(&un, 0, sizeof(un));
     un.sun_family = AF_UNIX;
+-- 
+2.54.0 (Apple Git-157)
+

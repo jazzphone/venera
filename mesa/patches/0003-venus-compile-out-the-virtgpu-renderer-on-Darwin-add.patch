@@ -1,7 +1,7 @@
 From adc0ddedaf4a4d4c3dfd6d4ba8fe95c35ce9bca4 Mon Sep 17 00:00:00 2001
 From: jazzphone <4240091+jazzphone@users.noreply.github.com>
 Date: Sun, 15 Nov 2026 11:35:37 -0500
-Subject: [PATCH 3/3] venus: compile out the virtgpu renderer on Darwin, add
+Subject: [PATCH 3/4] venus: compile out the virtgpu renderer on Darwin, add
  macOS renderer stub
 
 vn_renderer_virtgpu.c needs libdrm/xf86drm.h and Linux DRM ioctls.  On
@@ -152,3 +152,6 @@ index 0000000..b32d720
 +
 +   return VK_ERROR_INITIALIZATION_FAILED;
 +}
+-- 
+2.54.0 (Apple Git-157)
+
