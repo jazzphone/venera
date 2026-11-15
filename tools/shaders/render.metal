@@ -53,3 +53,11 @@ kernel void pattern(texture2d<float, access::write> out [[texture(0)]], uint2 gi
         out.write(float4(float(gid.x & 255), float(gid.y & 255), float((gid.x ^ gid.y) & 255), 255.0) / 255.0, gid);
     }
 }
+
+// Framebuffer fetch ([[color(0)]]): Core Animation's shaders read the destination this way (stage 5b).
+fragment float4 fetch_swap_fragment(VOut in [[stage_in]], float4 dst [[color(0)]]) {
+    return float4(dst.b, dst.g, dst.r, 1.0);
+}
+fragment float4 fetch_half_fragment(VOut in [[stage_in]], float4 dst [[color(0)]]) {
+    return dst * 0.5;
+}

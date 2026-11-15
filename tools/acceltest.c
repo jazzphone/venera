@@ -2,6 +2,7 @@
 //   acceltest            find the accelerator, print its state
 //   acceltest arm [NAME [CLASS]]   publish MetalPluginName (default VirtioGPUMetal) + class (default VGMTLDevice)
 //   acceltest disarm               withdraw them
+//   acceltest legacy on|off        stage 5b probe: legacy IOAccelSurfaces for an armed WindowServer
 //   acceltest wsarm | withdraw     stage 5a: arm the display for WindowServer / withdraw it (needs vgpuaccel=3 or 4)
 //   acceltest T...       for each user-client type T: IOServiceOpen, print the class the family made, close;
 //                        on an IOAccelDevice2 also call get_config (sel 0) and get_name (sel 1) -- nothing else
@@ -90,6 +91,16 @@ int main(int argc, char **argv) {
         CFRelease(mp);
     }
 
+    if (argc > 2 && !strcmp(argv[1], "legacy")) {
+        // stage 5b probe: legacy IOAccelSurfaces for an armed WindowServer, on or off
+        CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+                                                             &kCFTypeDictionaryValueCallBacks);
+        CFDictionarySetValue(d, CFSTR("VirtioGPULegacySurfaces"), !strcmp(argv[2], "on") ? kCFBooleanTrue : kCFBooleanFalse);
+        kern_return_t kr = IORegistryEntrySetCFProperties(svc, d);
+        CFRelease(d);
+        say("legacy %s -> 0x%x\n", argv[2], kr);
+        return kr == KERN_SUCCESS ? 0 : 1;
+    }
     if (argc > 1 && (!strcmp(argv[1], "wsarm") || !strcmp(argv[1], "withdraw"))) {
         // stage 5a: arm the display for WindowServer / withdraw it (AGDC, pipe capabilities, MetalPluginName)
         CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,

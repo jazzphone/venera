@@ -637,3 +637,63 @@ core in one reboot. `tools/build.sh` no longer deletes all of `build/` (it took 
 Recommendation for 5b: start with (2) because it decides the whole present path, and it's kernel-side and cheap to
 probe at run time (`wsarm` + WindowServer restart, no reboot), then (1), which unblocks Core Animation. Keep lenient
 mode on in WindowServer while bringing up, and keep the guard.
+
+## Stage 5b progress (2026-11-15): Core Animation's pipelines build in WindowServer; it still aborts on a lost transient surface
+
+With `vgpuaccel=4` (and `-vgpulegacy`), the armed WindowServer now builds Core Animation's real pipelines on our
+device. That includes `fixed_vert_*+fixed_frag_lpf_cpf` (60 named function constants, framebuffer fetch, ~690 KB of
+SPIR-V each), CoreDisplay's GPUPass and the MPS kernels of the desktop window effects. The first WindowServer of each
+boot still aborts ~20 s in, on `Assertion failed: (found != slist->end ()), function push_surface, file
+ogl-context.cpp, line 1186`, which Core Animation logs as "context(2) transient surface … not found". The second
+WindowServer stays up on the Metal compositor. Nothing reaches the display pipe yet. VM 108 is back on `vgpuaccel=2`.
+
+### Built (plugin; all of it checked by mtlrender / mtlcompute / mtlsurface in the guest)
+
+- **Framebuffer fetch by copies** (`VGMTLRender.m`, NV's `nvmtl_fetch_copy.h` vendored). A fragment module that reads
+  `[[color(n)]]` (set 3, binding 192+n) is rewritten to texel-fetch a sampled image at FragCoord. Before such a draw the
+  encoder ends rendering, copies each read color attachment into a scratch image (one per attachment per encoder),
+  resumes with load, and binds the copies at set 3 (set 2 is an empty layout). Attachments always store, so a pass
+  can be split. New mtlrender case: two fetch draws in one pass (swap, then halve) give the expected pixel.
+- **Translation cache**: (module text, stage, constants, threadgroup lengths) -> SPIR-V, so CA's ~4 s translations
+  happen once per variant.
+- **Unbound slots** read placeholders (a zeroed 64 KB buffer, a 1x1 texture, a linear clamp sampler) instead of
+  failing the command buffer: CA's specialized shaders keep declarations their constants folded away.
+- `commitAndWaitUntilSubmitted` (CA commits this way; lenient mode had swallowed it, so those frames were never
+  submitted), `userDictionary`, `globalTraceObjectID`, `newBufferWithBytesNoCopy:...deallocator:` and the private
+  `-[MTLBuffer initStandinWithDevice:bytesNoCopy:length:deallocator:]` (copied into the buffer at each bind),
+  blit texture<->buffer and texture<->texture copies, `A8Unorm` (R8 with an alpha swizzle), resources made by a heap
+  report it (`heap`, `heapOffset`, `makeAliasable`).
+
+Kernel (VirtioGPUAccel 0.5.3): `VGDisplayPipe` logs the family entry points (`newDisplayPipeTransaction`,
+`submitTransaction`, `beginTransaction`, VBL / transaction interrupt enables, `framebuffer_did_power_on`, wsaa defer)
+and the pipe's gate bytes (NV's +0x298 active, +0x282 defer). Legacy `IOAccelSurface` user clients (type 0) are
+refused to an armed WindowServer unless `-vgpulegacy` or `acceltest legacy on`.
+
+### What the probes showed
+
+- **Display-pipe transactions: none.** WindowServer opens the pipe's user client, but the family never calls any
+  pipe transaction entry point, never enables the pipe's VBL interrupt, and the active byte stays 0, whether or not
+  legacy surfaces are allowed. CoreDisplay logs `isAcc=YES` and presents through its legacy display-surface path:
+  `CGXAccessDisplayDeviceSurface` composites into the display IOSurface, then `CGXReleaseDisplayDeviceSurface` copies to
+  the framebuffer on the CPU (`vRotate`), and `copy_forward_region` fails 0xe00002bc against our stub `VGSurface`.
+  With legacy surfaces refused, WindowServer aborts sooner. Open question: what makes CoreDisplay pick IOPresentment
+  transactions over the legacy path on 26 (NV's notes say 10.13/10.14 decided by the framebuffer's class name).
+- **The first armed WindowServer** always runs the same sequence: CA's first textured quad, ~6 s with no GPU work
+  ("timed out fence (pid<<32 | n)", "synchronize timed out"), MPS's wallpaper-average compute, then the transient
+  surface assertion. Neither the heap fix nor the texture copies changed it, so the likely root is a wait that never
+  completes: something CA synchronizes on (an `MTLSharedEvent`, a fence or a scheduled handler on our command buffers)
+  that the plugin doesn't signal. The plugin has no `MTLSharedEvent`/`MTLEvent` code at all; `newSharedEvent` is left to
+  `MTLIOAccelDevice`, and our command buffers don't implement `encodeSignalEvent:` / `encodeWaitForEvent:` (lenient mode
+  would log them if they were sent; none were logged, so CA may wait through another mechanism).
+- Lenient mode also lists `-[VGMTLTexture setResponsibleProcess:/protectionOptions]`,
+  `-[VGMTLCommandBuffer protectionOptions]`, and `-[VGMTLCommandQueue setCompletionQueue:/setSubmissionQueue:/setGPUPriority:]`.
+- WindowServer crash reports are throttled after the first few. ReportCrash's own log keeps the assertion text:
+  `log show --predicate 'process == "ReportCrash" AND eventMessage CONTAINS "ASI found [lib"'`.
+
+### Next
+
+1. Find the wait. Read `CA::OGL::MetalContext` (fence and synchronize code) with codepeek, as for CoreDisplay. Look for
+   what it creates on the device (`newSharedEvent`, `newFence`) and what it sends our command buffers. Then implement
+   that: shared events signaled at completion, `encodeSignalEvent:value:`, `addScheduledHandler:` timing.
+2. Then the present path: why CoreDisplay doesn't use IOPresentment transactions, or make the legacy path work
+   (`VGSurface` shape/copy-forward backed by the framebuffer RAM).

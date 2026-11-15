@@ -18,7 +18,7 @@ install)
   sudo -u _windowserver test -r /Library/GPUBundles/VirtioGPUMetal.bundle/Contents/MacOS/VirtioGPUMetal && echo "readable by _windowserver"
   ls -la /Library/GPUBundles /Library/GPUBundles/VirtioGPUMetal.bundle/Contents/*
   ;;
-arm | disarm | wsarm | withdraw)
+arm | disarm | wsarm | withdraw | legacy)
   $T/acceltest "$@"
   ;;
 ws) # stage 5a: WindowServer's state: its pid, the accelerator's arm state, the plugin's and CoreDisplay's last lines

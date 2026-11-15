@@ -20,10 +20,16 @@ enum {
     NSUInteger _length;
     MTLResourceOptions _options;
     id<MTLDevice> _dev;
+    // newBufferWithBytesNoCopy: the caller's memory; copied into _b each time the buffer is bound (Venus can't map
+    // guest memory under a VkBuffer), so CPU writes made before encoding reach the GPU. GPU writes don't come back.
+    void *_host;
+    void (^_deallocator)(void *pointer, NSUInteger length);
 }
 @property(readonly) id<MTLDevice> device;
 @property(copy, atomic) NSString *label;
 @end
+id<MTLBuffer> vg_new_buffer_nocopy(id<MTLDevice> device, void *pointer, NSUInteger length, MTLResourceOptions options,
+                                   void (^deallocator)(void *, NSUInteger));
 
 @interface VGMTLTexture : NSObject <MTLTexture> {
 @public
@@ -135,10 +141,16 @@ VkDescriptorSet vg_write_set(VGMTLCommandBuffer *cmd, VkDescriptorSetLayout dsl,
 
 VkBuffer vg_vkbuffer(id<MTLBuffer> b);
 id<MTLTexture> vg_new_texture(id<MTLDevice> device, MTLTextureDescriptor *d);
+NSUInteger vg_bytes_per_pixel(MTLPixelFormat f);   // 0 for a format we don't have
 // VGMTLHeap.m
 id<MTLHeap> vg_new_heap(id<MTLDevice> device, MTLHeapDescriptor *d);
 MTLSizeAndAlign vg_heap_texture_size(MTLTextureDescriptor *d);
 MTLSizeAndAlign vg_heap_buffer_size(NSUInteger length);
+// What a resource made by a heap answers (associated objects; nil / 0 / NO for the device's own resources).
+id<MTLHeap> vg_heap_of(id resource);
+NSUInteger vg_heap_offset_of(id resource);
+BOOL vg_heap_aliasable(id resource);
+void vg_heap_make_aliasable(id resource);
 id<MTLSamplerState> vg_new_sampler(id<MTLDevice> device, MTLSamplerDescriptor *d);
 id<MTLDepthStencilState> vg_new_depth_stencil(id<MTLDevice> device, MTLDepthStencilDescriptor *d);
 id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRenderPipelineDescriptor *d, NSError **error);

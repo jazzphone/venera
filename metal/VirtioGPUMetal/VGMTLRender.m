@@ -9,7 +9,53 @@
 //   picture in Vulkan (NV does the same), and keeps Metal's winding meaning.
 // - Topology, cull mode, winding, depth test/write/compare, primitive restart, viewport, scissor and blend color are
 //   dynamic state; one VkPipeline per topology class (points, lines, triangles), made at the first draw.
+// - Framebuffer fetch ([[color(n)]] reads, Core Animation's shaders in WindowServer): the translator reads color n as an
+//   input attachment at set 3, binding 192+n. NV's rewrite (vendor/nullmoth/plugin/nvmtl_fetch_copy.h) turns each such
+//   read into a texel fetch of a sampled image at the fragment's position; before a draw with such a pipeline the
+//   encoder ends rendering, copies the color attachments to scratch images, resumes rendering (load) and binds the
+//   copies at set 3 (NV's "fetch copy"). A [[color(n)]] the pass has no attachment for reads a zeroed scratch image.
 #import "objects.h"
+#include "nvmtl_fetch_copy.h"
+
+// Which [[color(n)]] inputs a fragment module reads: OpDecorate Binding 192+n.
+static uint32_t vg_spirv_fetch_mask(NSData *spv) {
+    const uint32_t *w = spv.bytes;
+    size_t nw = spv.length / 4;
+    uint32_t m = 0;
+    if (nw < 5 || w[0] != 0x07230203u) {
+        return 0;
+    }
+    for (size_t i = 5; i < nw;) {
+        uint32_t wc = w[i] >> 16, op = w[i] & 0xffffu;
+        if (!wc || i + wc > nw) {
+            break;
+        }
+        if (op == 71 && wc == 4 && w[i + 2] == 33 && w[i + 3] >= 192 && w[i + 3] < 200) {
+            m |= 1u << (w[i + 3] - 192);
+        }
+        i += wc;
+    }
+    return m;
+}
+
+// Set 3 for fetch pipelines: sampled images at 192..199 (set 2 is an empty layout so the sets stay numbered).
+static VkDescriptorSetLayout gFetchLayout, gEmptyLayout;
+static BOOL vg_fetch_layouts(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        VkDescriptorSetLayoutBinding b[8];
+        for (uint32_t i = 0; i < 8; i++) {
+            b[i] = (VkDescriptorSetLayoutBinding){192 + i, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
+        }
+        VkDescriptorSetLayoutCreateInfo fi = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 8, b};
+        VkDescriptorSetLayoutCreateInfo ei = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 0, NULL};
+        if (gVk.vkCreateDescriptorSetLayout(gVk.device, &fi, NULL, &gFetchLayout) != VK_SUCCESS ||
+            gVk.vkCreateDescriptorSetLayout(gVk.device, &ei, NULL, &gEmptyLayout) != VK_SUCCESS) {
+            gFetchLayout = gEmptyLayout = VK_NULL_HANDLE;
+        }
+    });
+    return gFetchLayout && gEmptyLayout;
+}
 
 // ---- vertex formats and blending ---------------------------------------------------------------------------------
 
@@ -81,7 +127,8 @@ enum { kVGMaxColor = 8 };
 @public
     NSString *_name;
     VkShaderModule _vs, _fs;
-    VkDescriptorSetLayout _dsl[2];   // 0 vertex, 1 fragment
+    VkDescriptorSetLayout _dsl[4];   // 0 vertex, 1 fragment, 2 empty, 3 framebuffer fetch (only with _fetchMask)
+    uint32_t _fetchMask;             // [[color(n)]] the fragment stage reads
     VkPipelineLayout _layout;
     vg_binding _vb[64], _fb[64];
     int _nvb, _nfb;
@@ -203,6 +250,19 @@ id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRende
         uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         NSData *vs = vg_translate([vf vgLL], "vertex", [vf vgFC], NULL, 0, &why);
         NSData *fs = ff && vs ? vg_translate([ff vgLL], "fragment", [ff vgFC], NULL, 0, &why) : nil;
+        uint32_t fetch = fs ? vg_spirv_fetch_mask(fs) : 0;
+        if (fetch) {
+            size_t nw = 0;
+            uint32_t *rw = nvmtl_spirv_fetch_to_texture(fs.bytes, fs.length / 4, &nw);
+            if (rw && vg_fetch_layouts()) {
+                fs = [NSData dataWithBytesNoCopy:rw length:nw * 4 freeWhenDone:YES];
+                p->_fetchMask = fetch;
+            } else {
+                free(rw);
+                why = @"framebuffer fetch: the fragment module couldn't be rewritten for copies";
+                fs = nil;
+            }
+        }
         if (fs) {
             fs = vg_spirv_retarget_set(fs, 1);
         }
@@ -219,13 +279,16 @@ id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRende
             p->_fs = fs ? vg_module(fs) : VK_NULL_HANDLE;
             p->_dsl[0] = vg_set_layout(p->_vb, p->_nvb, VK_SHADER_STAGE_VERTEX_BIT);
             p->_dsl[1] = vg_set_layout(p->_fb, p->_nfb, VK_SHADER_STAGE_FRAGMENT_BIT);
-            VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 2, p->_dsl, 0, NULL};
+            p->_dsl[2] = gEmptyLayout;
+            p->_dsl[3] = gFetchLayout;
+            VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, p->_fetchMask ? 4 : 2,
+                                               p->_dsl, 0, NULL};
             vg_trace_sync("shader modules + set layouts");
             gVk.vkCreatePipelineLayout(gVk.device, &plci, NULL, &p->_layout);
             vg_trace_sync("pipeline layout");
-            vglog("render pipeline %s: translated in %.1f ms (%lu + %lu bytes of SPIR-V, %d + %d bindings)",
+            vglog("render pipeline %s: translated in %.1f ms (%lu + %lu bytes of SPIR-V, %d + %d bindings%s)",
                   p->_name.UTF8String, (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e6, (unsigned long)vs.length,
-                  (unsigned long)fs.length, p->_nvb, p->_nfb);
+                  (unsigned long)fs.length, p->_nvb, p->_nfb, p->_fetchMask ? ", framebuffer fetch by copies" : "");
         }
     }
     if (p) {
@@ -319,6 +382,11 @@ id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRende
     VGMTLDepthStencilState *_ds;
     float _blend[4];
     BOOL _open;
+    // the pass, kept so rendering can be ended and resumed around a framebuffer-fetch copy
+    VGMTLTexture *_colorTex[kVGMaxColor], *_depthTex;
+    VkRenderingAttachmentInfo _colorInfo[kVGMaxColor], _depthInfo;
+    uint32_t _ncolor;
+    VGMTLTexture *_fetchCopy[kVGMaxColor];   // scratch copies, made at the first fetch draw of the encoder
 }
 @end
 
@@ -435,15 +503,21 @@ static void vg_set_sampler(VGMTLCommandBuffer *cmd, vg_stage_bindings *t, id<MTL
         [_owner fail:why];
         return NO;
     }
-    VkDescriptorSet sets[2];
+    VkDescriptorSet sets[2], fetchSet = VK_NULL_HANDLE;
     sets[0] = vg_write_set(_owner, _pso->_dsl[0], _pso->_vb, _pso->_nvb, &_vt, _pso->_name);
     sets[1] = sets[0] ? vg_write_set(_owner, _pso->_dsl[1], _pso->_fb, _pso->_nfb, &_ft, _pso->_name) : VK_NULL_HANDLE;
     if (!sets[1]) {
         return NO;
     }
+    if (_pso->_fetchMask && !(fetchSet = [self fetchCopy:_pso->_fetchMask])) {
+        return NO;
+    }
     VkCommandBuffer cb = _owner->_cb;
     gVk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     gVk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, _pso->_layout, 0, 2, sets, 0, NULL);
+    if (fetchSet) {
+        gVk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, _pso->_layout, 3, 1, &fetchSet, 0, NULL);
+    }
     for (uint32_t i = 0; i < _pso->_nvbind; i++) {
         uint32_t b = _pso->_vbind[i].binding;
         if (!_vt.buf[b]) {
@@ -469,6 +543,76 @@ static void vg_set_sampler(VGMTLCommandBuffer *cmd, vg_stage_bindings *t, id<MTL
     gVk.vkCmdSetStencilTestEnable(cb, VK_FALSE);
     gVk.vkCmdSetBlendConstants(cb, _blend);
     return YES;
+}
+
+// Framebuffer fetch by copies: end the pass, copy each read color attachment to its scratch image, resume the pass
+// (load), and return set 3 naming the copies. The command buffer's full barrier orders draw -> copy -> sample.
+- (VkDescriptorSet)fetchCopy:(uint32_t)mask {
+    VkCommandBuffer cb = _owner->_cb;
+    gVk.vkCmdEndRendering(cb);
+    [_owner barrier];
+    VkDescriptorImageInfo ii[8];
+    VkWriteDescriptorSet wr[8];
+    uint32_t nw = 0;
+    for (uint32_t i = 0; i < 8; i++) {
+        if (!(mask & (1u << i))) {
+            continue;
+        }
+        VGMTLTexture *src = i < kVGMaxColor ? _colorTex[i] : nil;
+        VGMTLTexture *dst = _fetchCopy[i];
+        if (!dst) {
+            MTLTextureDescriptor *td = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:src ? src->_pixelFormat : MTLPixelFormatBGRA8Unorm
+                                             width:_area.extent.width
+                                            height:_area.extent.height
+                                         mipmapped:NO];
+            td.usage = MTLTextureUsageShaderRead;
+            td.storageMode = MTLStorageModePrivate;
+            dst = (VGMTLTexture *)vg_new_texture(_owner.device, td);
+            if (!dst) {
+                [_owner fail:@"framebuffer fetch: no scratch image"];
+                return VK_NULL_HANDLE;
+            }
+            _fetchCopy[i] = dst;
+            [_owner->_keep addObject:dst];
+        }
+        if (src) {
+            VkImageCopy r = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
+                             {MIN((uint32_t)src->_width, _area.extent.width), MIN((uint32_t)src->_height, _area.extent.height), 1}};
+            gVk.vkCmdCopyImage(cb, src->_image, VK_IMAGE_LAYOUT_GENERAL, dst->_image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+        }
+        ii[nw] = (VkDescriptorImageInfo){VK_NULL_HANDLE, dst->_view, VK_IMAGE_LAYOUT_GENERAL};
+        wr[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, VK_NULL_HANDLE, 192 + i, 0, 1,
+                                        VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &ii[nw], NULL, NULL};
+        nw++;
+    }
+    [_owner barrier];
+    // resume: everything loads what the pass has drawn so far
+    VkRenderingAttachmentInfo color[kVGMaxColor];
+    for (uint32_t i = 0; i < _ncolor; i++) {
+        color[i] = _colorInfo[i];
+        if (color[i].imageView) {
+            color[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        }
+    }
+    VkRenderingAttachmentInfo depth = _depthInfo;
+    depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, _area, 1, 0, _ncolor, color, _depthTex ? &depth : NULL, NULL};
+    gVk.vkCmdBeginRendering(cb, &ri);
+    VkDescriptorSet set = [_owner allocSet:gFetchLayout];
+    if (!set) {
+        [_owner fail:@"framebuffer fetch: no descriptor set"];
+        return VK_NULL_HANDLE;
+    }
+    for (uint32_t k = 0; k < nw; k++) {
+        wr[k].dstSet = set;
+    }
+    gVk.vkUpdateDescriptorSets(gVk.device, nw, wr, 0, NULL);
+    static int logged = 0;
+    if (logged++ < 3) {
+        vglog("render: framebuffer fetch by copies (mask 0x%x, %ux%u)", mask, _area.extent.width, _area.extent.height);
+    }
+    return set;
 }
 
 - (void)drawPrimitives:(MTLPrimitiveType)type vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count
@@ -528,8 +672,10 @@ static VkAttachmentLoadOp vg_load(MTLLoadAction a) {
            : a == MTLLoadActionLoad ? VK_ATTACHMENT_LOAD_OP_LOAD
                                     : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
 }
+// Always store: a pass may be ended and resumed for a framebuffer-fetch copy, and "don't care" allows storing anyway.
 static VkAttachmentStoreOp vg_store(MTLStoreAction a) {
-    return a == MTLStoreActionDontCare ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
+    (void)a;
+    return VK_ATTACHMENT_STORE_OP_STORE;
 }
 
 - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
@@ -589,6 +735,13 @@ static VkAttachmentStoreOp vg_store(MTLStoreAction a) {
     e->_viewport = (VkViewport){0, (float)h, (float)w, -(float)h, 0, 1};
     e->_front = VK_FRONT_FACE_CLOCKWISE;   // Metal's default winding
     e->_cull = VK_CULL_MODE_NONE;
+    for (uint32_t i = 0; i < ncolor; i++) {
+        e->_colorInfo[i] = color[i];
+        e->_colorTex[i] = (VGMTLTexture *)d.colorAttachments[i].texture;
+    }
+    e->_ncolor = ncolor;
+    e->_depthInfo = depth;
+    e->_depthTex = dt;
     VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, e->_area, 1, 0, ncolor, color, dt ? &depth : NULL, NULL};
     gVk.vkCmdBeginRendering(_cb, &ri);
     e->_open = YES;

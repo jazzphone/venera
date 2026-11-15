@@ -19,3 +19,6 @@ it in Contents/Resources with its license (`libnvmtl_translate.LICENSE`) and loa
   RGhA into an 8-bit or 30-bit scanout). Copied unchanged.
 - `agdc/AppleGraphicsDeviceControl_re.h` (stage 5a): NV's `kexts/NVRMAGDC/AppleGraphicsDeviceControl_re.h`, the
   reconstructed AppleGraphicsDeviceControl base class (0x110 bytes, one pure `vendor_doDeviceAttribute`). Copied unchanged.
+- `plugin/nvmtl_fetch_copy.h` (stage 5b): NV's `plugin/nvmtl_fetch_copy.h`, the SPIR-V rewrite that turns `[[color(n)]]`
+  subpass-input reads into texel fetches of a sampled image at the fragment's position (framebuffer fetch by copies).
+  Copied unchanged.

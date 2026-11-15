@@ -9,14 +9,37 @@
 // KernelDispatch::plan (full groups, then the partial tail of each dimension with its own local size).
 #import "objects.h"
 #import <mach/mach_time.h>
+#import <objc/runtime.h>
 
 // ---- MTLBuffer ---------------------------------------------------------------------------------------------------
 
 @implementation VGMTLBuffer
 @synthesize label = _label;
 - (id<MTLDevice>)device { return _dev; }
-- (void)dealloc { vg_buffer_destroy(&_b); }
-- (void *)contents { return _b.map; }
+- (void)dealloc {
+    vg_buffer_destroy(&_b);
+    if (_deallocator) {
+        _deallocator(_host, _length);
+    }
+}
+- (void *)contents { return _host ? _host : _b.map; }
+// Metal's own no-copy path makes [[buffer class] alloc] and sends this (seen from WindowServer, 5b).
+- (instancetype)initStandinWithDevice:(id<MTLDevice>)device bytesNoCopy:(void *)pointer length:(NSUInteger)length
+                          deallocator:(void (^)(void *, NSUInteger))deallocator {
+    if ((self = [super init])) {
+        if (vg_vulkan_init() || vg_buffer_create(length, &_b)) {
+            return nil;
+        }
+        _length = length;
+        _dev = device;
+        _host = pointer;
+        _deallocator = deallocator;
+        if (pointer) {
+            memcpy(_b.map, pointer, length);
+        }
+    }
+    return self;
+}
 - (NSUInteger)length { return _length; }
 - (NSUInteger)allocatedSize { return (NSUInteger)_b.size; }
 - (MTLResourceOptions)resourceOptions { return _options; }
@@ -26,10 +49,10 @@
 - (void)didModifyRange:(NSRange)range { }   // coherent memory
 - (uint64_t)gpuAddress { return 0; }
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { return MTLPurgeableStateNonVolatile; }
-- (BOOL)isAliasable { return NO; }
-- (void)makeAliasable { }
-- (id<MTLHeap>)heap { return nil; }
-- (NSUInteger)heapOffset { return 0; }
+- (BOOL)isAliasable { return vg_heap_aliasable(self); }
+- (void)makeAliasable { vg_heap_make_aliasable(self); }
+- (id<MTLHeap>)heap { return vg_heap_of(self); }
+- (NSUInteger)heapOffset { return vg_heap_offset_of(self); }
 @end
 
 id<MTLBuffer> vg_new_buffer(id<MTLDevice> device, NSUInteger length, MTLResourceOptions options, const void *bytes) {
@@ -45,6 +68,16 @@ id<MTLBuffer> vg_new_buffer(id<MTLDevice> device, NSUInteger length, MTLResource
     b->_dev = device;
     if (bytes) {
         memcpy(b->_b.map, bytes, length);
+    }
+    return b;
+}
+
+id<MTLBuffer> vg_new_buffer_nocopy(id<MTLDevice> device, void *pointer, NSUInteger length, MTLResourceOptions options,
+                                   void (^deallocator)(void *, NSUInteger)) {
+    VGMTLBuffer *b = (VGMTLBuffer *)vg_new_buffer(device, length, options, pointer);
+    if (b) {
+        b->_host = pointer;
+        b->_deallocator = deallocator;
     }
     return b;
 }
@@ -108,6 +141,9 @@ int vg_spirv_bindings(NSData *spv, uint32_t wantSet, vg_binding *out, int max, N
         uint32_t id = vars[v].id;
         if (!hasBind[id]) {
             continue;
+        }
+        if (set[id] == 3 && bind[id] >= 192 && bind[id] < 200) {
+            continue;   // [[color(n)]] framebuffer fetch: its own set, made by the render code (VGMTLRender.m)
         }
         if (set[id] != wantSet || bind[id] >= 640) {   // the bindless heap (set 2) or the buffer address table (640+)
             *error = [NSString stringWithFormat:@"the module uses set %u binding %u (bindless heap / address table): "
@@ -179,6 +215,53 @@ NSData *vg_spirv_retarget_set(NSData *spv, uint32_t newSet) {
 
 // ---- descriptors from a stage's argument tables ------------------------------------------------------------------
 
+// What an unbound slot reads (5b): Metal tolerates a declared resource the draw never touches (Core Animation's
+// specialized shaders keep declarations whose uses folded away); Vulkan needs something valid in the descriptor.
+// A zeroed 64 KB buffer, a 1x1 transparent 2D texture, a linear clamp sampler.
+static VkBuffer vg_dummy_buffer(void) {
+    static vg_buffer b;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        if (!vg_buffer_create(65536, &b)) {
+            memset(b.map, 0, 65536);
+        }
+    });
+    return b.buffer;
+}
+static VGMTLTexture *vg_dummy_texture(id<MTLDevice> dev) {
+    static VGMTLTexture *t;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                     width:1
+                                                                                    height:1
+                                                                                 mipmapped:NO];
+        d.usage = MTLTextureUsageShaderRead;
+        t = (VGMTLTexture *)vg_new_texture(dev, d);
+        uint32_t zero = 0;
+        [t replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&zero bytesPerRow:4];
+    });
+    return t;
+}
+static VkSampler vg_dummy_sampler(void) {
+    static VkSampler s;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        VkSamplerCreateInfo ci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        ci.magFilter = ci.minFilter = VK_FILTER_LINEAR;
+        ci.addressModeU = ci.addressModeV = ci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        ci.maxLod = 1000.0f;
+        gVk.vkCreateSampler(gVk.device, &ci, NULL, &s);
+    });
+    return s;
+}
+static void vg_unbound(NSString *who, const char *what, int slot) {
+    static int logged = 0;
+    if (logged++ < 10) {
+        vglog("%s: nothing bound at %s(%d): a placeholder instead", who.UTF8String, what, slot);
+    }
+}
+
 VkDescriptorSet vg_write_set(VGMTLCommandBuffer *cmd, VkDescriptorSetLayout dsl, const vg_binding *bindings, int n,
                              const vg_stage_bindings *t, NSString *who) {
     VkDescriptorSet set = [cmd allocSet:dsl];
@@ -194,15 +277,16 @@ VkDescriptorSet vg_write_set(VGMTLCommandBuffer *cmd, VkDescriptorSetLayout dsl,
         VkDescriptorType type = bindings[i].type;
         writes[i] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, b, 0, 1, type, NULL, NULL, NULL};
         if (type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
-            if (b >= kVGMaxBufferSlots || !t->buf[b]) {
-                [cmd fail:[NSString stringWithFormat:@"%@: nothing bound at buffer(%u)", who, b]];
-                return VK_NULL_HANDLE;
-            }
             VkDeviceSize range = VK_WHOLE_SIZE;
             if (type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
                 range = MIN((VkDeviceSize)gVk.props.limits.maxUniformBufferRange, 65536);
             }
-            binfo[i] = (VkDescriptorBufferInfo){t->buf[b], t->off[b], range};
+            if (b >= kVGMaxBufferSlots || !t->buf[b]) {
+                vg_unbound(who, "buffer", (int)b);
+                binfo[i] = (VkDescriptorBufferInfo){vg_dummy_buffer(), 0, VK_WHOLE_SIZE};
+            } else {
+                binfo[i] = (VkDescriptorBufferInfo){t->buf[b], t->off[b], range};
+            }
             writes[i].pBufferInfo = &binfo[i];
             continue;
         }
@@ -210,18 +294,24 @@ VkDescriptorSet vg_write_set(VGMTLCommandBuffer *cmd, VkDescriptorSetLayout dsl,
         if (type == VK_DESCRIPTOR_TYPE_SAMPLER) {
             slot = b - kVGSamplerBase;
             if (b < kVGSamplerBase || slot >= kVGMaxSamplerSlots || !t->smp[slot]) {
-                [cmd fail:[NSString stringWithFormat:@"%@: nothing bound at sampler(%d)", who, (int)b - kVGSamplerBase]];
-                return VK_NULL_HANDLE;
+                vg_unbound(who, "sampler", (int)b - kVGSamplerBase);
+                iinfo[i] = (VkDescriptorImageInfo){vg_dummy_sampler(), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+            } else {
+                iinfo[i] = (VkDescriptorImageInfo){t->smp[slot]->_sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
             }
-            iinfo[i] = (VkDescriptorImageInfo){t->smp[slot]->_sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
         } else {
             uint32_t base = type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ? kVGStorageTextureBase : kVGTextureBase;
             slot = b - base;
-            if (b < base || slot >= kVGMaxTextureSlots || !t->tex[slot]) {
+            VGMTLTexture *tex = (b >= base && slot < kVGMaxTextureSlots) ? t->tex[slot] : nil;
+            if (!tex && type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) {
+                vg_unbound(who, "texture", (int)b - (int)base);
+                tex = vg_dummy_texture(cmd.device);
+            }
+            if (!tex) {
                 [cmd fail:[NSString stringWithFormat:@"%@: nothing bound at texture(%d)", who, (int)b - (int)base]];
                 return VK_NULL_HANDLE;
             }
-            iinfo[i] = (VkDescriptorImageInfo){VK_NULL_HANDLE, t->tex[slot]->_view, VK_IMAGE_LAYOUT_GENERAL};
+            iinfo[i] = (VkDescriptorImageInfo){VK_NULL_HANDLE, tex->_view, VK_IMAGE_LAYOUT_GENERAL};
             if (type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
                 [cmd fail:[NSString stringWithFormat:@"%@: combined image-samplers aren't supported yet", who]];
                 return VK_NULL_HANDLE;
@@ -452,13 +542,21 @@ id<MTLCommandQueue> vg_new_queue(id<MTLDevice> device) {
     return self;
 }
 - (void)endEncoding { }
+- (uint64_t)globalTraceObjectID { return 0; }
 - (void)insertDebugSignpost:(NSString *)s { }
 - (void)pushDebugGroup:(NSString *)s { }
 - (void)popDebugGroup { }
 @end
 
 VkBuffer vg_vkbuffer(id<MTLBuffer> b) {
-    return [(NSObject *)b isKindOfClass:[VGMTLBuffer class]] ? ((VGMTLBuffer *)b)->_b.buffer : VK_NULL_HANDLE;
+    if (![(NSObject *)b isKindOfClass:[VGMTLBuffer class]]) {
+        return VK_NULL_HANDLE;
+    }
+    VGMTLBuffer *vb = (VGMTLBuffer *)b;
+    if (vb->_host) {
+        memcpy(vb->_b.map, vb->_host, vb->_length);   // a no-copy buffer: what the CPU wrote, at bind time
+    }
+    return vb->_b.buffer;
 }
 
 @interface VGComputeEncoder : VGEncoder <MTLComputeCommandEncoder> {
@@ -652,6 +750,105 @@ VkBuffer vg_vkbuffer(id<MTLBuffer> b) {
     }
 }
 - (void)synchronizeResource:(id<MTLResource>)r { }   // coherent memory
+- (void)synchronizeTexture:(id<MTLTexture>)t slice:(NSUInteger)s level:(NSUInteger)l { }
+- (void)generateMipmapsForTexture:(id<MTLTexture>)t {
+    static int logged = 0;
+    if (logged++ < 3) {
+        vglog("blit: generateMipmapsForTexture not supported yet (ignored)");
+    }
+}
+- (uint64_t)globalTraceObjectID { return 0; }
+
+// ---- texture copies (5b: Core Animation and MPS in WindowServer) ----
+static VGMTLTexture *vg_blit_texture(VGMTLCommandBuffer *cmd, id<MTLTexture> t, BOOL writes) {
+    if (![(NSObject *)t isKindOfClass:[VGMTLTexture class]]) {
+        return nil;
+    }
+    VGMTLTexture *v = (VGMTLTexture *)t;
+    [cmd->_keep addObject:v];
+    if (writes) {
+        vg_cmd_wrote(cmd, v);
+    } else {
+        vg_surface_pull(v);
+    }
+    return v;
+}
+static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSUInteger level) {
+    return (VkImageSubresourceLayers){t->_aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT, (uint32_t)level, (uint32_t)slice, 1};
+}
+- (void)copyFromTexture:(id<MTLTexture>)src sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl
+           sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)size toBuffer:(id<MTLBuffer>)dst
+      destinationOffset:(NSUInteger)doff destinationBytesPerRow:(NSUInteger)bpr
+    destinationBytesPerImage:(NSUInteger)bpi options:(MTLBlitOption)opt {
+    VGMTLTexture *s = vg_blit_texture(_owner, src, NO);
+    VkBuffer d = vg_vkbuffer(dst);
+    NSUInteger bpp = s ? vg_bytes_per_pixel(s->_pixelFormat) : 0;
+    if (!s || !d || !bpp || ![_owner begin]) {
+        [_owner fail:@"copyFromTexture:toBuffer: not our objects or format"];
+        return;
+    }
+    [_owner->_keep addObject:dst];
+    VkBufferImageCopy r = {doff, (uint32_t)(bpr / bpp), bpr ? (uint32_t)(bpi / bpr) : 0, vg_layers(s, ss, sl),
+                           {(int32_t)so.x, (int32_t)so.y, (int32_t)so.z},
+                           {(uint32_t)size.width, (uint32_t)size.height, (uint32_t)MAX(size.depth, 1u)}};
+    gVk.vkCmdCopyImageToBuffer(_owner->_cb, s->_image, VK_IMAGE_LAYOUT_GENERAL, d, 1, &r);
+    [_owner barrier];
+}
+- (void)copyFromTexture:(id<MTLTexture>)src sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl
+           sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)size toBuffer:(id<MTLBuffer>)dst
+      destinationOffset:(NSUInteger)doff destinationBytesPerRow:(NSUInteger)bpr
+    destinationBytesPerImage:(NSUInteger)bpi {
+    [self copyFromTexture:src sourceSlice:ss sourceLevel:sl sourceOrigin:so sourceSize:size toBuffer:dst
+        destinationOffset:doff destinationBytesPerRow:bpr destinationBytesPerImage:bpi options:MTLBlitOptionNone];
+}
+- (void)copyFromBuffer:(id<MTLBuffer>)src sourceOffset:(NSUInteger)soff sourceBytesPerRow:(NSUInteger)bpr
+    sourceBytesPerImage:(NSUInteger)bpi sourceSize:(MTLSize)size toTexture:(id<MTLTexture>)dst
+       destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dorg
+                options:(MTLBlitOption)opt {
+    VkBuffer s = vg_vkbuffer(src);
+    VGMTLTexture *d = vg_blit_texture(_owner, dst, YES);
+    NSUInteger bpp = d ? vg_bytes_per_pixel(d->_pixelFormat) : 0;
+    if (!s || !d || !bpp || ![_owner begin]) {
+        [_owner fail:@"copyFromBuffer:toTexture: not our objects or format"];
+        return;
+    }
+    [_owner->_keep addObject:src];
+    VkBufferImageCopy r = {soff, (uint32_t)(bpr / bpp), bpr ? (uint32_t)(bpi / bpr) : 0, vg_layers(d, ds, dl),
+                           {(int32_t)dorg.x, (int32_t)dorg.y, (int32_t)dorg.z},
+                           {(uint32_t)size.width, (uint32_t)size.height, (uint32_t)MAX(size.depth, 1u)}};
+    gVk.vkCmdCopyBufferToImage(_owner->_cb, s, d->_image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    [_owner barrier];
+}
+- (void)copyFromBuffer:(id<MTLBuffer>)src sourceOffset:(NSUInteger)soff sourceBytesPerRow:(NSUInteger)bpr
+    sourceBytesPerImage:(NSUInteger)bpi sourceSize:(MTLSize)size toTexture:(id<MTLTexture>)dst
+       destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dorg {
+    [self copyFromBuffer:src sourceOffset:soff sourceBytesPerRow:bpr sourceBytesPerImage:bpi sourceSize:size
+               toTexture:dst destinationSlice:ds destinationLevel:dl destinationOrigin:dorg options:MTLBlitOptionNone];
+}
+- (void)copyFromTexture:(id<MTLTexture>)src sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl
+           sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)size toTexture:(id<MTLTexture>)dst
+       destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dorg {
+    VGMTLTexture *s = vg_blit_texture(_owner, src, NO), *d = vg_blit_texture(_owner, dst, YES);
+    if (!s || !d || ![_owner begin]) {
+        [_owner fail:@"copyFromTexture:toTexture: not our textures"];
+        return;
+    }
+    VkImageCopy r = {vg_layers(s, ss, sl), {(int32_t)so.x, (int32_t)so.y, (int32_t)so.z}, vg_layers(d, ds, dl),
+                     {(int32_t)dorg.x, (int32_t)dorg.y, (int32_t)dorg.z},
+                     {(uint32_t)size.width, (uint32_t)size.height, (uint32_t)MAX(size.depth, 1u)}};
+    gVk.vkCmdCopyImage(_owner->_cb, s->_image, VK_IMAGE_LAYOUT_GENERAL, d->_image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    [_owner barrier];
+}
+- (void)copyFromTexture:(id<MTLTexture>)src toTexture:(id<MTLTexture>)dst {
+    VGMTLTexture *s = (VGMTLTexture *)src;
+    if (![(NSObject *)src isKindOfClass:[VGMTLTexture class]]) {
+        [_owner fail:@"copyFromTexture:toTexture: not our textures"];
+        return;
+    }
+    [self copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+               sourceSize:MTLSizeMake(s->_width, s->_height, MAX(s->_depth, 1u)) toTexture:dst destinationSlice:0
+         destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+}
 @end
 
 @implementation VGMTLCommandBuffer
@@ -887,6 +1084,18 @@ VkBuffer vg_vkbuffer(id<MTLBuffer> b) {
 }
 
 - (void)waitUntilScheduled { }
+// Core Animation in WindowServer commits this way (5b: lenient mode swallowed it, and its frames were never submitted).
+- (void)commitAndWaitUntilSubmitted { [self commit]; }
+- (NSMutableDictionary *)userDictionary {
+    @synchronized(self) {
+        NSMutableDictionary *d = objc_getAssociatedObject(self, @selector(userDictionary));
+        if (!d) {
+            d = [NSMutableDictionary dictionary];
+            objc_setAssociatedObject(self, @selector(userDictionary), d, OBJC_ASSOCIATION_RETAIN);
+        }
+        return d;
+    }
+}
 - (void)waitUntilCompleted {
     if (_status >= MTLCommandBufferStatusCommitted) {
         dispatch_group_wait(_done, DISPATCH_TIME_FOREVER);

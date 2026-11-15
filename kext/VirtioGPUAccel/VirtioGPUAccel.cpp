@@ -338,6 +338,14 @@ static unsigned gIopLogs = 0;
         IOPLOG(fmt, ##__VA_ARGS__);                                                                                \
         return (rc);                                                                                               \
     } while (0)
+static unsigned gPipeLogs = 0;
+#define PIPELOG(fmt, ...)                                                                                          \
+    do {                                                                                                           \
+        if (gPipeLogs < 60) {                                                                                      \
+            gPipeLogs++;                                                                                           \
+            vlog(fmt, ##__VA_ARGS__);                                                                              \
+        }                                                                                                          \
+    } while (0)
 static IOService *displayFramebuffer();
 static const OSSymbol *gSymScanoutInfo, *gSymPresent, *gSymNewClient;   // made in start()
 static void iopPublishCounts();
@@ -356,6 +364,52 @@ public:
     }
     IOReturn performTransaction(IOAccelDisplayPipeTransaction2 *txn) APPLE_KEXT_OVERRIDE;
     bool isTransactionComplete(IOAccelDisplayPipeTransaction2 *) APPLE_KEXT_OVERRIDE { return true; }   // copied synchronously
+    // 5b probes: which of the family's pipe entry points WindowServer drives (first calls logged, then the base class).
+    void gates(const char *why) {
+        vlog("pipe %s: active(+0x298) %u wsaaDefer(+0x282) %u", why, *(const volatile uint8_t *)((const uint8_t *)this + 0x298),
+             *(const volatile uint8_t *)((const uint8_t *)this + 0x282));
+    }
+    OSObject *newDisplayPipeTransaction() APPLE_KEXT_OVERRIDE {
+        OSObject *t = IOAccelLegacyDisplayPipe::newDisplayPipeTransaction();
+        PIPELOG("pipe newDisplayPipeTransaction -> %p", t);
+        return t;
+    }
+    void submitTransaction(IOAccelDisplayPipeTransaction2 *t) APPLE_KEXT_OVERRIDE {
+        PIPELOG("pipe submitTransaction %p", t);
+        IOAccelLegacyDisplayPipe::submitTransaction(t);
+    }
+    void beginTransaction(IOAccelEvent *e) APPLE_KEXT_OVERRIDE {
+        PIPELOG("pipe beginTransaction");
+        IOAccelLegacyDisplayPipe::beginTransaction(e);
+    }
+    void enableVBLInterrupt() APPLE_KEXT_OVERRIDE {
+        PIPELOG("pipe enableVBLInterrupt");
+        IOAccelLegacyDisplayPipe::enableVBLInterrupt();
+    }
+    void disableVBLInterrupt() APPLE_KEXT_OVERRIDE {
+        PIPELOG("pipe disableVBLInterrupt");
+        IOAccelLegacyDisplayPipe::disableVBLInterrupt();
+    }
+    void enableTransactionInterrupt() APPLE_KEXT_OVERRIDE {
+        PIPELOG("pipe enableTransactionInterrupt");
+        IOAccelLegacyDisplayPipe::enableTransactionInterrupt();
+    }
+    void displayModeDidChange() APPLE_KEXT_OVERRIDE {
+        IOAccelLegacyDisplayPipe::displayModeDidChange();
+        gates("after displayModeDidChange");
+    }
+    void framebuffer_did_power_on() APPLE_KEXT_OVERRIDE {
+        PIPELOG("pipe framebuffer_did_power_on");
+        IOAccelLegacyDisplayPipe::framebuffer_did_power_on();
+    }
+    void wsaaEnterDefer(int a) APPLE_KEXT_OVERRIDE {
+        PIPELOG("pipe wsaaEnterDefer(%d)", a);
+        IOAccelLegacyDisplayPipe::wsaaEnterDefer(a);
+    }
+    void wsaaDidExitDefer(int a) APPLE_KEXT_OVERRIDE {
+        PIPELOG("pipe wsaaDidExitDefer(%d)", a);
+        IOAccelLegacyDisplayPipe::wsaaDidExitDefer(a);
+    }
     void free() APPLE_KEXT_OVERRIDE {
         dropSources();
         IOAccelLegacyDisplayPipe::free();
@@ -558,7 +612,8 @@ public:
     unsigned carrierNext_ = 0;
     int wsPids_[4] = {};                      // WindowServer pids that opened the Venus client since the last arm
     unsigned wsCount_ = 0;
-    volatile SInt32 request_ = 0;             // for armTick after the first arm: 1 withdraw, 2 arm for WindowServer
+    volatile SInt32 request_ = 0;
+    bool noLegacy_ = true;                    // armed: refuse WindowServer legacy IOAccelSurfaces (type 0); 5b probe             // for armTick after the first arm: 1 withdraw, 2 arm for WindowServer
 
     IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;
     bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
@@ -754,6 +809,9 @@ bool VirtioGPUAccel::start(IOService *provider) {
         return false;
     }
     gate_ = gate;
+    if (int legacy = 0; PE_parse_boot_argn("-vgpulegacy", &legacy, sizeof(legacy))) {
+        noLegacy_ = false;   // armed WindowServer may open legacy IOAccelSurfaces (as before 5b)
+    }
     gSymScanoutInfo = OSSymbol::withCStringNoCopy(kVGPUFBScanoutInfo);
     gSymPresent = OSSymbol::withCStringNoCopy(kVGPUFBPresent);
     gSymNewClient = OSSymbol::withCStringNoCopy(kVGPUNewClient);
@@ -988,6 +1046,13 @@ void VirtioGPUAccel::withdrawForWindowServer(const char *why) {
 IOReturn VirtioGPUAccel::newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) {
     char who[32] = "?";
     proc_selfname(who, sizeof(who));
+    if (type == 0 && armed_ == 3 && noLegacy_ && !strcmp(who, "WindowServer")) {
+        static int logged = 0;
+        if (logged++ < 3) {
+            vlog("WindowServer asks for a legacy IOAccelSurface (type 0): refused while armed (VirtioGPULegacySurfaces)");
+        }
+        return kIOReturnUnsupported;
+    }
     if (type != kVGUCAccelType) {
         IOReturn r = IOGraphicsAccelerator2::newUserClient(owningTask, securityID, type, handler);
         static int logged = 0;
@@ -1010,6 +1075,11 @@ IOReturn VirtioGPUAccel::newUserClient(task_t owningTask, void *securityID, UInt
             }
             wsCount_++;
             vlog("WindowServer pid %d opens the Venus client (WindowServer #%u this boot)", pid, wsCount_);
+            if (dm_ && *(volatile uint32_t *)((uint8_t *)dm_ + 0x108) >= 1) {
+                if (VGDisplayPipe *p = OSDynamicCast(VGDisplayPipe, *(OSObject *volatile *)((uint8_t *)dm_ + 0x88))) {
+                    p->gates("as WindowServer opens Venus");
+                }
+            }
             if (wsCount_ >= 3 && armed_ == 3) {
                 setProperty("VirtioGPUGuardWhy", "a third WindowServer since the arm");
                 vlog("GUARD: a third WindowServer since the arm: withdrawing");
@@ -1075,11 +1145,17 @@ void VirtioGPUAccel::stop(IOService *provider) {
 // sees it). Nothing persists: every boot starts unarmed. Anything else goes to the family's own setProperties.
 IOReturn VirtioGPUAccel::setProperties(OSObject *properties) {
     OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
-    if (dict && (dict->getObject("VirtioGPUArm") || dict->getObject("VirtioGPUDisarm") ||
+    if (dict && (dict->getObject("VirtioGPUArm") || dict->getObject("VirtioGPUDisarm") || dict->getObject("VirtioGPULegacySurfaces") ||
                  dict->getObject("VirtioGPUArmWindowServer") || dict->getObject("VirtioGPUWithdraw"))) {
         if (IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator) != kIOReturnSuccess) {
             vlog("arm: refused, the caller isn't root");
             return kIOReturnNotPrivileged;
+        }
+        if (OSBoolean *b = OSDynamicCast(OSBoolean, dict->getObject("VirtioGPULegacySurfaces"))) {
+            noLegacy_ = !b->getValue();
+            setProperty("VirtioGPULegacySurfaces", b);
+            vlog("legacy IOAccelSurfaces for an armed WindowServer: %s", noLegacy_ ? "refused" : "allowed");
+            return kIOReturnSuccess;
         }
         if (dict->getObject("VirtioGPUArmWindowServer") || dict->getObject("VirtioGPUWithdraw")) {
             if (armed_ < 1 || !armTimer_) {

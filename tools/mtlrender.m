@@ -230,6 +230,30 @@ int main(int argc, char **argv) {
             }
         }
 
+        // 5b. Framebuffer fetch: two draws in one pass, each reading what the pass holds ([[color(0)]]).
+        id<MTLRenderPipelineState> pSwap = pipeline(@"tri_vertex", @"fetch_swap_fragment", nil, NO);
+        id<MTLRenderPipelineState> pHalf = pipeline(@"tri_vertex", @"fetch_half_fragment", nil, NO);
+        if (pSwap && pHalf) {
+            Vtx v[3] = {{{-3, -1}, {0, 0}, {1, 1, 1, 1}}, {{1, 3}, {0, 0}, {1, 1, 1, 1}}, {{1, -1}, {0, 0}, {1, 1, 1, 1}}};
+            float zero[2] = {0, 0};
+            id<MTLCommandBuffer> cb = [queue commandBuffer];
+            id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:pass(t, MTLLoadActionClear, gray)];
+            [e setVertexBytes:v length:sizeof(v) atIndex:0];
+            [e setVertexBytes:zero length:sizeof(zero) atIndex:1];
+            [e setRenderPipelineState:pSwap];
+            [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [e setRenderPipelineState:pHalf];
+            [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [e endEncoding];
+            if (finish(cb)) {
+                const int p[][2] = {{32, 32}};
+                const uint8_t w[][4] = {{96, 64, 32, 128}};   // gray (64,128,192) swapped, then halved
+                expect(t, "framebuffer fetch: swap, then halve", 1, p, w);
+            }
+        } else {
+            failures++;
+        }
+
         // 6. Vertex attributes through a vertex descriptor: an interleaved float2 + float4 triangle in the bottom half.
         MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
         vd.attributes[0].format = MTLVertexFormatFloat2;

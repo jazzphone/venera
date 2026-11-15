@@ -130,8 +130,51 @@ static void vg_fc_unpack(NSDictionary<NSNumber *, NSData *> *fc, vg_fc_args *a) 
     }
 }
 
+// Translations are cached by (module text object -- the function keeps it for the library's life -- its hash, stage, constants, threadgroup lengths): Core Animation's fixed-function
+// shaders are ~690 KB of SPIR-V and ~4 s each, asked again for every pipeline that uses them (5b).
+static NSString *vg_translate_key(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc,
+                                  const uint32_t *tg, uint32_t tgCount) {
+    NSMutableString *k = [NSMutableString stringWithFormat:@"%p:%lx:%lu:%s", ll, (unsigned long)ll.hash, (unsigned long)ll.length, stage];
+    for (NSNumber *i in [fc.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+        [k appendFormat:@"|%@=%@", i, fc[i]];
+    }
+    for (uint32_t i = 0; tg && i < tgCount; i++) {
+        if (tg[i]) {
+            [k appendFormat:@"|t%u=%u", i, tg[i]];
+        }
+    }
+    return k;
+}
+
+static NSData *vg_translate_uncached(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc,
+                                     const uint32_t *tgLengths, uint32_t tgCount, NSString **error);
+
 NSData *vg_translate(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc, const uint32_t *tgLengths,
                      uint32_t tgCount, NSString **error) {
+    static NSMutableDictionary<NSString *, NSData *> *cache;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSMutableDictionary dictionary]; });
+    NSString *key = vg_translate_key(ll, stage, fc, tgLengths, tgCount);
+    @synchronized(cache) {
+        NSData *hit = cache[key];
+        if (hit) {
+            return hit;
+        }
+    }
+    NSData *spv = vg_translate_uncached(ll, stage, fc, tgLengths, tgCount, error);
+    if (spv) {
+        @synchronized(cache) {
+            if (cache.count > 1024) {
+                [cache removeAllObjects];
+            }
+            cache[key] = spv;
+        }
+    }
+    return spv;
+}
+
+static NSData *vg_translate_uncached(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc,
+                                     const uint32_t *tgLengths, uint32_t tgCount, NSString **error) {
     if (!vg_translator_ready()) {
         if (error) {
             *error = @"no translator";

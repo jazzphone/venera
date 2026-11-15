@@ -34,7 +34,7 @@ void vg_trace_sync(const char *after);
     X(vkCmdDispatch) X(vkGetPhysicalDeviceFeatures2) X(vkGetPhysicalDeviceFormatProperties) X(vkCreateImage)       \
     X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateImageView)                     \
     X(vkDestroyImageView) X(vkCreateSampler) X(vkDestroySampler) X(vkCmdCopyBufferToImage)                         \
-    X(vkCmdCopyImageToBuffer) X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCreateGraphicsPipelines)              \
+    X(vkCmdCopyImageToBuffer) X(vkCmdCopyImage) X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCreateGraphicsPipelines)              \
     X(vkDestroyPipeline) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetPrimitiveTopology) X(vkCmdSetCullMode)    \
     X(vkCmdSetFrontFace) X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp)           \
     X(vkCmdSetBlendConstants) X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) X(vkCmdDraw) X(vkCmdDrawIndexed)   \

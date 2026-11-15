@@ -1,8 +1,25 @@
 // MTLHeap (stage 5a: CoreDisplay makes one when WindowServer creates its Metal device). No sub-allocation yet: each
 // resource from the heap is an ordinary device allocation, the heap only keeps the books Metal callers read (size,
 // used size). Placement offsets are ignored, so aliasing resources don't alias (nothing in WindowServer's path needs it
-// so far). Resources report no heap (their -heap is nil), as the device's own do.
+// so far). Resources report their heap and offset (vg_heap_of).
 #import "objects.h"
+#import <objc/runtime.h>
+
+// Resources made by a heap keep it (Metal's resources retain their heap) and their place in it: Core Animation finds its
+// transient surfaces again through -heap / -heapOffset ("transient surface not found" asserts when the heap is nil).
+static char kHeapKey, kOffsetKey, kAliasKey;
+id<MTLHeap> vg_heap_of(id r) { return objc_getAssociatedObject(r, &kHeapKey); }
+NSUInteger vg_heap_offset_of(id r) { return [objc_getAssociatedObject(r, &kOffsetKey) unsignedIntegerValue]; }
+BOOL vg_heap_aliasable(id r) { return [objc_getAssociatedObject(r, &kAliasKey) boolValue]; }
+void vg_heap_make_aliasable(id r) {
+    if (vg_heap_of(r)) {
+        objc_setAssociatedObject(r, &kAliasKey, @YES, OBJC_ASSOCIATION_RETAIN);
+    }
+}
+static void vg_heap_adopt(id r, id<MTLHeap> heap, NSUInteger offset) {
+    objc_setAssociatedObject(r, &kHeapKey, heap, OBJC_ASSOCIATION_RETAIN);
+    objc_setAssociatedObject(r, &kOffsetKey, @(offset), OBJC_ASSOCIATION_RETAIN);
+}
 
 @interface VGMTLHeap : NSObject <MTLHeap> {
 @public
@@ -56,25 +73,35 @@ MTLSizeAndAlign vg_heap_buffer_size(NSUInteger length) {
     id<MTLBuffer> b = vg_new_buffer(_dev, length, options, NULL);
     if (b) {
         @synchronized(self) {
+            vg_heap_adopt(b, self, _used);
             _used += vg_heap_buffer_size(length).size;
         }
     }
     return b;
 }
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options offset:(NSUInteger)offset {
-    return [self newBufferWithLength:length options:options];
+    id<MTLBuffer> b = vg_new_buffer(_dev, length, options, NULL);
+    if (b) {
+        vg_heap_adopt(b, self, offset);
+    }
+    return b;
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
     id<MTLTexture> t = vg_new_texture(_dev, d);
     if (t) {
         @synchronized(self) {
+            vg_heap_adopt(t, self, _used);
             _used += vg_heap_texture_size(d).size;
         }
     }
     return t;
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset {
-    return [self newTextureWithDescriptor:d];
+    id<MTLTexture> t = vg_new_texture(_dev, d);
+    if (t) {
+        vg_heap_adopt(t, self, offset);
+    }
+    return t;
 }
 - (NSString *)description {
     return [NSString stringWithFormat:@"<VGMTLHeap %p size %lu used %lu %@>", self, (unsigned long)_size,

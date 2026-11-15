@@ -189,6 +189,10 @@ static id vg_refuse_before_init(id obj) {
 - (id<MTLBuffer>)newBufferWithBytes:(const void *)bytes length:(NSUInteger)length options:(MTLResourceOptions)options {
     return vg_new_buffer(self, length, options, bytes);
 }
+- (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options
+                               deallocator:(void (^)(void *, NSUInteger))deallocator {
+    return vg_new_buffer_nocopy(self, pointer, length, options, deallocator);
+}
 - (id<MTLCommandQueue>)newCommandQueue { return vg_new_queue(self); }
 - (id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)n { return vg_new_queue(self); }
 - (id<MTLCommandQueue>)newCommandQueueWithDescriptor:(MTLCommandQueueDescriptor *)d { return vg_new_queue(self); }

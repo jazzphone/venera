@@ -23,6 +23,7 @@ static const vg_format kFormats[] = {
     {MTLPixelFormatRGBA8Uint, VK_FORMAT_R8G8B8A8_UINT, 4, VK_IMAGE_ASPECT_COLOR_BIT},
     {MTLPixelFormatRGBA8Snorm, VK_FORMAT_R8G8B8A8_SNORM, 4, VK_IMAGE_ASPECT_COLOR_BIT},
     {MTLPixelFormatR8Unorm, VK_FORMAT_R8_UNORM, 1, VK_IMAGE_ASPECT_COLOR_BIT},
+    {MTLPixelFormatA8Unorm, VK_FORMAT_R8_UNORM, 1, VK_IMAGE_ASPECT_COLOR_BIT},   // sampled as (0, 0, 0, r): the view swizzles
     {MTLPixelFormatR8Uint, VK_FORMAT_R8_UINT, 1, VK_IMAGE_ASPECT_COLOR_BIT},
     {MTLPixelFormatRG8Unorm, VK_FORMAT_R8G8_UNORM, 2, VK_IMAGE_ASPECT_COLOR_BIT},
     {MTLPixelFormatR16Float, VK_FORMAT_R16_SFLOAT, 2, VK_IMAGE_ASPECT_COLOR_BIT},
@@ -52,6 +53,11 @@ static const vg_format *vg_format_of(MTLPixelFormat f) {
         }
     }
     return NULL;
+}
+
+NSUInteger vg_bytes_per_pixel(MTLPixelFormat f) {
+    const vg_format *v = vg_format_of(f);
+    return v ? v->bytes : 0;
 }
 
 VkFormat vg_vk_format(MTLPixelFormat f) {
@@ -147,10 +153,10 @@ BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
 - (id<MTLBuffer>)buffer { return nil; }
 - (NSUInteger)allocatedSize { return _width * _height * _depth * _layers * MAX(vg_format_of(_pixelFormat)->bytes, 1); }
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { return MTLPurgeableStateNonVolatile; }
-- (BOOL)isAliasable { return NO; }
-- (void)makeAliasable { }
-- (id<MTLHeap>)heap { return nil; }
-- (NSUInteger)heapOffset { return 0; }
+- (BOOL)isAliasable { return vg_heap_aliasable(self); }
+- (void)makeAliasable { vg_heap_make_aliasable(self); }
+- (id<MTLHeap>)heap { return vg_heap_of(self); }
+- (NSUInteger)heapOffset { return vg_heap_offset_of(self); }
 - (MTLResourceID)gpuResourceID { return (MTLResourceID){0}; }
 - (MTLTextureSwizzleChannels)swizzle {
     return MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue,
@@ -309,9 +315,12 @@ id<MTLTexture> vg_new_texture(id<MTLDevice> device, MTLTextureDescriptor *d) {
     if (r == VK_SUCCESS) {
         r = gVk.vkBindImageMemory(gVk.device, t->_image, t->_memory, 0);
     }
+    const BOOL alpha8 = f->mtl == MTLPixelFormatA8Unorm;
     VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, t->_image, vtype, f->vk,
-                                 {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
-                                  VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY},
+                                 {alpha8 ? VK_COMPONENT_SWIZZLE_ZERO : VK_COMPONENT_SWIZZLE_IDENTITY,
+                                  alpha8 ? VK_COMPONENT_SWIZZLE_ZERO : VK_COMPONENT_SWIZZLE_IDENTITY,
+                                  alpha8 ? VK_COMPONENT_SWIZZLE_ZERO : VK_COMPONENT_SWIZZLE_IDENTITY,
+                                  alpha8 ? VK_COMPONENT_SWIZZLE_R : VK_COMPONENT_SWIZZLE_IDENTITY},
                                  {f->aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT, 0, (uint32_t)t->_mips, 0, (uint32_t)t->_layers}};
     if (r == VK_SUCCESS) {
         vgtrace("texture: bound (%d), vkCreateImageView", r);
