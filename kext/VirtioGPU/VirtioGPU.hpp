@@ -71,7 +71,7 @@ public:
     uint32_t allocateContextID() { return OSIncrementAtomic(reinterpret_cast<volatile SInt32 *>(&nextContext_)); }
     bool hostmemAllocate(uint64_t size, uint64_t *offset);
     void hostmemFree(uint64_t offset, uint64_t size);
-    IODeviceMemory *hostmem() const { return hostmemMemory_; }
+    uint64_t hostmemPhys() const { return hostmemPhys_; }
     uint64_t hostmemSize() const { return hostmemLength_; }
     uint64_t features() const { return features_; }
     uint32_t capsetCount() const { return numCapsets_; }
@@ -145,7 +145,7 @@ private:
     uint8_t hostmemBar_ = 0;
     uint64_t hostmemOffset_ = 0;
     uint64_t hostmemLength_ = 0;
-    IODeviceMemory *hostmemMemory_ = nullptr;
+    uint64_t hostmemPhys_ = 0; // physical base of the host-visible window
     struct HostmemRange {
         uint64_t offset;
         uint64_t size;

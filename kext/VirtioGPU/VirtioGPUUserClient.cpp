@@ -247,11 +247,11 @@ IOReturn VirtioGPUUserClient::mapBlob(IOExternalMethodArguments *args) {
 IOReturn VirtioGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) {
     IOLockLock(lock_);
     Resource *r = find(type);
-    if (!r || !r->mapped || !core_->hostmem()) {
+    if (!r || !r->mapped || !core_->hostmemPhys()) {
         IOLockUnlock(lock_);
         return kIOReturnNotFound;
     }
-    uint64_t phys = core_->hostmem()->getPhysicalAddress() + r->offset;
+    uint64_t phys = core_->hostmemPhys() + r->offset;
     uint32_t mapInfo = r->mapInfo;
     uint64_t size = r->size;
     IOLockUnlock(lock_);

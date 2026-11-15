@@ -362,16 +362,16 @@ bool VirtioGPU::bringUp() {
         if ((low & 0x6) == 0x4) {
             base |= (uint64_t)pci_->configRead32(reg + 4) << 32;
         }
+        // No IODeviceMemory for the whole window: macOS won't make a 4 GB one up there.
+        // Each mapping gets its own descriptor (clientMemoryForType).
         if (base && !(low & 1)) {
-            hostmemMemory_ = IODeviceMemory::withRange(base + hostmemOffset_, hostmemLength_);
-        }
-        if (hostmemMemory_) {
+            hostmemPhys_ = base + hostmemOffset_;
             hostmemLock_ = IOLockAlloc();
             hostmemRanges_ = static_cast<HostmemRange *>(IOMallocZero(kMaxHostmemRanges * sizeof(HostmemRange)));
-            LOG("hostmem window at phys 0x%llx, %llu MB", (unsigned long long)hostmemMemory_->getPhysicalAddress(),
+            LOG("hostmem window at phys 0x%llx, %llu MB", (unsigned long long)hostmemPhys_,
                 (unsigned long long)(hostmemLength_ >> 20));
         } else {
-            LOG("hostmem BAR%u not usable (raw 0x%08x)", hostmemBar_, low);
+            LOG("hostmem BAR%u not assigned (0x%08x)", hostmemBar_, low);
         }
     }
 
@@ -1158,7 +1158,7 @@ void VirtioGPU::moveCursor(uint32_t x, uint32_t y, bool visible) {
 void VirtioGPU::fillInfo(struct vgpu_info *info) {
     bzero(info, sizeof(*info));
     info->features = features_;
-    info->hostmem_size = hostmemMemory_ ? hostmemLength_ : 0;
+    info->hostmem_size = hostmemPhys_ ? hostmemLength_ : 0;
     info->pci_vendor = pci_->configRead16(kIOPCIConfigVendorID);
     info->pci_device = pci_->configRead16(kIOPCIConfigDeviceID);
     info->num_capsets = numCapsets_ < VGPU_MAX_CAPSETS ? numCapsets_ : VGPU_MAX_CAPSETS;
