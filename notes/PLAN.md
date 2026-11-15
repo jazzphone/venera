@@ -88,3 +88,17 @@ GET_EDID         -> OK_EDID in 50 us: RHT 0x1234 "QEMU Monitor", preferred 1280x
 Registry: `ProbeLog`, `DisplayModes`, `EDID`. Kill switch: boot-arg `-vgpuoff`.
 Next (stage 2): MSI-X interrupts instead of polling, then the IOFramebuffer
 (RESOURCE_CREATE_2D, ATTACH_BACKING, SET_SCANOUT, TRANSFER_TO_HOST_2D, RESOURCE_FLUSH, cursor).
+
+## Stage 2a/2b result (2026-11-15)
+
+- MSI-X: IOPCIDevice interrupt index 0 = INTx, 1..3 = message signaled (type 0x30000); index 1
+  = vector 0 for config + both queues. 1,182 of 1,190 commands completed by interrupt (8 fell to
+  the 5 ms poll).
+- 2D pipeline (test 45 s after the kext starts, then scanout off + reset gives the screen back to
+  the VGA framebuffer):
+  RESOURCE_CREATE_2D (B8G8R8X8 1280x800), ATTACH_BACKING (4,096,000 bytes, one contiguous
+  segment), SET_SCANOUT, TRANSFER_TO_HOST_2D + RESOURCE_FLUSH: all OK_NODATA.
+  Full frame transfer + flush 4.2 ms; 172x160 damage updates avg 232 us, worst 2.8 ms
+  (590 frames in 10 s with a 16 ms sleep between).
+- Screenshots (`tools/deploy.sh shots`) started too late to catch the test; the desktop was back
+  afterward.

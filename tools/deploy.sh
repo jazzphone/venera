@@ -27,4 +27,10 @@ logs)
 disable)
   "${SSH[@]}" $HOST 'bash /root/vgpu/vm-remote.sh disable VirtioGPU.kext'
   ;;
+shots) # tools/deploy.sh shots COUNT INTERVAL -> build/shots/NN.png
+  "${SSH[@]}" $HOST "bash /root/vgpu/vm-remote.sh shots ${2:-20} ${3:-3}"
+  rm -rf build/shots && mkdir -p build/shots
+  "${SCP[@]}" "$HOST:/tmp/vgpu-shots/*.png" build/shots/
+  ls build/shots | wc -l
+  ;;
 esac

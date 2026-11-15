@@ -52,6 +52,8 @@ public:
     int submit(const Segment *segments, unsigned count);
     // Takes one completed chain off the used ring, if any. Returns true with its id and length.
     bool takeUsed(uint32_t *id, uint32_t *length);
+    // Asks the device for interrupts (clears VIRTQ_AVAIL_F_NO_INTERRUPT) or not.
+    void setInterrupts(bool on);
 
 private:
     struct Desc {
@@ -88,14 +90,19 @@ public:
     // Writes the driver features and sets FEATURES_OK; false if the device refuses them.
     bool negotiate(uint64_t wanted, uint64_t *accepted);
     uint16_t numQueues();
-    // Sizes, allocates and enables queue `index` (polling: no MSI-X vector).
-    Virtqueue *setupQueue(uint16_t index, uint16_t maxSize);
+    // Routes config-change interrupts to an MSI-X vector (kNoVector for none); false if refused.
+    bool setConfigVector(uint16_t vector);
+    // Sizes, allocates and enables queue `index` on an MSI-X vector (kNoVector to poll).
+    Virtqueue *setupQueue(uint16_t index, uint16_t maxSize, uint16_t vector = 0xffff);
     void notify(Virtqueue *queue);
+    // Reading the ISR acknowledges it (needed for INTx; harmless with MSI-X).
+    uint8_t readISR();
 
     volatile uint8_t *deviceConfig() { return device_; }
 
 private:
     volatile uint8_t *common_ = nullptr;
+    volatile uint8_t *isr_ = nullptr;
     volatile uint8_t *notify_ = nullptr;
     volatile uint8_t *device_ = nullptr;
     uint32_t notifyMultiplier_ = 0;

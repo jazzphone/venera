@@ -66,7 +66,15 @@ logs)
 logs-raw)
   agent 'ioreg -w0 -r -c VirtioGPU -l' 90
   ;;
+shots) # shots COUNT INTERVAL: QEMU screenshots into /tmp/vgpu-shots/NN.png
+  rm -rf /tmp/vgpu-shots && mkdir -p /tmp/vgpu-shots
+  for i in $(seq -w 1 "${2:-20}"); do
+    echo "screendump /tmp/vgpu-shots/$i.png -f png" | qm monitor $VM >/dev/null 2>&1
+    sleep "${3:-3}"
+  done
+  ls /tmp/vgpu-shots | wc -l
+  ;;
 *)
-  echo "usage: $0 deploy KEXT | disable NAME | logs"; exit 2
+  echo "usage: $0 deploy KEXT | disable NAME | logs | logs-raw | shots COUNT INTERVAL"; exit 2
   ;;
 esac

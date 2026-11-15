@@ -123,6 +123,11 @@ int Virtqueue::submit(const Segment *segments, unsigned count) {
     return head;
 }
 
+void Virtqueue::setInterrupts(bool on) {
+    avail_[0] = on ? 0 : kAvailNoInterrupt;
+    fence();
+}
+
 bool Virtqueue::takeUsed(uint32_t *id, uint32_t *length) {
     fence();
     uint16_t usedIdx = used_[1];
@@ -157,6 +162,7 @@ bool Virtqueue::takeUsed(uint32_t *id, uint32_t *length) {
 bool Transport::attach(IOPCIDevice *pci, const Region regions[9], uint32_t notifyMultiplier) {
     const Region &common = regions[1];
     const Region &notify = regions[2];
+    const Region &isr = regions[3];
     const Region &device = regions[4];
     if (!common.present || !notify.present || !device.present) {
         probeLog("transport: missing a region (common %d notify %d device %d)", common.present,
@@ -175,6 +181,7 @@ bool Transport::attach(IOPCIDevice *pci, const Region regions[9], uint32_t notif
     }
     volatile uint8_t *base = reinterpret_cast<volatile uint8_t *>(map_->getVirtualAddress());
     common_ = base + common.offset;
+    isr_ = (isr.present && isr.bar == common.bar) ? base + isr.offset : nullptr;
     notify_ = base + notify.offset;
     device_ = base + device.offset;
     notifyMultiplier_ = notifyMultiplier;
@@ -186,8 +193,15 @@ void Transport::detach() {
         map_->release();
         map_ = nullptr;
     }
-    common_ = notify_ = device_ = nullptr;
+    common_ = isr_ = notify_ = device_ = nullptr;
 }
+
+bool Transport::setConfigVector(uint16_t vector) {
+    wr<uint16_t>(common_, kMsixConfig, vector);
+    return rd<uint16_t>(common_, kMsixConfig) == vector;
+}
+
+uint8_t Transport::readISR() { return isr_ ? *isr_ : 0; }
 
 void Transport::reset() {
     wr<uint8_t>(common_, kDeviceStatus, 0);
@@ -224,7 +238,7 @@ bool Transport::negotiate(uint64_t wanted, uint64_t *accepted) {
 
 uint16_t Transport::numQueues() { return rd<uint16_t>(common_, kNumQueues); }
 
-Virtqueue *Transport::setupQueue(uint16_t index, uint16_t maxSize) {
+Virtqueue *Transport::setupQueue(uint16_t index, uint16_t maxSize, uint16_t vector) {
     wr<uint16_t>(common_, kQueueSelect, index);
     uint16_t deviceSize = rd<uint16_t>(common_, kQueueSize);
     if (deviceSize == 0) {
@@ -238,7 +252,13 @@ Virtqueue *Transport::setupQueue(uint16_t index, uint16_t maxSize) {
         return nullptr;
     }
     wr<uint16_t>(common_, kQueueSize, size);
-    wr<uint16_t>(common_, kQueueMsixVector, kNoVector);
+    wr<uint16_t>(common_, kQueueMsixVector, vector);
+    if (vector != kNoVector && rd<uint16_t>(common_, kQueueMsixVector) != vector) {
+        probeLog("queue %u: device refused MSI-X vector %u, polling", index, vector);
+        wr<uint16_t>(common_, kQueueMsixVector, kNoVector);
+    } else if (vector != kNoVector) {
+        q->setInterrupts(true);
+    }
     wr64(common_, kQueueDesc, q->descPhys());
     wr64(common_, kQueueDriver, q->availPhys());
     wr64(common_, kQueueDevice, q->usedPhys());
