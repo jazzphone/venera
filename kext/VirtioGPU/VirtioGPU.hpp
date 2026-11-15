@@ -37,6 +37,9 @@ public:
     bool flush(uint32_t x, uint32_t y, uint32_t width, uint32_t height);
     // Turns the scanout off and drops the resource.
     void disableScanout();
+    // Hardware cursor (cursor queue): 64x64 BGRA image + hot spot; position of the hot spot.
+    bool setCursor(const uint32_t *pixels, uint32_t hotX, uint32_t hotY);
+    void moveCursor(uint32_t x, uint32_t y, bool visible);
     void addLog(const char *line);
     void publishLog();
     // Serves the selectors in VirtioGPUAPI.h (the nub forwards its calls here).
@@ -58,6 +61,7 @@ private:
     void getEDID(uint32_t scanout);
     void getCapsets();
     void venusProbe();
+    bool cursorCommand(uint32_t type, uint32_t resource);
     bool attachBacking(uint32_t resource, IOBufferMemoryDescriptor *memory, uint32_t bytes);
     void dropResource(uint32_t resource);
 
@@ -99,6 +103,16 @@ private:
     uint8_t hostmemBar_ = 0;
     uint64_t hostmemOffset_ = 0;
     uint64_t hostmemLength_ = 0;
+    // Hardware cursor
+    IOLock *cursorLock_ = nullptr;
+    IOBufferMemoryDescriptor *cursorImage_ = nullptr;  // 64x64x4 backing of the cursor resource
+    IOBufferMemoryDescriptor *cursorCmds_ = nullptr;   // one 64-byte slot per cursor queue entry
+    uint32_t cursorResource_ = 0;
+    uint32_t cursorHotX_ = 0, cursorHotY_ = 0, cursorX_ = 0, cursorY_ = 0;
+    bool cursorVisible_ = false;
+    uint32_t cursorSlot_ = 0;
+    uint32_t cursorInFlight_ = 0;
+    uint32_t cursorDropped_ = 0;
 };
 
 // The nub VirtioGPUFramebuffer.kext matches on. Forwards callPlatformFunction to the core.

@@ -136,6 +136,7 @@ bool VirtioGPU::start(IOService *provider) {
     }
     commandLock_ = IOLockAlloc();
     scanoutLock_ = IOLockAlloc();
+    cursorLock_ = IOLockAlloc();
     LOG("core start: stage 2c (MSI-X, scanout API for the framebuffer)");
     pci_->setMemoryEnable(true);
     pci_->setBusMasterEnable(true);
@@ -216,6 +217,7 @@ void VirtioGPU::publishLog() {
             {"CommandsByInterrupt", commandsByInterrupt_},
             {"CommandsByPolling", commandsByPolling_},
             {"Flushes", flushes_},
+            {"CursorDropped", cursorDropped_},
         };
         for (const auto &item : items) {
             if (OSNumber *n = OSNumber::withNumber(item.value, 32)) {
@@ -730,6 +732,15 @@ IOReturn VirtioGPU::callPlatformFunction(const OSSymbol *name, bool wait, void *
                    ? kIOReturnSuccess
                    : kIOReturnError;
     }
+    if (name->isEqualTo(kVGPUSetCursor)) {
+        return setCursor(static_cast<const uint32_t *>(p1), (uint32_t)(uintptr_t)p2, (uint32_t)(uintptr_t)p3)
+                   ? kIOReturnSuccess
+                   : kIOReturnError;
+    }
+    if (name->isEqualTo(kVGPUMoveCursor)) {
+        moveCursor((uint32_t)(uintptr_t)p1, (uint32_t)(uintptr_t)p2, p3 != nullptr);
+        return kIOReturnSuccess;
+    }
     if (name->isEqualTo(kVGPUDisableScanout)) {
         disableScanout();
         return kIOReturnSuccess;
@@ -779,4 +790,109 @@ bool VirtioGPUFramebufferSlot::start(IOService *provider) {
     }
     probeLog("framebuffer slot held on the PCI device (IONDRVFramebuffer stays off)");
     return true;
+}
+
+// ---- Hardware cursor ----
+
+bool VirtioGPU::cursorCommand(uint32_t type, uint32_t resource) {
+    // Cursor queue entries are fire-and-forget: reclaim what the device finished, then submit.
+    IOLockLock(cursorLock_);
+    if (!cursor_ || !cursorCmds_) {
+        IOLockUnlock(cursorLock_);
+        return false;
+    }
+    uint32_t id = 0, length = 0;
+    while (cursor_->takeUsed(&id, &length)) {
+        cursorInFlight_--;
+    }
+    if (cursorInFlight_ >= cursor_->size()) {
+        cursorDropped_++;
+        IOLockUnlock(cursorLock_);
+        return false;
+    }
+    uint32_t slot = cursorSlot_++ % cursor_->size();
+    auto *cmd = reinterpret_cast<vgpu::CmdUpdateCursor *>(
+        static_cast<uint8_t *>(cursorCmds_->getBytesNoCopy()) + slot * 64);
+    bzero(cmd, sizeof(*cmd));
+    cmd->hdr.type = type;
+    cmd->pos.scanoutID = 0;
+    cmd->pos.x = cursorX_;
+    cmd->pos.y = cursorY_;
+    cmd->resourceID = resource;
+    cmd->hotX = cursorHotX_;
+    cmd->hotY = cursorHotY_;
+    uint64_t phys = cursorCmds_->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone) + slot * 64;
+    virtio::Segment segment = {phys, (uint32_t)sizeof(*cmd), false};
+    bool ok = cursor_->submit(&segment, 1) >= 0;
+    if (ok) {
+        cursorInFlight_++;
+        transport_.notify(cursor_);
+    } else {
+        cursorDropped_++;
+    }
+    IOLockUnlock(cursorLock_);
+    return ok;
+}
+
+bool VirtioGPU::setCursor(const uint32_t *pixels, uint32_t hotX, uint32_t hotY) {
+    if (!ready() || !pixels) {
+        return false;
+    }
+    constexpr uint32_t kSize = kVGPUCursorSize, kBytes = kSize * kSize * 4;
+    IOLockLock(scanoutLock_); // the control queue work uses the shared command memory
+    if (!cursorResource_) {
+        cursorImage_ = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+            kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous, kBytes, 0xFFFFFFFFFFFFF000ULL);
+        cursorCmds_ = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+            kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous, 64 * 64, 0xFFFFFFFFFFFFF000ULL);
+        if (!cursorImage_ || !cursorCmds_ || cursorImage_->prepare() != kIOReturnSuccess ||
+            cursorCmds_->prepare() != kIOReturnSuccess) {
+            OSSafeReleaseNULL(cursorImage_);
+            OSSafeReleaseNULL(cursorCmds_);
+            IOLockUnlock(scanoutLock_);
+            LOG("cursor: allocation failed");
+            return false;
+        }
+        uint32_t resource = nextResource_++;
+        auto *create = reinterpret_cast<vgpu::CmdResourceCreate2D *>(commandBytes_);
+        bzero(create, sizeof(*create));
+        create->hdr.type = vgpu::kCmdResourceCreate2D;
+        create->resourceID = resource;
+        create->format = vgpu::kFormatB8G8R8A8;
+        create->width = kSize;
+        create->height = kSize;
+        uint32_t type = simple(sizeof(*create));
+        bool ok = type == vgpu::kRespOkNoData && attachBacking(resource, cursorImage_, kBytes);
+        LOG("cursor: resource %u 64x64 -> %s", resource, ok ? "ready" : respName(type));
+        if (!ok) {
+            IOLockUnlock(scanoutLock_);
+            return false;
+        }
+        cursorResource_ = resource;
+    }
+    memcpy(cursorImage_->getBytesNoCopy(), pixels, kBytes);
+    auto *t = reinterpret_cast<vgpu::CmdTransferToHost2D *>(commandBytes_);
+    bzero(t, sizeof(*t));
+    t->hdr.type = vgpu::kCmdTransferToHost2D;
+    t->r = {0, 0, kSize, kSize};
+    t->resourceID = cursorResource_;
+    bool ok = simple(sizeof(*t)) == vgpu::kRespOkNoData;
+    IOLockUnlock(scanoutLock_);
+    if (!ok) {
+        return false;
+    }
+    cursorHotX_ = hotX;
+    cursorHotY_ = hotY;
+    return cursorVisible_ ? cursorCommand(vgpu::kCmdUpdateCursor, cursorResource_) : true;
+}
+
+void VirtioGPU::moveCursor(uint32_t x, uint32_t y, bool visible) {
+    cursorX_ = x;
+    cursorY_ = y;
+    if (visible != cursorVisible_) {
+        cursorVisible_ = visible;
+        cursorCommand(vgpu::kCmdUpdateCursor, visible ? cursorResource_ : 0); // 0 hides it
+    } else if (visible) {
+        cursorCommand(vgpu::kCmdMoveCursor, cursorResource_);
+    }
 }

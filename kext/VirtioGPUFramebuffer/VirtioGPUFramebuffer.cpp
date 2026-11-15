@@ -6,7 +6,8 @@
 // and talks to the core only through callPlatformFunction (../VirtioGPUAPI.h). Gives WindowServer
 // a block of contiguous RAM as VRAM (aperture), shows it through a virtio-gpu 2D scanout resource,
 // and pushes the whole frame to the host 30 times a second (WindowServer doesn't say what
-// changed). Software cursor for now: WindowServer draws it into the frame. The core's
+// changed). Hardware cursor: 64x64 ARGB images converted by convertCursorImage, shown and moved on
+// the device's cursor queue, so pointer motion doesn't depend on the frame flush. The core's
 // VirtioGPUFramebufferSlot keeps IONDRVFramebuffer off the PCI device, so this is the only
 // framebuffer.
 
@@ -64,6 +65,8 @@ public:
     IOReturn getAttributeForConnection(IOIndex index, IOSelect attribute, uintptr_t *value) override;
     IOReturn setAttributeForConnection(IOIndex index, IOSelect attribute, uintptr_t value) override;
     bool hasDDCConnect(IOIndex index) override;
+    IOReturn setCursorImage(void *cursorImage) override;
+    IOReturn setCursorState(SInt32 x, SInt32 y, bool visible) override;
     IOReturn getDDCBlock(IOIndex index, UInt32 blockNumber, IOSelect blockType, IOOptionBits options,
                          UInt8 *data, IOByteCount *length) override;
 
@@ -95,6 +98,10 @@ private:
     IOWorkLoop *flushLoop_ = nullptr;
     IOTimerEventSource *flushTimer_ = nullptr;
     volatile bool flushing_ = false;
+    uint32_t cursorPixels_[kVGPUCursorSize * kVGPUCursorSize] = {};
+    uint32_t cursorHotX_ = 0, cursorHotY_ = 0;
+    bool cursorReady_ = false;
+    uint32_t cursorImages_ = 0, cursorMoves_ = 0;
     uint32_t ticks_ = 0;
 };
 
@@ -356,7 +363,7 @@ IOReturn VirtioGPUFramebuffer::getTimingInfoForDisplayMode(IODisplayModeID id, I
 IOReturn VirtioGPUFramebuffer::getAttribute(IOSelect attribute, uintptr_t *value) {
     if (attribute == kIOHardwareCursorAttribute) {
         if (value) {
-            *value = 0; // software cursor for now
+            *value = 1; // cursor queue
         }
         return kIOReturnSuccess;
     }
@@ -415,5 +422,55 @@ IOReturn VirtioGPUFramebuffer::getDDCBlock(IOIndex index, UInt32 blockNumber, IO
     }
     memcpy(data, static_cast<const uint8_t *>(edid->getBytesNoCopy()) + offset, 128);
     *length = 128;
+    return kIOReturnSuccess;
+}
+
+// ---- Hardware cursor ----
+
+IOReturn VirtioGPUFramebuffer::setCursorImage(void *cursorImage) {
+    IOHardwareCursorDescriptor desc;
+    bzero(&desc, sizeof(desc));
+    desc.majorVersion = kHardwareCursorDescriptorMajorVersion;
+    desc.height = kVGPUCursorSize;
+    desc.width = kVGPUCursorSize;
+    desc.bitDepth = 32; // ARGB, which is B8G8R8A8 in memory
+    IOHardwareCursorInfo info;
+    bzero(&info, sizeof(info));
+    info.majorVersion = kHardwareCursorInfoMajorVersion;
+    bzero(cursorPixels_, sizeof(cursorPixels_));
+    info.hardwareCursorData = reinterpret_cast<UInt8 *>(cursorPixels_);
+    if (!convertCursorImage(cursorImage, &desc, &info)) {
+        return kIOReturnUnsupported;
+    }
+    // convertCursorImage packs rows at the cursor's own width; the device wants a 64-pixel stride.
+    uint32_t w = info.cursorWidth, h = info.cursorHeight;
+    if (w && w < kVGPUCursorSize) {
+        for (int y = (int)h - 1; y >= 0; y--) {
+            memmove(&cursorPixels_[y * kVGPUCursorSize], &cursorPixels_[y * w], w * 4);
+            bzero(&cursorPixels_[y * kVGPUCursorSize + w], (kVGPUCursorSize - w) * 4);
+        }
+    }
+    cursorHotX_ = info.cursorHotSpotX;
+    cursorHotY_ = info.cursorHotSpotY;
+    cursorReady_ = call(kVGPUSetCursor, cursorPixels_, (void *)(uintptr_t)cursorHotX_,
+                        (void *)(uintptr_t)cursorHotY_) == kIOReturnSuccess;
+    if (cursorImages_++ < 3) {
+        log("cursor image %ux%u hot %u,%u -> %s", w, h, cursorHotX_, cursorHotY_,
+            cursorReady_ ? "on the cursor queue" : "FAILED");
+    }
+    return cursorReady_ ? kIOReturnSuccess : kIOReturnError;
+}
+
+IOReturn VirtioGPUFramebuffer::setCursorState(SInt32 x, SInt32 y, bool visible) {
+    if (!cursorReady_) {
+        return kIOReturnNotReady;
+    }
+    // IOFramebuffer gives the image's top-left corner; virtio-gpu positions the hot spot.
+    SInt32 hx = x + (SInt32)cursorHotX_, hy = y + (SInt32)cursorHotY_;
+    call(kVGPUMoveCursor, (void *)(uintptr_t)(hx < 0 ? 0 : hx), (void *)(uintptr_t)(hy < 0 ? 0 : hy),
+         visible ? (void *)1 : nullptr);
+    if (cursorMoves_++ == 0) {
+        log("first cursor move to %d,%d visible %d", (int)hx, (int)hy, visible);
+    }
     return kIOReturnSuccess;
 }
