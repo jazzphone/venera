@@ -364,3 +364,57 @@ working set.
 
 Next (4b): command queue, buffers on Venus host-visible memory, a host-built metallib through the translator
 (the guest's GPUCompiler libLLVM reads AIR), compute pipeline, dispatch, blit; `mtlcompute` checks results.
+
+## Stage 4b result (2026-11-15): Metal compute runs on the host GPU
+
+**`tools/mtlcompute.m`, plain Metal API in VM 108, PASS on the first full run**: Apple's metal compiler (on the Mac)
+-> `compute.metallib` -> our plugin -> Venus -> Iris Xe:
+
+```
+library compute.metallib: loaded (235.4 ms) functions: vadd, reduce_sum
+pipelines: vadd ok, reduce_sum ok (15.0 ms)
+  vadd 16777216 floats, threadgroup 256           54.61 ms   all right (first run)
+  vadd 16777216 floats, threadgroup 256           12.22 ms   all right (cached pipeline)
+  vadd 1000003 floats, threadgroup 64              9.49 ms   all right (partial last threadgroup)
+  reduce_sum 16M uints (threadgroup memory)       71.67 ms   sum 50331645 right (atomics, barriers, setBytes)
+  fill 64 MB + copy 64 MB                         29.13 ms   all right, completion handler ran
+```
+
+Times are commit-to-completion seen from the app, including the Venus round trips (vkexec's raw Vulkan fill+copy of
+64 MB was 23 ms).
+
+The path (all in `metal/VirtioGPUMetal/`):
+
+- **Library** (`VGMTLLibrary.m`): bitcode blobs found in the metallib by the wrapper magic (NV's method); each blob
+  -> LLVM IR text with **the guest's own LLVM** (`GPUCompiler.framework/Versions/32023/Libraries/libLLVM.dylib`,
+  dlopen from the dyld cache; it read Xcode 27.2's AIR fine); entry name and stage from `!air.kernel` metadata.
+- **Translator**: NV's metal2vulkan wrapper (`libnvmtl_translate.dylib`, LGPL, in the bundle's Resources with its
+  license; `tools/build-translator.sh`). Homebrew's Rust has no x86_64 std, but `RUSTC_BOOTSTRAP=1 cargo build
+  -Z build-std=std,panic_abort --target x86_64-apple-darwin` builds it from the shipped std source; no rustup.
+  The translator's CLI needs spirv-val; the wrapper's in-process path (what the plugin calls) doesn't.
+  `nvmtl_reflect` gives the binding map and dispatch contract as JSON; translation waits until dispatch, because
+  threadgroup-memory lengths (`setThreadgroupMemoryLength`) are baked into the SPIR-V
+  (`nvmtl_translate_set_threadgroup_lengths`). vadd translated in 18.7 ms, reduce_sum in 12.3 ms.
+- **Pipelines** (`VGMTLCompute.m`): one translation per threadgroup-length set; descriptor layout read from the
+  SPIR-V itself (set 0, storage vs uniform buffer); local size via spec constants 0..2; one VkPipeline per local
+  size. Dispatch is the translator's `KernelDispatch::plan` (full groups, then each dimension's tail with its own
+  local size) with the 48-byte ThreadsDynamic push-constant block (thread grid, thread base, threadgroup base,
+  threadgroup grid).
+- **Buffers**: every MTLBuffer is a VkBuffer in host-visible coherent cached memory (type 2), mapped for life
+  (`contents`). setBytes goes to a per-command-buffer upload arena.
+- **Command buffers**: one VkCommandBuffer each, a full memory barrier after every command, submit with a fence at
+  commit, completion (handlers, status, freeing descriptor pools/arenas/retained resources) on a background queue;
+  `waitUntilCompleted` waits on it. Blit: copyFromBuffer, fillBuffer (4-byte-aligned ranges only).
+- `vg.h` + `VGVulkan.m`: the process's one Venus VkDevice, queue, command pool and a function table.
+
+Checks after the run: every Venus context closed (ctx 6..11 "closed"), no user clients left, WindowServer kept its
+boot pid; disarmed again afterwards.
+
+Known gaps (later stages): no textures, samplers or render pipelines (4c); kernels whose reflection has anything but
+buffers and threadgroup memory are refused with a message (argument buffers, textures, the BufferAddressTable of
+pointer-chasing kernels); no function constants; no MTLHeap, events, indirect dispatch; unaligned fillBuffer;
+private storage still in host memory; one queue, serialized submits. Each MTLBuffer is its own Venus blob
+(hostmem range cap 2048 per VM, `VirtioGPU.hpp`), so a buffer pool is needed before real apps.
+
+Next (4c): textures (VkImage + views, samplers), render pipelines (vertex + fragment translation), render passes,
+`replaceRegion`/`getBytes`, a triangle and a textured quad read back and compared.

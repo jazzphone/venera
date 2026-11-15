@@ -11,9 +11,8 @@
 //
 // Shape after nullmoth/nvidia-macos-driver's NVMTLDevice (plugin/NVMTLDevice.m): the refusal before super's init and
 // the initLimits call are theirs.
-#import <Foundation/Foundation.h>
+#import "vg.h"
 #import <IOKit/IOKitLib.h>
-#import <Metal/Metal.h>
 #import <dlfcn.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
@@ -21,8 +20,6 @@
 #import <stdio.h>
 #import <string.h>
 
-#define VK_NO_PROTOTYPES
-#include <vulkan/vulkan_core.h>
 
 @interface MTLIOAccelDevice : NSObject
 - (instancetype)initWithAcceleratorPort:(mach_port_t)port;
@@ -43,8 +40,7 @@ static os_log_t vglog_handle(void) {
     return h;
 }
 
-static void vglog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-static void vglog(const char *fmt, ...) {
+void vglog(const char *fmt, ...) {
     char line[600];
     va_list ap;
     va_start(ap, fmt);
@@ -96,119 +92,6 @@ static BOOL vg_process_allowed(void) {
 static id vg_refuse_before_init(id obj) {
     (void)CFBridgingRetain(obj);
     return nil;
-}
-
-// ---- Venus ---------------------------------------------------------------------------------------------------------
-
-typedef PFN_vkVoidFunction(VKAPI_PTR *PFN_icdGetInstanceProcAddr)(VkInstance, const char *);
-typedef VkResult(VKAPI_PTR *PFN_negotiate)(uint32_t *version);
-
-static struct {
-    int state;   // 0 not tried, 1 up, -1 failed
-    VkInstance instance;
-    VkPhysicalDevice physical;
-    VkDevice device;
-    VkPhysicalDeviceProperties props;
-    uint32_t queueFamily;
-} gVk;
-
-static int vg_vulkan_init(void) {
-    if (gVk.state) {
-        return gVk.state > 0 ? 0 : -1;
-    }
-    gVk.state = -1;
-    Dl_info info;
-    if (!dladdr((const void *)vg_vulkan_init, &info) || !info.dli_fname) {
-        vglog("vulkan: can't find my own image");
-        return -1;
-    }
-    // .../VirtioGPUMetal.bundle/Contents/MacOS/VirtioGPUMetal -> .../Contents/Resources/libvulkan_virtio.dylib
-    char path[1024];
-    snprintf(path, sizeof(path), "%s", info.dli_fname);
-    char *slash = strrchr(path, '/');
-    if (slash) {
-        *slash = 0;
-    }
-    slash = strrchr(path, '/');
-    if (slash) {
-        *slash = 0;
-    }
-    strlcat(path, "/Resources/libvulkan_virtio.dylib", sizeof(path));
-    void *lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
-    if (!lib) {
-        vglog("vulkan: dlopen %s: %s", path, dlerror());
-        return -1;
-    }
-    PFN_negotiate negotiate = (PFN_negotiate)dlsym(lib, "vk_icdNegotiateLoaderICDInterfaceVersion");
-    PFN_icdGetInstanceProcAddr gipa = (PFN_icdGetInstanceProcAddr)dlsym(lib, "vk_icdGetInstanceProcAddr");
-    if (!negotiate || !gipa) {
-        vglog("vulkan: the ICD has no loader entry points");
-        return -1;
-    }
-    uint32_t icdVersion = 5;
-    negotiate(&icdVersion);
-    PFN_vkCreateInstance createInstance = (PFN_vkCreateInstance)gipa(NULL, "vkCreateInstance");
-    VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "VirtioGPUMetal", 1, "VirtioGPUMetal", 1,
-                             VK_API_VERSION_1_3};
-    VkInstanceCreateInfo ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, NULL, 0, &app, 0, NULL, 0, NULL};
-    VkResult r = createInstance(&ici, NULL, &gVk.instance);
-    if (r != VK_SUCCESS) {
-        vglog("vulkan: vkCreateInstance %d", r);
-        return -1;
-    }
-#define GET(name) PFN_##name name = (PFN_##name)gipa(gVk.instance, #name)
-    GET(vkEnumeratePhysicalDevices);
-    GET(vkGetPhysicalDeviceProperties);
-    GET(vkGetPhysicalDeviceQueueFamilyProperties);
-    GET(vkCreateDevice);
-#undef GET
-    VkPhysicalDevice devs[8];
-    uint32_t n = 8;
-    r = vkEnumeratePhysicalDevices(gVk.instance, &n, devs);
-    if (r < 0 || !n) {
-        vglog("vulkan: vkEnumeratePhysicalDevices %d, %u devices", r, n);
-        return -1;
-    }
-    // The host's GPU, not llvmpipe (Venus lists both).
-    for (uint32_t i = 0; i < n && !gVk.physical; i++) {
-        VkPhysicalDeviceProperties p;
-        vkGetPhysicalDeviceProperties(devs[i], &p);
-        if (p.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU) {
-            gVk.physical = devs[i];
-            gVk.props = p;
-        }
-    }
-    if (!gVk.physical) {
-        vglog("vulkan: only CPU devices");
-        return -1;
-    }
-    VkQueueFamilyProperties qf[8];
-    uint32_t qn = 8;
-    vkGetPhysicalDeviceQueueFamilyProperties(gVk.physical, &qn, qf);
-    gVk.queueFamily = UINT32_MAX;
-    for (uint32_t q = 0; q < qn; q++) {
-        if ((qf[q].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) == (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) {
-            gVk.queueFamily = q;
-            break;
-        }
-    }
-    if (gVk.queueFamily == UINT32_MAX) {
-        vglog("vulkan: no graphics+compute queue family");
-        return -1;
-    }
-    float prio = 1.0f;
-    VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, gVk.queueFamily, 1, &prio};
-    VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, NULL, 0, 1, &qci, 0, NULL, 0, NULL, NULL};
-    r = vkCreateDevice(gVk.physical, &dci, NULL, &gVk.device);
-    if (r != VK_SUCCESS) {
-        vglog("vulkan: vkCreateDevice %d", r);
-        return -1;
-    }
-    vglog("vulkan: %s (vendor %04x device %04x, API %u.%u.%u), queue family %u, VkDevice up", gVk.props.deviceName,
-          gVk.props.vendorID, gVk.props.deviceID, VK_VERSION_MAJOR(gVk.props.apiVersion),
-          VK_VERSION_MINOR(gVk.props.apiVersion), VK_VERSION_PATCH(gVk.props.apiVersion), gVk.queueFamily);
-    gVk.state = 1;
-    return 0;
 }
 
 // ---- the device ----------------------------------------------------------------------------------------------------
@@ -266,6 +149,49 @@ static int vg_vulkan_init(void) {
         return [NSString stringWithFormat:@"%s (VirtioGPUMetal)", gVk.props.deviceName];
     }
     return @"Virtio-GPU (VirtioGPUMetal)";
+}
+
+// ---- stage 4b: the objects compute needs (VGMTLCompute.m, VGMTLLibrary.m) ----
+
+- (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
+    return vg_new_buffer(self, length, options, NULL);
+}
+- (id<MTLBuffer>)newBufferWithBytes:(const void *)bytes length:(NSUInteger)length options:(MTLResourceOptions)options {
+    return vg_new_buffer(self, length, options, bytes);
+}
+- (id<MTLCommandQueue>)newCommandQueue { return vg_new_queue(self); }
+- (id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)n { return vg_new_queue(self); }
+- (id<MTLCommandQueue>)newCommandQueueWithDescriptor:(MTLCommandQueueDescriptor *)d { return vg_new_queue(self); }
+- (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {
+    return vg_new_library(self, (NSData *)data, error);   // dispatch_data_t is an NSData on macOS
+}
+- (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(NSError **)error {
+    NSData *d = [NSData dataWithContentsOfURL:url options:0 error:error];
+    return d ? vg_new_library(self, d, error) : nil;
+}
+- (id<MTLLibrary>)newLibraryWithFile:(NSString *)path error:(NSError **)error {
+    return [self newLibraryWithURL:[NSURL fileURLWithPath:path] error:error];
+}
+- (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)f error:(NSError **)error {
+    return vg_new_compute_pipeline(self, f, error);
+}
+- (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)f
+                                                           options:(MTLPipelineOption)o
+                                                        reflection:(MTLAutoreleasedComputePipelineReflection *)r
+                                                             error:(NSError **)error {
+    if (r) {
+        *r = nil;
+    }
+    return vg_new_compute_pipeline(self, f, error);
+}
+- (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d
+                                                             options:(MTLPipelineOption)o
+                                                          reflection:(MTLAutoreleasedComputePipelineReflection *)r
+                                                               error:(NSError **)error {
+    if (r) {
+        *r = nil;
+    }
+    return vg_new_compute_pipeline(self, d.computeFunction, error);
 }
 
 - (NSString *)vendorName {

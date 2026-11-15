@@ -11,3 +11,7 @@ published, these files and anything built from them stay under that license.
   renamed to ours (`NVResource` -> `VGResource`, ..., `NVAccel` -> `VirtioGPUAccel`) by a perl one-liner; nothing
   else changed. Each listed slot is an inherited method macOS 26 no longer exports; the override tail-jumps through
   Apple's exported base vtable. Valid only while our classes override the same set of methods NV's do.
+
+Not vendored, built from the same checkout: the translator (`translator/`, metal2vulkan + NV's `wrapper/`,
+LGPL-3.0-or-later). `tools/build-translator.sh` builds `libnvmtl_translate.dylib` for x86_64; the plugin bundle carries
+it in Contents/Resources with its license (`libnvmtl_translate.LICENSE`) and loads it with dlopen, as NV's does.

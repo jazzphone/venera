@@ -14,12 +14,17 @@ install)
   mv /tmp/vgmetal/VirtioGPUMetal.bundle /Library/GPUBundles/
   chown -R root:wheel /Library/GPUBundles/VirtioGPUMetal.bundle
   chmod -R go-w,a+rX /Library/GPUBundles/VirtioGPUMetal.bundle
-  cp /tmp/vgmetal/mtlprobe /tmp/vgmetal/acceltest $T/ && chmod 755 $T $T/mtlprobe $T/acceltest
+  cp /tmp/vgmetal/mtlprobe /tmp/vgmetal/mtlcompute /tmp/vgmetal/compute.metallib /tmp/vgmetal/acceltest $T/ && chmod 755 $T $T/mtlprobe $T/mtlcompute $T/acceltest && chmod 644 $T/compute.metallib
   sudo -u _windowserver test -r /Library/GPUBundles/VirtioGPUMetal.bundle/Contents/MacOS/VirtioGPUMetal && echo "readable by _windowserver"
   ls -la /Library/GPUBundles /Library/GPUBundles/VirtioGPUMetal.bundle/Contents/*
   ;;
 arm | disarm)
   $T/acceltest "$@"
+  ;;
+compute) # stage 4b: mtlcompute (allow-listed by VGMTL_ENABLE), then the plugin's log
+  rm -f /var/tmp/VirtioGPUMetal.log
+  cd $T && sudo -u dev env VGMTL_ENABLE=1 ./mtlcompute compute.metallib 2>&1; echo "mtlcompute exit $?"
+  echo "== plugin log"; cat /var/tmp/VirtioGPUMetal.log 2>/dev/null | tail -40
   ;;
 refused) # a process the allow-list doesn't name (mtlprobe under another name): Metal must list nothing, no crash
   rm -f /var/tmp/VirtioGPUMetal.log
@@ -43,6 +48,6 @@ probe)
   log show --last 2m --style compact --predicate '(process == "mtlprobe") OR (sender == "IOAcceleratorFamily2")' 2>/dev/null | grep -v '^Timestamp' | grep -viE 'activity|signpost' | cut -c1-220 | tail -40
   ;;
 *)
-  echo "usage: $0 install | arm [NAME [CLASS]] | disarm | probe | refused | health"; exit 2
+  echo "usage: $0 install | arm [NAME [CLASS]] | disarm | probe | compute | refused | health"; exit 2
   ;;
 esac

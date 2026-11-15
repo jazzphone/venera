@@ -1,5 +1,5 @@
 #!/bin/zsh
-# User-space tools for the VM (x86_64): build/vgputest, build/vkprobe, build/vkexec, build/acceltest, build/llvmprobe, build/mtlprobe
+# User-space tools for the VM (x86_64): build/vgputest, build/vkprobe, build/vkexec, build/acceltest, build/llvmprobe, build/mtlprobe, build/mtlcompute (+ build/compute.metallib)
 set -euo pipefail
 cd "${0:A:h}/.."
 mkdir -p build
@@ -10,4 +10,6 @@ $CC -I"$HOME/src/mesa/include" tools/vkexec.c -o build/vkexec
 $CC -framework IOKit -framework CoreFoundation tools/acceltest.c -o build/acceltest
 $CC tools/llvmprobe.c -o build/llvmprobe
 $CC -fobjc-arc -framework Foundation -framework Metal tools/mtlprobe.m -o build/mtlprobe
-file build/vgputest build/vkprobe build/vkexec build/acceltest build/llvmprobe build/mtlprobe
+$CC -fobjc-arc -framework Foundation -framework Metal tools/mtlcompute.m -o build/mtlcompute
+xcrun metal -target air64-apple-macos26.0 -c tools/shaders/compute.metal -o build/compute.air && xcrun metallib build/compute.air -o build/compute.metallib
+file build/vgputest build/vkprobe build/vkexec build/acceltest build/llvmprobe build/mtlprobe build/mtlcompute

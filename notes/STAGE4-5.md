@@ -600,6 +600,8 @@ Effort is focused-engineer days for the stage, excluding VM reboot waits, assumi
 
 ### Stage 4b: a compute kernel runs
 
+**Done 2026-11-15 (PLAN.md, "Stage 4b result").**
+
 - **Do:** buffers (`newBufferWithLength`, map via Venus host-visible blobs), library load for a host-built `.metallib`, translator + AIR reader, `newComputePipelineState`,
   command queue/buffer/compute encoder, `waitUntilCompleted`. A blit encoder copy. `addCompletedHandler`. A shared event if cheap.
 - **Checkpoint:** `mtlcompute` runs a vector add and a small reduction; results correct for 16 M floats; a blit copy matches; timing recorded (compare to `vkexec`: 64 MB copy 23 ms).
