@@ -59,7 +59,7 @@
 - (MTLHazardTrackingMode)hazardTrackingMode { return MTLHazardTrackingModeTracked; }
 - (void)didModifyRange:(NSRange)range { }   // coherent memory
 - (uint64_t)gpuAddress { return 0; }
-- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { return MTLPurgeableStateNonVolatile; }
+- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { return vg_purgeable(self, state); }
 - (BOOL)isAliasable { return vg_heap_aliasable(self); }
 - (void)makeAliasable { vg_heap_make_aliasable(self); }
 - (id<MTLHeap>)heap { return vg_heap_of(self); }
@@ -1015,7 +1015,9 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
             return;
         }
     }
-    block(self);   // already scheduled
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        block(self);   // already scheduled: still not on the caller's thread
+    });
 }
 - (void)enqueue {
     if (_status == MTLCommandBufferStatusNotEnqueued) {
@@ -1139,13 +1141,21 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
         scheduled = [_scheduledHandlers copy];
         [_scheduledHandlers removeAllObjects];
     }
-    for (MTLCommandBufferHandler h in scheduled) {
-        h(self);
-    }
     MTLCommandBufferStatus end = _error ? MTLCommandBufferStatusError : MTLCommandBufferStatusCompleted;
     VGMTLCommandQueue *q = [(NSObject *)self.commandQueue isKindOfClass:[VGMTLCommandQueue class]]
                                ? (VGMTLCommandQueue *)self.commandQueue
                                : nil;
+    // Scheduled handlers run asynchronously, as Metal's do, and before the completed ones on the same queue: Core
+    // Animation releases surfaces from them (set_surface_volatile), which must not happen inside its own frame on the
+    // committing thread (5b).
+    if (scheduled.count) {
+        dispatch_queue_t sq = q && q->_userCompletion ? q->_userCompletion : dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+        dispatch_async(sq, ^{
+            for (MTLCommandBufferHandler h in scheduled) {
+                h(self);
+            }
+        });
+    }
     // In order on the queue's serial queue when the caller named a completion queue; otherwise as before (a handler
     // that waits for a later command buffer of the same queue must not deadlock behind it).
     dispatch_async(q && q->_userCompletion ? q->_serial : dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{

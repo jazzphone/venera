@@ -6,7 +6,20 @@
 #import "objects.h"
 #import <objc/runtime.h>
 
-static char kProtectionKey, kResponsibleKey;
+static char kProtectionKey, kResponsibleKey, kPurgeKey;
+
+MTLPurgeableState vg_purgeable(id r, MTLPurgeableState state) {
+    @synchronized(r) {
+        NSNumber *prev = objc_getAssociatedObject(r, &kPurgeKey);
+        MTLPurgeableState was = prev ? (MTLPurgeableState)prev.unsignedIntegerValue : MTLPurgeableStateNonVolatile;
+        if (state != MTLPurgeableStateKeepCurrent) {
+            // Empty (discard the contents) leaves a resource that is volatile and empty; we keep the contents anyway
+            objc_setAssociatedObject(r, &kPurgeKey, @(state == MTLPurgeableStateEmpty ? MTLPurgeableStateVolatile : state),
+                                     OBJC_ASSOCIATION_RETAIN);
+        }
+        return was;
+    }
+}
 
 static uint64_t vg_protection(id self, SEL _cmd) { return [objc_getAssociatedObject(self, &kProtectionKey) unsignedLongLongValue]; }
 static void vg_set_protection(id self, SEL _cmd, uint64_t v) {

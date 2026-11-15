@@ -4,6 +4,9 @@
 //   codepeek LIBPATH find SUBSTRING          functions of the library whose (mangled) name contains SUBSTRING
 //   codepeek LIBPATH sels SUBSTRING          every selector those functions load (unique), with the function
 //   codepeek LIBPATH callers OFFSET          the functions of the library that call (call rel32) the one at OFFSET
+//   codepeek LIBPATH vtable OFFSET           data words pointing at the function at OFFSET (vtable slots), and the
+//                                            named functions in the 80 words around the first one
+//   codepeek LIBPATH xref STRING             the functions that load the address of a C string containing STRING
 // OFFSET is the image offset a crash report gives (imageOffset - symbolLocation = the function's start). Writes the raw
 // bytes to OUTFILE (disassemble on the Mac: llvm-objdump -D -b binary -m i386:x86-64 --adjust-vma=OFFSET) and prints
 // every RIP-relative load whose target holds a selector (mov reg, [rip+d] of a selref) and every call's target name.
@@ -46,7 +49,7 @@ static const char *name_at(const void *p) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 4 || (argc < 5 && strcmp(argv[2], "find") && strcmp(argv[2], "sels") && strcmp(argv[2], "callers"))) {
+    if (argc < 4 || (argc < 5 && strcmp(argv[2], "find") && strcmp(argv[2], "sels") && strcmp(argv[2], "callers") && strcmp(argv[2], "xref") && strcmp(argv[2], "vtable"))) {
         fprintf(stderr, "usage: codepeek LIBPATH OFFSET LENGTH OUTFILE\n");
         return 2;
     }
@@ -65,6 +68,72 @@ int main(int argc, char **argv) {
         return 1;
     }
     gStubs = getsectiondata((const struct mach_header_64 *)mh, "__TEXT", "__objc_stubs", &gStubsSize);
+    if (!strcmp(argv[2], "vtable")) {
+        const uint8_t *want = (const uint8_t *)mh + strtoul(argv[3], NULL, 0);
+        const char *segs[] = {"__DATA_CONST", "__AUTH_CONST", "__DATA"};
+        const char *sects[] = {"__const", "__auth_ptr", "__data"};
+        for (int sg = 0; sg < 3; sg++) {
+            for (int sc = 0; sc < 3; sc++) {
+                unsigned long sz = 0;
+                const uint8_t *d = getsectiondata((const struct mach_header_64 *)mh, segs[sg], sects[sc], &sz);
+                for (unsigned long i = 0; d && i + 8 <= sz; i += 8) {
+                    const void *v = *(const void *const *)(d + i);
+                    if (v != want) {
+                        continue;
+                    }
+                    const uint8_t *slot = d + i;
+                    printf("slot %s,%s +0x%lx\n", segs[sg], sects[sc], (unsigned long)(slot - (const uint8_t *)mh));
+                    if (argc > 4 && !strcmp(argv[4], "all")) {
+                        continue;   // every slot, no neighborhood
+                    }
+                    for (int k = -60; k < 60; k++) {
+                        const uint8_t *w = slot + 8 * k;
+                        if (w < d || w + 8 > d + sz) {
+                            continue;
+                        }
+                        const void *fn = *(const void *const *)w;
+                        Dl_info di;
+                        if (fn && dladdr(fn, &di) && di.dli_sname && di.dli_saddr == fn) {
+                            printf("  [%+d] +0x%lx -> +0x%lx %s\n", k, (unsigned long)(w - (const uint8_t *)mh),
+                                   (unsigned long)((const uint8_t *)fn - (const uint8_t *)mh), di.dli_sname);
+                        } else {
+                            printf("  [%+d] +0x%lx = %p\n", k, (unsigned long)(w - (const uint8_t *)mh), fn);
+                        }
+                    }
+                    return 0;
+                }
+            }
+        }
+        printf("no data word points at it\n");
+        return 0;
+    }
+    if (!strcmp(argv[2], "xref")) {
+        unsigned long csize = 0, tsize = 0;
+        const char *cstr = (const char *)getsectiondata((const struct mach_header_64 *)mh, "__TEXT", "__cstring", &csize);
+        const uint8_t *text = getsectiondata((const struct mach_header_64 *)mh, "__TEXT", "__text", &tsize);
+        if (!cstr || !text) {
+            return 1;
+        }
+        for (const char *c = cstr; c < cstr + csize; c += strlen(c) + 1) {
+            if (!strstr(c, argv[3])) {
+                continue;
+            }
+            printf("string +0x%lx \"%.120s\"\n", (unsigned long)((const uint8_t *)c - (const uint8_t *)mh), c);
+            for (unsigned long i = 0; i + 7 <= tsize; i++) {
+                const uint8_t *q = text + i;
+                // lea r64, [rip+d]: REX.W 8d modrm(00 reg 101)
+                if ((q[0] == 0x48 || q[0] == 0x4c) && q[1] == 0x8d && (q[2] & 0xc7) == 0x05) {
+                    int32_t d;
+                    memcpy(&d, q + 3, 4);
+                    if ((const char *)(q + 7 + d) == c) {
+                        const char *n = name_at(q);
+                        printf("  +0x%lx %s\n", (unsigned long)(q - (const uint8_t *)mh), n ? n : "?");
+                    }
+                }
+            }
+        }
+        return 0;
+    }
     if (!strcmp(argv[2], "callers")) {
         unsigned long tsize = 0;
         const uint8_t *text = getsectiondata((const struct mach_header_64 *)mh, "__TEXT", "__text", &tsize);

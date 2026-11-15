@@ -68,7 +68,7 @@ MTLSizeAndAlign vg_heap_buffer_size(NSUInteger length) {
 - (NSUInteger)currentAllocatedSize { return _size; }
 - (MTLHeapType)type { return _type; }
 - (NSUInteger)maxAvailableSizeWithAlignment:(NSUInteger)alignment { return _size > _used ? _size - _used : 0; }
-- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { return MTLPurgeableStateNonVolatile; }
+- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { return vg_purgeable(self, state); }
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
     id<MTLBuffer> b = vg_new_buffer(_dev, length, options, NULL);
     VGCALL("heap %p newBufferWithLength:%lu -> %p", self, (unsigned long)length, b);

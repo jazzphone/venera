@@ -751,3 +751,50 @@ refused to an armed WindowServer unless `-vgpulegacy` or `acceltest legacy on`.
   `CA::OGL::Context` (`slist`). Read `create_surface_with_properties` and the surface release/volatile paths
   (`set_surface_volatile` -> `setPurgeableState:`, `purge_iosurface_cache`, heap aliasing) with codepeek, and make
   carender exercise transient surfaces (blur filter, shadow, masks) so the loss reproduces outside WindowServer.
+
+### 5b, round 4 (2026-11-15): root cause of the WindowServer abort -- the display still goes through the software compositor
+
+**Found, with probes inside WindowServer.** The "transient surface … not found" abort comes from WindowServer's
+*software* compositor, not from Core Animation's Metal context. The failing stack (logged by the probe just before
+the assertion):
+
+```
+CA::OGL::FlattenNode::retain_surface -> push_surface         (CA "context(2)", not the MetalContext)
+CA::OGL::ImagingNode::render / render_layers / LayerNode::apply ...
+CA::OGL::Renderer::render  <- CARenderOGLRender
+SkyLight CGLayerKitFetch <- layer_blit_byte <- layer_blit_entry
+SkyLight CompositorSW::CompositeLayersToDestination <- WS::Displays::CDDisplay::render_update
+```
+
+So with "Metal compositor activated", WindowServer still renders the display with `CompositorSW` (Core Animation's
+software OGL context), while other work runs on our Metal device: SkyLight's `desktop_window_effects_update` (its own
+`MetalContext`, the `sum_rgba` compute + blit + Finish, which completes normally) and CA's MetalContext. A flattened
+layer's cached surface is then looked up in a context that doesn't own it, and CA asserts. The plugin bugs fixed on
+the way (rounds 2-4) were real, but this mixed state is the cause. **It is the same open question as 5a: the display
+isn't on the IOPresentment / display-pipe path** (no transactions reach `VGDisplayPipe`; CoreDisplay presents through
+the legacy display surface, `CGXAccessDisplayDeviceSurface` / `vRotate` copies), so `CDDisplay` gets `CompositorSW`.
+Refusing legacy surfaces (`-vgpulegacy` absent) ends the same way.
+
+Also learned this round:
+- The `sum_rgba_*` compute pass is SkyLight's own (`desktop_window_effects_update`), not CA's `calculate_average_luma`;
+  it runs and completes correctly on our device.
+- In-process Core Animation rendering on our device is correct with effects: `carender N fx` renders a Gaussian-blurred
+  layer, a backdrop material, a shadow, a mask and group opacity (picture checked).
+- Plugin: purgeable state kept per resource (previous state returned, as Metal's contract says); scheduled handlers run
+  asynchronously (they used to run inline on the committing thread, where CA releases surfaces from them).
+
+**Probes for next time** (plugin, WindowServer only, each behind a file in /Library/GPUBundles, all removed now):
+- `VirtioGPUMetal-calls`: CALL/STACK trace of command buffers, encoders, commits.
+- `VirtioGPUMetal-cahook`: wraps 14 `CA::OGL::MetalContext` vtable slots and inline-hooks 5 non-virtual
+  `CA::OGL::Context` functions (release_surface, release_surface_async, add_transient_render_texture, push_surface,
+  FlattenNode::retain_surface), logging surface pointers and flags; `push_surface` repeats CA's list lookup first and
+  logs a miss with the full call stack. Offsets are 25G342's and every slot/prologue is checked before patching.
+  Inline patching works because AMFI is off in this VM.
+- `tools/codepeek`: `find`, `sels`, `callers`, `vtable OFFSET [all]`, `xref STRING`.
+
+**Next (5b, the present path)**: find what makes `WS::Displays::CDDisplay` render with `CompositorMetal` and present
+through IOPresentment. With the probes this is now directly observable: hook or trace SkyLight's display setup
+(`WS::Displays::CDDisplay` construction, `CompositorMetal::new_compositor`, CoreDisplay's choice between
+`CGXAccessDisplayDeviceSurface` (legacy) and the IOPresentment surface), and IOPresentment's interface creation
+("Interface creation error: 0x2002" seen with the software WindowServer). The kernel side (pipe, AGDC, capabilities)
+is in place and waiting for transactions.

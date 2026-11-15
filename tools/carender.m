@@ -3,10 +3,14 @@
 // Renders a layer tree into an offscreen texture with CARenderer: a gradient image, a CABackdropLayer that tracks the
 // luma under it (what the menu bar does; it runs CA::OGL::MetalContext::calculate_average_luma), a rounded,
 // translucent layer on top. Prints a few pixels per frame.
-//   VGMTL_ENABLE=1 carender [FRAMES] [notrack]
+//   VGMTL_ENABLE=1 carender [FRAMES] [notrack|fx]
+// fx adds what makes Core Animation render through transient (offscreen) surfaces: a Gaussian blur filter on a layer,
+// a blurring backdrop (a "material"), a shadow, a mask and a group-opacity subtree.
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
 #import <objc/message.h>
+#import <ImageIO/ImageIO.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 static CGImageRef gradient(size_t w, size_t h) {
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
@@ -25,6 +29,7 @@ int main(int argc, char **argv) {
     @autoreleasepool {
         int frames = argc > 1 ? atoi(argv[1]) : 5;
         BOOL track = !(argc > 2 && !strcmp(argv[2], "notrack"));
+        BOOL fx = argc > 2 && !strcmp(argv[2], "fx");
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
         if (!dev) {
             printf("no Metal device (VGMTL_ENABLE=1? accelerator armed?)\n");
@@ -72,6 +77,49 @@ int main(int argc, char **argv) {
         panel.backgroundColor = CGColorCreateGenericRGB(1, 1, 1, 0.6);
         [root addSublayer:panel];
 
+        if (fx) {
+            Class filterClass = NSClassFromString(@"CAFilter");
+            id (*mk)(id, SEL, id) = (id(*)(id, SEL, id))objc_msgSend;
+            id blur = filterClass ? mk(filterClass, @selector(filterWithType:), @"gaussianBlur") : nil;
+            [blur setValue:@8 forKey:@"inputRadius"];
+            id bblur = filterClass ? mk(filterClass, @selector(filterWithType:), @"gaussianBlur") : nil;
+            [bblur setValue:@20 forKey:@"inputRadius"];
+            printf("fx: CAFilter %s\n", blur ? "yes" : "NO");
+            panel.shadowOpacity = 0.8;
+            panel.shadowRadius = 10;
+            panel.shadowOffset = CGSizeMake(0, -6);
+            if (backdrop && bblur) {
+                backdrop.filters = @[ bblur ];   // a material: blur what's behind
+            }
+            CALayer *blurred = [CALayer layer];
+            blurred.frame = CGRectMake(20, 160, 90, 60);
+            blurred.backgroundColor = CGColorCreateGenericRGB(0, 1, 0, 1);
+            if (blur) {
+                blurred.filters = @[ blur ];
+            }
+            [root addSublayer:blurred];
+            CALayer *masked = [CALayer layer];
+            masked.frame = CGRectMake(150, 160, 90, 60);
+            masked.backgroundColor = CGColorCreateGenericRGB(1, 1, 0, 1);
+            CALayer *mask = [CALayer layer];
+            mask.frame = CGRectMake(0, 0, 90, 60);
+            mask.cornerRadius = 30;
+            mask.backgroundColor = CGColorCreateGenericRGB(0, 0, 0, 1);
+            masked.mask = mask;
+            [root addSublayer:masked];
+            CALayer *group = [CALayer layer];
+            group.frame = CGRectMake(100, 10, 80, 40);
+            group.opacity = 0.5;
+            group.allowsGroupOpacity = YES;
+            for (int k = 0; k < 2; k++) {
+                CALayer *c = [CALayer layer];
+                c.frame = CGRectMake(k * 30, 0, 50, 40);
+                c.backgroundColor = CGColorCreateGenericRGB(k, 0, 1 - k, 1);
+                [group addSublayer:c];
+            }
+            [root addSublayer:group];
+        }
+
         // A local CAContext (private) gives the tree a render context ID; update_backdrop_luma looks it up.
         id ctx = nil;
         Class ctxClass = NSClassFromString(@"CAContext");
@@ -104,6 +152,23 @@ int main(int argc, char **argv) {
                    f, px[0][2], px[0][1], px[0][0], px[0][3], px[1][2], px[1][1], px[1][0], px[1][3], px[2][2], px[2][1],
                    px[2][0], px[2][3], px[3][2], px[3][1], px[3][0], px[3][3]);
             fflush(stdout);
+        }
+        {   // the last frame as /var/tmp/carender.png (BGRA)
+            NSMutableData *pix = [NSMutableData dataWithLength:W * H * 4];
+            [target getBytes:pix.mutableBytes bytesPerRow:W * 4 fromRegion:MTLRegionMake2D(0, 0, W, H) mipmapLevel:0];
+            CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+            CGContextRef c = CGBitmapContextCreate(pix.mutableBytes, W, H, 8, W * 4, cs,
+                                                   kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+            CGImageRef out = CGBitmapContextCreateImage(c);
+            CGImageDestinationRef d = CGImageDestinationCreateWithURL(
+                (__bridge CFURLRef)[NSURL fileURLWithPath:@"/var/tmp/carender.png"], (__bridge CFStringRef)UTTypePNG.identifier, 1, NULL);
+            CGImageDestinationAddImage(d, out, NULL);
+            CGImageDestinationFinalize(d);
+            CFRelease(d);
+            CGImageRelease(out);
+            CGContextRelease(c);
+            CGColorSpaceRelease(cs);
+            printf("frame saved: /var/tmp/carender.png\n");
         }
         CGImageRelease(img);
         printf("done\n");

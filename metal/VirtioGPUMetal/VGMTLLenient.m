@@ -59,7 +59,12 @@ BOOL vg_lenient(void) {
 }
 
 // Every class of this bundle whose name starts with VG (the sink excepted) gets the forwarding hook.
+void vg_cahook_install(void);
+
 __attribute__((constructor)) static void vg_lenient_install(void) {
+    if (!strcmp(getprogname(), "WindowServer")) {
+        vg_cahook_install();   // only with /Library/GPUBundles/VirtioGPUMetal-cahook present
+    }
     if (!vg_lenient()) {
         return;
     }

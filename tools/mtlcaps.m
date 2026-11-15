@@ -26,6 +26,9 @@ int main(void) {
                 printf("  %-40s (no answer)\n", bools[i]);
             }
         }
+        printf("  %-40s %llu\n", "currentAllocatedSize", (unsigned long long)d.currentAllocatedSize);
+        printf("  %-40s %llu\n", "recommendedMaxWorkingSetSize", (unsigned long long)d.recommendedMaxWorkingSetSize);
+        printf("  %-40s %llu\n", "maxBufferLength", (unsigned long long)d.maxBufferLength);
         const char *nums[] = {"maxFragmentTextures", "maxFragmentSamplers", "maxTextureWidth2D", "maxTextureHeight2D",
                               "maxColorAttachments", "deviceLinearReadOnlyTextureAlignmentBytes"};
         for (size_t i = 0; i < sizeof(nums) / sizeof(*nums); i++) {

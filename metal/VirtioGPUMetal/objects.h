@@ -152,6 +152,9 @@ VkDescriptorSet vg_write_set(VGMTLCommandBuffer *cmd, VkDescriptorSetLayout dsl,
 VkBuffer vg_vkbuffer(id<MTLBuffer> b);
 id<MTLTexture> vg_new_texture(id<MTLDevice> device, MTLTextureDescriptor *d);
 NSUInteger vg_bytes_per_pixel(MTLPixelFormat f);   // 0 for a format we don't have
+// Purgeable state, kept per object (VGMTLProtection.m): returns the previous state and keeps the new one unless it is
+// KeepCurrent. Nothing is ever purged, so Empty never comes back (5b: Core Animation tracks its surfaces by it).
+MTLPurgeableState vg_purgeable(id resource, MTLPurgeableState state);
 // VGMTLHeap.m
 id<MTLHeap> vg_new_heap(id<MTLDevice> device, MTLHeapDescriptor *d);
 MTLSizeAndAlign vg_heap_texture_size(MTLTextureDescriptor *d);

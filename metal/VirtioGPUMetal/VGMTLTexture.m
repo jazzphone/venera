@@ -166,7 +166,7 @@ BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
 - (NSUInteger)bufferOffset { return _srcOffset; }
 - (NSUInteger)bufferBytesPerRow { return _srcBpr; }
 - (NSUInteger)allocatedSize { return _width * _height * _depth * _layers * MAX(vg_format_of(_pixelFormat)->bytes, 1); }
-- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { return MTLPurgeableStateNonVolatile; }
+- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { return vg_purgeable(self, state); }
 - (BOOL)isAliasable { return vg_heap_aliasable(self); }
 - (void)makeAliasable { vg_heap_make_aliasable(self); }
 - (id<MTLHeap>)heap { return vg_heap_of(self); }
