@@ -137,3 +137,24 @@ Getting the AuxKC in (each cost a round):
 
 Next: hardware cursor (cursor queue), measure flush cost at idle, then smarter updates (dirty
 tiles, or zero-copy blob scanout) before stage 3.
+
+## Stage 3 so far (2026-11-15)
+
+- the Proxmox host: `mesa-vulkan-drivers` + `vulkan-tools` installed; ANV sees "Intel Iris Xe Graphics (ADL GT2)",
+  Vulkan 1.4.305 (Mesa 25.0.7). VM 108: `vga: virtio-gl` + `args: ... -global virtio-vga-gl.venus=on
+  -global virtio-vga-gl.blob=on -global virtio-vga-gl.hostmem=4G` (Proxmox adds egl-headless).
+  QEMU's screendump captures nothing with the GL display.
+- Device: features VIRGL, EDID, RESOURCE_BLOB, CONTEXT_INIT accepted; capsets virgl (1), virgl2 (2),
+  venus (4, max size 160); shared memory id 1 = BAR4, 4 GiB at 0x384000000000; control queue max 256.
+- Venus capset: wire format 1, vk.xml 1.3.269, command serialization spec 1, Mesa Venus protocol
+  spec 2, supports blob id 0 (fields after that don't match our struct; check venus_hw.h).
+- CTX_CREATE (context_init = 4) and CTX_DESTROY answered OK_NODATA: a Venus context exists on the
+  host from the macOS guest.
+- Hardware cursor (0.3.0): 64x64 B8G8R8A8 resource, UPDATE/MOVE_CURSOR on the cursor queue,
+  convertCursorImage in the framebuffer; the owner: "smooth and accurate". No drops.
+- Without a GPU, WindowServer composites on the CPU: the Genie minimize ran at 234% CPU and
+  looked frozen. dev now has Dock mineffect=scale, reduceMotion, reduceTransparency.
+
+Next: a user client in the core (context, blob create/map in hostmem, SUBMIT_3D with ring_idx,
+fences/wait) and Mesa's Venus for x86_64 macOS with `vn_renderer_macos.c`; goal: `vulkaninfo` in
+the VM listing the Iris Xe.
