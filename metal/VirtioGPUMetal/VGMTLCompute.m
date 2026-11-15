@@ -487,6 +487,10 @@ VkBuffer vg_vkbuffer(id<MTLBuffer> b) {
         _t.tex[index] = [(NSObject *)texture isKindOfClass:[VGMTLTexture class]] ? (VGMTLTexture *)texture : nil;
         if (texture) {
             [_owner->_keep addObject:texture];
+            vg_surface_pull(_t.tex[index]);
+            if (texture.usage & MTLTextureUsageShaderWrite) {
+                vg_cmd_wrote(_owner, _t.tex[index]);
+            }
         }
     }
 }
@@ -654,6 +658,8 @@ VkBuffer vg_vkbuffer(id<MTLBuffer> b) {
         _handlers = [NSMutableArray array];
         _done = dispatch_group_create();
         _status = MTLCommandBufferStatusNotEnqueued;
+        _surfacesWritten = [NSMutableSet set];
+        _drawables = [NSMutableArray array];
     }
     return self;
 }
@@ -779,7 +785,13 @@ VkBuffer vg_vkbuffer(id<MTLBuffer> b) {
 - (CFTimeInterval)GPUEndTime { return _completed / 1e9; }
 - (CFTimeInterval)kernelStartTime { return _submitted / 1e9; }
 - (CFTimeInterval)kernelEndTime { return _completed / 1e9; }
-- (void)presentDrawable:(id<MTLDrawable>)d { }
+- (void)presentDrawable:(id<MTLDrawable>)d {
+    if (d) {
+        [_drawables addObject:d];
+    }
+}
+- (void)presentDrawable:(id<MTLDrawable>)d atTime:(CFTimeInterval)t { [self presentDrawable:d]; }
+- (void)presentDrawable:(id<MTLDrawable>)d afterMinimumDuration:(CFTimeInterval)t { [self presentDrawable:d]; }
 - (void)pushDebugGroup:(NSString *)s { }
 - (void)popDebugGroup { }
 
@@ -803,6 +815,21 @@ VkBuffer vg_vkbuffer(id<MTLBuffer> b) {
         vg_buffer_destroy(&_arena[i]);
     }
     _narena = 0;
+    if (status == MTLCommandBufferStatusCompleted) {
+        for (VGMTLTexture *t in _surfacesWritten) {
+            IOSurfaceLock(t->_surface, 0, NULL);
+            memcpy(IOSurfaceGetBaseAddressOfPlane(t->_surface, t->_plane), t->_staging.map, t->_surfaceBpr * t->_height);
+            uint32_t seed = 0;
+            IOSurfaceUnlock(t->_surface, 0, &seed);
+            t->_syncedSeed = seed;   // our own write: no pull needed for it
+            t->_neverSynced = NO;
+        }
+    }
+    [_surfacesWritten removeAllObjects];
+    for (id<MTLDrawable> d in _drawables) {
+        [d present];
+    }
+    [_drawables removeAllObjects];
     _status = status;
     NSArray *handlers;
     @synchronized(self) {
@@ -822,6 +849,17 @@ VkBuffer vg_vkbuffer(id<MTLBuffer> b) {
     _submitted = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     VkFence fence = VK_NULL_HANDLE;
     if (_cb && !_error) {
+        // IOSurface textures this command buffer wrote: image -> staging, written into the surface at completion.
+        for (VGMTLTexture *t in _surfacesWritten) {
+            [self barrier];
+            NSUInteger px = IOSurfaceGetBytesPerElementOfPlane(t->_surface, t->_plane);
+            VkBufferImageCopy c = {0, (uint32_t)(t->_surfaceBpr / px), (uint32_t)t->_height,
+                                   {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {(uint32_t)t->_width, (uint32_t)t->_height, 1}};
+            gVk.vkCmdCopyImageToBuffer(_cb, t->_image, VK_IMAGE_LAYOUT_GENERAL, t->_staging.buffer, 1, &c);
+        }
+        if (_surfacesWritten.count) {
+            [self barrier];
+        }
         gVk.vkEndCommandBuffer(_cb);
         VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         gVk.vkCreateFence(gVk.device, &fci, NULL, &fence);
@@ -850,3 +888,9 @@ VkBuffer vg_vkbuffer(id<MTLBuffer> b) {
     }
 }
 @end
+
+void vg_cmd_wrote(id cmd, VGMTLTexture *t) {
+    if (t && t->_surface) {
+        [((VGMTLCommandBuffer *)cmd)->_surfacesWritten addObject:t];
+    }
+}

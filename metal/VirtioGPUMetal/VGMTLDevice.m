@@ -206,6 +206,9 @@ static id vg_refuse_before_init(id obj) {
 // ---- stage 4c: textures and rendering (VGMTLTexture.m, VGMTLRender.m) ----
 
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d { return vg_new_texture(self, d); }
+- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)s plane:(NSUInteger)p {
+    return vg_new_surface_texture(self, d, s, p);
+}
 - (id<MTLSamplerState>)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)d { return vg_new_sampler(self, d); }
 - (id<MTLDepthStencilState>)newDepthStencilStateWithDescriptor:(MTLDepthStencilDescriptor *)d {
     return vg_new_depth_stencil(self, d);

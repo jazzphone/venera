@@ -338,6 +338,7 @@ static void vg_set_texture(VGMTLCommandBuffer *cmd, vg_stage_bindings *t, id<MTL
         t->tex[i] = [(NSObject *)tex isKindOfClass:[VGMTLTexture class]] ? (VGMTLTexture *)tex : nil;
         if (tex) {
             [cmd->_keep addObject:tex];
+            vg_surface_pull(t->tex[i]);   // synchronous, before this command buffer runs
         }
     }
 }
@@ -548,6 +549,12 @@ static VkAttachmentStoreOp vg_store(MTLStoreAction a) {
             return nil;
         }
         [_keep addObject:t];
+        if (c.loadAction == MTLLoadActionLoad) {
+            vg_surface_pull(t);
+        }
+        if (c.storeAction != MTLStoreActionDontCare) {
+            vg_cmd_wrote(self, t);
+        }
         color[i].imageView = t->_view;
         color[i].loadOp = vg_load(c.loadAction);
         color[i].storeOp = vg_store(c.storeAction);

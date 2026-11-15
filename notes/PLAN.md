@@ -484,3 +484,41 @@ caching); pipelines and translation aren't cached across processes. Depth attach
 
 Next (4d): IOSurface-backed textures (`newTextureWithDescriptor:iosurface:plane:`, copy in / out with seeds), a
 CAMetalLayer / MTKView app that animates in a window through the software compositor.
+
+## Stage 4d result (2026-11-15): a Metal app animates in a window
+
+**`tools/mtlwindow.m`, a plain Cocoa app with a CAMetalLayer, renders a spinning triangle on our Metal device in a
+real window in VM 108, and WindowServer (still the software compositor) shows it**: the owner saw the spinning
+triangle on the console. Over 12.6 s: 337 frames completed, 335 presented by Core Animation, **~27 fps** (25-30 over
+three runs; a 60 Hz timer, three drawables). Frame 30's drawable IOSurface holds exactly that frame's clear color;
+the frame as handed to WindowServer is `notes/img/stage4d-frame30.png`.
+
+`tools/mtlsurface.m` (CLI) PASS: `newTextureWithDescriptor:iosurface:plane:`; a GPU clear lands in the IOSurface's
+own memory; a CPU write to the surface is seen by `getBytes` and by a GPU sampling pass; a 1280x800 surface frame
+(clear + copy-out) takes 3.3 ms. mtlrender and mtlcompute still pass.
+
+How (plugin):
+
+- **IOSurface textures = NV's headless copy path**: Venus can't put a guest IOSurface's pages under a host image, so
+  a surface texture is a private VkImage plus a staging buffer laid out like the surface plane. The surface seed
+  tells when the CPU (or another process) changed it: before the GPU reads it (bound for sampling or storage, or a
+  Load attachment) a changed surface is pulled in (synchronous one-shot copy); a command buffer that writes it
+  (stored attachment, writable storage texture) records image -> staging at its end, and at completion the plugin
+  copies staging into the surface under IOSurfaceLock and remembers the resulting seed as its own.
+- **presentDrawable**: drawables are presented (`-[MTLDrawable present]`) at completion, after the copy-out, so
+  WindowServer never reads a surface before its pixels are in it.
+- **CAMetalLayer needed nothing else**: with `layer.device` = our device it made its three drawables through
+  `newTextureWithDescriptor:iosurface:plane:` and no unanswered selector was logged.
+- `screencapture` can't read this display ("could not create image from display", as dev or root), like QEMU's
+  screendump with the GL display; the app saves its own frame instead.
+
+Seen in passing: other processes that ask Metal for devices while armed load the plugin and are refused by the
+allow-list (e.g. `universalAccessAuthWarn`, started by the screenshot attempt), with no crash.
+
+Known gaps: the copy path costs two CPU copies per frame (surface <-> staging) plus a GPU copy; two command buffers in
+flight that write the same surface share one staging buffer; no planar / YUV surfaces; nothing waits for
+WindowServer to finish reading a surface before the next write (CAMetalLayer's drawable pool covers that today).
+Frame rate isn't tuned (25-30 fps for a trivial frame): measure where the time goes before 5a.
+
+Stage 4 is done: an app-only Metal device on Venus (compute, render, IOSurfaces, CAMetalLayer). Next is 5a
+(WindowServer picks the device: AGDC, display pipe, framebuffer registration, VBL, the arming moved into the kext).

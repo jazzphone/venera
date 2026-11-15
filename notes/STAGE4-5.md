@@ -622,6 +622,8 @@ Effort is focused-engineer days for the stage, excluding VM reboot waits, assumi
 
 ### Stage 4d: IOSurface textures and presentation shape
 
+**Done 2026-11-15 (PLAN.md, "Stage 4d result"): a CAMetalLayer app animates in a window.**
+
 - **Do:** `newTextureWithDescriptor:iosurface:plane:` with the private image + copy-in/out path; `CAMetalLayer` in a test app
   (`MTKView` sample) shows a rotating quad **in a window through the software compositor**: the app draws with our device, WindowServer still composites in software and reads the IOSurface.
 - **Checkpoint:** a Metal app animates correctly in a window at 30+ fps with the device allowed for that process only; `IOSurfaceLock` read in the app shows the GPU's pixels; seeds and

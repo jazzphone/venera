@@ -14,7 +14,7 @@ install)
   mv /tmp/vgmetal/VirtioGPUMetal.bundle /Library/GPUBundles/
   chown -R root:wheel /Library/GPUBundles/VirtioGPUMetal.bundle
   chmod -R go-w,a+rX /Library/GPUBundles/VirtioGPUMetal.bundle
-  cp /tmp/vgmetal/mtlprobe /tmp/vgmetal/mtlcompute /tmp/vgmetal/mtlrender /tmp/vgmetal/*.metallib /tmp/vgmetal/acceltest $T/ && chmod 755 $T $T/mtlprobe $T/mtlcompute $T/mtlrender $T/acceltest && chmod 644 $T/*.metallib
+  for f in /tmp/vgmetal/*; do [ -d "$f" ] || cp "$f" $T/; done && chmod 755 $T $T/mtl* $T/acceltest && chmod 644 $T/*.metallib
   sudo -u _windowserver test -r /Library/GPUBundles/VirtioGPUMetal.bundle/Contents/MacOS/VirtioGPUMetal && echo "readable by _windowserver"
   ls -la /Library/GPUBundles /Library/GPUBundles/VirtioGPUMetal.bundle/Contents/*
   ;;
@@ -25,6 +25,21 @@ compute) # stage 4b: mtlcompute (allow-listed by VGMTL_ENABLE), then the plugin'
   rm -f /var/tmp/VirtioGPUMetal.log
   cd $T && sudo -u dev env VGMTL_ENABLE=1 ./mtlcompute compute.metallib 2>&1; echo "mtlcompute exit $?"
   echo "== plugin log"; cat /var/tmp/VirtioGPUMetal.log 2>/dev/null | tail -40
+  ;;
+tool) # tool NAME [ARGS]: one of the test tools as the console user (allow-listed by VGMTL_ENABLE), then the log
+  shift
+  rm -f /var/tmp/VirtioGPUMetal.log
+  cd $T && sudo -u dev env VGMTL_ENABLE=1 VGMTL_TRACE=${VGMTL_TRACE:-0} ./"$@" 2>&1; echo "$1 exit $?"
+  echo "== plugin log"; cat /var/tmp/VirtioGPUMetal.log 2>/dev/null | tail -40
+  ;;
+window) # window [SECONDS]: mtlwindow in dev's GUI session, a screenshot halfway (/var/tmp/vgwin.png), then the log
+  rm -f /var/tmp/VirtioGPUMetal.log /var/tmp/vgwin.png /var/tmp/vgframe.png /var/tmp/mtlwindow.out
+  U=$(id -u dev); S=${2:-8}
+  cd $T && launchctl asuser $U sudo -u dev env VGMTL_ENABLE=1 ./mtlwindow $S render.metallib > /var/tmp/mtlwindow.out 2>&1 &
+  sleep $(( S / 2 + 2 ))
+  launchctl asuser $U screencapture -x /var/tmp/vgwin.png; echo "screenshot $?"
+  wait; cat /var/tmp/mtlwindow.out
+  echo "== plugin log"; grep -v "^$" /var/tmp/VirtioGPUMetal.log 2>/dev/null | grep -v "pull\|sync" | tail -30
   ;;
 render) # stage 4c: mtlrender, then the plugin's log
   rm -f /var/tmp/VirtioGPUMetal.log
@@ -53,6 +68,6 @@ probe)
   log show --last 2m --style compact --predicate '(process == "mtlprobe") OR (sender == "IOAcceleratorFamily2")' 2>/dev/null | grep -v '^Timestamp' | grep -viE 'activity|signpost' | cut -c1-220 | tail -40
   ;;
 *)
-  echo "usage: $0 install | arm [NAME [CLASS]] | disarm | probe | compute | render | refused | health"; exit 2
+  echo "usage: $0 install | arm [NAME [CLASS]] | disarm | probe | compute | render | tool NAME [ARGS] | window [SECONDS] | refused | health"; exit 2
   ;;
 esac

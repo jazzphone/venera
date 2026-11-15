@@ -110,6 +110,10 @@ BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
 @synthesize label = _label;
 - (id<MTLDevice>)device { return _dev; }
 - (void)dealloc {
+    if (_surface) {
+        CFRelease(_surface);
+    }
+    vg_buffer_destroy(&_staging);
     if (_view) {
         gVk.vkDestroyImageView(gVk.device, _view, NULL);
     }
@@ -136,8 +140,8 @@ BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
 - (BOOL)isFramebufferOnly { return NO; }
 - (BOOL)allowGPUOptimizedContents { return YES; }
 - (BOOL)isShareable { return NO; }
-- (IOSurfaceRef)iosurface { return NULL; }
-- (NSUInteger)iosurfacePlane { return 0; }
+- (IOSurfaceRef)iosurface { return _surface; }
+- (NSUInteger)iosurfacePlane { return _plane; }
 - (id<MTLTexture>)parentTexture { return nil; }
 - (id<MTLTexture>)rootResource { return nil; }
 - (id<MTLBuffer>)buffer { return nil; }
@@ -198,6 +202,18 @@ BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
 }
 - (void)replaceRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes
           bytesPerRow:(NSUInteger)bpr {
+    if (_surface && level == 0) {   // the surface is the truth for its texture: write it, then the image follows
+        const NSUInteger px = vg_format_of(_pixelFormat)->bytes;
+        IOSurfaceLock(_surface, 0, NULL);
+        uint8_t *base = IOSurfaceGetBaseAddressOfPlane(_surface, _plane);
+        for (NSUInteger y = 0; y < region.size.height; y++) {
+            memcpy(base + (region.origin.y + y) * _surfaceBpr + region.origin.x * px, (const uint8_t *)bytes + y * bpr,
+                   region.size.width * px);
+        }
+        IOSurfaceUnlock(_surface, 0, NULL);
+        vg_surface_pull(self);
+        return;
+    }
     [self copyRegion:region level:level slice:0 bytes:(void *)bytes bytesPerRow:bpr bytesPerImage:0 toImage:YES];
 }
 - (void)replaceRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice
@@ -205,6 +221,7 @@ BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
     [self copyRegion:region level:level slice:slice bytes:(void *)bytes bytesPerRow:bpr bytesPerImage:bpi toImage:YES];
 }
 - (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)bpr fromRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level {
+    vg_surface_pull(self);
     [self copyRegion:region level:level slice:0 bytes:bytes bytesPerRow:bpr bytesPerImage:0 toImage:NO];
 }
 - (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi fromRegion:(MTLRegion)region
@@ -403,4 +420,68 @@ id<MTLDepthStencilState> vg_new_depth_stencil(id<MTLDevice> device, MTLDepthSten
         vglog("depth-stencil: stencil isn't supported yet (ignored)");
     }
     return s;
+}
+
+// ---- IOSurface-backed textures (stage 4d) -------------------------------------------------------------------------
+//
+// Venus can't put a guest IOSurface's pages under a host image, so a surface texture is NV's headless path: a private
+// VkImage plus a staging buffer laid out like the surface plane. The surface's seed says when the CPU (or another
+// process) changed it: before the GPU reads the texture, a changed surface is pulled into the image; when a command
+// buffer wrote the texture, the image is copied to the staging buffer at the end of it and into the surface when it
+// completes (VGMTLCompute.m), and the seed after that write is remembered as ours.
+
+void vg_surface_pull(VGMTLTexture *t) {
+    if (!t || !t->_surface) {
+        return;
+    }
+    uint32_t seed = IOSurfaceGetSeed(t->_surface);
+    if (!t->_neverSynced && seed == t->_syncedSeed) {
+        return;
+    }
+    const vg_format *f = vg_format_of(t->_pixelFormat);
+    NSUInteger rows = t->_height;
+    IOSurfaceLock(t->_surface, kIOSurfaceLockReadOnly, &seed);
+    memcpy(t->_staging.map, IOSurfaceGetBaseAddressOfPlane(t->_surface, t->_plane), t->_surfaceBpr * rows);
+    IOSurfaceUnlock(t->_surface, kIOSurfaceLockReadOnly, NULL);
+    VkBufferImageCopy c = {0, (uint32_t)(t->_surfaceBpr / f->bytes), (uint32_t)rows,
+                           {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
+                           {(uint32_t)t->_width, (uint32_t)rows, 1}};
+    VkBuffer buf = t->_staging.buffer;
+    VkImage image = t->_image;
+    vgtrace("surface %u: pull (seed %u, had %u)", IOSurfaceGetID(t->_surface), seed, t->_syncedSeed);
+    vg_one_shot(^(VkCommandBuffer cb) {
+        gVk.vkCmdCopyBufferToImage(cb, buf, image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    });
+    t->_syncedSeed = seed;
+    t->_neverSynced = NO;
+}
+
+id<MTLTexture> vg_new_surface_texture(id<MTLDevice> device, MTLTextureDescriptor *d, IOSurfaceRef surface, NSUInteger plane) {
+    const vg_format *f = vg_format_of(d.pixelFormat);
+    if (!surface || !f || (f->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT) || d.textureType != MTLTextureType2D ||
+        d.mipmapLevelCount > 1) {
+        vglog("surface texture: only single-level 2D color textures (format %lu, type %lu)", (unsigned long)d.pixelFormat,
+              (unsigned long)d.textureType);
+        return nil;
+    }
+    size_t bpr = IOSurfaceGetBytesPerRowOfPlane(surface, plane);
+    size_t sw = IOSurfaceGetWidthOfPlane(surface, plane), sh = IOSurfaceGetHeightOfPlane(surface, plane);
+    if (d.width > sw || d.height > sh || bpr % f->bytes || IOSurfaceGetBytesPerElementOfPlane(surface, plane) != f->bytes) {
+        vglog("surface texture: %lux%lu format %lu doesn't fit surface %zux%zu, %zu bytes per row, %zu per element",
+              (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.pixelFormat, sw, sh, bpr,
+              IOSurfaceGetBytesPerElementOfPlane(surface, plane));
+        return nil;
+    }
+    VGMTLTexture *t = (VGMTLTexture *)vg_new_texture(device, d);
+    if (!t || vg_buffer_create(bpr * d.height, &t->_staging)) {
+        return nil;
+    }
+    t->_surface = (IOSurfaceRef)CFRetain(surface);
+    t->_plane = plane;
+    t->_surfaceBpr = bpr;
+    t->_neverSynced = YES;
+    vg_surface_pull(t);
+    vglog("surface texture: IOSurface %u plane %lu, %lux%lu, %zu bytes per row", IOSurfaceGetID(surface),
+          (unsigned long)plane, (unsigned long)d.width, (unsigned long)d.height, bpr);
+    return t;
 }

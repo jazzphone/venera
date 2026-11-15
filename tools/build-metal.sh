@@ -6,7 +6,7 @@ cd "${0:A:h}/.."
 B=build/VirtioGPUMetal.bundle
 rm -rf $B && mkdir -p $B/Contents/MacOS $B/Contents/Resources
 xcrun clang -arch x86_64 -mmacosx-version-min=26.0 -O1 -Wall -Wno-protocol -Wno-incomplete-implementation -Wno-objc-protocol-property-synthesis -bundle -fobjc-arc -I"$HOME/src/mesa/include" \
-  metal/VirtioGPUMetal/*.m -framework Foundation -framework Metal -framework IOKit \
+  metal/VirtioGPUMetal/*.m -framework Foundation -framework Metal -framework IOKit -framework IOSurface \
   -o $B/Contents/MacOS/VirtioGPUMetal
 cp metal/VirtioGPUMetal/Info.plist $B/Contents/Info.plist
 cp mesa/out/libvulkan_virtio.dylib $B/Contents/Resources/

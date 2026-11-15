@@ -1,6 +1,7 @@
 // The plugin's Metal objects that more than one file needs.
 #pragma once
 #import "vg.h"
+#import <IOSurface/IOSurfaceRef.h>
 
 enum {
     kVGMaxBufferSlots = 31,
@@ -37,10 +38,22 @@ enum {
     MTLTextureUsage _usage;
     MTLStorageMode _storage;
     id<MTLDevice> _dev;
+    // IOSurface-backed (stage 4d): the image is a private GPU copy; _staging is laid out like the surface's plane.
+    IOSurfaceRef _surface;
+    NSUInteger _plane, _surfaceBpr;
+    uint32_t _syncedSeed;   // the surface seed the image matches (after a pull or our own copy-out)
+    BOOL _neverSynced;
+    vg_buffer _staging;
 }
 @property(readonly) id<MTLDevice> device;
 @property(copy, atomic) NSString *label;
 @end
+
+// The surface's CPU contents -> the image, when the surface changed since the image last matched it (synchronous).
+void vg_surface_pull(VGMTLTexture *t);
+// Records that `cmd` writes texture `t`: a surface texture is copied back to its IOSurface when `cmd` completes.
+void vg_cmd_wrote(id cmd, VGMTLTexture *t);
+id<MTLTexture> vg_new_surface_texture(id<MTLDevice> device, MTLTextureDescriptor *d, IOSurfaceRef surface, NSUInteger plane);
 
 @interface VGMTLSamplerState : NSObject <MTLSamplerState> {
 @public
@@ -85,6 +98,8 @@ BOOL vg_spirv_has_push_constants(NSData *spv);   // DescriptorSet 0 -> newSet (N
     MTLCommandBufferStatus _status;
     NSError *_error;
     uint64_t _submitted, _completed;
+    NSMutableSet *_surfacesWritten;   // VGMTLTexture with an IOSurface, copied out at completion
+    NSMutableArray *_drawables;       // presented after the copy-out
 }
 @property(readonly) id<MTLDevice> device;
 @property(readonly) id<MTLCommandQueue> commandQueue;
