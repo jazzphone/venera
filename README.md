@@ -18,7 +18,8 @@ Target: macOS 26.7.3 (25G342) on Proxmox VE 9.2 / pve-qemu 11.1, host GPU an Ald
    `SUBMIT_3D` + fences in the kext; Mesa's Venus built for macOS with a transport in place of
    `vn_renderer_virtgpu.c`.
 4. **Metal** — an IOAccelerator kext (IOAcceleratorFamily2) and a Metal driver bundle over Vulkan.
-   4.0 (the accelerator starts in the guest, unarmed) done; see `notes/PLAN.md`.
+   4.0 (the accelerator starts in the guest, unarmed) and 4a (Metal lists the device, late arm, allow-list)
+   done; see `notes/PLAN.md`.
 5. **WindowServer** — IOSurface-backed accelerated compositing.
 
 See `notes/PLAN.md` for the research behind this and what each stage needs.
@@ -27,6 +28,7 @@ See `notes/PLAN.md` for the research behind this and what each stage needs.
 
 - `kext/VirtioGPU/` — the core kext (C++, built with the macOS SDK's Kernel.framework), OpenCore-injected.
 - `kext/VirtioGPUFramebuffer/`, `kext/VirtioGPUAccel/` — the IOFramebuffer and the IOAccelerator (Auxiliary KC).
+- `metal/VirtioGPUMetal/` — the Metal driver plugin (`/Library/GPUBundles/VirtioGPUMetal.bundle`).
 - `vendor/nullmoth/` — nvidia-macos-driver's reconstructed IOAccel headers (PolyForm Noncommercial).
 - `tools/` — build and deploy scripts (build here, inject into VM 108's OpenCore, read logs).
 - `notes/` — plan, findings, device dumps.

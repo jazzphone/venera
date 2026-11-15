@@ -587,6 +587,8 @@ Effort is focused-engineer days for the stage, excluding VM reboot waits, assumi
 
 ### Stage 4a: plugin loads, `MTLCopyAllDevices` lists the device (late arm)
 
+**Done 2026-11-15 (PLAN.md, "Stage 4a result").**
+
 - **Do:** `VirtioGPUMetal.bundle` with `VGMTLDevice : MTLIOAccelDevice`, `initWithAcceleratorPort:` that checks `IOObjectConformsTo(port, "VirtioGPUAccel")`, calls super,
   runs `nvmtl_vk_init` against Venus, `initLimits`, and returns. Kernel: `debug.vgpuaccel=1` publishes `MetalPluginName`/`MetalPluginClassName`. A tiny `mtlprobe` tool prints
   `MTLCopyAllDevices`, `name`, `registryID`, `supportsFamily:`, `recommendedMaxWorkingSetSize`, `isHeadless`.

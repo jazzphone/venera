@@ -1,5 +1,5 @@
 #!/bin/zsh
-# User-space tools for the VM (x86_64): build/vgputest, build/vkprobe, build/vkexec, build/acceltest, build/llvmprobe
+# User-space tools for the VM (x86_64): build/vgputest, build/vkprobe, build/vkexec, build/acceltest, build/llvmprobe, build/mtlprobe
 set -euo pipefail
 cd "${0:A:h}/.."
 mkdir -p build
@@ -9,4 +9,5 @@ $CC -I"$HOME/src/mesa/include" tools/vkprobe.c -o build/vkprobe
 $CC -I"$HOME/src/mesa/include" tools/vkexec.c -o build/vkexec
 $CC -framework IOKit -framework CoreFoundation tools/acceltest.c -o build/acceltest
 $CC tools/llvmprobe.c -o build/llvmprobe
-file build/vgputest build/vkprobe build/vkexec build/acceltest build/llvmprobe
+$CC -fobjc-arc -framework Foundation -framework Metal tools/mtlprobe.m -o build/mtlprobe
+file build/vgputest build/vkprobe build/vkexec build/acceltest build/llvmprobe build/mtlprobe

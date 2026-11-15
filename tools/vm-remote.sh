@@ -130,6 +130,14 @@ xfer) # xfer FILE...: copy files onto the transfer disk (virtio1, FAT "VGPU", /V
   mount "$XDISK" /mnt/vgpuxfer && cp -r "$@" /mnt/vgpuxfer/ && sync && umount /mnt/vgpuxfer
   agent 'diskutil mount $(diskutil list | awk "/VGPU/{print \$NF; exit}") >/dev/null; ls -la /Volumes/VGPU | tail -n +2' 60
   ;;
+pull) # pull 'GUEST_GLOB' DIR: copy guest files out through the transfer disk into DIR here
+  XDISK=/dev/pve/$(qm config $VM | grep ^virtio1 | sed -E "s/.*local-lvm:(vm-108-disk-[0-9]+).*/\1/")
+  agent "mkdir -p /Volumes/VGPU/pull && rm -rf /Volumes/VGPU/pull/* && cp $2 /Volumes/VGPU/pull/ && sync; diskutil unmount force /Volumes/VGPU >/dev/null 2>&1; true" 60 || true
+  mkdir -p /mnt/vgpuxfer "$3" && lvchange -ay "$XDISK" 2>/dev/null
+  mount "$XDISK" /mnt/vgpuxfer && cp -r /mnt/vgpuxfer/pull/. "$3"/ && umount /mnt/vgpuxfer
+  agent 'diskutil mount $(diskutil list | awk "/VGPU/{print \$NF; exit}") >/dev/null' 60
+  ls -la "$3"
+  ;;
 push) # push LOCAL REMOTE: copy a file into the VM over the guest agent
   push_file "$2" "$3"
   ;;

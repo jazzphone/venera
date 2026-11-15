@@ -47,6 +47,17 @@ accel) # stage 4: VirtioGPUAccel into /Library/Extensions + the AuxKC (beside th
 accel-logs)
   "${SSH[@]}" $HOST 'bash /root/vgpu/vm-remote.sh accel-logs'
   ;;
+metal) # stage 4a: VirtioGPUMetal.bundle + mtlprobe/acceltest over the transfer disk, installed in the VM
+  tools/build-metal.sh >/dev/null && tools/build-tools.sh >/dev/null
+  tar -czf build/vgmetal.tgz -C build VirtioGPUMetal.bundle mtlprobe acceltest
+  "${SSH[@]}" $HOST 'mkdir -p /root/vgpu/xfer && rm -rf /root/vgpu/xfer/*'
+  "${SCP[@]}" build/vgmetal.tgz tools/metal-vm.sh $HOST:/root/vgpu/xfer/
+  "${SSH[@]}" $HOST "bash /root/vgpu/vm-remote.sh xfer /root/vgpu/xfer/* >/dev/null; bash /root/vgpu/vm-remote.sh run 'sh /Volumes/VGPU/metal-vm.sh install' 120"
+  ;;
+mtl) # tools/deploy.sh mtl arm|disarm|probe: run tools/metal-vm.sh in the VM
+  shift
+  "${SSH[@]}" $HOST "bash /root/vgpu/vm-remote.sh run 'sh /Volumes/VGPU/metal-vm.sh $*' 240"
+  ;;
 bootarg) # tools/deploy.sh bootarg set vgpuaccel=1 | del vgpuaccel | show
   "${SSH[@]}" $HOST "bash /root/vgpu/vm-remote.sh bootarg $2 ${3:-}"
   ;;
@@ -69,6 +80,10 @@ vk) # Venus: Mesa's ICD + vkprobe over the transfer disk, run as the console use
   "${SSH[@]}" $HOST 'mkdir -p /root/vgpu/xfer && rm -rf /root/vgpu/xfer/*'
   "${SCP[@]}" mesa/out/libvulkan_virtio.dylib build/vkprobe build/vkexec build/vgputest $HOST:/root/vgpu/xfer/
   "${SSH[@]}" $HOST "bash /root/vgpu/vm-remote.sh xfer /root/vgpu/xfer/* >/dev/null; bash /root/vgpu/vm-remote.sh run 'mkdir -p /tmp/vk && cp /Volumes/VGPU/libvulkan_virtio.dylib /Volumes/VGPU/vkprobe /Volumes/VGPU/vkexec /Volumes/VGPU/vgputest /tmp/vk/ && chmod 755 /tmp/vk /tmp/vk/vkprobe /tmp/vk/vkexec /tmp/vk/vgputest && chmod 644 /tmp/vk/libvulkan_virtio.dylib && cd /tmp/vk && sudo -u dev env VN_DEBUG=${VN_DEBUG:-init,result} ./${VKTOOL:-vkprobe} ./libvulkan_virtio.dylib ${VKARGS:-} 2>&1 | tail -70; echo exit \$?' 240"
+  ;;
+pull) # tools/deploy.sh pull 'GUEST_GLOB' -> build/pull/
+  "${SSH[@]}" $HOST "rm -rf /root/vgpu/pull && bash /root/vgpu/vm-remote.sh pull '$2' /root/vgpu/pull"
+  rm -rf build/pull && mkdir -p build/pull && "${SCP[@]}" -r "$HOST:/root/vgpu/pull/*" build/pull/
   ;;
 shots) # tools/deploy.sh shots COUNT INTERVAL -> build/shots/NN.png
   "${SSH[@]}" $HOST "bash /root/vgpu/vm-remote.sh shots ${2:-20} ${3:-3}"

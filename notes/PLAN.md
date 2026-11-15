@@ -309,3 +309,58 @@ Recommendation: proceed to **4a** as planned. Changes to the plan from what 4.0 
   registered accelerator, then the bundle and `mtlprobe` with the allow-list.
 - Legacy surfaces (type 0) need VRAM descriptors (a framebuffer registered with the display machine); that is
   5a's `found_framebuffer` work and doesn't affect Metal on IOSurfaces.
+
+## Stage 4a result (2026-11-15): Metal lists the device
+
+**`MTLCopyAllDevices` in VM 108 returns one device, "Virtio-GPU Venus (Intel(R) Iris(R) Xe Graphics (ADL GT2))
+(VirtioGPUMetal)", and `MTLCreateSystemDefaultDevice` returns it** (tools/mtlprobe.m, run as dev after the late arm).
+Apple's own `-[MTLIOAccelDevice initWithAcceleratorPort:]` succeeds against VirtioGPUAccel (it opens the family's
+user clients itself), the plugin brings up a Venus VkDevice on the Iris Xe in the same process, and
+`-[_MTLDevice initLimits]` completes.
+
+Pieces:
+
+- **Late arm** (VirtioGPUAccel 0.4.1, `setProperties`): a root process sets `{"VirtioGPUArm": {MetalPluginName,
+  MetalPluginClassName}}` or `{"VirtioGPUDisarm": true}` on the accelerator (`acceltest arm|disarm`;
+  `tools/deploy.sh mtl arm|disarm`). Non-root is refused. Boots unarmed every time.
+- **`metal/VirtioGPUMetal/VGMTLDevice.m`** -> `/Library/GPUBundles/VirtioGPUMetal.bundle` (built by
+  `tools/build-metal.sh`, Mesa's Venus ICD in its Resources; `tools/deploy.sh metal` installs it root-owned,
+  readable by `_windowserver`). Class `VGMTLDevice : MTLIOAccelDevice <MTLDevice>`; `MTLDeviceSPI` adopted at
+  `+load` from the runtime (`objc_getProtocol`, no header). MetalPluginName is the bare `VirtioGPUMetal`: Metal
+  found `/Library/GPUBundles/VirtioGPUMetal.bundle` by it (Reims' form; NV's relative path wasn't needed).
+- **Allow-list**: WindowServer always refused (until 5a); `mtlprobe` always allowed; others need
+  `/Library/GPUBundles/VirtioGPUMetal-allow.txt` (names, `*`) or `VGMTL_ENABLE=1`. A refusal before super's init
+  keeps the object (NV's lesson). Tested: the same binary under another name loads the plugin, gets no device,
+  exits normally.
+- Log: os_log subsystem `local.homelab.VirtioGPUMetal`, `/var/tmp/VirtioGPUMetal.log`, stderr with `VGMTL_LOG=1`.
+  Unanswered selectors are logged by name (`-doesNotRecognizeSelector:`). `tools/deploy.sh mtl probe|refused|health`;
+  `tools/deploy.sh pull 'GLOB'` copies guest files (crash reports) out through the transfer disk.
+
+What Metal demanded, in order (each was a crash until answered):
+1. `-[_MTLDevice initLimits]` sends vendor selectors: `featureProfile` (10002, NV's value) and the rest of NV's
+   contract set (FP configs, timestamp frequency, depth24stencil8, assertions, texture buffer alignment, ...).
+2. `MTLAddDevice` asserts `conformsToProtocol:@protocol(MTLDevice)`, then `@protocol(MTLDeviceSPI)`.
+3. `maxThreadsPerThreadgroup` (now from Vulkan's limits: 1024 x 1024 x 1024).
+
+What the base class answers on its own: registryID 4294968177 (the accelerator), location 0 / number 1, not
+headless / low power / removable, hasUnifiedMemory 0, recommendedMaxWorkingSetSize 2,863,312,896,
+maxBufferLength 2 GiB, supportsFamily Mac2 / Common3 / Metal3 all YES (from featureProfile; may claim more than
+we'll deliver, revisit in 4b/4c).
+
+Checks: Venus contexts all closed when mtlprobe exits (core ProbeLog "uc: ctx N closed", 0 VirtioGPUUserClient
+left); after disarm a new mtlprobe lists 0 devices; WindowServer kept its boot pid (no restart, no new crash
+report); only mtlprobe processes logged plugin activity while armed.
+
+Probe 3 (Venus features, `vkprobe ICD --features`): every hard requirement of the plugin is there (Vulkan 1.3,
+graphics+compute queue, bufferDeviceAddress, descriptor indexing incl. update-after-bind and variable count,
+dynamicRendering, synchronization2, maintenance4, shaderFloat16/Int8/Int16/Int64, 8/16-bit storage, timeline
+semaphores, scalar block layout, BC compression, geometry + tessellation; no shaderFloat64). Of its 17 optional
+extensions: yes = extended_dynamic_state3, depth_clip_enable, image_drm_format_modifier, external_memory_fd,
+mutable_descriptor_type, calibrated_timestamps, provoking_vertex (and VALVE_mutable_descriptor_type); no =
+memory_budget, acceleration_structure, ray_query, deferred_host_operations, external_memory_host,
+cooperative_matrix, sample_locations, pipeline_executable_properties, vertex_attribute_divisor,
+pipeline_robustness. So no ray tracing, no host-pointer import (newBufferWithBytesNoCopy copies), estimated
+working set.
+
+Next (4b): command queue, buffers on Venus host-visible memory, a host-built metallib through the translator
+(the guest's GPUCompiler libLLVM reads AIR), compute pipeline, dispatch, blit; `mtlcompute` checks results.

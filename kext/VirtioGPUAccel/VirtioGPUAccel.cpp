@@ -5,7 +5,8 @@
 // family's 17 pure virtuals with stubs and does nothing with the GPU. The question it answers: does the family start
 // in this guest, and does our subclass attach and register?
 //
-// UNARMED: no MetalPluginName, so no process (WindowServer included) can load a Metal driver for it.
+// UNARMED at boot: no MetalPluginName, so no process (WindowServer included) can load a Metal driver for it until a
+// root tool arms it at run time (setProperties below, `acceltest arm`).
 // Gates: boot-arg vgpuaccel=1 to start at all (absent = the kext loads, the family loads as its dependency, start
 // refuses), -vgpuaccoff to refuse even the probe.
 //
@@ -20,6 +21,7 @@
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #include <IOKit/pci/IOPCIDevice.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IOUserClient.h>
 #include <IOKit/IORangeAllocator.h>
 #include <libkern/c++/OSSymbol.h>
 #include <pexpert/pexpert.h>
@@ -331,6 +333,7 @@ public:
     IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;
     bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
     void free() APPLE_KEXT_OVERRIDE;
+    IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
 
     uint64_t getStampMemory(unsigned int *count) APPLE_KEXT_OVERRIDE {
         if (!stamps_) {
@@ -492,6 +495,41 @@ bool VirtioGPUAccel::start(IOService *provider) {
     }
     enableNow("start");
     return true;
+}
+
+// The late arm (stage 4a). A root process sets, through IORegistryEntrySetCFProperties on this service:
+//   {"VirtioGPUArm": {"MetalPluginName": "...", "MetalPluginClassName": "..."}}  publish the Metal plugin
+//   {"VirtioGPUDisarm": true}                                                     withdraw it
+// Only processes that ask Metal for devices afterwards load the plugin (WindowServer is already running and never
+// sees it). Nothing persists: every boot starts unarmed. Anything else goes to the family's own setProperties.
+IOReturn VirtioGPUAccel::setProperties(OSObject *properties) {
+    OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
+    if (dict && (dict->getObject("VirtioGPUArm") || dict->getObject("VirtioGPUDisarm"))) {
+        if (IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator) != kIOReturnSuccess) {
+            vlog("arm: refused, the caller isn't root");
+            return kIOReturnNotPrivileged;
+        }
+        if (dict->getObject("VirtioGPUDisarm")) {
+            removeProperty("MetalPluginName");
+            removeProperty("MetalPluginClassName");
+            setProperty("VirtioGPUAccelUnarmed", kOSBooleanTrue);
+            vlog("disarmed: MetalPluginName withdrawn");
+            return kIOReturnSuccess;
+        }
+        OSDictionary *arm = OSDynamicCast(OSDictionary, dict->getObject("VirtioGPUArm"));
+        OSString *name = arm ? OSDynamicCast(OSString, arm->getObject("MetalPluginName")) : nullptr;
+        OSString *cls = arm ? OSDynamicCast(OSString, arm->getObject("MetalPluginClassName")) : nullptr;
+        if (!name || !cls || !name->getLength() || !cls->getLength()) {
+            vlog("arm: needs MetalPluginName and MetalPluginClassName strings");
+            return kIOReturnBadArgument;
+        }
+        setProperty("MetalPluginName", name);
+        setProperty("MetalPluginClassName", cls);
+        removeProperty("VirtioGPUAccelUnarmed");
+        vlog("armed: MetalPluginName %s, MetalPluginClassName %s", name->getCStringNoCopy(), cls->getCStringNoCopy());
+        return kIOReturnSuccess;
+    }
+    return IOGraphicsAccelerator2::setProperties(properties);
 }
 
 void VirtioGPUAccel::free() {

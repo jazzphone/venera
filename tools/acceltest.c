@@ -1,10 +1,13 @@
 // acceltest: stage 4.0 probe of VirtioGPUAccel's family user clients (IOAcceleratorFamily2 answers them, not us).
 //   acceltest            find the accelerator, print its state
+//   acceltest arm [NAME [CLASS]]   publish MetalPluginName (default VirtioGPUMetal) + class (default VGMTLDevice)
+//   acceltest disarm               withdraw them
 //   acceltest T...       for each user-client type T: IOServiceOpen, print the class the family made, close;
 //                        on an IOAccelDevice2 also call get_config (sel 0) and get_name (sel 1) -- nothing else
 //                        is called on any client
 // Every step is appended to /var/tmp/acceltest.log and synced first, so a panic still says which type did it.
 // Build: tools/build-tools.sh. Run in the VM as root.
+#include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <fcntl.h>
 #include <mach/mach.h>
@@ -86,6 +89,36 @@ int main(int argc, char **argv) {
         CFRelease(mp);
     }
 
+    if (argc > 1 && (!strcmp(argv[1], "arm") || !strcmp(argv[1], "disarm"))) {
+        CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+                                                             &kCFTypeDictionaryValueCallBacks);
+        if (!strcmp(argv[1], "arm")) {
+            CFMutableDictionaryRef a = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+                                                                 &kCFTypeDictionaryValueCallBacks);
+            CFStringRef n = CFStringCreateWithCString(NULL, argc > 2 ? argv[2] : "VirtioGPUMetal", kCFStringEncodingUTF8);
+            CFStringRef c = CFStringCreateWithCString(NULL, argc > 3 ? argv[3] : "VGMTLDevice", kCFStringEncodingUTF8);
+            CFDictionarySetValue(a, CFSTR("MetalPluginName"), n);
+            CFDictionarySetValue(a, CFSTR("MetalPluginClassName"), c);
+            CFDictionarySetValue(d, CFSTR("VirtioGPUArm"), a);
+            CFRelease(n);
+            CFRelease(c);
+            CFRelease(a);
+        } else {
+            CFDictionarySetValue(d, CFSTR("VirtioGPUDisarm"), kCFBooleanTrue);
+        }
+        kern_return_t kr = IORegistryEntrySetCFProperties(svc, d);
+        CFRelease(d);
+        mp = IORegistryEntryCreateCFProperty(svc, CFSTR("MetalPluginName"), kCFAllocatorDefault, 0);
+        char name[256] = "absent";
+        if (mp && CFGetTypeID(mp) == CFStringGetTypeID()) {
+            CFStringGetCString(mp, name, sizeof(name), kCFStringEncodingUTF8);
+        }
+        if (mp) {
+            CFRelease(mp);
+        }
+        say("%s -> 0x%x; MetalPluginName now: %s\n", argv[1], kr, name);
+        return kr == KERN_SUCCESS ? 0 : 1;
+    }
     for (int i = 1; i < argc; i++) {
         uint32_t type = (uint32_t)strtoul(argv[i], NULL, 0);
         say("type %u: opening\n", type);
