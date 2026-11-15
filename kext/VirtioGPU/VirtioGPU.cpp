@@ -11,7 +11,27 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/pci/IOPCIDevice.h>
 
-#define LOG(fmt, ...) IOLog("VirtioGPU: " fmt "\n", ##__VA_ARGS__)
+// IOLog from an OpenCore-injected kext doesn't reach dmesg or the unified log on Tahoe, so every
+// line also goes into the "ProbeLog" registry property (read it with ioreg).
+static OSArray *gProbeLog;
+
+static void probeLog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void probeLog(const char *fmt, ...) {
+    char line[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    IOLog("VirtioGPU: %s\n", line);
+    if (gProbeLog) {
+        if (OSString *s = OSString::withCString(line)) {
+            gProbeLog->setObject(s);
+            s->release();
+        }
+    }
+}
+
+#define LOG(fmt, ...) probeLog(fmt, ##__VA_ARGS__)
 
 namespace {
 
@@ -101,6 +121,7 @@ bool VirtioGPU::start(IOService *provider) {
     if (!pci) {
         return false;
     }
+    gProbeLog = OSArray::withCapacity(64);
     LOG("start: stage 0 probe (no device writes except feature select)");
     pci->setMemoryEnable(true);
 
@@ -109,6 +130,11 @@ bool VirtioGPU::start(IOService *provider) {
     logCapabilities(pci, regions);
     logDevice(pci, regions);
 
+    if (gProbeLog) {
+        setProperty("ProbeLog", gProbeLog);
+        gProbeLog->release();
+        gProbeLog = nullptr;
+    }
     registerService();
     LOG("probe done; device left as the firmware set it");
     return true;

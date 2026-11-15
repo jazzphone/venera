@@ -45,7 +45,8 @@ inject() {
   local src=$1 name
   name=$(basename "$src")
   rm -rf "$MNT/EFI/OC/Kexts/$name" && cp -r "$src" "$MNT/EFI/OC/Kexts/$name" &&
-    python3 -I "$HERE/oc_kext.py" "$MNT/EFI/OC/config.plist" "$name" enable
+    python3 -I "$HERE/oc_kext.py" "$MNT/EFI/OC/config.plist" "$name" enable &&
+    python3 -I "$HERE/oc_kext.py" "$MNT/EFI/OC/config.plist" - nopicker
 }
 
 case "$1" in
@@ -60,7 +61,10 @@ disable)
   qm start $VM && wait_agent
   ;;
 logs)
-  agent 'log show --last boot --style compact --predicate "eventMessage CONTAINS \"VirtioGPU\"" 2>/dev/null | grep -v "^Timestamp" | cut -c25-; echo "== tree"; ioreg -w0 -r -n S08@1 | grep -E "\+-o" | cut -c1-110; echo "== kext"; kextstat 2>/dev/null | grep -i virtiogpu | cut -c1-120' 90
+  agent 'echo "== probe"; ioreg -w0 -r -c VirtioGPU -a | plutil -extract 0.ProbeLog json -o - - 2>/dev/null | tr "," "\n" | sed -E "s/^\[?\"/  /; s/\"\]?$//" || ioreg -w0 -r -c VirtioGPU -a | plutil -p - | sed -n "/ProbeLog/,/]/p"; echo "== tree"; ioreg -w0 -r -n S08@1 | grep -E "\+-o" | head -4 | cut -c1-110' 90
+  ;;
+logs-raw)
+  agent 'ioreg -w0 -r -c VirtioGPU -l' 90
   ;;
 *)
   echo "usage: $0 deploy KEXT | disable NAME | logs"; exit 2

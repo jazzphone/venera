@@ -44,3 +44,30 @@
   (`/etc/qemu/qemu-ga.conf`) first.
 - No GPU: Setup Assistant's closing animation needs Metal and hangs; new users need
   `AccountInfo:FirstLogins:<user>` in `/Library/Preferences/com.apple.loginwindow.plist`.
+
+## Stage 0 result (2026-11-15, VM 108, `vga: virtio`)
+
+The probe kext (OpenCore-injected) takes `S08@1` from `AppleVirtIOPCITransport` (score 20000 >
+10000, default match category); `.Display_boot` (IONDRVFramebuffer, BAR0) keeps the screen.
+
+```
+pci 1af4:1050 sub 1af4:1100 rev 01 class 030000 cmd 0007
+BAR0 mem32 0x80000000 len 8 MB   (VGA framebuffer)
+BAR2 mem64 0x80c00000 len 16 KB  (virtio modern regions)
+BAR4 mem32 0x81c1b000 len 4 KB   (MSI-X table @0, PBA @0x800)
+msi-x 3 vectors (disabled)
+virtio common  bar 2 off 0x1000 len 0x800
+virtio isr     bar 2 off 0x1800 len 0x800
+virtio device  bar 2 off 0x2000 len 0x1000
+virtio notify  bar 2 off 0x3000 len 0x1000 multiplier 4
+features 0x0000010130000002: EDID, INDIRECT_DESC, EVENT_IDX, VERSION_1
+num_queues 2 (control, cursor)   num_scanouts 1   num_capsets 0
+```
+
+No VIRGL / RESOURCE_BLOB / CONTEXT_INIT: expected with plain `virtio-vga`; they appear with
+`virtio-vga-gl` + venus/blob (stage 3).
+
+Lessons: a hand-built kext needs `kmod_info` (kmod_info.c) or OpenCore says "Prelinked injection
+... Invalid Parameter"; IOLog from an injected kext doesn't reach dmesg/unified log on Tahoe, so
+the kext publishes a `ProbeLog` registry property (`tools/deploy.sh logs`). OpenCore `ShowPicker`
+is off on 108 (`oc_kext.py CONFIG - picker` turns it back on).
