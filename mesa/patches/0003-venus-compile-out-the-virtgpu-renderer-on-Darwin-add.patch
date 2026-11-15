@@ -1,0 +1,154 @@
+From adc0ddedaf4a4d4c3dfd6d4ba8fe95c35ce9bca4 Mon Sep 17 00:00:00 2001
+From: jazzphone <4240091+jazzphone@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 11:35:37 -0500
+Subject: [PATCH 3/3] venus: compile out the virtgpu renderer on Darwin, add
+ macOS renderer stub
+
+vn_renderer_virtgpu.c needs libdrm/xf86drm.h and Linux DRM ioctls.  On
+Darwin build a vn_renderer_macos.c stub instead (vn_renderer_create_macos
+returns VK_ERROR_INITIALIZATION_FAILED); vtest stays available. Also link
+with -dead_strip and -undefined dynamic_lookup because the generated
+entrypoint tables reference optional vn_/vk_/wsi_ entrypoints through weak
+undefined symbols, and name the ICD library libvulkan_virtio.dylib.
+---
+ src/virtio/vulkan/meson.build         | 23 ++++++++++++++++----
+ src/virtio/vulkan/vn_renderer.h       | 11 ++++++++++
+ src/virtio/vulkan/vn_renderer_macos.c | 30 +++++++++++++++++++++++++++
+ 3 files changed, 60 insertions(+), 4 deletions(-)
+ create mode 100644 src/virtio/vulkan/vn_renderer_macos.c
+
+diff --git a/src/virtio/vulkan/meson.build b/src/virtio/vulkan/meson.build
+index ed72910..33ccf52 100644
+--- a/src/virtio/vulkan/meson.build
++++ b/src/virtio/vulkan/meson.build
+@@ -23,7 +23,7 @@ virtio_icd = custom_target(
+     prog_python, '@INPUT0@',
+     '--api-version', '1.3', '--xml', '@INPUT1@',
+     '--lib-path', join_paths(get_option('prefix'), get_option('libdir'),
+-                             'libvulkan_virtio.so'),
++                             'libvulkan_virtio.' + libname_suffix),
+     '--out', '@OUTPUT@',
+   ],
+   build_by_default : true,
+@@ -40,7 +40,7 @@ _dev_icd = custom_target(
+   command : [
+     prog_python, '@INPUT0@',
+     '--api-version', '1.3', '--xml', '@INPUT1@',
+-    '--lib-path', meson.current_build_dir() / 'libvulkan_virtio.so',
++    '--lib-path', meson.current_build_dir() / ('libvulkan_virtio.' + libname_suffix),
+     '--out', '@OUTPUT@',
+   ],
+   build_by_default : true,
+@@ -70,10 +70,15 @@ libvn_files = files(
+   'vn_ring.c',
+   'vn_renderer_internal.c',
+   'vn_renderer_util.c',
+-  'vn_renderer_virtgpu.c',
+   'vn_renderer_vtest.c',
+ )
+ 
++if host_machine.system() == 'darwin'
++  libvn_files += files('vn_renderer_macos.c')
++else
++  libvn_files += files('vn_renderer_virtgpu.c')
++endif
++
+ vn_deps = [
+   dep_libdrm,
+   dep_thread,
+@@ -92,6 +97,16 @@ vn_flags = [
+ 
+ vn_libs = []
+ 
++# The generated entrypoint tables (--weak) refer to optional vn_*/vk_*/wsi_*
++# entrypoints through weak undefined symbols.  ELF accepts those in a shared
++# library; ld64 needs to be told that they may stay unresolved (they bind to
++# NULL).  Real (non-weak) undefined symbols are still checked by
++# build-mesa.sh with nm.
++vn_link_args = []
++if host_machine.system() == 'darwin'
++  vn_link_args += ['-Wl,-dead_strip', '-Wl,-undefined,dynamic_lookup']
++endif
++
+ if with_platform_wayland or with_platform_x11
+   libvn_files += files('vn_wsi.c')
+   vn_flags += '-DVN_USE_WSI_PLATFORM'
+@@ -119,7 +134,7 @@ libvulkan_virtio = shared_library(
+   link_with : vn_libs,
+   dependencies : [vn_deps],
+   c_args : [vn_flags],
+-  link_args : [vulkan_icd_link_args, ld_args_bsymbolic, ld_args_gc_sections],
++  link_args : [vn_link_args, vulkan_icd_link_args, ld_args_bsymbolic, ld_args_gc_sections],
+   link_depends : vulkan_icd_link_depends,
+   gnu_symbol_visibility : 'hidden',
+   install : true,
+diff --git a/src/virtio/vulkan/vn_renderer.h b/src/virtio/vulkan/vn_renderer.h
+index 05b7900..81e1ee4 100644
+--- a/src/virtio/vulkan/vn_renderer.h
++++ b/src/virtio/vulkan/vn_renderer.h
+@@ -218,10 +218,17 @@ struct vn_renderer {
+    struct vn_renderer_sync_ops sync_ops;
+ };
+ 
++#ifdef __APPLE__
++VkResult
++vn_renderer_create_macos(struct vn_instance *instance,
++                         const VkAllocationCallbacks *alloc,
++                         struct vn_renderer **renderer);
++#else
+ VkResult
+ vn_renderer_create_virtgpu(struct vn_instance *instance,
+                            const VkAllocationCallbacks *alloc,
+                            struct vn_renderer **renderer);
++#endif
+ 
+ VkResult
+ vn_renderer_create_vtest(struct vn_instance *instance,
+@@ -239,7 +246,11 @@ vn_renderer_create(struct vn_instance *instance,
+          return VK_SUCCESS;
+    }
+ 
++#ifdef __APPLE__
++   return vn_renderer_create_macos(instance, alloc, renderer);
++#else
+    return vn_renderer_create_virtgpu(instance, alloc, renderer);
++#endif
+ }
+ 
+ static inline void
+diff --git a/src/virtio/vulkan/vn_renderer_macos.c b/src/virtio/vulkan/vn_renderer_macos.c
+new file mode 100644
+index 0000000..b32d720
+--- /dev/null
++++ b/src/virtio/vulkan/vn_renderer_macos.c
+@@ -0,0 +1,30 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * macOS backend for Venus.  This is a placeholder: the real backend talks
++ * to a virtio-gpu kernel extension through a user client instead of Linux
++ * DRM ioctls.  Until it exists, creating the renderer fails cleanly so that
++ * vkCreateInstance returns VK_ERROR_INITIALIZATION_FAILED.
++ *
++ * To implement: fill in struct vn_renderer (info, ops, shmem_ops, bo_ops,
++ * sync_ops, see vn_renderer.h) and return it from vn_renderer_create_macos.
++ */
++
++#include "vn_renderer.h"
++
++#include "vn_common.h"
++
++VkResult
++vn_renderer_create_macos(struct vn_instance *instance,
++                         const VkAllocationCallbacks *alloc,
++                         struct vn_renderer **renderer)
++{
++   (void)instance;
++   (void)alloc;
++   (void)renderer;
++
++   if (VN_DEBUG(INIT))
++      vn_log(instance, "macOS renderer backend not implemented");
++
++   return VK_ERROR_INITIALIZATION_FAILED;
++}
