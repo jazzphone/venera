@@ -1,6 +1,6 @@
 // VirtioGPU: the virtio core. Owns the device (default match category on 1af4:1050), the queues
-// and the command buffer; VirtioGPUFramebuffer (IOFramebuffer category, same PCI device) drives
-// the screen through the small API below.
+// and the command buffer. VirtioGPUFramebuffer (another kext) drives the screen through the
+// VirtioGPUDisplay nub and callPlatformFunction (see ../VirtioGPUAPI.h).
 #pragma once
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -39,6 +39,9 @@ public:
     void disableScanout();
     void addLog(const char *line);
     void publishLog();
+    // Serves the selectors in VirtioGPUAPI.h (the nub forwards its calls here).
+    IOReturn callPlatformFunction(const OSSymbol *functionName, bool waitForFunction, void *param1,
+                                  void *param2, void *param3, void *param4) override;
 
 private:
     void logHeader();
@@ -86,4 +89,25 @@ private:
     uint32_t scanoutHeight_ = 0;
     uint32_t scanoutStride_ = 0;
     uint32_t flushes_ = 0;
+    IOService *display_ = nullptr; // VirtioGPUDisplay nub
+};
+
+// The nub VirtioGPUFramebuffer.kext matches on. Forwards callPlatformFunction to the core.
+class VirtioGPUDisplay : public IOService {
+    OSDeclareDefaultStructors(VirtioGPUDisplay)
+
+public:
+    IOReturn callPlatformFunction(const OSSymbol *functionName, bool waitForFunction, void *param1,
+                                  void *param2, void *param3, void *param4) override;
+};
+
+// Holds the IOFramebuffer match category on the PCI device (score 30000 > IONDRVFramebuffer's
+// 20000), so the firmware framebuffer driver from the System kernel collection never takes the
+// screen. Does nothing else.
+class VirtioGPUFramebufferSlot : public IOService {
+    OSDeclareDefaultStructors(VirtioGPUFramebufferSlot)
+
+public:
+    IOService *probe(IOService *provider, SInt32 *score) override;
+    bool start(IOService *provider) override;
 };

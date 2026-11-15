@@ -14,6 +14,18 @@ SCP=(scp -q -o BatchMode=yes -o HostKeyAlias=pve-host -i ~/.ssh/vgpu_host_key)
 
 case "${1:-deploy}" in
 deploy)
+  # 1. core via OpenCore (+ SIP 0x201) and boot; 2. framebuffer into the AuxKC and reboot; 3. logs
+  tools/build.sh >/dev/null
+  tar -czf build/VirtioGPUFramebuffer.tgz -C build VirtioGPUFramebuffer.kext
+  "${SSH[@]}" $HOST 'rm -rf /root/vgpu/VirtioGPU.kext'
+  "${SCP[@]}" -r build/VirtioGPU.kext build/VirtioGPUFramebuffer.tgz $HOST:/root/vgpu/
+  "${SSH[@]}" $HOST 'bash /root/vgpu/vm-remote.sh deploy /root/vgpu/VirtioGPU.kext'
+  sleep 10
+  "${SSH[@]}" $HOST 'bash /root/vgpu/vm-remote.sh aux /root/vgpu/VirtioGPUFramebuffer.tgz VirtioGPUFramebuffer.kext'
+  sleep 20
+  "${SSH[@]}" $HOST 'bash /root/vgpu/vm-remote.sh logs'
+  ;;
+core) # only the OpenCore-injected core, no AuxKC step
   tools/build.sh >/dev/null
   "${SSH[@]}" $HOST 'rm -rf /root/vgpu/VirtioGPU.kext'
   "${SCP[@]}" -r build/VirtioGPU.kext $HOST:/root/vgpu/

@@ -46,7 +46,33 @@ inject() {
   name=$(basename "$src")
   rm -rf "$MNT/EFI/OC/Kexts/$name" && cp -r "$src" "$MNT/EFI/OC/Kexts/$name" &&
     python3 -I "$HERE/oc_kext.py" "$MNT/EFI/OC/config.plist" "$name" enable &&
-    python3 -I "$HERE/oc_kext.py" "$MNT/EFI/OC/config.plist" - nopicker
+    python3 -I "$HERE/oc_kext.py" "$MNT/EFI/OC/config.plist" - nopicker &&
+    python3 -I "$HERE/oc_kext.py" "$MNT/EFI/OC/config.plist" - csr 0x201 # + unapproved kexts (AuxKC)
+}
+
+# Installs a kext into /Library/Extensions over the guest agent (tarball on stdin, no network)
+# and builds it into the Auxiliary kernel collection.
+aux_install() {
+  local tgz=$1 name=$2
+  qm guest exec $VM --timeout 300 --pass-stdin 1 -- /bin/sh -c "
+    set -e
+    rm -rf /Library/Extensions/$name /tmp/vgpu-aux && mkdir -p /tmp/vgpu-aux
+    tar -xzf - -C /tmp/vgpu-aux
+    mv /tmp/vgpu-aux/$name /Library/Extensions/$name
+    chown -R root:wheel /Library/Extensions/$name && chmod -R 755 /Library/Extensions/$name
+    csrutil status | head -1
+    kmutil load -p /Library/Extensions/$name 2>&1 | tail -15 || true
+    kmutil showloaded --collection aux 2>/dev/null | grep -i homelab || echo 'not in the loaded aux collection yet'
+  " < "$tgz" | python3 -I -c '
+import json, sys
+r = json.load(sys.stdin)
+print(r.get("out-data", ""), end=""); print(r.get("err-data", ""), end="", file=sys.stderr)'
+}
+
+reboot_vm() {
+  qm guest exec $VM --timeout 10 -- /sbin/shutdown -r now >/dev/null 2>&1
+  sleep 30
+  wait_agent
 }
 
 case "$1" in
@@ -61,10 +87,14 @@ disable)
   qm start $VM && wait_agent
   ;;
 logs)
-  agent 'echo "== probe"; ioreg -w0 -r -c VirtioGPU -a | plutil -extract 0.ProbeLog xml1 -o - - 2>/dev/null | sed -n "s/.*<string>\\(.*\\)<\/string>.*/  \\1/p" | sed "s/&quot;/\\\"/g"; echo "== tree"; ioreg -w0 -r -n S08@1 | grep -E "\\+-o" | head -4 | cut -c1-110' 90
+  agent 'echo "== probe"; ioreg -w0 -r -c VirtioGPU -a | plutil -extract 0.ProbeLog xml1 -o - - 2>/dev/null | sed -n "s/.*<string>\\(.*\\)<\/string>.*/  \\1/p" | sed "s/&quot;/\\\"/g"; echo "== tree"; ioreg -w0 -r -n S08@1 | grep -E "\\+-o" | head -8 | cut -c1-110; echo "== aux"; kmutil showloaded --collection aux 2>/dev/null | grep -i homelab | cut -c1-110; echo "== framebuffers"; ioreg -w0 -r -c IOFramebuffer | grep -E "\\+-o" | head -6 | cut -c1-110' 120
   ;;
 logs-raw)
   agent 'ioreg -w0 -r -c VirtioGPU -l' 90
+  ;;
+aux) # aux TGZ NAME: install into /Library/Extensions + AuxKC, then reboot
+  aux_install "$2" "$3"
+  reboot_vm
   ;;
 shots) # shots COUNT INTERVAL: QEMU screenshots into /tmp/vgpu-shots/NN.png
   rm -rf /tmp/vgpu-shots && mkdir -p /tmp/vgpu-shots

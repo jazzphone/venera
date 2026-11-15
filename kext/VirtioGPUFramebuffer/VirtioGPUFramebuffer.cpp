@@ -1,20 +1,22 @@
-// VirtioGPUFramebuffer - stage 2c: the screen.
+// VirtioGPUFramebuffer - stage 2c: the screen. A kext of its own in the Auxiliary kernel
+// collection, because IOFramebuffer lives in IOGraphicsFamily (System KC), which OpenCore can't
+// link injected kexts against.
 //
-// Matches the virtio-gpu PCI function in the IOFramebuffer category at probe score 30000, above
-// IONDRVFramebuffer's 20000 for "display" devices, so macOS has exactly one framebuffer: ours.
-// It finds the VirtioGPU core attached to the same PCI device, gives WindowServer a block of
-// contiguous RAM as VRAM (aperture), shows it through a virtio-gpu 2D scanout resource, and pushes
-// the whole frame to the host 30 times a second (WindowServer doesn't say what changed).
-// Software cursor for now: WindowServer draws it into the frame.
+// Matches the VirtioGPUDisplay nub that VirtioGPU.kext (the core, injected by OpenCore) publishes,
+// and talks to the core only through callPlatformFunction (../VirtioGPUAPI.h). Gives WindowServer
+// a block of contiguous RAM as VRAM (aperture), shows it through a virtio-gpu 2D scanout resource,
+// and pushes the whole frame to the host 30 times a second (WindowServer doesn't say what
+// changed). Software cursor for now: WindowServer draws it into the frame. The core's
+// VirtioGPUFramebufferSlot keeps IONDRVFramebuffer off the PCI device, so this is the only
+// framebuffer.
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/graphics/IOFramebuffer.h>
-#include <IOKit/pci/IOPCIDevice.h>
 #include <kern/thread_call.h>
 #include <pexpert/pexpert.h>
 
-#include "VirtioGPU.hpp"
+#include "../VirtioGPUAPI.h"
 
 namespace {
 
@@ -71,10 +73,18 @@ private:
     }
     bool applyMode(IODisplayModeID id);
     void log(const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+    IOReturn call(const char *function, void *p1 = nullptr, void *p2 = nullptr, void *p3 = nullptr,
+                  void *p4 = nullptr);
+    bool setScanout(uint32_t w, uint32_t h, uint32_t stride) {
+        return call(kVGPUSetScanout, vram_, (void *)(uintptr_t)w, (void *)(uintptr_t)h,
+                    (void *)(uintptr_t)stride) == kIOReturnSuccess;
+    }
+    void publish() { call(kVGPULog, nullptr, (void *)1); }
     static void flushThunk(thread_call_param_t self, thread_call_param_t);
     void flushTick();
 
-    VirtioGPU *core_ = nullptr;
+    IOService *nub_ = nullptr;
+    OSData *edid_ = nullptr;
     IOBufferMemoryDescriptor *vram_ = nullptr;
     uint64_t vramPhys_ = 0;
     uint32_t vramBytes_ = 0;
@@ -95,39 +105,44 @@ void VirtioGPUFramebuffer::log(const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
-    probeLog("fb: %s", line);
+    char prefixed[210];
+    snprintf(prefixed, sizeof(prefixed), "fb: %s", line);
+    IOLog("VirtioGPU %s\n", prefixed);
+    call(kVGPULog, prefixed);
+}
+
+IOReturn VirtioGPUFramebuffer::call(const char *function, void *p1, void *p2, void *p3, void *p4) {
+    if (!nub_) {
+        return kIOReturnNotReady;
+    }
+    const OSSymbol *sym = OSSymbol::withCString(function);
+    if (!sym) {
+        return kIOReturnNoMemory;
+    }
+    IOReturn r = nub_->callPlatformFunction(sym, false, p1, p2, p3, p4);
+    sym->release();
+    return r;
 }
 
 IOService *VirtioGPUFramebuffer::probe(IOService *provider, SInt32 *score) {
-    IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
     char arg[8];
-    if (!pci || PE_parse_boot_argn("-vgpuoff", arg, sizeof(arg)) ||
-        pci->configRead16(kIOPCIConfigVendorID) != 0x1af4 ||
-        pci->configRead16(kIOPCIConfigDeviceID) != 0x1050) {
+    if (PE_parse_boot_argn("-vgpuoff", arg, sizeof(arg))) {
         return nullptr;
     }
     return IOFramebuffer::probe(provider, score);
 }
 
 bool VirtioGPUFramebuffer::start(IOService *provider) {
-    // The core matches the same PCI device in the default category; wait for it.
-    OSDictionary *match = serviceMatching("VirtioGPU");
-    IOService *found = match ? waitForMatchingService(match, 15ULL * 1000 * 1000 * 1000) : nullptr;
-    if (match) {
-        match->release();
-    }
-    core_ = OSDynamicCast(VirtioGPU, found);
-    if (!core_ || core_->getProvider() != provider || !core_->ready()) {
-        probeLog("fb: no ready VirtioGPU core on this device; not starting");
-        if (found) {
-            found->release();
-        }
-        core_ = nullptr;
+    nub_ = provider; // VirtioGPUDisplay, published by the core once the device is up
+    uint32_t pw = 0, ph = 0;
+    if (call(kVGPUPreferredSize, &pw, &ph) != kIOReturnSuccess) {
+        IOLog("VirtioGPU fb: the core didn't answer; not starting\n");
+        nub_ = nullptr;
         return false;
     }
-
-    uint32_t pw = 0, ph = 0;
-    core_->preferredSize(&pw, &ph);
+    if (call(kVGPUCopyEDID, &edid_) != kIOReturnSuccess) {
+        edid_ = nullptr;
+    }
     for (const Mode &m : kBaseModes) {
         modes_[modeCount_++] = m;
         if (m.width == pw && m.height == ph) {
@@ -148,8 +163,8 @@ bool VirtioGPUFramebuffer::start(IOService *provider) {
     if (!vram_ || vram_->prepare() != kIOReturnSuccess) {
         log("VRAM allocation (%u bytes) failed", vramBytes_);
         OSSafeReleaseNULL(vram_);
-        core_->release();
-        core_ = nullptr;
+        OSSafeReleaseNULL(edid_);
+        nub_ = nullptr;
         return false;
     }
     bzero(vram_->getBytesNoCopy(), vramBytes_);
@@ -163,7 +178,7 @@ bool VirtioGPUFramebuffer::start(IOService *provider) {
         log("IOFramebuffer::start failed");
         return false;
     }
-    core_->publishLog();
+    publish();
     return true;
 }
 
@@ -174,11 +189,11 @@ void VirtioGPUFramebuffer::stop(IOService *provider) {
         thread_call_free(flushCall_);
         flushCall_ = nullptr;
     }
-    if (core_) {
-        core_->disableScanout();
-        core_->release();
-        core_ = nullptr;
+    if (nub_) {
+        call(kVGPUDisableScanout);
+        nub_ = nullptr;
     }
+    OSSafeReleaseNULL(edid_);
     if (vram_) {
         vram_->complete();
         vram_->release();
@@ -189,10 +204,10 @@ void VirtioGPUFramebuffer::stop(IOService *provider) {
 
 bool VirtioGPUFramebuffer::applyMode(IODisplayModeID id) {
     const Mode *m = modeFor(id);
-    if (!m || !core_) {
+    if (!m || !nub_) {
         return false;
     }
-    bool ok = core_->setScanout(vram_, m->width, m->height, m->width * 4);
+    bool ok = setScanout(m->width, m->height, m->width * 4);
     log("mode %d %ux%u -> %s", id, m->width, m->height, ok ? "on screen" : "FAILED");
     if (ok) {
         currentMode_ = id;
@@ -203,7 +218,7 @@ bool VirtioGPUFramebuffer::applyMode(IODisplayModeID id) {
             thread_call_enter_delayed(flushCall_, deadline);
         }
     }
-    core_->publishLog();
+    publish();
     return ok;
 }
 
@@ -216,10 +231,10 @@ void VirtioGPUFramebuffer::flushTick() {
         return;
     }
     if (const Mode *m = modeFor(currentMode_)) {
-        core_->flush(0, 0, m->width, m->height);
+        call(kVGPUFlush, nullptr, nullptr, (void *)(uintptr_t)m->width, (void *)(uintptr_t)m->height);
     }
     if (++ticks_ % 300 == 0) { // every ~10 s
-        core_->publishLog();
+        publish();
     }
     uint64_t deadline = 0;
     clock_interval_to_deadline(kFlushIntervalMs, kMillisecondScale, &deadline);
@@ -364,7 +379,7 @@ IOReturn VirtioGPUFramebuffer::getAttributeForConnection(IOIndex index, IOSelect
         }
         return kIOReturnSuccess;
     case kConnectionSupportsHLDDCSense:
-        return (core_ && core_->edid()) ? kIOReturnSuccess : kIOReturnUnsupported;
+        return edid_ ? kIOReturnSuccess : kIOReturnUnsupported;
     case kConnectionDisplayParameterCount:
         if (value) {
             *value = 0;
@@ -386,12 +401,12 @@ IOReturn VirtioGPUFramebuffer::setAttributeForConnection(IOIndex index, IOSelect
 }
 
 bool VirtioGPUFramebuffer::hasDDCConnect(IOIndex index) {
-    return index == 0 && core_ && core_->edid() && core_->edid()->getLength() >= 128;
+    return index == 0 && edid_ && edid_->getLength() >= 128;
 }
 
 IOReturn VirtioGPUFramebuffer::getDDCBlock(IOIndex index, UInt32 blockNumber, IOSelect blockType,
                                            IOOptionBits, UInt8 *data, IOByteCount *length) {
-    OSData *edid = core_ ? core_->edid() : nullptr;
+    OSData *edid = edid_;
     if (index != 0 || blockType != kIODDCBlockTypeEDID || !edid || !data || !length || blockNumber < 1) {
         return kIOReturnBadArgument;
     }

@@ -20,6 +20,7 @@
 #include <libkern/c++/OSString.h>
 #include <pexpert/pexpert.h>
 
+#include "../VirtioGPUAPI.h"
 #include "VirtioGPUProtocol.h"
 
 // IOLog from an OpenCore-injected kext doesn't reach dmesg or the unified log on Tahoe, so every
@@ -132,6 +133,15 @@ bool VirtioGPU::start(IOService *provider) {
             getEDID(0);
         }
         LOG("core ready: %ux%u preferred, interrupts %u", width_, height_, interrupts_);
+        VirtioGPUDisplay *nub = OSTypeAlloc(VirtioGPUDisplay);
+        if (nub && nub->init() && nub->attach(this)) {
+            nub->registerService(); // VirtioGPUFramebuffer.kext matches on this
+            display_ = nub;
+            LOG("published %s nub", kVGPUDisplayClass);
+        } else {
+            OSSafeReleaseNULL(nub);
+            LOG("could not publish the display nub");
+        }
     } else {
         LOG("bring-up failed; resetting the device");
         tearDown();
@@ -142,6 +152,11 @@ bool VirtioGPU::start(IOService *provider) {
 }
 
 void VirtioGPU::stop(IOService *provider) {
+    if (display_) {
+        display_->terminate();
+        display_->release();
+        display_ = nullptr;
+    }
     disableScanout();
     tearDown();
     if (interrupt_) {
@@ -578,4 +593,90 @@ void VirtioGPU::disableScanout() {
         scanoutResource_ = 0;
     }
     IOLockUnlock(scanoutLock_);
+}
+
+IOReturn VirtioGPU::callPlatformFunction(const OSSymbol *name, bool wait, void *p1, void *p2, void *p3,
+                                         void *p4) {
+    if (!name) {
+        return kIOReturnBadArgument;
+    }
+    if (name->isEqualTo(kVGPUPreferredSize)) {
+        if (!p1 || !p2) {
+            return kIOReturnBadArgument;
+        }
+        preferredSize(static_cast<uint32_t *>(p1), static_cast<uint32_t *>(p2));
+        return kIOReturnSuccess;
+    }
+    if (name->isEqualTo(kVGPUCopyEDID)) {
+        if (!p1) {
+            return kIOReturnBadArgument;
+        }
+        if (!edid_) {
+            return kIOReturnNotFound;
+        }
+        edid_->retain();
+        *static_cast<OSData **>(p1) = edid_;
+        return kIOReturnSuccess;
+    }
+    if (name->isEqualTo(kVGPUSetScanout)) {
+        auto *memory = OSDynamicCast(IOBufferMemoryDescriptor, static_cast<OSObject *>(p1));
+        return setScanout(memory, (uint32_t)(uintptr_t)p2, (uint32_t)(uintptr_t)p3, (uint32_t)(uintptr_t)p4)
+                   ? kIOReturnSuccess
+                   : kIOReturnError;
+    }
+    if (name->isEqualTo(kVGPUFlush)) {
+        return flush((uint32_t)(uintptr_t)p1, (uint32_t)(uintptr_t)p2, (uint32_t)(uintptr_t)p3,
+                     (uint32_t)(uintptr_t)p4)
+                   ? kIOReturnSuccess
+                   : kIOReturnError;
+    }
+    if (name->isEqualTo(kVGPUDisableScanout)) {
+        disableScanout();
+        return kIOReturnSuccess;
+    }
+    if (name->isEqualTo(kVGPULog)) {
+        if (p1) {
+            probeLog("%s", static_cast<const char *>(p1));
+        }
+        if (p2) {
+            publishLog();
+        }
+        return kIOReturnSuccess;
+    }
+    return IOService::callPlatformFunction(name, wait, p1, p2, p3, p4);
+}
+
+// ---- VirtioGPUDisplay: the nub the framebuffer kext matches ----
+
+OSDefineMetaClassAndStructors(VirtioGPUDisplay, IOService)
+
+IOReturn VirtioGPUDisplay::callPlatformFunction(const OSSymbol *name, bool wait, void *p1, void *p2,
+                                                void *p3, void *p4) {
+    if (VirtioGPU *core = OSDynamicCast(VirtioGPU, getProvider())) {
+        return core->callPlatformFunction(name, wait, p1, p2, p3, p4);
+    }
+    return IOService::callPlatformFunction(name, wait, p1, p2, p3, p4);
+}
+
+// ---- VirtioGPUFramebufferSlot: keeps IONDRVFramebuffer off the device ----
+
+OSDefineMetaClassAndStructors(VirtioGPUFramebufferSlot, IOService)
+
+IOService *VirtioGPUFramebufferSlot::probe(IOService *provider, SInt32 *score) {
+    IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
+    char arg[8];
+    if (!pci || PE_parse_boot_argn("-vgpuoff", arg, sizeof(arg)) ||
+        pci->configRead16(kIOPCIConfigVendorID) != 0x1af4 ||
+        pci->configRead16(kIOPCIConfigDeviceID) != 0x1050) {
+        return nullptr;
+    }
+    return IOService::probe(provider, score);
+}
+
+bool VirtioGPUFramebufferSlot::start(IOService *provider) {
+    if (!IOService::start(provider)) {
+        return false;
+    }
+    probeLog("framebuffer slot held on the PCI device (IONDRVFramebuffer stays off)");
+    return true;
 }
