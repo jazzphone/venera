@@ -364,12 +364,27 @@ bool VirtioGPU::bringUp() {
         }
         // No IODeviceMemory for the whole window: macOS won't make a 4 GB one up there.
         // Each mapping gets its own descriptor (clientMemoryForType).
+        // IOPCIFamily's own descriptor for the BAR (an IOSubMemoryDescriptor in the device's
+        // memory list): mappings are sub-ranges of it.
+        for (unsigned i = 0; i < getDeviceMemoryCount() || i < pci_->getDeviceMemoryCount(); i++) {
+            IOMemoryDescriptor *md = reinterpret_cast<IOMemoryDescriptor *>(pci_->getDeviceMemoryWithIndex(i));
+            if (!md) {
+                break;
+            }
+            uint64_t start = md->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+            LOG("device memory %u: %s phys 0x%llx length 0x%llx", i, md->getMetaClass()->getClassName(),
+                (unsigned long long)start, (unsigned long long)md->getLength());
+            if (start == base && md->getLength() >= hostmemOffset_ + hostmemLength_) {
+                hostmemDesc_ = md;
+                hostmemDesc_->retain();
+            }
+        }
         if (base && !(low & 1)) {
             hostmemPhys_ = base + hostmemOffset_;
             hostmemLock_ = IOLockAlloc();
             hostmemRanges_ = static_cast<HostmemRange *>(IOMallocZero(kMaxHostmemRanges * sizeof(HostmemRange)));
-            LOG("hostmem window at phys 0x%llx, %llu MB", (unsigned long long)hostmemPhys_,
-                (unsigned long long)(hostmemLength_ >> 20));
+            LOG("hostmem window at phys 0x%llx, %llu MB, descriptor %s", (unsigned long long)hostmemPhys_,
+                (unsigned long long)(hostmemLength_ >> 20), hostmemDesc_ ? "found" : "MISSING");
         } else {
             LOG("hostmem BAR%u not assigned (0x%08x)", hostmemBar_, low);
         }

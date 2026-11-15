@@ -1,6 +1,7 @@
 #include "VirtioGPUUserClient.hpp"
 
 #include <IOKit/IOLib.h>
+#include <IOKit/IOSubMemoryDescriptor.h>
 
 #include "../VirtioGPUUserAPI.h"
 #include "VirtioGPU.hpp"
@@ -253,6 +254,7 @@ IOReturn VirtioGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *opt
         return kIOReturnNotFound;
     }
     uint64_t phys = core_->hostmemPhys() + r->offset;
+    uint64_t r_offset = r->offset;
     uint32_t mapInfo = r->mapInfo;
     uint64_t size = r->size;
     IOLockUnlock(lock_);
@@ -264,8 +266,10 @@ IOReturn VirtioGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *opt
     } else if (mapInfo == vgpu::kMapCacheUncached) {
         cache = kIOMapInhibitCache;
     }
-    IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(phys, size, kIODirectionInOut | kIOMemoryMapperNone,
-                                                                  TASK_NULL);
+    IOMemoryDescriptor *bar = core_->hostmemDescriptor();
+    IOMemoryDescriptor *md = bar ? IOSubMemoryDescriptor::withSubRange(bar, core_->hostmemDescriptorOffset() + r_offset,
+                                                                         size, kIODirectionInOut)
+                                 : nullptr;
     if (!md) {
         LOG("map: no descriptor for phys 0x%llx size %llu", (unsigned long long)phys, (unsigned long long)size);
         return kIOReturnNoMemory;

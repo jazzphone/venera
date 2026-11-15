@@ -72,6 +72,8 @@ public:
     bool hostmemAllocate(uint64_t size, uint64_t *offset);
     void hostmemFree(uint64_t offset, uint64_t size);
     uint64_t hostmemPhys() const { return hostmemPhys_; }
+    IOMemoryDescriptor *hostmemDescriptor() const { return hostmemDesc_; }
+    uint64_t hostmemDescriptorOffset() const { return hostmemOffset_; }
     uint64_t hostmemSize() const { return hostmemLength_; }
     uint64_t features() const { return features_; }
     uint32_t capsetCount() const { return numCapsets_; }
@@ -146,6 +148,7 @@ private:
     uint64_t hostmemOffset_ = 0;
     uint64_t hostmemLength_ = 0;
     uint64_t hostmemPhys_ = 0; // physical base of the host-visible window
+    IOMemoryDescriptor *hostmemDesc_ = nullptr; // IOPCIFamily's descriptor for the whole BAR
     struct HostmemRange {
         uint64_t offset;
         uint64_t size;
