@@ -1129,3 +1129,34 @@ noncommercial headers); `NOTICE.md`. No release is published.
 - Host observation (read-only `top`): Venus' ring thread for WindowServer (`vkr-ring` in virgl_render_server) ran
   at ~68 % of a host core under load; decoding WindowServer's commands there is what queues each command buffer, so
   fewer commands per frame is the next latency lever (push descriptors instead of allocate/update/bind per draw).
+
+## Stage 5c, round 7 (2026-11-16): push descriptors, measured and set aside
+
+The idea from round 6: Venus' host ring thread for WindowServer (`vkr-ring`) ran at ~68% of a host core, so fewer
+commands per draw (push descriptors instead of allocate + update + bind) might shorten the wait before the GPU starts
+a command buffer.
+
+- Built on branch `experiment/push-descriptors` (not on main): `VK_KHR_push_descriptor` (Venus has it, max 32 on the
+  Iris Xe), one render set pushed per draw, chosen by `/Library/GPUBundles/VirtioGPUMetal-push` (1 vertex, 2
+  fragment); a push is skipped when its contents match the last one. Half of WindowServer's descriptor sets became
+  pushes (~14 k of ~29 k per 5 s during a drag).
+- Measured (snapshot `pre-push-r7` first): six boots alternating off / fragment / vertex, 2 min after login, three
+  8 s drags from a fresh `dragtest` each, frame gaps from the kext and the ring thread from the host's `top`
+  (read-only): **no difference**. Settled drags 19.0-19.5 ms mean frame gap and the ring thread 74-85% of a core in
+  every mode.
+- Why: the ring thread's CPU is mostly not decoding. From `/proc` (read-only) during a drag, 46 user ticks against
+  343 system ticks: ~88% of its time is in the kernel, ~7 k voluntary context switches a second, sampled mostly in
+  `clock_nanosleep` / `sched_yield` / futex: virglrenderer's ring polling (`vkr_ring_relax`: yields, then short
+  sleeps) and the GPU driver's ioctls, not command decoding. Command count isn't the lever; the earlier "~68% of a
+  core" never meant the thread was saturated.
+- Also found: the default Tahoe wallpaper is an Aerial that keeps playing on VM 108 after login. The guest decodes
+  it in software (`VTDecoderXPCService` 105-115% of a guest core, steadily for 10+ minutes) and WindowServer
+  composites it ~20 times a second (60 command buffers/s at "idle"). Every benchmark since the reboots ran on top of
+  that; a still wallpaper would free a guest core and the compositor's idle frames. Not changed (a user setting).
+- First pass of this A/B discarded: its boot check counted a guest-agent error as "up" and benchmarked during login.
+
+VM 108 is back on main's driver (0.1.0 + round 6), no flag files.
+
+**Next**: what remains under a frame is GPU time per command buffer (~2.7 ms each, ~3 per frame, queued behind each
+other) and the host's flip (egl-headless reads the frame back for VNC, 2-9 ms). Fewer or cheaper command buffers per
+frame (the ~40 framebuffer-fetch splits) is the guest-side lever; a non-VNC display removes the readback.
