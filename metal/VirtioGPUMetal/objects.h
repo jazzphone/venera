@@ -57,6 +57,10 @@ id<MTLBuffer> vg_new_buffer_nocopy(id<MTLDevice> device, void *pointer, NSUInteg
     // A texture view (newTextureViewWithPixelFormat:...): shares _parent's image, has its own VkImageView.
     VGMTLTexture *_parent;
     VkImageUsageFlags _imageUsage;
+    // A WindowServer display surface's twin (5c): a host-visible copy of each presented frame, made on the GPU, that the
+    // kext shows with SET_SCANOUT_BLOB instead of copying the surface through the CPU.
+    vg_buffer _twin;
+    uint32_t _twinRes;
 }
 @property(readonly) id<MTLDevice> device;
 @property(copy, atomic) NSString *label;
@@ -66,6 +70,10 @@ id<MTLBuffer> vg_new_buffer_nocopy(id<MTLDevice> device, void *pointer, NSUInteg
 void vg_surface_pull(VGMTLTexture *t);
 // Records that `cmd` writes texture `t`: a surface texture is copied back to its IOSurface when `cmd` completes.
 void vg_cmd_wrote(id cmd, VGMTLTexture *t);
+// Display-surface twins (5c): make and register one for a root surface texture that qualifies (WindowServer, BGRA,
+// screen-sized); forget it (the kext first) before the texture goes.
+BOOL vg_twin_ensure(VGMTLTexture *t);
+void vg_twin_forget(VGMTLTexture *t);
 id<MTLTexture> vg_new_surface_texture(id<MTLDevice> device, MTLTextureDescriptor *d, IOSurfaceRef surface, NSUInteger plane);
 id<MTLTexture> vg_texture_view(VGMTLTexture *p, MTLPixelFormat pf, MTLTextureType type, NSRange levels, NSRange slices);
 id<MTLTexture> vg_new_buffer_texture(id<MTLBuffer> buffer, MTLTextureDescriptor *d, NSUInteger offset, NSUInteger bpr);
@@ -104,6 +112,9 @@ BOOL vg_spirv_has_push_constants(NSData *spv);   // DescriptorSet 0 -> newSet (N
     VkCommandBuffer _pendingCb;   // deferred work submitted just ahead of _cb (5c), freed at completion
     NSMutableData *_pendingOwned;
     int _timePair;   // GPU timestamps (5c), -1 when off
+    BOOL _present;          // committed by commitAndWaitUntilSubmitted (Core Animation's display frames)
+    BOOL _allTwinned;       // every IOSurface it wrote got a twin copy: waiting for the GPU is enough
+    dispatch_semaphore_t _gpuDone;   // signaled once the fence is (before the CPU write-backs)
     VkDescriptorPool _pools[64];
     int _npools;
     uint32_t _setsInPool;

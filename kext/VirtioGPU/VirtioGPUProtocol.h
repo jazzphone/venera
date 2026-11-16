@@ -158,6 +158,20 @@ struct CmdSetScanout {
     uint32_t resourceID; // 0 disables the scanout
 };
 
+// Shows a blob resource (5c: a Venus host-visible allocation the Metal plugin copied a frame into) on a scanout.
+struct CmdSetScanoutBlob {
+    CtrlHdr hdr;
+    Rect r;
+    uint32_t scanoutID;
+    uint32_t resourceID;
+    uint32_t width;
+    uint32_t height;
+    uint32_t format;
+    uint32_t padding;
+    uint32_t strides[4];
+    uint32_t offsets[4];
+};
+
 struct CmdTransferToHost2D {
     CtrlHdr hdr;
     Rect r;

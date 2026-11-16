@@ -23,6 +23,9 @@ public:
     // user clients, not the core's). Set before start(); start() then takes any provider.
     void setCore(VirtioGPU *core) { core_ = core; }
 
+    // Stage 5c: whether `res` is one of this client's blobs and the client belongs to `task` (twin checks).
+    bool owns(task_t task, uint32_t res);
+
     // Called by the core (its command lock held) when an async request of ours completes.
     void requestCompleted(uint32_t ring, uint64_t fence);
 

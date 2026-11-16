@@ -402,6 +402,87 @@ static unsigned gPipeLogs = 0;
     } while (0)
 static IOService *displayFramebuffer();
 static const OSSymbol *gSymScanoutInfo, *gSymPresent, *gSymNewClient;   // made in start()
+static const OSSymbol *gSymTwinFor, *gSymScanoutBlob;                   // 5c, made in start()
+static IOService *coreService();                                         // the core (VirtioGPU), for blob scanouts
+static SInt64 gIopBlob = 0;                                              // frames shown from a twin (5c)
+static volatile bool gBlobShown = false;                                 // a twin is on scanout 0
+// Blob flips run on a work loop of their own (5c): QEMU answers SET_SCANOUT_BLOB / RESOURCE_FLUSH only after it has
+// drawn the frame and read it back for VNC (~9 ms with egl-headless), which must not stall WindowServer's present.
+// The newest frame wins; Core Animation rotates 3-4 surfaces, so a twin isn't rewritten before its flip.
+static IOWorkLoop *gPresentLoop;
+static IOTimerEventSource *gPresentTimer;
+static IOLock *gPresentLock;
+static uint32_t gPendingTwin[4];   // resource, width, height, stride; resource 0 = nothing pending
+static SInt64 gFlipNs = 0, gFlipMaxNs = 0, gFlips = 0, gFlipsSkipped = 0;
+// The shortest time between two flips, in ms (0 = no limit). 16 by default: evenly paced flips (at most ~60 a
+// second, the newest frame each time) judder less on VM 108's console than flips as they come (the tester, 2026-11-15).
+// Boot-arg vgpuflipms, or {"VirtioGPUFlipMs": n} at run time (root, `acceltest flipms N`).
+static volatile uint32_t gFlipMinMs = 16;
+static uint64_t gLastFlipAbs = 0;
+
+static void presentTick(OSObject *, IOTimerEventSource *) {
+    for (;;) {
+        if (gFlipMinMs && gLastFlipAbs) {
+            uint64_t since = 0;
+            absolutetime_to_nanoseconds(mach_absolute_time() - gLastFlipAbs, &since);
+            if (since < (uint64_t)gFlipMinMs * 1000000ULL) {   // too soon: come back, showing the newest frame then
+                gPresentTimer->setTimeoutUS((uint32_t)(((uint64_t)gFlipMinMs * 1000000ULL - since) / 1000) + 1);
+                return;
+            }
+        }
+        uint32_t t[4];
+        IOLockLock(gPresentLock);
+        memcpy(t, gPendingTwin, sizeof(t));
+        gPendingTwin[0] = 0;
+        IOLockUnlock(gPresentLock);
+        if (!t[0]) {
+            return;
+        }
+        IOService *core = coreService();
+        uint64_t t0 = mach_absolute_time(), ns = 0;
+        if (core) {
+            core->callPlatformFunction(gSymScanoutBlob, false, (void *)(uintptr_t)t[0], (void *)(uintptr_t)t[1],
+                                       (void *)(uintptr_t)t[2], (void *)(uintptr_t)t[3]);
+        }
+        gLastFlipAbs = mach_absolute_time();
+        absolutetime_to_nanoseconds(gLastFlipAbs - t0, &ns);
+        gFlipNs += (SInt64)ns;
+        gFlips++;
+        if ((SInt64)ns > gFlipMaxNs) {
+            gFlipMaxNs = (SInt64)ns;
+        }
+    }
+}
+
+// Queues a flip (performTransaction); false when there is no present loop (then the caller flips itself).
+static bool queueFlip(const uint32_t twin[4]) {
+    if (!gPresentTimer || !gPresentLock) {
+        return false;
+    }
+    IOLockLock(gPresentLock);
+    if (gPendingTwin[0]) {
+        gFlipsSkipped++;   // an older frame not shown yet: the newer one replaces it
+    }
+    memcpy(gPendingTwin, twin, sizeof(gPendingTwin));
+    IOLockUnlock(gPresentLock);
+    gPresentTimer->setTimeoutUS(1);
+    return true;
+}
+
+// Back to the framebuffer's own resource (the CPU path, a withdraw).
+static void scanoutFramebufferAgain() {
+    if (gPresentLock) {   // a queued flip must not land after this
+        IOLockLock(gPresentLock);
+        gPendingTwin[0] = 0;
+        IOLockUnlock(gPresentLock);
+    }
+    if (gBlobShown || gPresentTimer) {   // with flips on their own loop, one may have just landed: ask the core
+        if (IOService *core = coreService()) {
+            core->callPlatformFunction(gSymScanoutBlob, false, nullptr, nullptr, nullptr, nullptr);
+        }
+        gBlobShown = false;
+    }
+}
 static void iopPublishCounts();
 
 class VGDisplayPipe : public IOAccelLegacyDisplayPipe {
@@ -584,6 +665,42 @@ IOReturn VGDisplayPipe::performTransactionTimed(IOAccelDisplayPipeTransaction2 *
     if (!W || !H || W > 16384 || H > 16384 || P < bpp * W || (P & 3)) {
         IOPFAIL(kIOReturnBadArgument, "surface 0x%x geometry %llux%llu pitch %llu", s->getSurfaceID(), W, H, P);
     }
+    // Stage 5c: a frame the Metal plugin also copied (on the GPU) into a blob of the same size: show that blob
+    // (SET_SCANOUT_BLOB). No CPU copy, and QEMU takes the frame straight from the host GPU's memory. -vgpunoblob off.
+    static int noBlob = -1;
+    if (noBlob < 0) {
+        bool off = false;
+        PE_parse_boot_argn("-vgpunoblob", &off, sizeof(off));
+        noBlob = off;
+    }
+    if (!noBlob && fmt == NV_IOP_FMT_BGRA) {
+        uint32_t twin[4] = {};
+        IOService *core = coreService();
+        VGPUScanoutInfo qi = {};
+        if (core && core->callPlatformFunction(gSymTwinFor, false, (void *)(uintptr_t)s->getSurfaceID(), twin, nullptr,
+                                               nullptr) == kIOReturnSuccess &&
+            twin[1] == W && twin[2] == H &&
+            fb->callPlatformFunction(gSymScanoutInfo, false, &qi, nullptr, nullptr, nullptr) == kIOReturnSuccess &&
+            qi.width == W && qi.height == H) {
+            IOReturn br = queueFlip(twin) ? kIOReturnSuccess
+                                          : core->callPlatformFunction(gSymScanoutBlob, false, (void *)(uintptr_t)twin[0],
+                                                                       (void *)(uintptr_t)twin[1],
+                                                                       (void *)(uintptr_t)twin[2],
+                                                                       (void *)(uintptr_t)twin[3]);
+            if (br == kIOReturnSuccess) {
+                gBlobShown = true;
+                SInt64 n = OSAddAtomic64(1, &gIopBlob);
+                OSAddAtomic64(1, &gIopOk);
+                if (n < 3 || n % 600 == 0) {
+                    IOPLOG("frame from twin #%lld: surface 0x%x -> blob %u (%ux%u stride %u)", (long long)n + 1,
+                           s->getSurfaceID(), twin[0], twin[1], twin[2], twin[3]);
+                }
+                return kIOReturnSuccess;
+            }
+            IOPLOG("blob scanout of %u refused (0x%x): copying instead", twin[0], br);
+        }
+    }
+    scanoutFramebufferAgain();
     IOMemoryDescriptor *md = s->getMemoryDescriptor();
     if (!md) {
         IOPFAIL(kIOReturnNoMemory, "surface 0x%x has no memory descriptor", s->getSurfaceID());
@@ -813,13 +930,22 @@ static IOService *displayFramebuffer() {
     return gAccel ? gAccel->fb_ : nullptr;
 }
 
+static IOService *coreService() {
+    static IOService *core;
+    if (!core && gAccel) {
+        core = gAccel->findCore();   // the core outlives us (it is our provider's other client)
+    }
+    return core;
+}
+
 static void iopPublishCounts() {
     if (!gAccel) {
         return;
     }
     char line[160];
-    snprintf(line, sizeof(line), "calls %lld ok %lld fail %lld empty %lld refused %lld", (long long)gIopCalls,
-             (long long)gIopOk, (long long)gIopFail, (long long)gIopEmpty, (long long)gIopRefused);
+    snprintf(line, sizeof(line), "calls %lld ok %lld (from a twin %lld) fail %lld empty %lld refused %lld",
+             (long long)gIopCalls, (long long)gIopOk, (long long)gIopBlob, (long long)gIopFail, (long long)gIopEmpty,
+             (long long)gIopRefused);
     gAccel->setProperty("VirtioGPUPipeFrames", line);
     uint64_t span = 0;
     absolutetime_to_nanoseconds((uint64_t)(gIopLastAbs - gIopFirstAbs), &span);
@@ -828,6 +954,10 @@ static void iopPublishCounts() {
              (long long)(span / 1000000), span ? (long long)(gIopCalls * 1000000000LL / (SInt64)span) : 0LL,
              span ? (long long)((gIopCalls * 10000000000LL / (SInt64)span) % 10) : 0LL);
     gAccel->setProperty("VirtioGPUPipeTiming", line);
+    snprintf(line, sizeof(line), "%lld flips, avg %lld us, max %lld us; %lld frames replaced before their flip",
+             (long long)gFlips, gFlips ? (long long)(gFlipNs / gFlips / 1000) : 0LL, (long long)(gFlipMaxNs / 1000),
+             (long long)gFlipsSkipped);
+    gAccel->setProperty("VirtioGPUBlobFlips", line);
 }
 
 void VirtioGPUAccel::populateAccelConfig(IOAccelConfig *c) {
@@ -898,6 +1028,8 @@ bool VirtioGPUAccel::start(IOService *provider) {
     }
     gSymScanoutInfo = OSSymbol::withCStringNoCopy(kVGPUFBScanoutInfo);
     gSymPresent = OSSymbol::withCStringNoCopy(kVGPUFBPresent);
+    gSymTwinFor = OSSymbol::withCStringNoCopy(kVGPUTwinFor);
+    gSymScanoutBlob = OSSymbol::withCStringNoCopy(kVGPUScanoutBlob);
     gSymNewClient = OSSymbol::withCStringNoCopy(kVGPUNewClient);
     pci_ = OSDynamicCast(IOPCIDevice, provider);
     setProperty("IOAccelRevision", 2ULL, 32);
@@ -915,6 +1047,19 @@ bool VirtioGPUAccel::start(IOService *provider) {
             break;
         }
         carriers_[i] = c;
+    }
+    if (uint32_t ms = 0; PE_parse_boot_argn("vgpuflipms", &ms, sizeof(ms))) {
+        gFlipMinMs = ms;
+    }
+    if (gate >= 3 && !gPresentLoop) {
+        gPresentLock = IOLockAlloc();
+        gPresentLoop = IOWorkLoop::workLoop();
+        gPresentTimer = IOTimerEventSource::timerEventSource(this, presentTick);
+        if (!gPresentLock || !gPresentLoop || !gPresentTimer ||
+            gPresentLoop->addEventSource(gPresentTimer) != kIOReturnSuccess) {
+            vlog("start: present work loop setup failed: blob flips run inline");
+            OSSafeReleaseNULL(gPresentTimer);
+        }
     }
     if (gate >= 3) {
         // The display (5a): hold the registry busy (WindowServer waits for quiet) until the arm finishes or 20 s pass.
@@ -1157,6 +1302,7 @@ void VirtioGPUAccel::withdrawForWindowServer(const char *why) {
     removeProperty("IOAccelDisplayPipeCapabilities");
     nameOnFramebuffer(false);
     gIop = 0;
+    scanoutFramebufferAgain();
     // The AGDC stays: AppleGraphicsDeviceControl refuses terminate (measured: -> 0), and without the capabilities
     // WindowServer finds no display pipe and composites in software anyway (measured 2026-11-15).
     armed_ = 1;
@@ -1328,6 +1474,18 @@ void VirtioGPUAccel::stop(IOService *provider) {
 // sees it). Nothing persists: every boot starts unarmed. Anything else goes to the family's own setProperties.
 IOReturn VirtioGPUAccel::setProperties(OSObject *properties) {
     OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
+    if (dict && dict->getObject("VirtioGPUFlipMs")) {
+        if (IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator) != kIOReturnSuccess) {
+            return kIOReturnNotPrivileged;
+        }
+        if (OSNumber *n = OSDynamicCast(OSNumber, dict->getObject("VirtioGPUFlipMs"))) {
+            gFlipMinMs = n->unsigned32BitValue();
+            setProperty("VirtioGPUFlipMs", gFlipMinMs, 32);
+            vlog("blob flips: at least %u ms apart", gFlipMinMs);
+            return kIOReturnSuccess;
+        }
+        return kIOReturnBadArgument;
+    }
     if (dict && (dict->getObject("VirtioGPUArm") || dict->getObject("VirtioGPUDisarm") || dict->getObject("VirtioGPULegacySurfaces") ||
                  dict->getObject("VirtioGPUArmWindowServer") || dict->getObject("VirtioGPUWithdraw"))) {
         if (IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator) != kIOReturnSuccess) {

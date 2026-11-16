@@ -1,6 +1,7 @@
 #include "VirtioGPUUserClient.hpp"
 
 #include <IOKit/IOLib.h>
+#include <sys/proc.h>
 #include <IOKit/IOSubMemoryDescriptor.h>
 
 #include "../VirtioGPUUserAPI.h"
@@ -26,7 +27,21 @@ bool VirtioGPUUserClient::start(IOService *provider) {
     if (!core_) {
         core_ = OSDynamicCast(VirtioGPU, provider);
     }
-    return core_ && IOUserClient::start(provider);
+    if (!core_ || !IOUserClient::start(provider)) {
+        return false;
+    }
+    core_->addClient(this);
+    return true;
+}
+
+bool VirtioGPUUserClient::owns(task_t task, uint32_t res) {
+    if (task != task_ || !lock_) {
+        return false;
+    }
+    IOLockLock(lock_);
+    bool yes = find(res) != nullptr;
+    IOLockUnlock(lock_);
+    return yes;
 }
 
 void VirtioGPUUserClient::free() {
@@ -54,6 +69,9 @@ IOReturn VirtioGPUUserClient::clientClose() {
         LOG("close: %u requests still in flight", pending_);
     }
     destroyAll();
+    if (core_) {
+        core_->removeClient(this);
+    }
     if (core_ && ctx_) {
         vgpu::CtrlHdr destroy = {};
         destroy.type = vgpu::kCmdCtxDestroy;
@@ -103,6 +121,31 @@ IOReturn VirtioGPUUserClient::externalMethod(uint32_t selector, IOExternalMethod
         return destroyResource((uint32_t)args->scalarInput[0]);
     case kVGUCSubmit: return submit(args);
     case kVGUCWaitFence: return waitFence(args);
+    case kVGUCSetTwin: {
+        if (args->scalarInputCount < 5) {
+            return kIOReturnBadArgument;
+        }
+        char who[32] = "";
+        proc_selfname(who, sizeof(who));
+        if (strcmp(who, "WindowServer")) {
+            return kIOReturnNotPermitted;
+        }
+        return core_->setTwin(task_, (uint32_t)args->scalarInput[0], (uint32_t)args->scalarInput[1],
+                              (uint32_t)args->scalarInput[2], (uint32_t)args->scalarInput[3],
+                              (uint32_t)args->scalarInput[4]);
+    }
+    case kVGUCScanoutBlob:
+        if (args->scalarInputCount < 5) {
+            return kIOReturnBadArgument;
+        }
+        if (IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator) != kIOReturnSuccess) {
+            return kIOReturnNotPrivileged;
+        }
+        return core_->setScanoutBlob((uint32_t)args->scalarInput[0], (uint32_t)args->scalarInput[1],
+                                     (uint32_t)args->scalarInput[2], (uint32_t)args->scalarInput[3],
+                                     (uint32_t)args->scalarInput[4])
+                   ? kIOReturnSuccess
+                   : kIOReturnError;
     default: return kIOReturnUnsupported;
     }
 }
@@ -314,6 +357,9 @@ IOReturn VirtioGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *opt
 }
 
 IOReturn VirtioGPUUserClient::destroyResource(uint32_t id) {
+    if (core_ && owns(task_, id)) {
+        core_->forgetResource(id);   // a twin of it is no longer shown (5c)
+    }
     IOLockLock(lock_);
     Resource *r = find(id);
     if (!r) {

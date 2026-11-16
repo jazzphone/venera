@@ -14,6 +14,8 @@
 // ---- MTLBuffer ---------------------------------------------------------------------------------------------------
 
 @implementation VGMTLBuffer
+// The blob resource of this buffer's memory, for tools (5c: tools/blobtest).
+- (uint32_t)vgResId { return vg_memory_res_id(_b.memory); }
 @synthesize label = _label;
 - (id<MTLDevice>)device { return _dev; }
 - (void)dealloc {
@@ -1056,6 +1058,9 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
             vg_gpu_time_collect(_timePair);
         }
     }
+    if (_gpuDone) {
+        dispatch_semaphore_signal(_gpuDone);   // the twins are written: a display frame may go to the screen
+    }
     _completed = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     if (_cb) {
         pthread_mutex_lock(&gVk.lock);
@@ -1134,12 +1139,40 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
     VkFence fence = VK_NULL_HANDLE;
     if (_cb && !_error) {
         // IOSurface textures this command buffer wrote: image -> staging, written into the surface at completion.
+        _allTwinned = _present && _surfacesWritten.count > 0;
+        static int writeBackTwins = -1;
+        if (writeBackTwins < 0) {
+            const char *e = getenv("VGMTL_TWIN_WRITEBACK");
+            writeBackTwins = e && e[0] == '1';
+        }
+        NSMutableSet *noWriteBack = nil;
         for (VGMTLTexture *t in _surfacesWritten) {
             [self barrier];
+            // A display frame: into the surface's twin, which the kext scans out (5c). Such a surface is only read on
+            // the GPU (Core Animation) and from the twin (the display), so its CPU write-back is skipped
+            // (VGMTL_TWIN_WRITEBACK=1 keeps it).
+            BOOL twinned = (_present || t->_twinRes) && vg_twin_ensure(t);
+            if (twinned) {
+                VkBufferImageCopy tc = {0, (uint32_t)t->_width, (uint32_t)t->_height, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                        {0, 0, 0}, {(uint32_t)t->_width, (uint32_t)t->_height, 1}};
+                gVk.vkCmdCopyImageToBuffer(_cb, t->_image, VK_IMAGE_LAYOUT_GENERAL, t->_twin.buffer, 1, &tc);
+                if (!writeBackTwins) {
+                    if (!noWriteBack) {
+                        noWriteBack = [NSMutableSet set];
+                    }
+                    [noWriteBack addObject:t];
+                    continue;
+                }
+            } else {
+                _allTwinned = NO;
+            }
             NSUInteger px = IOSurfaceGetBytesPerElementOfPlane(t->_surface, t->_plane);
             VkBufferImageCopy c = {0, (uint32_t)(t->_surfaceBpr / px), (uint32_t)t->_height,
                                    {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {(uint32_t)t->_width, (uint32_t)t->_height, 1}};
             gVk.vkCmdCopyImageToBuffer(_cb, t->_image, VK_IMAGE_LAYOUT_GENERAL, t->_staging.buffer, 1, &c);
+        }
+        if (noWriteBack) {
+            [_surfacesWritten minusSet:noWriteBack];   // no CPU copy at completion either
         }
         if (_surfacesWritten.count) {
             [self barrier];
@@ -1228,10 +1261,18 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
         nowait = e && e[0] == '1';
     }
     BOOL wroteSurfaces = _surfacesWritten.count > 0;
+    _present = YES;
+    _gpuDone = wroteSurfaces ? dispatch_semaphore_create(0) : nil;
     [self commit];
     if (wroteSurfaces && !nowait) {
         uint64_t t0 = vg_now();
-        dispatch_group_wait(_done, DISPATCH_TIME_FOREVER);
+        if (_allTwinned) {
+            // every surface has a twin the kext scans out: the GPU being done is enough (5c); the CPU write-backs
+            // follow on the completion queue for whoever reads the surfaces on the CPU
+            dispatch_semaphore_wait(_gpuDone, DISPATCH_TIME_FOREVER);
+        } else {
+            dispatch_group_wait(_done, DISPATCH_TIME_FOREVER);
+        }
         vg_perf(VG_PERF_SUBMIT_WAIT, 0, vg_now() - t0);
     }
 }

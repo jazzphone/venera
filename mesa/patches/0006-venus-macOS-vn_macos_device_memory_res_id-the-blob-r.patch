@@ -1,0 +1,55 @@
+From f3a455ccb698452780314d25c5e53f76cec6589e Mon Sep 17 00:00:00 2001
+From: build <build@localhost>
+Date: Sun, 15 Nov 2026 19:11:34 -0500
+Subject: [PATCH] venus: macOS: vn_macos_device_memory_res_id, the blob
+ resource behind a mappable allocation
+
+The Metal plugin scans display frames out of a host-visible buffer (SET_SCANOUT_BLOB) and needs its virtio-gpu
+resource id.
+---
+ src/virtio/vulkan/vn_device_memory.c | 14 ++++++++++++++
+ src/virtio/vulkan/vn_device_memory.h |  6 ++++++
+ 2 files changed, 20 insertions(+)
+
+diff --git a/src/virtio/vulkan/vn_device_memory.c b/src/virtio/vulkan/vn_device_memory.c
+index e277ce6..f40571e 100644
+--- a/src/virtio/vulkan/vn_device_memory.c
++++ b/src/virtio/vulkan/vn_device_memory.c
+@@ -633,3 +633,17 @@ vn_GetMemoryFdPropertiesKHR(VkDevice device,
+ 
+    return VK_SUCCESS;
+ }
++
++#ifdef __APPLE__
++/* macOS (stage 5c): the virtio-gpu blob resource behind a mappable allocation, so the Metal plugin can have the
++ * display scan a frame out of it (SET_SCANOUT_BLOB) instead of copying it through the CPU. 0 when the memory has
++ * none (not mappable, or not mapped yet). Found by the plugin with dlsym.
++ */
++PUBLIC uint32_t
++vn_macos_device_memory_res_id(VkDevice device, VkDeviceMemory memory)
++{
++   (void)device;
++   struct vn_device_memory *mem = vn_device_memory_from_handle(memory);
++   return mem && mem->base_bo ? mem->base_bo->res_id : 0;
++}
++#endif
+diff --git a/src/virtio/vulkan/vn_device_memory.h b/src/virtio/vulkan/vn_device_memory.h
+index eeff571..75035db 100644
+--- a/src/virtio/vulkan/vn_device_memory.h
++++ b/src/virtio/vulkan/vn_device_memory.h
+@@ -61,6 +61,12 @@ vn_device_memory_import_dma_buf(struct vn_device *dev,
+                                 bool force_unmappable,
+                                 int fd);
+ 
++#ifdef __APPLE__
++/* the virtio-gpu blob resource behind a mappable allocation (0 if none); exported for the Metal plugin */
++PUBLIC uint32_t
++vn_macos_device_memory_res_id(VkDevice device, VkDeviceMemory memory);
++#endif
++
+ VkResult
+ vn_get_memory_dma_buf_properties(struct vn_device *dev,
+                                  int fd,
+-- 
+2.54.0 (Apple Git-157)
+

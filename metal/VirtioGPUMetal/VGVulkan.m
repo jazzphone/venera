@@ -18,6 +18,12 @@ NSString *vg_resource_path(const char *name) {
     return [[contents stringByAppendingPathComponent:@"Resources"] stringByAppendingPathComponent:@(name)];
 }
 
+static uint32_t (*gResIdOf)(VkDevice, VkDeviceMemory);
+
+uint32_t vg_memory_res_id(VkDeviceMemory memory) {
+    return gResIdOf && memory ? gResIdOf(gVk.device, memory) : 0;
+}
+
 static int vg_vulkan_init_locked(void) {
     // Fence waits through the kernel's interrupt instead of Venus' shared-memory fence feedback (5c): feedback is polled
     // with short usleeps that macOS stretches under load (median small submit under WindowServer load: 8.3 ms with
@@ -29,6 +35,7 @@ static int vg_vulkan_init_locked(void) {
         vglog("vulkan: dlopen %s: %s", path.UTF8String, dlerror());
         return -1;
     }
+    gResIdOf = (uint32_t(*)(VkDevice, VkDeviceMemory))dlsym(lib, "vn_macos_device_memory_res_id");   // Mesa patch 0006
     PFN_negotiate negotiate = (PFN_negotiate)dlsym(lib, "vk_icdNegotiateLoaderICDInterfaceVersion");
     PFN_icdGetInstanceProcAddr gipa = (PFN_icdGetInstanceProcAddr)dlsym(lib, "vk_icdGetInstanceProcAddr");
     if (!negotiate || !gipa) {

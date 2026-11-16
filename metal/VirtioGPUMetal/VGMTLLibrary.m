@@ -146,6 +146,88 @@ static NSString *vg_translate_key(NSString *ll, const char *stage, NSDictionary<
     return k;
 }
 
+// ---- on-disk translation cache (5c) ----------------------------------------------------------------------------
+// Translating Core Animation's shaders is seconds of WindowServer's own thread per new pipeline variant, at every
+// boot and every new effect on screen. Translations (and reflections) are kept on disk, in the process's Darwin cache
+// directory (WindowServer's sandbox allows it), keyed by a SHA-256 of what decides them: a version tag, the
+// translator (a hash of the file), the stage, the function constants, the threadgroup lengths and the module
+// text. VGMTL_NODISKCACHE=1 turns it off.
+#import <CommonCrypto/CommonDigest.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+static NSString *vg_disk_dir(void) {
+    static NSString *dir;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *off = getenv("VGMTL_NODISKCACHE");
+        char base[PATH_MAX];
+        if ((off && off[0] == '1') || !confstr(_CS_DARWIN_USER_CACHE_DIR, base, sizeof(base))) {
+            return;
+        }
+        NSString *d = [@(base) stringByAppendingPathComponent:@"local.homelab.VirtioGPUMetal/spirv"];
+        if ([[NSFileManager defaultManager] createDirectoryAtPath:d withIntermediateDirectories:YES attributes:nil error:nil]) {
+            dir = d;
+        }
+        vglog("translation cache: %s", dir ? dir.UTF8String : "none (can't make the directory)");
+    });
+    return dir;
+}
+
+static NSString *vg_disk_key(const char *kind, NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc,
+                             const uint32_t *tg, uint32_t tgCount) {
+    // the translator by its content (a reinstalled bundle with the same translator keeps the cache)
+    static char tool[96];
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *path = vg_resource_path("libnvmtl_translate.dylib");
+        NSData *bin = path ? [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil] : nil;
+        unsigned char d[CC_SHA256_DIGEST_LENGTH] = {0};
+        if (bin) {
+            CC_SHA256(bin.bytes, (CC_LONG)bin.length, d);
+        }
+        snprintf(tool, sizeof(tool), "vgmtl-cache-2|%02x%02x%02x%02x%02x%02x%02x%02x", d[0], d[1], d[2], d[3], d[4], d[5],
+                 d[6], d[7]);
+    });
+    CC_SHA256_CTX c;
+    CC_SHA256_Init(&c);
+    CC_SHA256_Update(&c, tool, (CC_LONG)strlen(tool));
+    CC_SHA256_Update(&c, kind, (CC_LONG)strlen(kind) + 1);
+    CC_SHA256_Update(&c, stage, (CC_LONG)strlen(stage) + 1);
+    for (NSNumber *i in [fc.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+        uint32_t idx = i.unsignedIntValue, n = (uint32_t)fc[i].length;
+        CC_SHA256_Update(&c, &idx, 4);
+        CC_SHA256_Update(&c, &n, 4);
+        CC_SHA256_Update(&c, fc[i].bytes, n);
+    }
+    for (uint32_t i = 0; tg && i < tgCount; i++) {
+        CC_SHA256_Update(&c, &tg[i], 4);
+    }
+    const char *text = ll.UTF8String;
+    CC_SHA256_Update(&c, text, (CC_LONG)strlen(text));
+    unsigned char md[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256_Final(md, &c);
+    NSMutableString *hex = [NSMutableString stringWithCapacity:64];
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) {
+        [hex appendFormat:@"%02x", md[i]];
+    }
+    return hex;
+}
+
+static NSData *vg_disk_get(NSString *key) {
+    NSString *dir = vg_disk_dir();
+    return dir ? [NSData dataWithContentsOfFile:[dir stringByAppendingPathComponent:key]] : nil;
+}
+
+static void vg_disk_put(NSString *key, NSData *data) {
+    NSString *dir = vg_disk_dir();
+    if (!dir || !data.length) {
+        return;
+    }
+    NSString *path = [dir stringByAppendingPathComponent:key];
+    [data writeToFile:path atomically:YES];   // a temporary file, renamed: readers never see half of it
+}
+
 static NSData *vg_translate_uncached(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc,
                                      const uint32_t *tgLengths, uint32_t tgCount, NSString **error);
 
@@ -161,7 +243,18 @@ NSData *vg_translate(NSString *ll, const char *stage, NSDictionary<NSNumber *, N
             return hit;
         }
     }
-    NSData *spv = vg_translate_uncached(ll, stage, fc, tgLengths, tgCount, error);
+    NSString *dkey = vg_disk_dir() ? vg_disk_key("spirv", ll, stage, fc, tgLengths, tgCount) : nil;
+    NSData *spv = dkey ? vg_disk_get(dkey) : nil;
+    if (spv) {
+        vg_perf(VG_PERF_DISK_HIT, spv.length, 0);
+    } else {
+        uint64_t t0 = vg_now();
+        spv = vg_translate_uncached(ll, stage, fc, tgLengths, tgCount, error);
+        vg_perf(VG_PERF_TRANSLATE, spv.length, vg_now() - t0);
+        if (spv && dkey) {
+            vg_disk_put(dkey, spv);
+        }
+    }
     if (spv) {
         @synchronized(cache) {
             if (cache.count > 1024) {
@@ -205,7 +298,28 @@ static NSData *vg_translate_uncached(NSString *ll, const char *stage, NSDictiona
     return spv;
 }
 
+static NSDictionary *vg_reflect_uncached(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc,
+                                         NSString **error, NSData **jsonOut);
+
 NSDictionary *vg_reflect(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc, NSString **error) {
+    NSString *dkey = vg_disk_dir() ? vg_disk_key("reflect", ll, stage, fc, NULL, 0) : nil;
+    NSData *json = dkey ? vg_disk_get(dkey) : nil;
+    if (json) {
+        NSDictionary *d = [NSJSONSerialization JSONObjectWithData:json options:0 error:nil];
+        if ([d isKindOfClass:[NSDictionary class]]) {
+            return d;
+        }
+    }
+    json = nil;
+    NSDictionary *d = vg_reflect_uncached(ll, stage, fc, error, &json);
+    if (d && json && dkey) {
+        vg_disk_put(dkey, json);
+    }
+    return d;
+}
+
+static NSDictionary *vg_reflect_uncached(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc,
+                                         NSString **error, NSData **jsonOut) {
     if (!vg_translator_ready()) {
         if (error) {
             *error = @"no translator";
@@ -231,6 +345,7 @@ NSDictionary *vg_reflect(NSString *ll, const char *stage, NSDictionary<NSNumber 
     }
     NSData *json = [NSData dataWithBytes:out length:len];
     pTranslateFree(out, len);
+    *jsonOut = json;
     NSDictionary *d = [NSJSONSerialization JSONObjectWithData:json options:0 error:nil];
     if (![d isKindOfClass:[NSDictionary class]] && error) {
         *error = @"reflection isn't a JSON object";

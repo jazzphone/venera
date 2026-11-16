@@ -138,6 +138,7 @@ bool VirtioGPU::start(IOService *provider) {
     }
     commandLock_ = IOLockAlloc();
     scanoutLock_ = IOLockAlloc();
+    twinLock_ = IOLockAlloc();
     cursorLock_ = IOLockAlloc();
     LOG("core start: stage 2c (MSI-X, scanout API for the framebuffer)");
     pci_->setMemoryEnable(true);
@@ -902,6 +903,7 @@ bool VirtioGPU::setScanout(IOBufferMemoryDescriptor *memory, uint32_t width, uin
         ok = type == vgpu::kRespOkNoData;
     }
     if (ok) {
+        scanoutBlob_ = 0;   // a new mode: the framebuffer's own resource is on screen again
         scanoutResource_ = resource;
         scanoutWidth_ = width;
         scanoutHeight_ = height;
@@ -919,10 +921,182 @@ bool VirtioGPU::setScanout(IOBufferMemoryDescriptor *memory, uint32_t width, uin
     return ok;
 }
 
+bool VirtioGPU::setScanoutBlob(uint32_t resource, uint32_t width, uint32_t height, uint32_t stride, uint32_t offset) {
+    if (!ready() || !scanoutLock_) {
+        return false;
+    }
+    IOLockLock(scanoutLock_);
+    bool ok;
+    if (!resource) {   // back to the framebuffer's 2D resource
+        if (!scanoutBlob_) {
+            IOLockUnlock(scanoutLock_);
+            return true;
+        }
+        auto *set = reinterpret_cast<vgpu::CmdSetScanout *>(commandBytes_);
+        bzero(set, sizeof(*set));
+        set->hdr.type = vgpu::kCmdSetScanout;
+        set->r = {0, 0, scanoutWidth_, scanoutHeight_};
+        set->scanoutID = 0;
+        set->resourceID = scanoutResource_;
+        uint32_t type = simple(sizeof(*set));
+        ok = type == vgpu::kRespOkNoData;
+        LOG("SET_SCANOUT back to res %u (from blob %u) -> %s", scanoutResource_, scanoutBlob_, respName(type));
+        scanoutBlob_ = 0;
+        IOLockUnlock(scanoutLock_);
+        if (ok) {
+            flush(0, 0, scanoutWidth_, scanoutHeight_);
+        }
+        return ok;
+    }
+    if (!width || !height || stride < width * 4) {
+        IOLockUnlock(scanoutLock_);
+        return false;
+    }
+    if (resource != scanoutBlob_) {
+        auto *set = reinterpret_cast<vgpu::CmdSetScanoutBlob *>(commandBytes_);
+        bzero(set, sizeof(*set));
+        set->hdr.type = vgpu::kCmdSetScanoutBlob;
+        set->r = {0, 0, width, height};
+        set->scanoutID = 0;
+        set->resourceID = resource;
+        set->width = width;
+        set->height = height;
+        set->format = vgpu::kFormatB8G8R8X8;
+        set->strides[0] = stride;
+        set->offsets[0] = offset;
+        uint32_t type = simple(sizeof(*set));
+        ok = type == vgpu::kRespOkNoData;
+        if (blobFlips_ < 8 || !ok) {
+            LOG("SET_SCANOUT_BLOB res %u %ux%u stride %u offset %u -> %s", resource, width, height, stride, offset,
+                respName(type));
+        }
+        if (!ok) {
+            IOLockUnlock(scanoutLock_);
+            return false;
+        }
+        scanoutBlob_ = resource;
+    }
+    auto *f = reinterpret_cast<vgpu::CmdResourceFlush *>(commandBytes_);
+    bzero(f, sizeof(*f));
+    f->hdr.type = vgpu::kCmdResourceFlush;
+    f->r = {0, 0, width, height};
+    f->resourceID = resource;
+    ok = simple(sizeof(*f)) == vgpu::kRespOkNoData;
+    blobFlips_++;
+    IOLockUnlock(scanoutLock_);
+    return ok;
+}
+
+void VirtioGPU::addClient(VirtioGPUUserClient *c) {
+    if (!twinLock_) {
+        return;
+    }
+    IOLockLock(twinLock_);
+    for (unsigned i = 0; i < kMaxClients; i++) {
+        if (!clients_[i]) {
+            clients_[i] = c;
+            break;
+        }
+    }
+    IOLockUnlock(twinLock_);
+}
+
+void VirtioGPU::removeClient(VirtioGPUUserClient *c) {
+    if (!twinLock_) {
+        return;
+    }
+    IOLockLock(twinLock_);
+    for (unsigned i = 0; i < kMaxClients; i++) {
+        if (clients_[i] == c) {
+            clients_[i] = nullptr;
+        }
+    }
+    IOLockUnlock(twinLock_);
+}
+
+IOReturn VirtioGPU::setTwin(task_t task, uint32_t surface, uint32_t resource, uint32_t width, uint32_t height,
+                            uint32_t stride) {
+    if (!twinLock_ || !surface) {
+        return kIOReturnBadArgument;
+    }
+    IOLockLock(twinLock_);
+    if (resource) {
+        bool owned = false;
+        for (unsigned i = 0; i < kMaxClients && !owned; i++) {
+            owned = clients_[i] && clients_[i]->owns(task, resource);
+        }
+        if (!owned || !width || !height || stride < width * 4) {
+            IOLockUnlock(twinLock_);
+            LOG("twin for surface 0x%x: resource %u refused (%s)", surface, resource, owned ? "size" : "not the caller's");
+            return kIOReturnNotPermitted;
+        }
+    }
+    unsigned slot = kMaxTwins, free = kMaxTwins;
+    for (unsigned i = 0; i < kMaxTwins; i++) {
+        if (twins_[i].surface == surface) {
+            slot = i;
+        } else if (!twins_[i].surface && free == kMaxTwins) {
+            free = i;
+        }
+    }
+    uint32_t old = slot < kMaxTwins ? twins_[slot].resource : 0;
+    if (!resource) {
+        if (slot < kMaxTwins) {
+            twins_[slot] = {};
+        }
+    } else {
+        if (slot == kMaxTwins) {
+            slot = free;
+        }
+        if (slot == kMaxTwins) {
+            IOLockUnlock(twinLock_);
+            return kIOReturnNoSpace;
+        }
+        twins_[slot] = {surface, resource, width, height, stride};
+    }
+    IOLockUnlock(twinLock_);
+    if (old && old != resource && scanoutBlob_ == old) {
+        setScanoutBlob(0, 0, 0, 0, 0);   // what was on screen is going away
+    }
+    return kIOReturnSuccess;
+}
+
+void VirtioGPU::forgetResource(uint32_t resource) {
+    if (!twinLock_ || !resource) {
+        return;
+    }
+    IOLockLock(twinLock_);
+    for (unsigned i = 0; i < kMaxTwins; i++) {
+        if (twins_[i].resource == resource) {
+            twins_[i] = {};
+        }
+    }
+    IOLockUnlock(twinLock_);
+    if (scanoutBlob_ == resource) {
+        setScanoutBlob(0, 0, 0, 0, 0);
+    }
+}
+
+bool VirtioGPU::twinFor(uint32_t surface, Twin *out) {
+    if (!twinLock_ || !surface) {
+        return false;
+    }
+    bool found = false;
+    IOLockLock(twinLock_);
+    for (unsigned i = 0; i < kMaxTwins && !found; i++) {
+        if (twins_[i].surface == surface) {
+            *out = twins_[i];
+            found = true;
+        }
+    }
+    IOLockUnlock(twinLock_);
+    return found;
+}
+
 bool VirtioGPU::flush(uint32_t x, uint32_t y, uint32_t width, uint32_t height) {
     IOLockLock(scanoutLock_);
     uint32_t resource = scanoutResource_;
-    if (!resource || x >= scanoutWidth_ || y >= scanoutHeight_) {
+    if (!resource || scanoutBlob_ || x >= scanoutWidth_ || y >= scanoutHeight_) {
         IOLockUnlock(scanoutLock_);
         return false;
     }
@@ -1017,6 +1191,21 @@ IOReturn VirtioGPU::callPlatformFunction(const OSSymbol *name, bool wait, void *
     if (name->isEqualTo(kVGPUDisableScanout)) {
         disableScanout();
         return kIOReturnSuccess;
+    }
+    if (name->isEqualTo(kVGPUTwinFor)) {
+        Twin t;
+        if (!p2 || !twinFor((uint32_t)(uintptr_t)p1, &t)) {
+            return kIOReturnNotFound;
+        }
+        uint32_t *out = static_cast<uint32_t *>(p2);
+        out[0] = t.resource, out[1] = t.width, out[2] = t.height, out[3] = t.stride;
+        return kIOReturnSuccess;
+    }
+    if (name->isEqualTo(kVGPUScanoutBlob)) {
+        return setScanoutBlob((uint32_t)(uintptr_t)p1, (uint32_t)(uintptr_t)p2, (uint32_t)(uintptr_t)p3,
+                              (uint32_t)(uintptr_t)p4, 0)
+                   ? kIOReturnSuccess
+                   : kIOReturnError;
     }
     if (name->isEqualTo(kVGPUNewClient)) {
         // Stage 5a: a Venus client for the accelerator to attach under itself (kVGUCAccelType).

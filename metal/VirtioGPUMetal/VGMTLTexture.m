@@ -68,6 +68,75 @@ VkFormat vg_vk_format(MTLPixelFormat f) {
     return v ? v->vk : VK_FORMAT_UNDEFINED;
 }
 
+// ---- display-surface twins (5c) ------------------------------------------------------------------------------------
+
+#import <IOKit/IOKitLib.h>
+#include "../../kext/VirtioGPUUserAPI.h"
+
+static io_connect_t vg_twin_conn(void) {
+    static io_connect_t conn;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching(kVGUCAccelClass));
+        if (s && IOServiceOpen(s, mach_task_self(), kVGUCAccelType, &conn) != KERN_SUCCESS) {
+            conn = 0;
+        }
+        if (s) {
+            IOObjectRelease(s);
+        }
+    });
+    return conn;
+}
+
+static BOOL vg_twins_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("VGMTL_TWIN");
+        on = !strcmp(getprogname(), "WindowServer") && !(e && e[0] == '0');
+    }
+    return on;
+}
+
+BOOL vg_twin_ensure(VGMTLTexture *t) {
+    if (t->_twinRes) {
+        return YES;
+    }
+    if (!vg_twins_on() || !t->_surface || t->_plane || t->_parent || t->_width < 640 || t->_height < 480 ||
+        (t->_pixelFormat != MTLPixelFormatBGRA8Unorm && t->_pixelFormat != MTLPixelFormatBGRA8Unorm_sRGB)) {
+        return NO;
+    }
+    if (t->_twin.buffer) {
+        return NO;   // made before and refused: don't try every frame
+    }
+    const uint32_t stride = (uint32_t)t->_width * 4;
+    if (vg_buffer_create((VkDeviceSize)stride * t->_height, &t->_twin)) {
+        return NO;
+    }
+    uint32_t res = vg_memory_res_id(t->_twin.memory);
+    io_connect_t c = vg_twin_conn();
+    uint64_t in[5] = {IOSurfaceGetID(t->_surface), res, t->_width, t->_height, stride};
+    kern_return_t kr = res && c ? IOConnectCallScalarMethod(c, kVGUCSetTwin, in, 5, NULL, NULL) : KERN_FAILURE;
+    vglog("twin for surface %u (%lux%lu): blob %u -> 0x%x", IOSurfaceGetID(t->_surface), (unsigned long)t->_width,
+          (unsigned long)t->_height, res, kr);
+    if (kr != KERN_SUCCESS) {
+        return NO;
+    }
+    t->_twinRes = res;
+    return YES;
+}
+
+void vg_twin_forget(VGMTLTexture *t) {
+    if (t->_twinRes && t->_surface) {
+        uint64_t in[5] = {IOSurfaceGetID(t->_surface), 0, 0, 0, 0};
+        io_connect_t c = vg_twin_conn();
+        if (c) {
+            IOConnectCallScalarMethod(c, kVGUCSetTwin, in, 5, NULL, NULL);
+        }
+    }
+    t->_twinRes = 0;
+    vg_buffer_destroy(&t->_twin);   // destroying the blob also takes it off the screen (the kext)
+}
+
 // ---- staging pool (5c) ---------------------------------------------------------------------------------------------
 
 enum { kPoolMax = 48 };
@@ -282,6 +351,9 @@ BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
 @synthesize label = _label;
 - (id<MTLDevice>)device { return _dev; }
 - (void)dealloc {
+    if (_twin.buffer) {
+        vg_twin_forget(self);
+    }
     if (_surface) {
         CFRelease(_surface);
     }
@@ -721,6 +793,12 @@ void vg_surface_pull(VGMTLTexture *t) {
     }
     const vg_format *f = vg_format_of(t->_pixelFormat);
     NSUInteger rows = t->_height;
+    static int logged;
+    if (logged < 40 && !strcmp(getprogname(), "WindowServer")) {
+        logged++;
+        vglog("pull: surface %u %lux%lu (seed %u, synced %u%s)", IOSurfaceGetID(t->_surface), (unsigned long)t->_width,
+              (unsigned long)t->_height, seed, t->_syncedSeed, t->_neverSynced ? ", new" : "");
+    }
     // The surface's bytes go into a staging buffer of their own now; the GPU copy waits for the next submit (5c: it
     // was a one-shot, ~9 ms of WindowServer's time per pulled frame). t->_staging stays the write-back's.
     uint64_t t0 = vg_now();
@@ -759,6 +837,32 @@ id<MTLTexture> vg_new_buffer_texture(id<MTLBuffer> buffer, MTLTextureDescriptor 
     return t;
 }
 
+// Surface roots stay alive 2 s after their last wrapper (5c): Core Animation makes a new texture for an app's drawable
+// every frame, so with only the weak map the root died in between and each frame built a new host image (369 times in
+// 5 min for one window). Called with the roots lock held.
+static NSMutableDictionary<NSString *, VGMTLTexture *> *gKept;
+static NSMutableDictionary<NSString *, NSNumber *> *gKeptAt;
+static void vg_root_keep(NSString *key, VGMTLTexture *root) {
+    if (!gKept) {
+        gKept = [NSMutableDictionary dictionary];
+        gKeptAt = [NSMutableDictionary dictionary];
+    }
+    uint64_t now = vg_now();
+    gKept[key] = root;
+    gKeptAt[key] = @(now);
+    static uint64_t lastSweep;
+    if (now - lastSweep < 500000000ull && gKept.count < 96) {
+        return;
+    }
+    lastSweep = now;
+    for (NSString *k in gKeptAt.allKeys) {
+        if (now - gKeptAt[k].unsignedLongLongValue > 2000000000ull || gKept.count > 96) {
+            [gKept removeObjectForKey:k];
+            [gKeptAt removeObjectForKey:k];
+        }
+    }
+}
+
 id<MTLTexture> vg_new_surface_texture(id<MTLDevice> device, MTLTextureDescriptor *d, IOSurfaceRef surface, NSUInteger plane) {
     const vg_format *f = vg_format_of(d.pixelFormat);
     if (!surface || !f || (f->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT) || d.textureType != MTLTextureType2D ||
@@ -789,6 +893,7 @@ id<MTLTexture> vg_new_surface_texture(id<MTLDevice> device, MTLTextureDescriptor
     }
     VGMTLTexture *root = [roots objectForKey:key];
     if (root && root->_surface == surface) {
+        vg_root_keep(key, root);
         pthread_mutex_unlock(&rootsLock);
         id<MTLTexture> v = vg_texture_view(root, d.pixelFormat, MTLTextureType2D, NSMakeRange(0, 1), NSMakeRange(0, 1));
         if (v) {
@@ -807,6 +912,7 @@ id<MTLTexture> vg_new_surface_texture(id<MTLDevice> device, MTLTextureDescriptor
     }
     t->_usage = d.usage;
     [roots setObject:t forKey:key];
+    vg_root_keep(key, t);
     pthread_mutex_unlock(&rootsLock);
     t->_surface = (IOSurfaceRef)CFRetain(surface);
     t->_plane = plane;

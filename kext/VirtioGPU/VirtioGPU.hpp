@@ -40,6 +40,22 @@ public:
     bool flush(uint32_t x, uint32_t y, uint32_t width, uint32_t height);
     // Turns the scanout off and drops the resource.
     void disableScanout();
+    // Stage 5c: shows blob resource `resource` (BGRX, `stride` bytes per row from `offset`) on scanout 0 and flushes
+    // it; resource 0 puts the framebuffer's own 2D resource back. While a blob is shown, flush() of the 2D resource
+    // does nothing (nothing of it is on screen).
+    bool setScanoutBlob(uint32_t resource, uint32_t width, uint32_t height, uint32_t stride, uint32_t offset);
+    uint32_t scanoutBlob() const { return scanoutBlob_; }
+
+    // Stage 5c: blob twins of IOSurfaces (kVGUCSetTwin). Clients register so a twin can be checked against the
+    // caller's own resources; a resource's destruction drops its twin and takes it off the screen.
+    void addClient(class VirtioGPUUserClient *c);
+    void removeClient(class VirtioGPUUserClient *c);
+    IOReturn setTwin(task_t task, uint32_t surface, uint32_t resource, uint32_t width, uint32_t height, uint32_t stride);
+    void forgetResource(uint32_t resource);
+    struct Twin {
+        uint32_t surface, resource, width, height, stride;
+    };
+    bool twinFor(uint32_t surface, Twin *out);
     // Hardware cursor (cursor queue): 64x64 BGRA image + hot spot; position of the hot spot.
     bool setCursor(const uint32_t *pixels, uint32_t hotX, uint32_t hotY);
     void moveCursor(uint32_t x, uint32_t y, bool visible);
@@ -136,6 +152,12 @@ private:
     uint32_t scanoutHeight_ = 0;
     uint32_t scanoutStride_ = 0;
     uint32_t flushes_ = 0;
+    uint32_t scanoutBlob_ = 0;   // the blob on scanout 0 (5c), 0 when it's the 2D resource
+    static constexpr unsigned kMaxClients = 64, kMaxTwins = 16;
+    IOLock *twinLock_ = nullptr;
+    class VirtioGPUUserClient *clients_[kMaxClients] = {};
+    Twin twins_[kMaxTwins] = {};
+    uint32_t blobFlips_ = 0;
     IOService *display_ = nullptr; // VirtioGPUDisplay nub
     // Stage 3: host-visible memory window (VIRTIO_PCI_CAP_SHARED_MEMORY_CFG) and capsets
     uint32_t numCapsets_ = 0;

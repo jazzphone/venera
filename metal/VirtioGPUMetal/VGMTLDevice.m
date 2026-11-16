@@ -261,6 +261,46 @@ static id vg_refuse_before_init(id obj) {
     }
     return vg_new_compute_pipeline(self, f, error);
 }
+// The two-argument form Core Animation's luma pass uses (5c: with transparency on, WindowServer aborted on
+// "function=compute_average_luma": MTLIOAccelDevice's own version returned nil without an error).
+- (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d
+                                                               error:(NSError **)error {
+    return vg_new_compute_pipeline(self, d.computeFunction, error);
+}
+// Completion-handler forms, answered synchronously (the base class's would not reach our pipelines either).
+- (void)newComputePipelineStateWithFunction:(id<MTLFunction>)f
+                          completionHandler:(MTLNewComputePipelineStateCompletionHandler)handler {
+    NSError *e = nil;
+    id<MTLComputePipelineState> p = vg_new_compute_pipeline(self, f, &e);
+    handler(p, e);
+}
+- (void)newComputePipelineStateWithFunction:(id<MTLFunction>)f
+                                    options:(MTLPipelineOption)o
+                          completionHandler:(MTLNewComputePipelineStateWithReflectionCompletionHandler)handler {
+    NSError *e = nil;
+    id<MTLComputePipelineState> p = vg_new_compute_pipeline(self, f, &e);
+    handler(p, nil, e);
+}
+- (void)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d
+                                      options:(MTLPipelineOption)o
+                            completionHandler:(MTLNewComputePipelineStateWithReflectionCompletionHandler)handler {
+    NSError *e = nil;
+    id<MTLComputePipelineState> p = vg_new_compute_pipeline(self, d.computeFunction, &e);
+    handler(p, nil, e);
+}
+- (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d
+                           completionHandler:(MTLNewRenderPipelineStateCompletionHandler)handler {
+    NSError *e = nil;
+    id<MTLRenderPipelineState> p = [self newRenderPipelineStateWithDescriptor:d error:&e];
+    handler(p, e);
+}
+- (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d
+                                     options:(MTLPipelineOption)o
+                           completionHandler:(MTLNewRenderPipelineStateWithReflectionCompletionHandler)handler {
+    NSError *e = nil;
+    id<MTLRenderPipelineState> p = [self newRenderPipelineStateWithDescriptor:d error:&e];
+    handler(p, nil, e);
+}
 - (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d
                                                              options:(MTLPipelineOption)o
                                                           reflection:(MTLAutoreleasedComputePipelineReflection *)r

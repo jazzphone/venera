@@ -42,6 +42,13 @@ enum {
     kVGUCSubmit = 6,
     /* scalar in: ring index, fence, timeout ns (0 = poll); scalar out: 1 signaled, 0 not yet */
     kVGUCWaitFence = 7,
+    /* stage 5c, root only: scalar in: blob resource id (0 = the framebuffer again), width, height, stride, offset.
+     * Shows that blob on scanout 0 (SET_SCANOUT_BLOB + RESOURCE_FLUSH). */
+    kVGUCScanoutBlob = 8,
+    /* stage 5c, WindowServer only: scalar in: IOSurface id, blob resource id (0 = forget it), width, height, stride.
+     * The blob (one of this process's Venus allocations) holds a copy of that surface's frames: the display pipe
+     * scans it out instead of copying the surface through the CPU. */
+    kVGUCSetTwin = 9,
     kVGUCMethodCount
 };
 

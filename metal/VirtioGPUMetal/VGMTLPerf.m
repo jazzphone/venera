@@ -11,7 +11,8 @@ static const char *const kNames[VG_PERF_N] = {"pull copy", "pull GPU", "write-ba
                                               "replaceRegion upload (deferred)", "deferred ops recorded (bytes = ops)",
                                               "framebuffer fetch copy (bytes ~ pixels x 4)", "completion: in line after commit",
                                               "completion: fence wait", "GPU time (timestamps)", "staging pool hit", "staging pool miss (new buffer)",
-                                              "commitAndWaitUntilSubmitted: waited for write-back"};
+                                              "commitAndWaitUntilSubmitted: waited (GPU, or the write-back)",
+                                              "shader translated", "shader from the disk cache"};
 
 void vg_perf(int kind, uint64_t bytes, uint64_t ns) {
     atomic_fetch_add_explicit(&gCount[kind], 1, memory_order_relaxed);

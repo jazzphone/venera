@@ -914,3 +914,51 @@ of the frame, so the write-back, the wait in `commitAndWaitUntilSubmitted` and t
 framebuffer-fetch splits: native input attachments (dynamic rendering local read, if Venus can pass it) instead of
 end-copy-resume; (3) find the guest/host latency on fence completion (QEMU's fence handling, the kext's interrupt
 path, guest scheduling).
+
+## Stage 5c, round 2 (2026-11-15): frames go to the screen straight from the host GPU
+
+**Zero-copy present works.** WindowServer's display frames reach VM 108's console without any CPU copy: the
+plugin copies each display surface, on the GPU, into a *twin* (a linear host-visible Venus buffer, i.e. a virtio-gpu
+blob resource), and the display pipe points scanout 0 at that blob with `SET_SCANOUT_BLOB` + `RESOURCE_FLUSH`; QEMU
+(11.1.3, virglrenderer 1.1.0, `egl-headless`) imports it as a dmabuf. Proven first with `tools/blobtest` (a color-bar
+pattern from a Metal buffer; the tester saw it), then end to end: `VirtioGPUPipeFrames` "ok N (from a twin N)".
+
+Pieces:
+- Mesa patch 0006: `vn_macos_device_memory_res_id()` returns the blob resource behind a mappable allocation (the
+  plugin finds it with dlsym; `-[VGMTLBuffer vgResId]` for tools).
+- Core 0.5.2: `setScanoutBlob()` (a blob on scanout 0, or the framebuffer's 2D resource again; the framebuffer's own
+  flushes are skipped while a blob is shown), a twin table (IOSurface id -> blob) filled by `kVGUCSetTwin` (WindowServer
+  only, and only for a blob one of its own clients created), `kVGUCScanoutBlob` (root, for blobtest). A destroyed
+  resource drops its twin and takes it off the screen (WindowServer exiting is safe). Links `com.apple.kpi.bsd`.
+- Accelerator 0.6.x: `performTransaction` looks the frame's surface up (`vgpu.twinFor`) and queues a flip instead of
+  copying; flips run on a work loop of their own (QEMU answers a flip only after drawing it and reading it back for
+  VNC, 4-7 ms, up to ~26 ms) and are paced at least 16 ms apart, newest frame wins (`vgpuflipms` boot-arg,
+  `acceltest flipms N` at run time; the tester: paced flips judder less). No twin, or a size mismatch: the CPU copy as
+  before, with the framebuffer put back on screen first. A withdraw puts the framebuffer back too.
+- Plugin: a twin per screen-sized BGRA IOSurface WindowServer presents (`commitAndWaitUntilSubmitted`), copied in the
+  same command buffer; that call then waits for the GPU only. Twinned surfaces get **no CPU write-back** any more
+  (nothing reads them on the CPU; `VGMTL_TWIN_WRITEBACK=1` keeps it). `VGMTL_TWIN=0` turns twins off.
+
+Also this round:
+- **Surface roots kept 2 s** after their last wrapper: Core Animation makes a new texture for an app's drawable every
+  frame, so with only the weak map each frame built a new host image (369 times in 5 min for one window).
+- **Translated shaders on disk** (`VGMTLLibrary.m`), in the process's Darwin cache directory, SHA-256 keyed (translator
+  content, stage, constants, threadgroup sizes, module text), for SPIR-V and reflection. Core Animation keeps asking for
+  new variants as the desktop does new things (~4 s each on WindowServer's thread), so the cache fills with use; the
+  key is stable across boots (2 of 83 files shared content). `VGMTL_NODISKCACHE=1` off.
+- **Transparency crash fixed**: with transparency on, Core Animation's luma pass asks for its compute pipeline with the
+  private two-argument `newComputePipelineStateWithDescriptor:error:`, which only `MTLIOAccelDevice` answered (nil, no
+  error): WindowServer aborted ("function=compute_average_luma") and the guard withdrew to software after two
+  restarts. The plugin now answers it and the completion-handler forms.
+
+Numbers (`mtlwindow` while WindowServer composites it): ~26-31 fps; WindowServer ~100 command buffers/s at ~6.4 ms
+when dragging, no write-backs, pulls 0.2 ms; transaction 10 us. The tester: smoother than before with paced flips, but it
+**still judders**.
+
+**What's left (judder)**: the framebuffer-fetch splits (~700/s while dragging, ~1 GB/s of GPU copies plus a pass
+restart each) are now the heaviest GPU work per frame and vary with the scene; QEMU's flip time varies (4-26 ms);
+new Core Animation variants still translate for ~4 s on WindowServer's thread until the disk cache has them; and the
+console itself (VNC/noVNC encoding full-screen changes) may add its own uneven pacing. Next: native input attachments
+or a cheaper fetch (e.g. copy once per pass and only re-copy when a draw writes what a later fetch reads), a look at
+the console path (SPICE vs VNC, egl-headless readback), and translating faster or ahead of time (warm the cache from
+Core Animation's library at install).

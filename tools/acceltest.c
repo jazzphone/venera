@@ -4,6 +4,7 @@
 //   acceltest disarm               withdraw them
 //   acceltest legacy on|off        stage 5b probe: legacy IOAccelSurfaces for an armed WindowServer
 //   acceltest wsarm | withdraw     stage 5a: arm the display for WindowServer / withdraw it (needs vgpuaccel=3 or 4)
+//   acceltest flipms N             stage 5c: blob flips at least N ms apart (0 = as they come)
 //   acceltest T...       for each user-client type T: IOServiceOpen, print the class the family made, close;
 //                        on an IOAccelDevice2 also call get_config (sel 0) and get_name (sel 1) -- nothing else
 //                        is called on any client
@@ -99,6 +100,19 @@ int main(int argc, char **argv) {
         kern_return_t kr = IORegistryEntrySetCFProperties(svc, d);
         CFRelease(d);
         say("legacy %s -> 0x%x\n", argv[2], kr);
+        return kr == KERN_SUCCESS ? 0 : 1;
+    }
+    if (argc > 2 && !strcmp(argv[1], "flipms")) {
+        // stage 5c: the shortest time between two blob flips (0 = no limit)
+        CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+                                                             &kCFTypeDictionaryValueCallBacks);
+        int ms = atoi(argv[2]);
+        CFNumberRef n = CFNumberCreate(NULL, kCFNumberIntType, &ms);
+        CFDictionarySetValue(d, CFSTR("VirtioGPUFlipMs"), n);
+        kern_return_t kr = IORegistryEntrySetCFProperties(svc, d);
+        CFRelease(n);
+        CFRelease(d);
+        say("flipms %d -> 0x%x\n", ms, kr);
         return kr == KERN_SUCCESS ? 0 : 1;
     }
     if (argc > 1 && (!strcmp(argv[1], "wsarm") || !strcmp(argv[1], "withdraw"))) {
