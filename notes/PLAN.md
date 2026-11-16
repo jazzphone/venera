@@ -1101,3 +1101,31 @@ host's addresses, name and SSH key name and first names (the original history is
 `private-history-2026-11-15`; commit ids in this file before this section are from it). The host now comes from
 `tools/local.env` (ignored). License: PolyForm Noncommercial 1.0.0 (the accelerator is built with NullMoth's
 noncommercial headers); `NOTICE.md`. No release is published.
+
+### Round 6, after midnight: flip pacing, the VNC ceiling, repeated screenshots, fetch in place
+
+- **Flips at most every 12 ms** (accelerator 0.6.10, was 16): with the newest-ready loop, WindowServer makes ~56
+  frames a second during a drag (mean gap 17.7 ms); a 16 ms floor dropped a quarter of them (flips 22 ms apart on
+  average), 12 follows it (18.5 ms), 8 too but less evenly. Fewer flips (33 ms) didn't lower latency. Pacing
+  histograms now have bins around 60 Hz and print the mean.
+- **The console is capped at ~33 fps by QEMU**: its VNC server (Proxmox's noVNC console) sends at most one update per
+  30 ms (`VNC_REFRESH_INTERVAL_BASE` = `GUI_REFRESH_INTERVAL_DEFAULT` = 30, checked in QEMU's source), however fast
+  the guest flips. 60 fps is only visible through a non-VNC display (gtk/sdl with gl, local SPICE gl) or streaming
+  from the guest. INSTALL.md says so.
+- **Repeated screenshots**: one in three still came out blank: WindowServer reads a capture surface on the CPU right
+  after `commitAndWaitUntilSubmitted`, which no longer waited for unshown surfaces' write-back. It waits again,
+  except for a surface written by 10 display command buffers in a row (the per-frame GPU-only intermediate): 8 of 8
+  correct, pacing unchanged.
+- **Framebuffer fetch in place, now the default** (mode 4): with `VK_EXT_attachment_feedback_loop_layout` the split
+  still ends and resumes the pass, but the draw samples the attachment itself in the feedback loop layout (render
+  targets get the feedback loop usage, fetch pipelines the flag, encoders put the layout back to GENERAL) instead of
+  a scratch copy. Against copies (tools/pngdiff on Cmd-Shift-3 screenshots of the same desktop): alike to the eye
+  (34 k pixels differ slightly at glass edges), deterministic, gesture snapshots clean; WindowServer's command
+  buffers complete in ~12 ms instead of ~20 (commit -> GPU start 7.9 vs 11.8 ms; the copies were host CPU work for
+  Venus' ring thread as well as GPU time), ~70 MB less memory. `VirtioGPUMetal-fetchmode` = 0 goes back to copies.
+- **Soak** (`tools/soak.sh`): 16 min with copies and 10 min in place, drags/resizes/scrolls/minimizes in a loop:
+  same WindowServer throughout, no crash reports, memory flat after the pool filled. Display modes (1024x768 to
+  1920x1080) switch with the Metal desktop running (`tools/modetest`). Display sleep/wake fine.
+- Host observation (read-only `top`): Venus' ring thread for WindowServer (`vkr-ring` in virgl_render_server) ran
+  at ~68 % of a host core under load; decoding WindowServer's commands there is what queues each command buffer, so
+  fewer commands per frame is the next latency lever (push descriptors instead of allocate/update/bind per draw).
