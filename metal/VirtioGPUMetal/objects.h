@@ -75,6 +75,7 @@ id<MTLBuffer> vg_new_buffer_nocopy(id<MTLDevice> device, void *pointer, NSUInteg
     BOOL _shareImported;
     uint32_t _shareParams[5];   // the creator's: VkFormat, width, height, usage, flags | tiling << 31
     uint64_t _shareSize;
+    BOOL _shareable;   // exportable, offered to other processes at its first GPU write-back (vg_surface_wrote_back)
 }
 @property(readonly) id<MTLDevice> device;
 @property(copy, atomic) NSString *label;

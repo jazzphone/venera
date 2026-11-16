@@ -728,6 +728,7 @@ BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
 @end
 
 static BOOL vg_surface_tagged(VGMTLTexture *t, uint32_t seed);
+static void vg_surface_tag(VGMTLTexture *t, uint32_t seed);
 // External memory for the next vg_new_texture on this thread (5d sharing): 0 none, 1 exportable, 2 imported from fd.
 static __thread int gVgExt;
 static __thread int gVgImportFd = -1;
@@ -901,6 +902,7 @@ id<MTLTexture> vg_new_texture(id<MTLDevice> device, MTLTextureDescriptor *d) {
         t->_shareParams[3] = usage;
         t->_shareParams[4] = (uint32_t)ici.flags | (ici.tiling == VK_IMAGE_TILING_LINEAR ? 0x80000000u : 0);
         t->_shareSize = mai.allocationSize;
+        t->_shareable = YES;   // initialized with the next submit like any image; offered at its first write-back
     }
     vg_pending_init_image(image, aspect, mips, layers);   // UNDEFINED -> GENERAL for life, ahead of the next submit
     return t;
@@ -1234,7 +1236,31 @@ void vg_surface_pull(VGMTLTexture *t) {
                            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
                            {(uint32_t)t->_width, (uint32_t)rows, 1}};
     vgtrace("surface %u: pull (seed %u, had %u)", IOSurfaceGetID(t->_surface), seed, t->_syncedSeed);
-    vg_pending_copy(up.buffer, t->_image, &c, &up);
+    if (t->_shareRes) {
+        // A shared image (5d): uploaded now. Left for our next submit, it could land after the other process put a
+        // newer frame in the same image, and take it back to this older one.
+        VkImage img = t->_image;
+        VkBuffer ub = up.buffer;
+        BOOL ok = vg_one_shot(^(VkCommandBuffer cb) {
+          VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                                VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT};
+          gVk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+          gVk.vkCmdCopyBufferToImage(cb, ub, img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+          VkMemoryBarrier after = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                   VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
+          gVk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &after,
+                                   0, NULL, 0, NULL);
+        });
+        if (ok) {
+            vg_staging_put(&up);
+            vg_surface_tag(t, seed);   // uploaded and done: the other process needn't upload this frame too
+        } else {
+            vg_pending_copy(up.buffer, t->_image, &c, &up);
+        }
+    } else {
+        vg_pending_copy(up.buffer, t->_image, &c, &up);
+    }
     t->_syncedSeed = seed;
     t->_neverSynced = NO;
 }
@@ -1300,7 +1326,15 @@ static void vg_surface_tag(VGMTLTexture *t, uint32_t seed) {
     IOSurfaceSetValue(t->_surface, (__bridge CFStringRef)kVgSeedTag, n);
     CFRelease(n);
 }
-void vg_surface_wrote_back(VGMTLTexture *t, uint32_t seed) { vg_surface_tag(t, seed); }
+static BOOL vg_share_register(VGMTLTexture *t, uint32_t surface);
+// After a write-back at completion: the image holds a GPU frame and has been initialized, so it can be offered now (an
+// image offered at creation had its first transition and uploads raced the other process's use of it).
+void vg_surface_wrote_back(VGMTLTexture *t, uint32_t seed) {
+    if (t->_shareable && !t->_shareRes && gVgSharing && t->_surface) {
+        t->_shareable = vg_share_register(t, IOSurfaceGetID(t->_surface));   // NO after a refusal: not again
+    }
+    vg_surface_tag(t, seed);
+}
 // YES when the surface's current contents are a frame our shared image already holds.
 static BOOL vg_surface_tagged(VGMTLTexture *t, uint32_t seed) {
     if (!t->_shareRes) {
@@ -1373,11 +1407,8 @@ static VGMTLTexture *vg_surface_root_image(id<MTLDevice> device, MTLTextureDescr
         gVgExt = 1;
         t = (VGMTLTexture *)vg_new_texture(device, rd);
         gVgExt = 0;
-        if (t && !vg_share_register(t, sid)) {
-            // a private image after all: fine, the pulls stay
-        }
         if (t) {
-            return t;
+            return t;   // registered at its first GPU write-back: surfaces only the CPU draws stay unshared
         }
     }
     return (VGMTLTexture *)vg_new_texture(device, rd);

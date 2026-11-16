@@ -47,7 +47,7 @@ inject() {
   rm -rf "$MNT/EFI/OC/Kexts/$name" && cp -r "$src" "$MNT/EFI/OC/Kexts/$name" &&
     python3 -I "$HERE/oc_kext.py" "$MNT/EFI/OC/config.plist" "$name" enable &&
     python3 -I "$HERE/oc_kext.py" "$MNT/EFI/OC/config.plist" - nopicker &&
-    python3 -I "$HERE/oc_kext.py" "$MNT/EFI/OC/config.plist" - csr 0x203 # + unapproved kexts, unrestricted fs (AuxKC in /Library/KernelCollections)
+    python3 -I "$HERE/oc_kext.py" "$MNT/EFI/OC/config.plist" - csr 0xA03 # + unapproved kexts, unrestricted fs (AuxKC in /Library/KernelCollections), authenticated root off (Venera on the system volume)
 }
 
 # Installs a kext into /Library/Extensions and builds it into the Auxiliary kernel collection.
