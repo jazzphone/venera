@@ -151,7 +151,10 @@ static int vg_vulkan_init_locked(void) {
                    : !strcmp(de[i].extensionName, "VK_EXT_external_memory_dma_buf") ? 2 : 0;
     }
     free(de);
-    BOOL share = haveExt == 3 && gImportSurface && access("/Library/GPUBundles/VirtioGPUMetal-noshare", F_OK) != 0;
+    // Opt-in (the flag file VirtioGPUMetal-share): measured on VM 108 it saves WindowServer's pull copies, under 1% of a
+    // core for a 640x480 window drawing every frame, against the risk of a surface's frames getting lost between
+    // processes (the first version lost Safari's page background).
+    BOOL share = haveExt == 3 && gImportSurface && access("/Library/GPUBundles/VirtioGPUMetal-share", F_OK) == 0;
     const char *const *base = exts;
     const char *withShare[4];
     if (share) {   // ahead of the optional ones the loop below drops from the end

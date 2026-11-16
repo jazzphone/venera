@@ -1252,3 +1252,35 @@ Measured on VM 108 (snapshots `pre-authroot`, `pre-watcher`, `pre-gl`), each fix
 - Safari's test page uses WindowServer ~150% and its GPU process ~120% of a guest core at 59 fps: app surfaces cross
   processes through CPU memory (write-back, then upload). Sharing them on the host GPU (blob resources across Venus
   contexts) is the big remaining performance lever for apps.
+
+### Round 8, part 4: OpenGL, SwiftUI effects, surfaces across processes (2026-11-16)
+
+Measured on VM 108 (snapshots `pre-gl`, `pre-share`, `pre-accel0612`):
+
+- **OpenGL** is on by default (accelerator 0.6.12 publishes `IOGLBundleName`; the `vgpugl` boot-arg is gone). Chess
+  draws fully: real pipeline reflection, swizzles, vendor name from the host GPU, the renderer's private calls. It takes
+  ~18 s to show its window here: Game Center waits for a network the VM doesn't have.
+- **SwiftUI/RenderBox effects** (the Dock's Calendar icon, which had gone blank and then vanished a second after
+  launch): linked visible functions (`nvmtl_visible_refs` + `nvmtl_link_visible`, under `specializedName`
+  "custom_fn"), render-target barriers (`memoryBarrierWithScope:`: end the Vulkan rendering, flush, resume; RenderBox
+  binds its coverage attachment as texture(5) between them), constexpr samplers (the translator's StaticSampler
+  bindings get a normalized VkSampler of their own), and function constants folded (constant-space loads and stores
+  spelled with opaque pointers, which the translator's static-initializer evaluator reads; `VirtioGPUMetal-typedconst`
+  turns that off). `com.apple.dock.extra` is on the driver by default; Core Image 7 of 7 still.
+- **Open**: Spotlight's result icons (Calendar, Shortcuts) still come out empty on the driver, so Spotlight stays off
+  by default (allow-list "Spotlight" to try it). Their image draws read an atlas that holds the icon and get zeros;
+  the Dock helper has one surface of this kind too, unseen. Debug flag files for it: `passlog`, `dumpsurf`, `dumplink`
+  (one process name a line).
+- **Surfaces shared across processes** (core 0.5.6, Mesa patch 0007, opt-in with `VirtioGPUMetal-share`): an
+  IOSurface's image lives on exportable memory, offered at its first GPU write-back and imported by the other process
+  (WindowServer), which then skips the pull of frames already in it (the surface is tagged with seed and resource).
+  It works and draws right (mtlwindow, Safari's page), but it saves little here: WindowServer's pull copies for a
+  640x480 window drawing every frame went from 37 to 6.5 ms per 5 s, under 1% of a core, inside run-to-run noise of
+  20 points. Correction to 384eaed's message: its "122% -> 29%" compared against a baseline in which my first version
+  (registered at creation, synchronous uploads) was still running in WindowServer; not a real gain. WindowServer's
+  CPU goes to Core Animation and Venus encoding, not the copies. Kept off by default because a first version lost
+  Safari's page background (fixed: an image offered before its first layout transition ran).
+- **Seen once, not reproduced**: right after a reboot that invalidated every translation cache, parts of Safari's page
+  stayed black (twice in the first minutes, never with warm caches). Watch for it after an update.
+- tools/vm-remote.sh injecting the core now keeps csr-active-config 0xA03: 0x203 turned authenticated root back on and
+  the next boot came up without the system-volume copy.

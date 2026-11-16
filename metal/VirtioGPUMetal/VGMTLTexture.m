@@ -1315,7 +1315,7 @@ static void vg_root_keep(NSString *key, VGMTLTexture *root) {
 // memory (vn_macos_import_surface) and makes the same image over it. WindowServer then reads an app's frames where the
 // app drew them, without pulling the surface's CPU memory (a memcpy and an upload per frame, per window). The CPU
 // write-back stays, for CPU readers; it tags the surface with its seed and resource, and a process whose image is that
-// resource skips the pull the new seed would otherwise cause. VirtioGPUMetal-noshare turns it off.
+// resource skips the pull the new seed would otherwise cause. Opt-in: the flag file VirtioGPUMetal-share turns it on.
 static NSString *const kVgSeedTag = @"VeneraSeed";
 static void vg_surface_tag(VGMTLTexture *t, uint32_t seed) {
     if (!t->_shareRes) {
