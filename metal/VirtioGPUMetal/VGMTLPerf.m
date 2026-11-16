@@ -13,7 +13,10 @@ static const char *const kNames[VG_PERF_N] = {"pull copy", "pull GPU", "write-ba
                                               "completion: fence wait", "GPU time (timestamps)", "staging pool hit", "staging pool miss (new buffer)",
                                               "commitAndWaitUntilSubmitted: waited (GPU, or the write-back)",
                                               "shader translated", "shader from the disk cache",
-                                              "waitUntilCompleted: blocked"};
+                                              "waitUntilCompleted: blocked",
+                                              "latency: commit -> GPU starts it", "latency: GPU done -> guest sees it",
+                                              "descriptor set written", "descriptor set reused",
+                                              "draw state commands skipped"};
 
 void vg_perf(int kind, uint64_t bytes, uint64_t ns) {
     atomic_fetch_add_explicit(&gCount[kind], 1, memory_order_relaxed);
@@ -68,14 +71,52 @@ void vg_gpu_time_end(VkCommandBuffer cb, int pair) {
     }
 }
 
-void vg_gpu_time_collect(int pair) {
+// GPU timestamps on the guest's clock: guest ns = device ticks x period + offset, the offset measured around a
+// vkGetCalibratedTimestampsEXT (a Venus round trip; its midpoint) and renewed every second.
+static double vg_gpu_offset(void) {
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static double offset;
+    static uint64_t at;
+    static PFN_vkGetCalibratedTimestampsEXT get;
+    if (!gVk.calibrated) {
+        return 0;
+    }
+    pthread_mutex_lock(&lock);
+    if (!get) {
+        get = (PFN_vkGetCalibratedTimestampsEXT)gVk.vkGetDeviceProcAddr(gVk.device, "vkGetCalibratedTimestampsEXT");
+    }
+    uint64_t now = vg_now();
+    if (get && now - at > 1000000000ull) {
+        VkCalibratedTimestampInfoEXT info = {VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT, NULL, VK_TIME_DOMAIN_DEVICE_EXT};
+        uint64_t dev = 0, dev_max = 0;
+        uint64_t t0 = vg_now();
+        if (get(gVk.device, 1, &info, &dev, &dev_max) == VK_SUCCESS) {
+            uint64_t t1 = vg_now();
+            offset = (double)(t0 + t1) / 2 - dev * (double)gVk.props.limits.timestampPeriod;
+            at = t1;
+        }
+    }
+    double o = offset;
+    pthread_mutex_unlock(&lock);
+    return o;
+}
+
+void vg_gpu_time_collect(int pair, uint64_t submittedNs, uint64_t observedNs) {
     uint64_t ts[2];
     if (pair < 0 || gVk.vkGetQueryPoolResults(gVk.device, gQueries, 2 * pair, 2, sizeof(ts), ts, sizeof(uint64_t),
                                               VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
         return;
     }
+    const double period = gVk.props.limits.timestampPeriod;
     if (ts[1] > ts[0]) {
-        vg_perf(VG_PERF_GPU, 0, (uint64_t)((ts[1] - ts[0]) * (double)gVk.props.limits.timestampPeriod));
+        vg_perf(VG_PERF_GPU, 0, (uint64_t)((ts[1] - ts[0]) * period));
+    }
+    double off = vg_gpu_offset();
+    if (off != 0 && submittedNs && observedNs) {
+        double start = ts[0] * period + off, end = ts[1] * period + off;
+        double pre = start - (double)submittedNs, post = (double)observedNs - end;
+        vg_perf(VG_PERF_LAT_PRE, 0, pre > 0 ? (uint64_t)pre : 0);
+        vg_perf(VG_PERF_LAT_POST, 0, post > 0 ? (uint64_t)post : 0);
     }
 }
 

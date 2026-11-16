@@ -20,12 +20,12 @@ void vg_callstack(const char *what);   // with the call trace on: the caller's f
 void vglog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 // 5c timing (VGMTLPerf.m): what each kind of work cost, summed and logged every 5 s in WindowServer (or with
 // VGMTL_PERF=1) while anything happened.
-enum { VG_PERF_PULL_COPY, VG_PERF_PULL_GPU, VG_PERF_WB_COPY, VG_PERF_CB, VG_PERF_ONESHOT, VG_PERF_UPLOAD, VG_PERF_DEFERRED, VG_PERF_FETCH, VG_PERF_CB_QUEUE, VG_PERF_CB_WAIT, VG_PERF_GPU, VG_PERF_POOL_HIT, VG_PERF_POOL_MISS, VG_PERF_SUBMIT_WAIT, VG_PERF_TRANSLATE, VG_PERF_DISK_HIT, VG_PERF_WAIT_COMPLETED, VG_PERF_N };
+enum { VG_PERF_PULL_COPY, VG_PERF_PULL_GPU, VG_PERF_WB_COPY, VG_PERF_CB, VG_PERF_ONESHOT, VG_PERF_UPLOAD, VG_PERF_DEFERRED, VG_PERF_FETCH, VG_PERF_CB_QUEUE, VG_PERF_CB_WAIT, VG_PERF_GPU, VG_PERF_POOL_HIT, VG_PERF_POOL_MISS, VG_PERF_SUBMIT_WAIT, VG_PERF_TRANSLATE, VG_PERF_DISK_HIT, VG_PERF_WAIT_COMPLETED, VG_PERF_LAT_PRE, VG_PERF_LAT_POST, VG_PERF_SET_WRITTEN, VG_PERF_SET_REUSED, VG_PERF_STATE_SKIPPED, VG_PERF_N };
 BOOL vg_perf_on(void);
 // GPU timestamps around a command buffer (5c, only while timing is on): begin returns a pair index or -1.
 int vg_gpu_time_begin(VkCommandBuffer cb);
 void vg_gpu_time_end(VkCommandBuffer cb, int pair);
-void vg_gpu_time_collect(int pair);
+void vg_gpu_time_collect(int pair, uint64_t submittedNs, uint64_t observedNs);
 void vg_perf(int kind, uint64_t bytes, uint64_t ns);
 static inline uint64_t vg_now(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 // VGMTL_TRACE=1: step-by-step lines for bisecting a host-side failure (the log is written before each step).
@@ -60,7 +60,7 @@ void vg_trace_sync(const char *after);
     X(vkCmdSetBlendConstants) X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) X(vkCmdDraw) X(vkCmdDrawIndexed)   \
     X(vkCmdSetStencilTestEnable) X(vkCmdSetDepthBiasEnable) X(vkCmdSetRasterizerDiscardEnable)                     \
     X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetDepthBoundsTestEnable) X(vkDeviceWaitIdle)                         \
-    X(vkCreateQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
+    X(vkCreateQueryPool) X(vkResetDescriptorPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
 
 #define VG_DECLARE(name) PFN_##name name;
 struct vg_vulkan {
@@ -74,6 +74,7 @@ struct vg_vulkan {
     uint32_t hostMemoryType;   // host-visible + coherent (cached when there is one): every buffer for now
     VkPhysicalDeviceMemoryProperties memory;
     BOOL formatlessStorage;    // shaderStorageImageRead/WriteWithoutFormat: typeless storage textures
+    BOOL calibrated;           // VK_EXT_calibrated_timestamps enabled
     VkCommandPool pool;
     pthread_mutex_t lock;      // the queue and the command pool
     VG_VK_FUNCS(VG_DECLARE)

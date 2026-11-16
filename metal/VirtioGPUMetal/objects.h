@@ -120,6 +120,8 @@ BOOL vg_spirv_has_push_constants(NSData *spv);   // DescriptorSet 0 -> newSet (N
     dispatch_semaphore_t _gpuDone;   // signaled once the fence is (before the CPU write-backs)
     NSMutableData *_twinFrames;      // (surface id, frame) pairs to mark ready once the GPU is done (5c round 3)
     VkDescriptorPool _pools[64];
+    void *_setMemo;   // recent descriptor sets by binding contents (5c round 4), see vg_write_set
+    unsigned _setMemoNext;
     int _npools;
     uint32_t _setsInPool;
     NSMutableArray *_keep;   // resources referenced until completion

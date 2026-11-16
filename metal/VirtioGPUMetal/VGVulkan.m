@@ -123,8 +123,17 @@ static int vg_vulkan_init_locked(void) {
     gVk.formatlessStorage = f2.features.shaderStorageImageReadWithoutFormat && f2.features.shaderStorageImageWriteWithoutFormat;
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, gVk.queueFamily, 1, &prio};
-    VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2, 0, 1, &qci, 0, NULL, 0, NULL, NULL};
+    // VK_EXT_calibrated_timestamps (5c round 4): GPU timestamps on the guest's clock, to split completion latency.
+    const char *exts[] = {"VK_EXT_calibrated_timestamps"};
+    VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2, 0, 1, &qci, 0, NULL, 1, exts, NULL};
     r = gVk.vkCreateDevice(gVk.physical, &dci, NULL, &gVk.device);
+    if (r == VK_ERROR_EXTENSION_NOT_PRESENT) {
+        dci.enabledExtensionCount = 0;
+        dci.ppEnabledExtensionNames = NULL;
+        r = gVk.vkCreateDevice(gVk.physical, &dci, NULL, &gVk.device);
+    } else if (r == VK_SUCCESS) {
+        gVk.calibrated = YES;
+    }
     if (r != VK_SUCCESS) {
         vglog("vulkan: vkCreateDevice %d", r);
         return -1;

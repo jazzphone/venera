@@ -994,3 +994,37 @@ files removed).
 signaling) is now the floor under every frame; the framebuffer-fetch splits (~40 per command buffer); shader
 translation stalls for new variants; and "flipped unready" (27 in one boot, likely startup translations: check it
 stays 0 in normal use).
+
+## Stage 5c, round 4 (2026-11-15): where completion latency comes from
+
+Measured with GPU timestamps mapped onto the guest's clock (`VK_EXT_calibrated_timestamps`, now enabled; with
+`VGMTL_PERF=2` or `/Library/GPUBundles/VirtioGPUMetal-gputime` the plugin logs "latency: commit -> GPU starts it" and
+"latency: GPU done -> guest sees it"). A WindowServer command buffer under `mtlwindow` load:
+
+| commit -> GPU starts | GPU work | GPU done -> guest sees it |
+|---|---|---|
+| 7.2-7.6 ms | 2.6 ms | 0.6 ms |
+
+- The completion side is fine now (round 3's USER_INTERACTIVE queues): a small submit round-trips in ~1 ms even under
+  load (`mtllat`; it was 6-12 ms).
+- The time before the GPU starts is mostly **queueing behind the same frame's earlier command buffers** (2-4 arrive
+  together, ~2.7 ms of GPU each); Venus' host ring thread for WindowServer runs at ~40 % of a core (bursty), not
+  saturated. So the floor under a frame is its GPU time, not Venus.
+- Command reductions (kept; correct and cheaper for the host): the render encoder sends pipeline, set binds, vertex
+  buffers and dynamic state only when they change (~5 skipped per command buffer here); descriptor sets are remembered
+  per command buffer by their exact contents (few reuses: `setBytes` data moves every draw, 24 189 written vs 1 937
+  reused); descriptor pools are reset and recycled instead of created per command buffer. No measurable fps change.
+
+**Tried and dropped: pre-specializing Core Animation's uber shaders with Apple's LLVM** (to cut the ~4 s translation
+stalls). LLVM's C API is all there (`LLVMParseIRInContext`, `LLVMRunPasses`, builder), but AIR copies each function
+constant into an internal global inside an initializer function, so folding the constants' own loads reaches little
+without `globalopt`, and the translator recognizes specific AIR shapes (the initializer, the static-init struct
+fields): pre-optimized modules fail in its native emitter ("getelementptr value requires instruction-local
+materialization"). The translator is already a `--release` build. Translation stalls stay mitigated by the disk cache.
+
+Also noted: Venus offers `VK_EXT_attachment_feedback_loop_layout` (a possible native path for framebuffer fetch, but
+barriers inside dynamic rendering need `dynamicRenderingLocalRead`, which it doesn't list).
+
+**Next**: GPU time per frame is now the lever (Core Animation's fetch splits, ~40 per command buffer in busy scenes;
+the size of the translated uber shaders), and the translation stalls (faster translation inside the translator, or
+building Core Animation's common variants ahead of time).

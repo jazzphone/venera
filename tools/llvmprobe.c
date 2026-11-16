@@ -9,12 +9,23 @@ int main(void) {
         "/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/libGPUCompilerImplLazy.dylib",
     };
     const char *syms[] = {"LLVMParseBitcodeInContext2", "LLVMPrintModuleToString", "LLVMContextCreate",
-                          "LLVMCreateMemoryBufferWithMemoryRange", "LLVMGetDefaultTargetTriple"};
+                          "LLVMCreateMemoryBufferWithMemoryRange", "LLVMGetDefaultTargetTriple",
+                          // 5c round 4: specializing function constants before translation
+                          "LLVMRunPasses", "LLVMCreatePassBuilderOptions", "LLVMGetNamedGlobal", "LLVMSetInitializer",
+                          "LLVMSetGlobalConstant", "LLVMConstInt", "LLVMGetFirstGlobal", "LLVMGetNextGlobal",
+                          "LLVMGetValueName2", "LLVMGetNamedMetadata", "LLVMGetNamedMetadataNumOperands",
+                          "LLVMGetNamedMetadataOperands", "LLVMGetMDNodeNumOperands", "LLVMGetMDNodeOperands",
+                          "LLVMReplaceAllUsesWith", "LLVMConstReal", "LLVMGetGlobalValueType",
+                          "LLVMCreatePassManager", "LLVMRunPassManager", "LLVMAddGlobalDCEPass", "LLVMWriteBitcodeToMemoryBuffer",
+                          "LLVMParseIRInContext", "LLVMGetFirstUse", "LLVMGetNextUse", "LLVMGetUser", "LLVMIsALoadInst",
+                          "LLVMInstructionEraseFromParent", "LLVMGlobalGetValueType", "LLVMGetTypeKind",
+                          "LLVMGetIntTypeWidth", "LLVMTypeOf", "LLVMDisposePassBuilderOptions", "LLVMGetErrorMessage",
+                          "LLVMDisposeErrorMessage", "LLVMVerifyModule", "LLVMIsAGlobalVariable"};
     for (int i = 0; i < 3; i++) {
         void *h = dlopen(libs[i], RTLD_LAZY | RTLD_LOCAL);
         printf("%s: %s\n", libs[i], h ? "loaded" : dlerror());
         if (!h) continue;
-        for (int j = 0; j < 5; j++) printf("  %-40s %s\n", syms[j], dlsym(h, syms[j]) ? "yes" : "no");
+        for (int j = 0; j < (int)(sizeof(syms) / sizeof(syms[0])); j++) printf("  %-40s %s\n", syms[j], dlsym(h, syms[j]) ? "yes" : "no");
     }
     return 0;
 }

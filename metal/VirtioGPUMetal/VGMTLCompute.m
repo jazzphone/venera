@@ -275,13 +275,47 @@ static void vg_unbound(NSString *who, const char *what, int slot) {
     }
 }
 
+// Descriptor pools recycled between command buffers (5c round 4): reset when a command buffer completes, instead of
+// destroyed and created again per command buffer.
+static pthread_mutex_t gPoolsLock = PTHREAD_MUTEX_INITIALIZER;
+static VkDescriptorPool gFreePools[128];
+static int gFreePoolCount;
+static VkDescriptorPool vg_pool_get(void) {
+    VkDescriptorPool p = VK_NULL_HANDLE;
+    pthread_mutex_lock(&gPoolsLock);
+    if (gFreePoolCount) {
+        p = gFreePools[--gFreePoolCount];
+    }
+    pthread_mutex_unlock(&gPoolsLock);
+    return p;
+}
+static void vg_pool_put(VkDescriptorPool p) {
+    gVk.vkResetDescriptorPool(gVk.device, p, 0);
+    pthread_mutex_lock(&gPoolsLock);
+    if (gFreePoolCount < 128) {
+        gFreePools[gFreePoolCount++] = p;
+        p = VK_NULL_HANDLE;
+    }
+    pthread_mutex_unlock(&gPoolsLock);
+    if (p) {
+        gVk.vkDestroyDescriptorPool(gVk.device, p, NULL);
+    }
+}
+
+// Descriptor sets are remembered per command buffer by what they hold (5c round 4): Core Animation's draws often bind
+// exactly what the previous draw of the same pipeline bound, and every allocation + update is commands Venus' host
+// thread decodes and replays (~8 ms of host CPU per WindowServer frame before the GPU even started).
+enum { kVGMemoEntries = 16 };
+typedef struct {
+    VkDescriptorSetLayout dsl;
+    int n;
+    uint64_t sig[64 * 3];
+    VkDescriptorSet set;
+} vg_set_memo;
+
 VkDescriptorSet vg_write_set(VGMTLCommandBuffer *cmd, VkDescriptorSetLayout dsl, const vg_binding *bindings, int n,
                              const vg_stage_bindings *t, NSString *who) {
-    VkDescriptorSet set = [cmd allocSet:dsl];
-    if (!set) {
-        [cmd fail:@"no descriptor set"];
-        return VK_NULL_HANDLE;
-    }
+    VkDescriptorSet set = VK_NULL_HANDLE;   // allocated once we know no remembered set has the same contents
     VkDescriptorBufferInfo binfo[64];
     VkDescriptorImageInfo iinfo[64];
     VkWriteDescriptorSet writes[64];
@@ -332,7 +366,42 @@ VkDescriptorSet vg_write_set(VGMTLCommandBuffer *cmd, VkDescriptorSetLayout dsl,
         }
         writes[i].pImageInfo = &iinfo[i];
     }
-    gVk.vkUpdateDescriptorSets(gVk.device, (uint32_t)MIN(n, 64), writes, 0, NULL);
+    // the contents, as compared against the remembered sets
+    int m = MIN(n, 64);
+    uint64_t sig[64 * 3];
+    for (int i = 0; i < m; i++) {
+        if (writes[i].pBufferInfo) {
+            sig[3 * i] = (uint64_t)binfo[i].buffer, sig[3 * i + 1] = binfo[i].offset, sig[3 * i + 2] = binfo[i].range;
+        } else {
+            sig[3 * i] = (uint64_t)iinfo[i].sampler, sig[3 * i + 1] = (uint64_t)iinfo[i].imageView,
+                    sig[3 * i + 2] = writes[i].descriptorType;
+        }
+    }
+    if (!cmd->_setMemo) {
+        cmd->_setMemo = calloc(kVGMemoEntries, sizeof(vg_set_memo));
+    }
+    vg_set_memo *memo = cmd->_setMemo;
+    for (int e = 0; memo && e < kVGMemoEntries; e++) {
+        if (memo[e].set && memo[e].dsl == dsl && memo[e].n == m && !memcmp(memo[e].sig, sig, sizeof(uint64_t) * 3 * m)) {
+            vg_perf(VG_PERF_SET_REUSED, 0, 0);
+            return memo[e].set;
+        }
+    }
+    set = [cmd allocSet:dsl];
+    if (!set) {
+        [cmd fail:@"no descriptor set"];
+        return VK_NULL_HANDLE;
+    }
+    for (int i = 0; i < m; i++) {
+        writes[i].dstSet = set;
+    }
+    gVk.vkUpdateDescriptorSets(gVk.device, (uint32_t)m, writes, 0, NULL);
+    vg_perf(VG_PERF_SET_WRITTEN, 0, 0);
+    if (memo) {
+        vg_set_memo *e = &memo[cmd->_setMemoNext++ % kVGMemoEntries];
+        e->dsl = dsl, e->n = m, e->set = set;
+        memcpy(e->sig, sig, sizeof(uint64_t) * 3 * m);
+    }
     return set;
 }
 
@@ -957,7 +1026,8 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
                                          {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, perPool * 16},
                                          {VK_DESCRIPTOR_TYPE_SAMPLER, perPool * 16}};
         VkDescriptorPoolCreateInfo pci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, perPool, 5, sizes};
-        if (gVk.vkCreateDescriptorPool(gVk.device, &pci, NULL, &_pools[_npools]) != VK_SUCCESS) {
+        _pools[_npools] = vg_pool_get();   // a recycled pool, reset (5c round 4)
+        if (!_pools[_npools] && gVk.vkCreateDescriptorPool(gVk.device, &pci, NULL, &_pools[_npools]) != VK_SUCCESS) {
             return VK_NULL_HANDLE;
         }
         _npools++;
@@ -1057,9 +1127,10 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
     if (fence) {
         gVk.vkWaitForFences(gVk.device, 1, &fence, VK_TRUE, UINT64_MAX);
         gVk.vkDestroyFence(gVk.device, fence, NULL);
-        vg_perf(VG_PERF_CB_WAIT, 0, vg_now() - dequeued);
+        uint64_t observed = vg_now();
+        vg_perf(VG_PERF_CB_WAIT, 0, observed - dequeued);
         if (_cb) {
-            vg_gpu_time_collect(_timePair);
+            vg_gpu_time_collect(_timePair, _submitted, observed);
         }
     }
     if (_twinFrames) {   // the twins are written: the kext may flip to these frames
@@ -1088,9 +1159,11 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
     vg_pending_release(_pendingOwned);
     _pendingOwned = nil;
     for (int i = 0; i < _npools; i++) {
-        gVk.vkDestroyDescriptorPool(gVk.device, _pools[i], NULL);
+        vg_pool_put(_pools[i]);
     }
     _npools = 0;
+    free(_setMemo);
+    _setMemo = NULL;
     for (int i = 0; i < _narena; i++) {
         vg_staging_put(&_arena[i]);   // back to the pool (5c)
     }

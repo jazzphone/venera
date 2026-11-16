@@ -420,6 +420,26 @@ id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRende
     VkRenderingAttachmentInfo _colorInfo[kVGMaxColor], _depthInfo;
     uint32_t _ncolor;
     VGMTLTexture *_fetchCopy[kVGMaxColor];   // scratch copies, made at the first fetch draw of the encoder
+    // What this encoder last put into the command buffer (5c round 4): a draw sends state only when it changes. Vulkan
+    // keeps dynamic state, the bound pipeline, sets and vertex buffers across render pass instances (the fetch
+    // copies' end/resume), so this stays valid for the whole encoder.
+    struct {
+        BOOL valid;
+        VkPipeline pipe;
+        VkPipelineLayout layout;
+        VkDescriptorSet sets[2], fetch;
+        int topo, restart;
+        VkViewport viewport;
+        VkRect2D scissor;
+        VkCullModeFlags cull;
+        VkFrontFace front;
+        VkBool32 dtest, dwrite;
+        VkCompareOp dcmp;
+        BOOL stencilSet;
+        float blend[4];
+        VkBuffer vb[kVGMaxBufferSlots];
+        VkDeviceSize vboff[kVGMaxBufferSlots];
+    } _last;
 }
 @end
 
@@ -546,35 +566,93 @@ static void vg_set_sampler(VGMTLCommandBuffer *cmd, vg_stage_bindings *t, id<MTL
         return NO;
     }
     VkCommandBuffer cb = _owner->_cb;
-    gVk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-    gVk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, _pso->_layout, 0, 2, sets, 0, NULL);
-    if (fetchSet) {
-        gVk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, _pso->_layout, 3, 1, &fetchSet, 0, NULL);
+    int skipped = 0;
+#define VG_CHANGED(cond) ((!_last.valid || (cond)) ? 1 : (skipped++, 0))
+    if (VG_CHANGED(_last.pipe != pipe)) {
+        gVk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        _last.pipe = pipe;
     }
+    BOOL layoutChanged = !_last.valid || _last.layout != _pso->_layout;   // other sets may be disturbed: rebind
+    if (layoutChanged || _last.sets[0] != sets[0] || _last.sets[1] != sets[1]) {
+        gVk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, _pso->_layout, 0, 2, sets, 0, NULL);
+        _last.sets[0] = sets[0], _last.sets[1] = sets[1];
+    } else {
+        skipped++;
+    }
+    if (fetchSet && (layoutChanged || _last.fetch != fetchSet)) {
+        gVk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, _pso->_layout, 3, 1, &fetchSet, 0, NULL);
+        _last.fetch = fetchSet;
+    }
+    _last.layout = _pso->_layout;
     for (uint32_t i = 0; i < _pso->_nvbind; i++) {
         uint32_t b = _pso->_vbind[i].binding;
         if (!_vt.buf[b]) {
             [_owner fail:[NSString stringWithFormat:@"%@: no vertex buffer at index %u", _pso->_name, b]];
             return NO;
         }
-        gVk.vkCmdBindVertexBuffers(cb, b, 1, &_vt.buf[b], &_vt.off[b]);
+        if (VG_CHANGED(_last.vb[b] != _vt.buf[b] || _last.vboff[b] != _vt.off[b])) {
+            gVk.vkCmdBindVertexBuffers(cb, b, 1, &_vt.buf[b], &_vt.off[b]);
+            _last.vb[b] = _vt.buf[b], _last.vboff[b] = _vt.off[b];
+        }
     }
     static const VkPrimitiveTopology kTopo[] = {
         [MTLPrimitiveTypePoint] = VK_PRIMITIVE_TOPOLOGY_POINT_LIST, [MTLPrimitiveTypeLine] = VK_PRIMITIVE_TOPOLOGY_LINE_LIST,
         [MTLPrimitiveTypeLineStrip] = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP,
         [MTLPrimitiveTypeTriangle] = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
         [MTLPrimitiveTypeTriangleStrip] = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP};
-    gVk.vkCmdSetPrimitiveTopology(cb, kTopo[type <= MTLPrimitiveTypeTriangleStrip ? type : MTLPrimitiveTypeTriangle]);
-    gVk.vkCmdSetPrimitiveRestartEnable(cb, type == MTLPrimitiveTypeLineStrip || type == MTLPrimitiveTypeTriangleStrip);
-    gVk.vkCmdSetViewport(cb, 0, 1, &_viewport);
-    gVk.vkCmdSetScissor(cb, 0, 1, &_scissor);
-    gVk.vkCmdSetCullMode(cb, _cull);
-    gVk.vkCmdSetFrontFace(cb, _front);
-    gVk.vkCmdSetDepthTestEnable(cb, _ds ? _ds->_test : VK_FALSE);
-    gVk.vkCmdSetDepthWriteEnable(cb, _ds ? _ds->_write : VK_FALSE);
-    gVk.vkCmdSetDepthCompareOp(cb, _ds ? _ds->_compare : VK_COMPARE_OP_ALWAYS);
-    gVk.vkCmdSetStencilTestEnable(cb, VK_FALSE);
-    gVk.vkCmdSetBlendConstants(cb, _blend);
+    int topo = (int)kTopo[type <= MTLPrimitiveTypeTriangleStrip ? type : MTLPrimitiveTypeTriangle];
+    int restart = type == MTLPrimitiveTypeLineStrip || type == MTLPrimitiveTypeTriangleStrip;
+    if (VG_CHANGED(_last.topo != topo)) {
+        gVk.vkCmdSetPrimitiveTopology(cb, (VkPrimitiveTopology)topo);
+        _last.topo = topo;
+    }
+    if (VG_CHANGED(_last.restart != restart)) {
+        gVk.vkCmdSetPrimitiveRestartEnable(cb, (VkBool32)restart);
+        _last.restart = restart;
+    }
+    if (VG_CHANGED(memcmp(&_last.viewport, &_viewport, sizeof(_viewport)))) {
+        gVk.vkCmdSetViewport(cb, 0, 1, &_viewport);
+        _last.viewport = _viewport;
+    }
+    if (VG_CHANGED(memcmp(&_last.scissor, &_scissor, sizeof(_scissor)))) {
+        gVk.vkCmdSetScissor(cb, 0, 1, &_scissor);
+        _last.scissor = _scissor;
+    }
+    if (VG_CHANGED(_last.cull != _cull)) {
+        gVk.vkCmdSetCullMode(cb, _cull);
+        _last.cull = _cull;
+    }
+    if (VG_CHANGED(_last.front != _front)) {
+        gVk.vkCmdSetFrontFace(cb, _front);
+        _last.front = _front;
+    }
+    VkBool32 dtest = _ds ? _ds->_test : VK_FALSE, dwrite = _ds ? _ds->_write : VK_FALSE;
+    VkCompareOp dcmp = _ds ? _ds->_compare : VK_COMPARE_OP_ALWAYS;
+    if (VG_CHANGED(_last.dtest != dtest)) {
+        gVk.vkCmdSetDepthTestEnable(cb, dtest);
+        _last.dtest = dtest;
+    }
+    if (VG_CHANGED(_last.dwrite != dwrite)) {
+        gVk.vkCmdSetDepthWriteEnable(cb, dwrite);
+        _last.dwrite = dwrite;
+    }
+    if (VG_CHANGED(_last.dcmp != dcmp)) {
+        gVk.vkCmdSetDepthCompareOp(cb, dcmp);
+        _last.dcmp = dcmp;
+    }
+    if (VG_CHANGED(!_last.stencilSet)) {
+        gVk.vkCmdSetStencilTestEnable(cb, VK_FALSE);
+        _last.stencilSet = YES;
+    }
+    if (VG_CHANGED(memcmp(_last.blend, _blend, sizeof(_blend)))) {
+        gVk.vkCmdSetBlendConstants(cb, _blend);
+        memcpy(_last.blend, _blend, sizeof(_blend));
+    }
+#undef VG_CHANGED
+    _last.valid = YES;
+    if (skipped) {
+        vg_perf(VG_PERF_STATE_SKIPPED, (uint64_t)skipped, 0);
+    }
     return YES;
 }
 
