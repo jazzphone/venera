@@ -658,10 +658,59 @@ static void vg_set_sampler(VGMTLCommandBuffer *cmd, vg_stage_bindings *t, id<MTL
 
 // Framebuffer fetch by copies: end the pass, copy each read color attachment to its scratch image, resume the pass
 // (load), and return set 3 naming the copies. The command buffer's full barrier orders draw -> copy -> sample.
+// How a fetch split is done, for measurements (5c round 5; /Library/GPUBundles/VirtioGPUMetal-fetchmode holds the
+// digit): 0 full barriers (the default), 1 no copy and 2 no split at all (both draw wrong pixels: they only show what
+// the copies and the splits cost), 3 targeted barriers. Measured in WindowServer under mtlwindow: GPU time per
+// command buffer 2.55 / 1.85 / 1.77 / 2.52 ms, frame rate the same in all four (the copies are ~27 % of the GPU time,
+// the splits and barriers almost nothing, and GPU time doesn't limit the frame rate).
+static int vg_fetch_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        mode = 0;
+        FILE *f = fopen("/Library/GPUBundles/VirtioGPUMetal-fetchmode", "r");
+        if (f) {
+            int m = fgetc(f) - '0';
+            fclose(f);
+            if (m >= 0 && m <= 3) {
+                mode = m;
+            }
+        }
+        vglog("framebuffer fetch: mode %d", mode);
+    }
+    return mode;
+}
+
+static void vg_fetch_barrier(VkCommandBuffer cb, BOOL beforeCopy) {
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    VkPipelineStageFlags src, dst;
+    if (beforeCopy) {   // what the pass drew -> the copy reads it
+        mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        src = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;   // the previous fetch draw sampled the scratch (WAR)
+        dst = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    } else {   // the copy -> the fetch draw samples it; the pass then writes the attachment again (WAR)
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                           VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        src = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        dst = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+              VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    }
+    gVk.vkCmdPipelineBarrier(cb, src, dst, 0, 1, &mb, 0, NULL, 0, NULL);
+}
+
 - (VkDescriptorSet)fetchCopy:(uint32_t)mask {
     VkCommandBuffer cb = _owner->_cb;
-    gVk.vkCmdEndRendering(cb);
-    [_owner barrier];
+    const int mode = vg_fetch_mode();
+    if (mode != 2) {
+        gVk.vkCmdEndRendering(cb);
+        if (mode == 3) {
+            vg_fetch_barrier(cb, YES);
+        } else {
+            [_owner barrier];
+        }
+    }
     VkDescriptorImageInfo ii[8];
     VkWriteDescriptorSet wr[8];
     uint32_t nw = 0;
@@ -696,7 +745,7 @@ static void vg_set_sampler(VGMTLCommandBuffer *cmd, vg_stage_bindings *t, id<MTL
                              MIN((int32_t)src->_width, (int32_t)_area.extent.width));
             int32_t y1 = MIN(_scissor.offset.y + (int32_t)_scissor.extent.height,
                              MIN((int32_t)src->_height, (int32_t)_area.extent.height));
-            if (x1 > x0 && y1 > y0) {
+            if (x1 > x0 && y1 > y0 && mode != 1 && mode != 2) {
                 VkImageCopy r = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {x0, y0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                                  {x0, y0, 0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0), 1}};
                 gVk.vkCmdCopyImage(cb, src->_image, VK_IMAGE_LAYOUT_GENERAL, dst->_image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
@@ -708,7 +757,11 @@ static void vg_set_sampler(VGMTLCommandBuffer *cmd, vg_stage_bindings *t, id<MTL
                                         VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &ii[nw], NULL, NULL};
         nw++;
     }
-    [_owner barrier];
+    if (mode == 3) {
+        vg_fetch_barrier(cb, NO);
+    } else if (mode != 2) {
+        [_owner barrier];
+    }
     // resume: everything loads what the pass has drawn so far
     VkRenderingAttachmentInfo color[kVGMaxColor];
     for (uint32_t i = 0; i < _ncolor; i++) {
@@ -720,7 +773,9 @@ static void vg_set_sampler(VGMTLCommandBuffer *cmd, vg_stage_bindings *t, id<MTL
     VkRenderingAttachmentInfo depth = _depthInfo;
     depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
     VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, _area, 1, 0, _ncolor, color, _depthTex ? &depth : NULL, NULL};
-    gVk.vkCmdBeginRendering(cb, &ri);
+    if (mode != 2) {
+        gVk.vkCmdBeginRendering(cb, &ri);
+    }
     VkDescriptorSet set = [_owner allocSet:gFetchLayout];
     if (!set) {
         [_owner fail:@"framebuffer fetch: no descriptor set"];

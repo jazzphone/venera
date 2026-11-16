@@ -1028,3 +1028,21 @@ barriers inside dynamic rendering need `dynamicRenderingLocalRead`, which it doe
 **Next**: GPU time per frame is now the lever (Core Animation's fetch splits, ~40 per command buffer in busy scenes;
 the size of the translated uber shaders), and the translation stalls (faster translation inside the translator, or
 building Core Animation's common variants ahead of time).
+
+## Stage 5c, round 5 (2026-11-15): what framebuffer fetch costs
+
+Four boots, WindowServer under `mtlwindow`, GPU timestamps on, the fetch emulation switched by
+`/Library/GPUBundles/VirtioGPUMetal-fetchmode` (kept for measurements; default 0):
+
+| mode | GPU per command buffer | mtlwindow |
+|---|---|---|
+| 0 full barriers (default) | 2.55 ms | 50.0 fps |
+| 1 no copies (wrong pixels) | 1.85 ms | 47.5 fps |
+| 2 no split at all (wrong pixels) | 1.77 ms | 47.8 fps |
+| 3 targeted barriers | 2.52 ms | 43.9 fps |
+
+The copies are ~27 % of WindowServer's GPU time; ending/resuming the pass and the barriers cost almost nothing, and
+narrower barriers save nothing. Sampling the attachment in place (VK_EXT_attachment_feedback_loop_layout) would remove
+the copies, but **the frame rate doesn't move even with no fetch work at all**: GPU time doesn't limit it here, so
+that rewrite is not worth its risk now. What limits the benchmark is the presentation chain (16 ms flip pacing, two
+frames in flight, QEMU's ~3-4 ms per flip), not the guest GPU or Venus.
