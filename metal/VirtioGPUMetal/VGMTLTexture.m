@@ -1288,6 +1288,10 @@ id<MTLTexture> vg_new_buffer_texture(id<MTLBuffer> buffer, MTLTextureDescriptor 
 // 5 min for one window). Called with the roots lock held.
 static NSMutableDictionary<NSString *, VGMTLTexture *> *gKept;
 static NSMutableDictionary<NSString *, NSNumber *> *gKeptAt;
+// Roots stay alive 2 s after their last use (Core Animation wraps a surface again for each frame it shows; a new root
+// is a new image and a full upload). Over budget, the least recently used go first -- the sweep used to drop entries in
+// dictionary order once there were more than 96, and WebGL's buffers in WindowServer and Safari's GPU process were
+// rebuilt about five times a second each (5d).
 static void vg_root_keep(NSString *key, VGMTLTexture *root) {
     if (!gKept) {
         gKept = [NSMutableDictionary dictionary];
@@ -1297,15 +1301,26 @@ static void vg_root_keep(NSString *key, VGMTLTexture *root) {
     gKept[key] = root;
     gKeptAt[key] = @(now);
     static uint64_t lastSweep;
-    if (now - lastSweep < 500000000ull && gKept.count < 96) {
+    if (now - lastSweep < 500000000ull) {
         return;
     }
     lastSweep = now;
-    for (NSString *k in gKeptAt.allKeys) {
-        if (now - gKeptAt[k].unsignedLongLongValue > 2000000000ull || gKept.count > 96) {
-            [gKept removeObjectForKey:k];
-            [gKeptAt removeObjectForKey:k];
+    const uint64_t budget = 512ull << 20;   // bytes of kept images beyond what is in use anyway
+    uint64_t bytes = 0;
+    NSArray *keys = [gKeptAt keysSortedByValueUsingSelector:@selector(compare:)];   // oldest first
+    for (NSString *k in keys) {
+        VGMTLTexture *t = gKept[k];
+        bytes += (uint64_t)t->_width * t->_height * MAX(t->_surfaceBpr / MAX(t->_width, 1), 4);
+    }
+    for (NSString *k in keys) {
+        VGMTLTexture *t = gKept[k];
+        BOOL old = now - gKeptAt[k].unsignedLongLongValue > 2000000000ull;
+        if (!old && bytes <= budget && gKept.count <= 512) {
+            break;   // the rest are newer
         }
+        bytes -= MIN(bytes, (uint64_t)t->_width * t->_height * MAX(t->_surfaceBpr / MAX(t->_width, 1), 4));
+        [gKept removeObjectForKey:k];
+        [gKeptAt removeObjectForKey:k];
     }
 }
 
@@ -1443,7 +1458,11 @@ id<MTLTexture> vg_new_surface_texture(id<MTLDevice> device, MTLTextureDescriptor
         roots = [NSMapTable strongToWeakObjectsMapTable];
     }
     VGMTLTexture *root = [roots objectForKey:key];
-    if (root && root->_surface == surface) {
+    // The same surface by id, not by IOSurfaceRef: Core Animation passes a surface between processes by mach port, and
+    // each lookup can make a new IOSurfaceRef for it -- compared by pointer, WebGL's buffers got a new image (and a full
+    // upload) about five times a second each in WindowServer and Safari's GPU process (5d). The root keeps its surface
+    // alive, so its id can't have been reused for another one.
+    if (root && root->_surface && IOSurfaceGetID(root->_surface) == IOSurfaceGetID(surface)) {
         vg_root_keep(key, root);
         pthread_mutex_unlock(&rootsLock);
         id<MTLTexture> v = vg_texture_view(root, d.pixelFormat, MTLTextureType2D, NSMakeRange(0, 1), NSMakeRange(0, 1));
@@ -1474,7 +1493,11 @@ id<MTLTexture> vg_new_surface_texture(id<MTLDevice> device, MTLTextureDescriptor
         t->_syncedSeed = IOSurfaceGetSeed(surface);
     }
     vg_surface_pull(t);
-    vglog("surface texture: IOSurface %u plane %lu, %lux%lu, %zu bytes per row", IOSurfaceGetID(surface),
-          (unsigned long)plane, (unsigned long)d.width, (unsigned long)d.height, bpr);
+    static int said;
+    if (said++ < 60) {
+        vglog("surface texture: IOSurface %u plane %lu, %lux%lu, %zu bytes per row (key %s, kept %lu, roots %lu)",
+              IOSurfaceGetID(surface), (unsigned long)plane, (unsigned long)d.width, (unsigned long)d.height, bpr,
+              key.UTF8String, (unsigned long)gKept.count, (unsigned long)roots.count);
+    }
     return t;
 }

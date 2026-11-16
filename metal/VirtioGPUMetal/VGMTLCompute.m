@@ -1223,9 +1223,16 @@ static void vg_events_wait(NSArray *waits) {
 NSString *vg_disk_dir(void);
 static void vg_surface_debug(VGMTLTexture *t) {
     static int on = -1, n;
-    if (on < 0) {
+    static uint64_t checked;
+    uint64_t now = vg_now();
+    if (on < 0 || now - checked > 2000000000ull) {   // rechecked every 2 s: it can be turned on in a running process
         BOOL vg_debug_flag(const char *name);
+        int was = on;
         on = vg_debug_flag("dumpsurf");
+        checked = now;
+        if (on && was == 0) {
+            n = 0;
+        }
     }
     size_t pe = IOSurfaceGetBytesPerElementOfPlane(t->_surface, t->_plane);
     if (!on || n >= 40 || (pe != 4 && pe != 8)) {
