@@ -6,8 +6,7 @@
 set -u
 TAG=${1:-bench}
 T=${2:-6}
-SSH=(ssh -o BatchMode=yes -o ConnectTimeout=8 -o HostKeyAlias=pve-host -i ~/.ssh/vgpu_host_key)
-H=root@pve-host
+. "$(dirname "$0")/host.sh"
 WSC=/var/folders/zz/zyxvpxvq6csfxvn_n00000b000002r/C/WindowServer/local.homelab.VirtioGPUMetal
 run() { "${SSH[@]}" $H "bash /root/vgpu/vm-remote.sh run '$1' ${2:-60}" 2>&1; }
 app() {   # MODE: (re)start dragtest

@@ -3,8 +3,7 @@
 #   tools/gesture-sample.sh drag|resize|scroll|minimize   -> build/pull/ws-GESTURE.txt, build/pull/app-GESTURE.txt
 set -u
 G=${1:-resize}
-SSH=(ssh -o BatchMode=yes -o ConnectTimeout=8 -o HostKeyAlias=pve-host -i ~/.ssh/vgpu_host_key)
-H=root@pve-host
+. "$(dirname "$0")/host.sh"
 case $G in scroll|minimize) MODE=$G ;; *) MODE= ;; esac
 "${SSH[@]}" $H "bash /root/vgpu/vm-remote.sh run 'pkill -x dragtest; U=\$(id -u dev); cd /var/tmp/vgpu; (launchctl asuser \$U sudo -u dev ./dragtest 60 $MODE >/dev/null 2>&1 &); sleep 4' 30" >/dev/null
 case $G in

@@ -9,6 +9,8 @@ cd "${0:A:h}/.."
 NVSRC=${NVSRC:-$HOME/src/vendor-src/nvidia-macos-driver}
 export CARGO_HOME=${CARGO_HOME:-$HOME/src/vendor-src/cargo-home} CARGO_TARGET_DIR=$PWD/build/translator-target
 export RUSTC_BOOTSTRAP=1 MACOSX_DEPLOYMENT_TARGET=26.0
+# no build machine paths in the binary (panic locations): home and the sources become fixed prefixes
+export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$NVSRC=/src/nvidia-macos-driver --remap-path-prefix=$CARGO_HOME=/cargo --remap-path-prefix=$HOME=/home"
 (cd $NVSRC/translator/wrapper && cargo build --release -Z build-std=std,panic_abort --target x86_64-apple-darwin)
 mkdir -p build/translator
 cp $CARGO_TARGET_DIR/x86_64-apple-darwin/release/libnvmtl_translate.dylib build/translator/

@@ -5,9 +5,7 @@
 #   tools/deploy.sh disable    turn the kext off in OpenCore and reboot (recovery)
 set -euo pipefail
 cd "${0:A:h}/.."
-HOST=root@pve-host
-SSH=(ssh -o BatchMode=yes -o ConnectTimeout=8 -o HostKeyAlias=pve-host -i ~/.ssh/vgpu_host_key)
-SCP=(scp -q -o BatchMode=yes -o HostKeyAlias=pve-host -i ~/.ssh/vgpu_host_key)
+. "$(dirname "$0")/host.sh"
 
 "${SSH[@]}" $HOST 'mkdir -p /root/vgpu'
 "${SCP[@]}" tools/vm-remote.sh tools/oc_kext.py $HOST:/root/vgpu/
