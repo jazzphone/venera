@@ -1,6 +1,6 @@
 #!/bin/bash
 # apptest (stage 5d, app Metal): give one app our Metal device and look at it.
-#   tools/apptest.sh APP [PROCESS...] [-- SECONDS]
+#   [OPEN=PATH] tools/apptest.sh APP [PROCESS...] [-- SECONDS]   (OPEN: a guest file the app opens, e.g. a page)
 # Writes the allow-list (/Library/GPUBundles/VirtioGPUMetal-allow.txt) with the PROCESS names (default: the app's
 # name), relaunches APP as the console user, waits SECONDS (default 12), takes a screenshot with Cmd-Shift-3 (QMP, so
 # no Screen Recording permission is involved) and pulls it to build/apptest/APP.png, then prints the Metal driver's
@@ -23,10 +23,10 @@ if [ "$APP" = none ]; then
 fi
 LIST=$(printf '%s\\n' "${PROCS[@]}")
 RX=$(IFS='|'; echo "${PROCS[*]}")
-run "printf \"$LIST\" > /Library/GPUBundles/VirtioGPUMetal-allow.txt; pkill -x \"$APP\"; rm -f /Users/dev/Desktop/Screenshot*; date +%s > /var/tmp/apptest.t0; sleep 1; U=\$(id -u dev); launchctl asuser \$U sudo -u dev open -a \"$APP\"" 30 >/dev/null
+run "printf \"$LIST\" > /Library/GPUBundles/VirtioGPUMetal-allow.txt; pkill -x \"$APP\"; rm -f /Users/dev/Desktop/Screenshot*; date +%s > /var/tmp/apptest.t0; sleep 1; U=\$(id -u dev); launchctl asuser \$U sudo -u dev open -a \"$APP\" ${OPEN:-}" 30 >/dev/null
 sleep "$WAIT"
 "${SSH[@]}" $H "qm sendkey 108 meta_l-shift-3"
-sleep 4
+sleep 8
 # the screenshot's name has a narrow no-break space before AM/PM: renamed in the guest before the pull
 F=$(run "F=\$(ls -t /Users/dev/Desktop/Screenshot*.png 2>/dev/null | head -1); [ -n \"\$F\" ] && mv \"\$F\" /var/tmp/apptest.png && echo ok" 30 | tail -1 | tr -d '\r')
 if [ "$F" = ok ]; then

@@ -1,4 +1,4 @@
-// Lenient mode (stage 5a bring-up): in WindowServer (or with VGMTL_LENIENT=1) a message none of our objects answers is
+// Lenient mode (stage 5a bring-up; every process since 5d, VGMTL_LENIENT=0 turns it off): a message none of our objects answers is
 // logged once (class and selector) and answered by a sink that returns nil / 0, instead of the unrecognized-selector
 // abort. One WindowServer start then lists everything the compositor sends that we don't implement yet, rather than one
 // crash per selector. respondsToSelector: stays truthful: only -forwardingTargetForSelector: changes, and it is used
@@ -52,8 +52,10 @@ static id vg_forwarding_target(id self, SEL _cmd, SEL sel) {
 BOOL vg_lenient(void) {
     static int on = -1;
     if (on < 0) {
+        // 5d (app Metal): on in every process, so an app that sends something we don't implement yet logs it and goes
+        // on instead of aborting on the unrecognized selector; VGMTL_LENIENT=0 restores the abort (to find the caller).
         const char *e = getenv("VGMTL_LENIENT");
-        on = (e && e[0] == '1') || !strcmp(getprogname(), "WindowServer");
+        on = !(e && e[0] == '0');
     }
     return on;
 }

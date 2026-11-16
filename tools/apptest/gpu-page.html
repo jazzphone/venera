@@ -1,0 +1,92 @@
+<!doctype html>
+<!-- apptest (stage 5d): what a browser's GPU process draws with Metal: WebGL, 2D canvas and CSS transforms, each
+     reporting its own frame rate. No network, no libraries. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>Venera GPU page</title>
+<style>
+  body { margin: 0; font: 15px -apple-system, sans-serif; background: #1d1f24; color: #eee; }
+  .row { display: flex; gap: 16px; padding: 16px; flex-wrap: wrap; }
+  .cell { background: #2a2d34; border-radius: 12px; padding: 12px; width: 320px; }
+  .cell h2 { font-size: 15px; margin: 0 0 8px; }
+  canvas { width: 296px; height: 222px; display: block; border-radius: 8px; background: #000; }
+  .stage { height: 222px; position: relative; overflow: hidden; border-radius: 8px; background: #111; }
+  .card { position: absolute; width: 90px; height: 60px; border-radius: 10px; background: linear-gradient(135deg, #4aa3ff, #a14aff);
+          box-shadow: 0 6px 18px rgba(0, 0, 0, .5); }
+  .blur { position: absolute; inset: 60px 40px; border-radius: 14px; backdrop-filter: blur(12px); background: rgba(255, 255, 255, .12); }
+  .fps { color: #8f8; font-variant-numeric: tabular-nums; }
+  #status { padding: 0 16px; color: #aaa; }
+</style>
+</head>
+<body>
+<div class="row">
+  <div class="cell"><h2>WebGL <span class="fps" id="f1">-</span></h2><canvas id="gl" width="592" height="444"></canvas></div>
+  <div class="cell"><h2>Canvas 2D <span class="fps" id="f2">-</span></h2><canvas id="c2" width="592" height="444"></canvas></div>
+  <div class="cell"><h2>CSS transforms + blur <span class="fps" id="f3">-</span></h2>
+    <div class="stage" id="stage"><div class="blur"></div></div></div>
+</div>
+<div id="status"></div>
+<script>
+const status = document.getElementById('status');
+function meter(id) {
+  let n = 0, t0 = performance.now(), el = document.getElementById(id);
+  return () => { n++; const t = performance.now(); if (t - t0 > 1000) { el.textContent = (n * 1000 / (t - t0)).toFixed(0) + ' fps'; n = 0; t0 = t; } };
+}
+function part(id, fn) { try { fn(); } catch (e) { document.getElementById(id).textContent = 'error: ' + e.message; } }
+// WebGL: a lit, spinning cube
+part('f1', function () {
+  const c = document.getElementById('gl'), gl = c.getContext('webgl');
+  if (!gl) { document.getElementById('f1').textContent = 'no WebGL'; return; }
+  const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+  status.textContent = 'WebGL renderer: ' + (dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER));
+  const vs = `attribute vec3 p; attribute vec3 n; uniform mat4 m; varying float l;
+    void main() { gl_Position = m * vec4(p, 1.0); l = 0.35 + 0.65 * max(dot(normalize((m * vec4(n, 0.0)).xyz), normalize(vec3(0.4, 0.6, -1.0))), 0.0); }`;
+  const fs = `precision mediump float; varying float l; void main() { gl_FragColor = vec4(vec3(0.3, 0.6, 1.0) * l, 1.0); }`;
+  function sh(t, s) { const o = gl.createShader(t); gl.shaderSource(o, s); gl.compileShader(o); return o; }
+  const pr = gl.createProgram(); gl.attachShader(pr, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(pr, sh(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(pr); gl.useProgram(pr);
+  const P = [], N = [];
+  const faces = [[0, 0, 1], [0, 0, -1], [0, 1, 0], [0, -1, 0], [1, 0, 0], [-1, 0, 0]];
+  for (const f of faces) {
+    const [a, b] = f[2] ? [[1, 0, 0], [0, 1, 0]] : f[1] ? [[1, 0, 0], [0, 0, 1]] : [[0, 1, 0], [0, 0, 1]];
+    const q = (s, t) => [0, 1, 2].map(i => f[i] * 0.5 + a[i] * s * 0.5 + b[i] * t * 0.5);
+    for (const v of [q(-1, -1), q(1, -1), q(1, 1), q(-1, -1), q(1, 1), q(-1, 1)]) { P.push(...v); N.push(...f); }
+  }
+  function buf(d, name) { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(d), gl.STATIC_DRAW);
+    const l = gl.getAttribLocation(pr, name); gl.enableVertexAttribArray(l); gl.vertexAttribPointer(l, 3, gl.FLOAT, false, 0, 0); }
+  buf(P, 'p'); buf(N, 'n');
+  const um = gl.getUniformLocation(pr, 'm'); gl.enable(gl.DEPTH_TEST);
+  const tick = meter('f1');
+  function frame(t) {
+    const a = t / 1000, b = t / 1600, ca = Math.cos(a), sa = Math.sin(a), cb = Math.cos(b), sb = Math.sin(b), s = 0.9;
+    const m = [ca * s, sa * sb * s * 0.75, 0, 0, 0, cb * s * 0.75, 0, 0, sa * s, -ca * sb * s * 0.75, 0.5, 0, 0, 0, 0.5, 1];
+    gl.viewport(0, 0, c.width, c.height); gl.clearColor(0.05, 0.05, 0.08, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.uniformMatrix4fv(um, false, m); gl.drawArrays(gl.TRIANGLES, 0, P.length / 3); tick(); requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+});
+// Canvas 2D: many moving shapes and text
+part('f2', function () {
+  const c = document.getElementById('c2'), x = c.getContext('2d'), tick = meter('f2');
+  const balls = Array.from({ length: 150 }, (_, i) => ({ x: Math.random() * 592, y: Math.random() * 444, vx: Math.random() * 4 - 2, vy: Math.random() * 4 - 2, r: 6 + (i % 14), h: (i * 37) % 360 }));
+  function frame() {
+    x.fillStyle = 'rgba(0,0,0,0.25)'; x.fillRect(0, 0, 592, 444);
+    for (const b of balls) { b.x += b.vx; b.y += b.vy; if (b.x < 0 || b.x > 592) b.vx *= -1; if (b.y < 0 || b.y > 444) b.vy *= -1;
+      x.beginPath(); x.arc(b.x, b.y, b.r, 0, 6.283); x.fillStyle = `hsl(${b.h},80%,60%)`; x.fill(); }
+    x.fillStyle = '#fff'; x.font = '28px -apple-system'; x.fillText('Canvas 2D', 20, 40); tick(); requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+});
+// CSS: transformed cards under a backdrop blur
+part('f3', function () {
+  const st = document.getElementById('stage'), cards = [], tick = meter('f3');
+  for (let i = 0; i < 12; i++) { const d = document.createElement('div'); d.className = 'card'; st.insertBefore(d, st.firstChild); cards.push(d); }
+  function frame(t) {
+    cards.forEach((d, i) => { const a = t / 900 + i * 0.52; d.style.transform = `translate(${115 + Math.cos(a) * 100}px, ${80 + Math.sin(a * 1.3) * 70}px) rotate(${a * 40}deg)`; });
+    tick(); requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+});
+</script>
+</body>
+</html>

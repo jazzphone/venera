@@ -1169,3 +1169,38 @@ VM 108 is back on main's driver (0.1.0 + round 6), no flag files.
 **Next**: what remains under a frame is GPU time per command buffer (~2.7 ms each, ~3 per frame, queued behind each
 other) and the host's flip (egl-headless reads the frame back for VNC, 2-9 ms). Fewer or cheaper command buffers per
 frame (the ~40 framebuffer-fetch splits) is the guest-side lever; a non-VNC display removes the readback.
+
+## Stage 5d, round 8 (2026-11-16): app Metal, first look
+
+Snapshot `pre-appmetal`. `tools/apptest.sh APP [PROCESS...]` writes the allow-list, launches the app as the console
+user (`OPEN=` a file for it), takes a Cmd-Shift-3 screenshot through QMP and prints the driver's log for it and any
+crash report; `tools/apptest/gpu-page.html` is a local WebGL / canvas / CSS page (VM 108 has no network).
+
+- **Lenient mode in every process** (`VGMTL_LENIENT=0` turns it off): an app that sends a message we don't implement
+  logs `LENIENT: -[class selector]` and gets nil/0 instead of aborting. It was WindowServer-only.
+- **Chess**: draws correctly, but not through us: it is OpenGL, and with no `IOGLBundleName` on the accelerator macOS
+  gives it the software renderer (`GLRendererFloat.bundle`). NullMoth sets `IOGLBundleName = AppleMetalOpenGLRenderer`
+  (Apple's OpenGL over Metal, present on this guest) and lowers the renderer's shaders through Apple's
+  `libGLDPlugin` (`plugin/NVMTLGL.m`, ~500 lines): the way to OpenGL apps.
+- **Safari**: without app Metal, WebGL gets no context (renderer null) and canvas / CSS run at 30 fps. Allow-listing
+  `com.apple.WebKit.GPU` does nothing: its sandbox denies `file-map-executable` for `/Library/GPUBundles`. It maps code
+  only from the sealed system (`/System/Library/Extensions`, `Frameworks`, `PrivateFrameworks`, `/usr/lib`) and the
+  cryptex folders, which on this guest are read-only grafts (`EROFS` even with Preboot mounted read-write). Opening
+  our device is allowed (`iokit-connection "IOAccelerator"`, Venus already goes through the accelerator's client) and
+  `/Library/GPUBundles` is readable. So WebGL in Safari needs the bundle in `/System/Library/Extensions`: authenticated
+  root off (csr 0x800), a root patch and a new blessed snapshot, as OpenCore Legacy Patcher does. Not done (owner's
+  call). NullMoth's Preboot copy (`safari_gpu_copy.sh`) can't work here for the same reason.
+- **Preview / QuickTime** (Core Image): `-[VGMTLCommandQueue setBackgroundGPUPriority:]` (now answered by lenient
+  mode), then Preview crashes in `CIKernelReflection::consolidate` (null) from `+[CIColorKernel kernelWithString:]`:
+  Core Image reads function reflection we don't give. NullMoth answers it with CI binding classes and bridges
+  `newLibraryWithStitchedDescriptor:` through Apple's own stitcher (NVMTLObjects.m, NVMTLDevice.m): the Core Image
+  milestone.
+- **Maps**: `-[VGRenderEncoder updateFence:afterStages:]` (fences; no-ops are safe here: every encoder ends with a full
+  barrier and all queues submit to the one Vulkan queue in order), library functions in namespaces not found
+  (`Clear::clear_vertex`), pipelines from them refused, `texture: type 4` (2D multisample).
+- Freeform, Photos: no driver activity in 15 s (nothing drawn with Metal yet, or not reached).
+
+Scale: NullMoth's plugin has ~100 classes (events, fences, argument encoders, indirect command buffers, reflection,
+stitching, Metal 4); ours 14, sized for WindowServer. Milestones: (1) the simple missing calls (fences, events,
+priorities, namespaced functions, MSAA textures); (2) Core Image (reflection + stitching); (3) OpenGL over Metal;
+(4) Safari WebGL once the system-volume install is decided.
