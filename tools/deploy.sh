@@ -46,7 +46,7 @@ stage5) # stage 5a: the bundle (no reboot), framebuffer + accelerator into the A
   # OpenCore with one stop/start; then the accelerator's log
   tools/build.sh >/dev/null
   tools/build-metal.sh >/dev/null && tools/build-tools.sh >/dev/null
-  tar -czf build/vgmetal.tgz -C build VirtioGPUMetal.bundle mtlprobe mtlcompute mtlrender mtlsurface mtlwindow compute.metallib render.metallib acceltest
+  tar -czf build/vgmetal.tgz -C build VirtioGPUMetal.bundle mtlprobe mtlcompute mtlrender mtlsurface mtlwindow mtlsource compute.metallib render.metallib acceltest
   "${SSH[@]}" $HOST 'mkdir -p /root/vgpu/xfer && rm -rf /root/vgpu/xfer/*'
   "${SCP[@]}" build/vgmetal.tgz tools/metal-vm.sh $HOST:/root/vgpu/xfer/
   "${SSH[@]}" $HOST "bash /root/vgpu/vm-remote.sh xfer /root/vgpu/xfer/* >/dev/null; bash /root/vgpu/vm-remote.sh run 'sh /Volumes/VGPU/metal-vm.sh install' 120"
@@ -64,7 +64,7 @@ accel-logs)
   ;;
 metal) # stage 4a: VirtioGPUMetal.bundle + mtlprobe/acceltest over the transfer disk, installed in the VM
   tools/build-metal.sh >/dev/null && tools/build-tools.sh >/dev/null
-  tar -czf build/vgmetal.tgz -C build VirtioGPUMetal.bundle mtlprobe mtlcompute mtlrender mtlsurface mtlwindow compute.metallib render.metallib acceltest
+  tar -czf build/vgmetal.tgz -C build VirtioGPUMetal.bundle mtlprobe mtlcompute mtlrender mtlsurface mtlwindow mtlsource compute.metallib render.metallib acceltest
   "${SSH[@]}" $HOST 'mkdir -p /root/vgpu/xfer && rm -rf /root/vgpu/xfer/*'
   "${SCP[@]}" build/vgmetal.tgz tools/metal-vm.sh $HOST:/root/vgpu/xfer/
   "${SSH[@]}" $HOST "bash /root/vgpu/vm-remote.sh xfer /root/vgpu/xfer/* >/dev/null; bash /root/vgpu/vm-remote.sh run 'sh /Volumes/VGPU/metal-vm.sh install' 120"

@@ -246,6 +246,52 @@ static id vg_refuse_before_init(id obj) {
     NSData *d = [NSData dataWithContentsOfURL:url options:0 error:error];
     return d ? vg_new_library(self, d, error) : nil;
 }
+// Metal shading language source (5d: ANGLE, i.e. WebGL in Safari and Chrome, writes its shaders as source at run time).
+// Apple's base class compiles it (MTLCompilerService) into an Apple library; its container (libraryDataContents, the
+// same metallib a file holds) goes through our own loader. After nullmoth/nvidia-macos-driver's
+// nvmtlBridgeAppleLibrary (NVMTLDevice.m).
+- (id<MTLLibrary>)newLibraryWithSource:(NSString *)source options:(MTLCompileOptions *)options error:(NSError **)error {
+    if (error) {
+        *error = nil;
+    }
+    struct objc_super sup = {self, class_getSuperclass(object_getClass(self))};
+    uint64_t t0 = vg_now();
+    id apple = ((id(*)(struct objc_super *, SEL, id, id, NSError **))objc_msgSendSuper)(
+        &sup, @selector(newLibraryWithSource:options:error:), source, options, error);
+    if (!apple) {
+        vglog("newLibraryWithSource: Apple's compiler failed: %s",
+              error && *error ? (*error).localizedDescription.UTF8String : "(no reason)");
+        return nil;
+    }
+    SEL contents = sel_registerName("libraryDataContents");
+    NSData *container = [apple respondsToSelector:contents] ? ((id(*)(id, SEL))objc_msgSend)(apple, contents) : nil;
+    if (![container isKindOfClass:[NSData class]] || container.length < 4) {
+        vglog("newLibraryWithSource: Apple's %s has no metallib container", object_getClassName(apple));
+        if (error) {
+            *error = [NSError errorWithDomain:@"VirtioGPUMetal" code:1
+                                     userInfo:@{NSLocalizedDescriptionKey : @"newLibraryWithSource: no metallib container"}];
+        }
+        return nil;
+    }
+    if (error) {
+        *error = nil;   // a warning from Apple's compiler isn't a failure of ours
+    }
+    id<MTLLibrary> mine = vg_new_library(self, container, error);
+    vglog("newLibraryWithSource: %lu chars -> %lu B container in %.1f ms -> %s", (unsigned long)source.length,
+          (unsigned long)container.length, (vg_now() - t0) / 1e6, mine ? "ours" : "FAILED");
+    return mine;
+}
+- (void)newLibraryWithSource:(NSString *)source
+                     options:(MTLCompileOptions *)options
+           completionHandler:(MTLNewLibraryCompletionHandler)handler {
+    NSError *e = nil;
+    id<MTLLibrary> lib = [self newLibraryWithSource:source options:options error:&e];
+    if (handler) {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+          handler(lib, lib ? nil : e);
+        });
+    }
+}
 - (id<MTLLibrary>)newLibraryWithFile:(NSString *)path error:(NSError **)error {
     return [self newLibraryWithURL:[NSURL fileURLWithPath:path] error:error];
 }

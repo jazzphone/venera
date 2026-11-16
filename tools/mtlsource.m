@@ -1,0 +1,103 @@
+// mtlsource (stage 5d): compile Metal shading language source at run time (as ANGLE does for WebGL) and run it: a
+// compute kernel checked on the CPU, then a render pass whose pixels are read back.
+//   mtlsource            (needs the process allow-listed, e.g. VGMTL_ENABLE=1)
+#import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
+
+static NSString *const kSource = @"#include <metal_stdlib>\n"
+                                  "using namespace metal;\n"
+                                  "kernel void scale_add(device const float *a [[buffer(0)]], device float *b [[buffer(1)]],\n"
+                                  "                      constant float &k [[buffer(2)]], uint i [[thread_position_in_grid]]) {\n"
+                                  "    b[i] = a[i] * k + float(i);\n"
+                                  "}\n"
+                                  "struct V { float4 p [[position]]; float4 c; };\n"
+                                  "vertex V vs(uint vid [[vertex_id]]) {\n"
+                                  "    float2 p[3] = {float2(-1, -1), float2(3, -1), float2(-1, 3)};\n"
+                                  "    V o; o.p = float4(p[vid], 0, 1); o.c = float4(0.25, 0.5, 1.0, 1.0); return o;\n"
+                                  "}\n"
+                                  "fragment float4 fs(V in [[stage_in]]) { return in.c; }\n";
+
+int main(void) {
+    @autoreleasepool {
+        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+        printf("device: %s\n", dev ? dev.name.UTF8String : "(none)");
+        if (!dev) {
+            return 2;
+        }
+        NSError *err = nil;
+        uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        id<MTLLibrary> lib = [dev newLibraryWithSource:kSource options:[MTLCompileOptions new] error:&err];
+        printf("newLibraryWithSource: %s (%.1f ms)%s%s\n", lib ? "ok" : "FAILED",
+               (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e6, err ? " error: " : "",
+               err ? err.localizedDescription.UTF8String : "");
+        if (!lib) {
+            return 1;
+        }
+        printf("functions: %s\n", [[lib functionNames] componentsJoinedByString:@", "].UTF8String);
+        int failures = 0;
+        // compute
+        id<MTLComputePipelineState> cps = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"scale_add"] error:&err];
+        const int n = 4096;
+        id<MTLBuffer> a = [dev newBufferWithLength:n * 4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b = [dev newBufferWithLength:n * 4 options:MTLResourceStorageModeShared];
+        float *pa = a.contents, k = 3.0f;
+        for (int i = 0; i < n; i++) {
+            pa[i] = i * 0.5f;
+        }
+        id<MTLCommandQueue> q = [dev newCommandQueue];
+        id<MTLCommandBuffer> cb = [q commandBuffer];
+        id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+        [ce setComputePipelineState:cps];
+        [ce setBuffer:a offset:0 atIndex:0];
+        [ce setBuffer:b offset:0 atIndex:1];
+        [ce setBytes:&k length:4 atIndex:2];
+        [ce dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        [ce endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        float *pb = b.contents;
+        int bad = 0;
+        for (int i = 0; i < n; i++) {
+            bad += pb[i] != pa[i] * k + i;
+        }
+        printf("compute from source: %s (%d of %d wrong)\n", bad ? "FAIL" : "ok", bad, n);
+        failures += bad != 0;
+        // render
+        MTLRenderPipelineDescriptor *rd = [MTLRenderPipelineDescriptor new];
+        rd.vertexFunction = [lib newFunctionWithName:@"vs"];
+        rd.fragmentFunction = [lib newFunctionWithName:@"fs"];
+        rd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+        id<MTLRenderPipelineState> rps = [dev newRenderPipelineStateWithDescriptor:rd error:&err];
+        printf("render pipeline from source: %s%s\n", rps ? "ok" : "FAILED ", rps ? "" : err.localizedDescription.UTF8String);
+        if (rps) {
+            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                         width:64 height:64 mipmapped:NO];
+            td.usage = MTLTextureUsageRenderTarget;
+            td.storageMode = MTLStorageModeManaged;
+            id<MTLTexture> t = [dev newTextureWithDescriptor:td];
+            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor new];
+            rp.colorAttachments[0].texture = t;
+            rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            cb = [q commandBuffer];
+            id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
+            [re setRenderPipelineState:rps];
+            [re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [re endEncoding];
+            id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+            [be synchronizeResource:t];
+            [be endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            uint8_t px[4];
+            [t getBytes:px bytesPerRow:64 * 4 fromRegion:MTLRegionMake2D(32, 32, 1, 1) mipmapLevel:0];
+            BOOL ok = abs(px[0] - 64) <= 1 && abs(px[1] - 128) <= 1 && px[2] == 255 && px[3] == 255;
+            printf("render from source: %s (pixel %u %u %u %u)\n", ok ? "ok" : "FAIL", px[0], px[1], px[2], px[3]);
+            failures += !ok;
+        } else {
+            failures++;
+        }
+        printf("%s\n", failures ? "FAILED" : "PASS");
+        return failures ? 1 : 0;
+    }
+}
