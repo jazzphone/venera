@@ -1142,18 +1142,27 @@ a command buffer.
   pushes (~14 k of ~29 k per 5 s during a drag).
 - Measured (snapshot `pre-push-r7` first): six boots alternating off / fragment / vertex, 2 min after login, three
   8 s drags from a fresh `dragtest` each, frame gaps from the kext and the ring thread from the host's `top`
-  (read-only): **no difference**. Settled drags 19.0-19.5 ms mean frame gap and the ring thread 74-85% of a core in
-  every mode.
+  (read-only). **No gain**: mean drag frame gap off 18.1 ms, fragment 19.1 ms, vertex 19.2 ms; the ring thread ~60%
+  of a core off, ~55% with pushes. (A first run of this A/B was thrown out: the session was locked, below, so its
+  drags moved a window behind the lock screen.)
 - Why: the ring thread's CPU is mostly not decoding. From `/proc` (read-only) during a drag, 46 user ticks against
   343 system ticks: ~88% of its time is in the kernel, ~7 k voluntary context switches a second, sampled mostly in
   `clock_nanosleep` / `sched_yield` / futex: virglrenderer's ring polling (`vkr_ring_relax`: yields, then short
   sleeps) and the GPU driver's ioctls, not command decoding. Command count isn't the lever; the earlier "~68% of a
-  core" never meant the thread was saturated.
-- Also found: the default Tahoe wallpaper is an Aerial that keeps playing on VM 108 after login. The guest decodes
-  it in software (`VTDecoderXPCService` 105-115% of a guest core, steadily for 10+ minutes) and WindowServer
-  composites it ~20 times a second (60 command buffers/s at "idle"). Every benchmark since the reboots ran on top of
-  that; a still wallpaper would free a guest core and the compositor's idle frames. Not changed (a user setting).
-- First pass of this A/B discarded: its boot check counted a guest-agent error as "up" and benchmarked during login.
+  core" never meant the thread was saturated. (Sampled on the locked screen; the split is the thread's, not the
+  scene's.)
+- **The session was locked** from the night before: loginwindow re-locks an auto-login session that was locked at
+  shutdown ("loginUserIsAutoLoginUser ... locking screenWasLocked", kLWLockFromCookieFile), so every reboot came back
+  locked, and the lock screen plays the Aerial video (`VTDecoderXPCService` ~110% of a guest core, software HEVC
+  through `VCPHEVC.bundle`: no video decoder for this GPU). Return at the lock screen unlocks it (no password on VM
+  108); measurement scripts now run `caffeinate -dimu` in the session after each boot and print the lock state
+  (`ioreg -n Root -d1 | grep ScreenIsLocked`).
+- Video decode on the GPU (looked into, not built): NullMoth's NVIDIA driver registers its own VideoToolbox decoders
+  (`VTRegisterVideoDecoderWithInfo`, WebKit's published VTVideoDecoder SPI) from its Metal plugin in every process,
+  VTDecoderXPCService included; Apple's AppleGVA bundle route is unmapped. For Venera the decoder would need an
+  engine: Venus has no Vulkan Video (Mesa main, 2026-11-15) and the host's virglrenderer 1.1.0 none either; vrend's
+  VA-API video exists in the library but QEMU never sets `VIRGL_RENDERER_USE_VIDEO` and the host has no VA driver.
+  Every route needs host changes; set aside for app Metal.
 
 VM 108 is back on main's driver (0.1.0 + round 6), no flag files.
 
