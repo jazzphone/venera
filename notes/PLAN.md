@@ -1204,3 +1204,26 @@ Scale: NullMoth's plugin has ~100 classes (events, fences, argument encoders, in
 stitching, Metal 4); ours 14, sized for WindowServer. Milestones: (1) the simple missing calls (fences, events,
 priorities, namespaced functions, MSAA textures); (2) Core Image (reflection + stitching); (3) OpenGL over Metal;
 (4) Safari WebGL once the system-volume install is decided.
+
+### Round 8, part 2: Safari on Venera (system-volume install)
+
+- `newLibraryWithSource:` (ANGLE writes MSL at run time): Apple's base class compiles it, the library's container
+  (`libraryDataContents`) goes through our loader (after NullMoth's `nvmtlBridgeAppleLibrary`). `tools/mtlsource`:
+  compute (4096/4096 right) and render (exact pixel) from source.
+- Authenticated root off on VM 108 (`packaging/sysvol.sh csr`: OpenCore csr 0x203 -> 0xA03; snapshot `pre-authroot`
+  first), the bundle copied into `/System/Library/Extensions` on the live system volume and a new snapshot blessed
+  (`sysvol.sh install`; `Sealed: Broken` after the reboot, as expected). Metal looks in `/Library/GPUBundles` first and
+  doesn't fall back when the sandbox refuses it, so that path is now a symlink to the system copy: the sandbox judges
+  the file mapped. `tools/deploy.sh metal` installs through `sysvol.sh` once the symlink is there (a reboot per
+  deploy).
+- **Safari's test page on Venera** (allow-list `com.apple.WebKit.GPU`): WebGL draws (renderer "Apple GPU"), canvas
+  and CSS transforms + backdrop blur at 60 fps; without app Metal: no WebGL context, canvas and CSS at 30 fps.
+- Open: (1) the animated canvas looks dim (balls ~ one fade behind); static colors (`tools/apptest/canvas-colors.html`)
+  match software exactly, fetch mode 0 changes nothing, so it's timing: the compositor sometimes shows the canvas
+  surface between its fade and its redraw (cross-process IOSurface write-back?). (2) WebKit's canvas pipeline
+  `fixed_vert_lpf_spc+fixed_frag_lpf_cpf` has 60 function constants and each new combination is translated afresh,
+  ~5.5 s and 685 KB of SPIR-V each, several in the first minute: specialization constants instead of a translation per
+  combination. (3) Missing: `generateMipmapsForTexture`, `setBackgroundGPUPriority:`, a fragment-stage setter and a
+  command-buffer encode call (lenient mode answers them).
+- The owner's direction (2026-11-16): every app through the driver, installed in `/System/Library/Extensions`, with a
+  helper that notices a macOS update removed or changed the copy, asks before reinstalling, and says why when it can't.

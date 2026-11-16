@@ -1,0 +1,39 @@
+<!doctype html>
+<!-- apptest (stage 5d): known colors on a 2D canvas (top row) and the same colors as plain boxes (bottom row), to
+     compare pixel by pixel in a screenshot. Each square is 100x100 CSS pixels. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>Canvas colors</title>
+<style>
+  body { margin: 0; padding: 20px; background: #000; font: 14px -apple-system, sans-serif; color: #888; }
+  canvas, .ref { display: block; width: 700px; height: 100px; margin-bottom: 20px; }
+  .ref { display: flex; }
+  .ref div { width: 100px; height: 100px; }
+</style>
+</head>
+<body>
+<canvas id="c" width="700" height="100"></canvas>
+<div class="ref">
+  <div style="background:#fff"></div>
+  <div style="background:#f00"></div>
+  <div style="background:#00f"></div>
+  <div style="background:#7f0080"></div>
+  <div style="background:#808080"></div>
+  <div style="background:#000"></div>
+  <div style="background:#000"></div>
+</div>
+<div>canvas: white, red, blue, red 50% over blue, white 50% over black, white text on black, a 0.25 black wash over white</div>
+<script>
+const x = document.getElementById('c').getContext('2d');
+x.fillStyle = '#000'; x.fillRect(0, 0, 700, 100);
+x.fillStyle = '#fff'; x.fillRect(0, 0, 100, 100);
+x.fillStyle = '#f00'; x.fillRect(100, 0, 100, 100);
+x.fillStyle = '#00f'; x.fillRect(200, 0, 100, 100);
+x.fillStyle = '#00f'; x.fillRect(300, 0, 100, 100); x.fillStyle = 'rgba(255,0,0,0.5)'; x.fillRect(300, 0, 100, 100);
+x.fillStyle = 'rgba(255,255,255,0.5)'; x.fillRect(400, 0, 100, 100);
+x.fillStyle = '#fff'; x.font = 'bold 60px -apple-system'; x.fillText('Aa', 505, 75);
+x.fillStyle = '#fff'; x.fillRect(600, 0, 100, 100); x.fillStyle = 'rgba(0,0,0,0.25)'; x.fillRect(600, 0, 100, 100);
+</script>
+</body>
+</html>
