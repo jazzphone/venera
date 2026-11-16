@@ -606,6 +606,8 @@ id<MTLComputePipelineState> vg_new_compute_pipeline(id<MTLDevice> device, id<MTL
 @synthesize device = _device, label = _label;
 // Priorities (5d: Core Image, WebKit): one Vulkan queue, so accepted and not applied.
 - (BOOL)setBackgroundGPUPriority:(NSUInteger)priority { return YES; }
+- (NSUInteger)getGPUPriority { return 0; }
+- (NSUInteger)getBackgroundGPUPriority { return 0; }
 - (instancetype)initWithDevice:(id<MTLDevice>)device {
     if ((self = [super init])) {
         _device = device;

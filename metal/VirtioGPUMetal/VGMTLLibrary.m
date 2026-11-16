@@ -924,3 +924,39 @@ static NSSet<NSString *> *vg_undefined_externs(NSArray<NSString *> *modules) {
     [decl minusSet:def];
     return decl;
 }
+
+// ---- binary archives (5d) -----------------------------------------------------------------------------------------
+// Ours, always empty: pipelines are translated and cached by this driver, so an archive records nothing and every
+// lookup misses. Apple's own archive class (made when the device doesn't make one) asked our device for a slice ID it
+// has no answer for and Metal asserted: SwiftUI's RenderBox opens archives with its custom shader effects, and the
+// Dock's extras and Spotlight crashed in a loop. After nullmoth/nvidia-macos-driver's NVMTLBinaryArchive.
+@interface VGMTLBinaryArchive : NSObject <MTLBinaryArchive>
+@property(copy, atomic) NSString *label;
+@property(readonly) id<MTLDevice> device;
+@end
+@implementation VGMTLBinaryArchive {
+    id<MTLDevice> _dev;
+}
+@synthesize label = _label;
+- (id<MTLDevice>)device { return _dev; }
+- (BOOL)addComputePipelineFunctionsWithDescriptor:(MTLComputePipelineDescriptor *)d error:(NSError **)error { return YES; }
+- (BOOL)addRenderPipelineFunctionsWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)error { return YES; }
+- (BOOL)addTileRenderPipelineFunctionsWithDescriptor:(MTLTileRenderPipelineDescriptor *)d error:(NSError **)error { return YES; }
+- (BOOL)addMeshRenderPipelineFunctionsWithDescriptor:(MTLMeshRenderPipelineDescriptor *)d error:(NSError **)error { return YES; }
+- (BOOL)addLibraryWithDescriptor:(MTLStitchedLibraryDescriptor *)d error:(NSError **)error { return YES; }
+- (BOOL)addFunctionWithDescriptor:(MTLFunctionDescriptor *)d library:(id<MTLLibrary>)l error:(NSError **)error { return YES; }
+- (BOOL)serializeToURL:(NSURL *)url error:(NSError **)error {
+    NSData *d = [NSPropertyListSerialization dataWithPropertyList:@{@"format" : @"VeneraBinaryArchive", @"version" : @1}
+                                                           format:NSPropertyListBinaryFormat_v1_0 options:0 error:error];
+    return d && [d writeToURL:url options:NSDataWritingAtomic error:error];
+}
+@end
+
+id<MTLBinaryArchive> vg_new_binary_archive(id<MTLDevice> device, MTLBinaryArchiveDescriptor *d, NSError **error) {
+    if (error) {
+        *error = nil;
+    }
+    VGMTLBinaryArchive *a = [VGMTLBinaryArchive new];
+    [a setValue:device forKey:@"_dev"];
+    return a;
+}

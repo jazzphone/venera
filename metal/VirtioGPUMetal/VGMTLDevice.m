@@ -315,6 +315,9 @@ static id vg_refuse_before_init(id obj) {
 }
 // Dynamic libraries (5d: Core Image's ci_stdlib).
 - (BOOL)supportsDynamicLibraries { return YES; }
+- (id<MTLBinaryArchive>)newBinaryArchiveWithDescriptor:(MTLBinaryArchiveDescriptor *)d error:(NSError **)error {
+    return vg_new_binary_archive(self, d, error);
+}
 - (BOOL)supportsRenderDynamicLibraries { return YES; }
 - (id<MTLDynamicLibrary>)newDynamicLibrary:(id<MTLLibrary>)library error:(NSError **)error {
     return vg_new_dynamic_library(library, error);
