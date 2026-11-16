@@ -8,7 +8,7 @@ M=${1:-15}
 run() { "${SSH[@]}" $H "bash /root/vgpu/vm-remote.sh run '$1' ${2:-60}" 2>&1; }
 app() { run "pkill -x dragtest; U=\$(id -u dev); cd /var/tmp/vgpu; (launchctl asuser \$U sudo -u dev ./dragtest 600 $1 >/dev/null 2>&1 &); sleep 2" 30 >/dev/null; }
 state() {
-  run "P=\$(pgrep -x WindowServer); echo \"pid \$P rss \$((\$(ps -o rss= -p \$P) / 1024)) MB, \$(vm_stat | awk \"/Pages free/ {printf \\\"%d MB free\\\", \\\$3 * 4096 / 1048576}\"), \$(ioreg -r -c VirtioGPUAccel -l -d 1 | grep -oE \"[0-9]+ flips\"), crashes \$(ls /Library/Logs/DiagnosticReports | grep -c WindowServer)\"" 30
+  run "P=\$(pgrep -x WindowServer); echo pid \$P rss \$((\$(ps -o rss= -p \$P) / 1024)) MB, \$(vm_stat | grep \"Pages free\" | tr -dc 0-9) pages free, \$(ioreg -r -c VirtioGPUAccel -l -d 1 | grep -oE \"[0-9]+ flips\" | head -1), crash reports \$(ls /Library/Logs/DiagnosticReports | grep -c WindowServer)" 30
 }
 echo "start: $(state)"
 end=$(($(date +%s) + M * 60))

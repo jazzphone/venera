@@ -63,6 +63,8 @@ id<MTLBuffer> vg_new_buffer_nocopy(id<MTLDevice> device, void *pointer, NSUInteg
     uint32_t _twinRes;
     uint32_t _twinGen;   // frames copied into the twin so far (kVGUCTwinMark)
     BOOL _twinRefused;   // the kext said no (not the screen's size): no twin, the CPU write-back stays
+    uint32_t _hotWrites;   // display command buffers in a row that wrote it, each within 100 ms of the last (5c round 6)
+    uint64_t _hotLast;
 }
 @property(readonly) id<MTLDevice> device;
 @property(copy, atomic) NSString *label;

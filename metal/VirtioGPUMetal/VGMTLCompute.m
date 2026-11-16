@@ -1272,10 +1272,16 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
                     _snapNumber = vg_snap_wanted();   // served at completion, from what the screen shows then
                 }
                 // Only a surface the display has shown skips its CPU write-back (5c round 6): Core Animation renders
-                // other screen-sized surfaces in display command buffers too (one GPU-only intermediate a frame, and
-                // a Cmd-Shift-3 screenshot, read on the CPU: it came out blank). Those keep it, landing before the
-                // completion handlers as Metal's results do, but commitAndWaitUntilSubmitted doesn't wait for it: only
-                // the display pipe's CPU copy needed that, and the pipe flips to the twin.
+                // other screen-sized surfaces in display command buffers too, and some are read on the CPU right after
+                // commitAndWaitUntilSubmitted (a Cmd-Shift-3 screenshot came out blank, then blank one time in three
+                // without the wait). Those keep the write-back and the wait for it, except a surface written by every
+                // frame (one GPU-only intermediate a frame): after 10 such frames in a row it is waited for no more.
+                uint64_t nowNs = vg_now();
+                t->_hotWrites = t->_hotLast && nowNs - t->_hotLast < 100000000ull ? t->_hotWrites + 1 : 1;
+                t->_hotLast = nowNs;
+                if (!shown && t->_hotWrites < 10) {
+                    _allTwinned = NO;
+                }
                 if (shown && !writeBackTwins) {
                     if (!noWriteBack) {
                         noWriteBack = [NSMutableSet set];
