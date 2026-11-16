@@ -47,6 +47,9 @@ ASK=0
 if [ ! -d "$KEEP" ]; then
   exit 0   # not installed by install.sh: nothing to keep
 fi
+case "$(readlink "$G" 2>/dev/null)" in
+/Library/GPUBundles/Venera/dev/*) exit 0 ;;   # a developer's build (tools/deploy.sh devmetal): left alone
+esac
 if [ -d "$SYS" ] && same "$SYS" "$KEEP"; then
   point "$SYS"
   [ -n "$(state pending)" ] && set_state pending ""   # the reinstall took

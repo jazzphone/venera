@@ -359,13 +359,16 @@ id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRende
                 continue;
             }
             MTLVertexBufferLayoutDescriptor *ld = vd.layouts[b];
-            if (ld.stepFunction != MTLVertexStepFunctionPerVertex && ld.stepFunction != MTLVertexStepFunctionPerInstance) {
-                why = @"vertex step functions other than per vertex / per instance aren't supported yet";
+            // Constant (5d: OpenGL's glVertexAttrib values through Apple's GL renderer): every vertex reads the same
+            // element, which is a per-vertex binding with stride 0 in Vulkan.
+            BOOL constant = ld.stepFunction == MTLVertexStepFunctionConstant;
+            if (!constant && ld.stepFunction != MTLVertexStepFunctionPerVertex && ld.stepFunction != MTLVertexStepFunctionPerInstance) {
+                why = @"vertex step functions other than per vertex, per instance and constant aren't supported yet";
                 p = nil;
                 break;
             }
             p->_vbind[p->_nvbind++] = (VkVertexInputBindingDescription){
-                b, (uint32_t)ld.stride,
+                b, constant ? 0 : (uint32_t)ld.stride,
                 ld.stepFunction == MTLVertexStepFunctionPerInstance ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX};
         }
     }

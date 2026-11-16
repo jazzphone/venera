@@ -13,6 +13,11 @@ install)
   if [ -L /Library/GPUBundles/VirtioGPUMetal.bundle ]; then
     # 5d: the driver lives on the system volume (packaging/sysvol.sh): a new copy there, a new snapshot, a reboot
     sh $X/sysvol.sh install /tmp/vgmetal/VirtioGPUMetal.bundle && echo "on the system volume: reboot to load it"
+    # and the copy the watcher keeps (packaging/venera-watch.sh): it must match, or the watcher switches to it
+    if [ -d /Library/GPUBundles/Venera ]; then
+      rm -rf /Library/GPUBundles/Venera/VirtioGPUMetal.bundle
+      ditto /tmp/vgmetal/VirtioGPUMetal.bundle /Library/GPUBundles/Venera/VirtioGPUMetal.bundle
+    fi
   else
     rm -rf /Library/GPUBundles/VirtioGPUMetal.bundle
     mv /tmp/vgmetal/VirtioGPUMetal.bundle /Library/GPUBundles/

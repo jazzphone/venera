@@ -405,8 +405,9 @@ static id vg_refuse_before_init(id obj) {
                                      options:(MTLPipelineOption)o
                            completionHandler:(MTLNewRenderPipelineStateWithReflectionCompletionHandler)handler {
     NSError *e = nil;
-    id<MTLRenderPipelineState> p = [self newRenderPipelineStateWithDescriptor:d error:&e];
-    handler(p, nil, e);
+    MTLAutoreleasedRenderPipelineReflection r = nil;
+    id<MTLRenderPipelineState> p = [self newRenderPipelineStateWithDescriptor:d options:o reflection:&r error:&e];
+    handler(p, r, e);
 }
 - (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d
                                                              options:(MTLPipelineOption)o
@@ -433,8 +434,13 @@ static id vg_refuse_before_init(id obj) {
 - (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)length options:(MTLResourceOptions)o {
     return vg_heap_buffer_size(length);
 }
+// OpenGL (5d, VGMTLGL.m): a pipeline of Apple GL functions is built from our lowering of them, and its reflection
+// carries what the lowering returned.
+MTLRenderPipelineDescriptor *vg_gl_rewrite_descriptor(id<MTLDevice> device, MTLRenderPipelineDescriptor *d, NSError **err);
+id vg_gl_reflection(MTLRenderPipelineDescriptor *d);
 - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)error {
-    return vg_new_render_pipeline(self, d, error);
+    d = vg_gl_rewrite_descriptor(self, d, error);
+    return d ? vg_new_render_pipeline(self, d, error) : nil;
 }
 - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d
                                                            options:(MTLPipelineOption)o
@@ -443,11 +449,26 @@ static id vg_refuse_before_init(id obj) {
     if (r) {
         *r = nil;
     }
-    return vg_new_render_pipeline(self, d, error);
+    d = vg_gl_rewrite_descriptor(self, d, error);
+    if (!d) {
+        return nil;
+    }
+    id<MTLRenderPipelineState> p = vg_new_render_pipeline(self, d, error);
+    if (p && r) {
+        *r = vg_gl_reflection(d);
+    }
+    return p;
 }
 
+// The vendor of the GPU underneath (5d): Apple's OpenGL-on-Metal renderer takes a device profile by vendor name and
+// asserts on one it doesn't know ("Virtio" crashed every OpenGL app in GLDDeviceRec::initWithDisplayMask).
 - (NSString *)vendorName {
-    return @"Virtio";
+    switch (gVk.props.vendorID) {
+    case 0x8086: return @"Intel";
+    case 0x1002: return @"AMD";
+    case 0x10de: return @"NVIDIA";
+    default: return @"Virtio";
+    }
 }
 
 // Metal's compute limit, from Vulkan's (Metal's own ceiling is 1024 threads per threadgroup).

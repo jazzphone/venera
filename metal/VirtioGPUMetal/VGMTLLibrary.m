@@ -960,3 +960,13 @@ id<MTLBinaryArchive> vg_new_binary_archive(id<MTLDevice> device, MTLBinaryArchiv
     [a setValue:device forKey:@"_dev"];
     return a;
 }
+
+// One of our functions from IR text (5d: OpenGL's lowered shaders): its entry from the module's metadata, else `name`.
+id<MTLFunction> vg_function_from_ll(id<MTLDevice> device, NSString *ll, NSString *stage, NSString *name) {
+    NSString *entry = nil, *st = nil;
+    if (vg_entry_of(ll, &entry, &st)) {
+        name = entry;
+        stage = st;
+    }
+    return [[VGMTLFunction alloc] initWithDevice:device name:name stage:stage ll:ll];
+}
