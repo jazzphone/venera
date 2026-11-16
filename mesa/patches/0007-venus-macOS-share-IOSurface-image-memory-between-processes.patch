@@ -1,0 +1,221 @@
+From 0bffd479ae980416ca247477c7689fcbb2e7cec9 Mon Sep 17 00:00:00 2001
+From: build <build@localhost>
+Date: Mon, 16 Nov 2026 12:50:39 -0500
+Subject: [PATCH] venus: macOS: share IOSurface image memory between processes
+ (kVGUCImportSurface)
+
+Exportable allocations are SHAREABLE blobs; vn_macos_import_surface attaches the resource another process shared for
+an IOSurface (core 0.5.6) and returns a placeholder fd that VkImportMemoryFdInfoKHR (dma-buf) imports: Venus closes
+an imported fd, so it is a real one standing for the resource id. has_dma_buf_import is on.
+---
+ src/virtio/vulkan/VirtioGPUUserAPI.h  |  5 ++
+ src/virtio/vulkan/vn_device_memory.c  | 12 ++++
+ src/virtio/vulkan/vn_device_memory.h  |  7 +++
+ src/virtio/vulkan/vn_renderer_macos.c | 90 +++++++++++++++++++++++++--
+ 4 files changed, 110 insertions(+), 4 deletions(-)
+
+diff --git a/src/virtio/vulkan/VirtioGPUUserAPI.h b/src/virtio/vulkan/VirtioGPUUserAPI.h
+index c9eb28a..f1781b3 100644
+--- a/src/virtio/vulkan/VirtioGPUUserAPI.h
++++ b/src/virtio/vulkan/VirtioGPUUserAPI.h
+@@ -42,6 +42,11 @@ enum {
+     kVGUCSubmit = 6,
+     /* scalar in: ring index, fence, timeout ns (0 = poll); scalar out: 1 signaled, 0 not yet */
+     kVGUCWaitFence = 7,
++    /* (8-10: the Metal plugin's scanout and twin calls) */
++    /* 5d, core 0.5.6: attaches the resource another process shared for an IOSurface (kVGUCShareSurface = 11) to this
++     * connection's context. scalar in: IOSurface id; scalar out: resource id, size, VkFormat, width, height, usage,
++     * flags | tiling << 31. */
++    kVGUCImportSurface = 12,
+     kVGUCMethodCount
+ };
+ 
+diff --git a/src/virtio/vulkan/vn_device_memory.c b/src/virtio/vulkan/vn_device_memory.c
+index f40571e..7c084ed 100644
+--- a/src/virtio/vulkan/vn_device_memory.c
++++ b/src/virtio/vulkan/vn_device_memory.c
+@@ -646,4 +646,16 @@ vn_macos_device_memory_res_id(VkDevice device, VkDeviceMemory memory)
+    struct vn_device_memory *mem = vn_device_memory_from_handle(memory);
+    return mem && mem->base_bo ? mem->base_bo->res_id : 0;
+ }
++
++/* macOS (5d): the image memory another process shared for an IOSurface, attached to this device's context; returns a
++ * placeholder fd for VkImportMemoryFdInfoKHR (dma-buf), -1 when nothing is shared. out: resource id, size, VkFormat,
++ * width, height, usage, flags | tiling << 31. Found by the plugin with dlsym.
++ */
++PUBLIC int
++vn_macos_import_surface(VkDevice device, uint32_t surface, uint64_t out[7])
++{
++   struct vn_device *dev = vn_device_from_handle(device);
++   return dev ? vn_macos_renderer_import_surface(dev->renderer, surface, out)
++              : -1;
++}
+ #endif
+diff --git a/src/virtio/vulkan/vn_device_memory.h b/src/virtio/vulkan/vn_device_memory.h
+index 75035db..474ed24 100644
+--- a/src/virtio/vulkan/vn_device_memory.h
++++ b/src/virtio/vulkan/vn_device_memory.h
+@@ -65,6 +65,13 @@ vn_device_memory_import_dma_buf(struct vn_device *dev,
+ /* the virtio-gpu blob resource behind a mappable allocation (0 if none); exported for the Metal plugin */
+ PUBLIC uint32_t
+ vn_macos_device_memory_res_id(VkDevice device, VkDeviceMemory memory);
++int
++vn_macos_import_surface(VkDevice device, uint32_t surface, uint64_t out[7]);
++struct vn_renderer;
++int
++vn_macos_renderer_import_surface(struct vn_renderer *renderer,
++                                 uint32_t surface,
++                                 uint64_t out[7]);
+ #endif
+ 
+ VkResult
+diff --git a/src/virtio/vulkan/vn_renderer_macos.c b/src/virtio/vulkan/vn_renderer_macos.c
+index dcf47a7..d758e57 100644
+--- a/src/virtio/vulkan/vn_renderer_macos.c
++++ b/src/virtio/vulkan/vn_renderer_macos.c
+@@ -15,6 +15,8 @@
+  */
+ 
+ #include <errno.h>
++#include <fcntl.h>
++#include <unistd.h>
+ #include <stddef.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -28,6 +30,7 @@
+ 
+ #include "VirtioGPUUserAPI.h"
+ #include "vn_renderer_internal.h"
++#include "vn_device_memory.h"
+ 
+ /* kept from virtgpu: sims, not kernel syncobjs */
+ #define SIMULATE_BO_SIZE_FIX 1
+@@ -89,6 +92,14 @@ struct virtgpu {
+ 
+    mtx_t dma_buf_import_mutex;
+ 
++   /* 5d: resources attached by kVGUCImportSurface, each behind a placeholder fd until Venus imports it (Venus closes
++    * an imported fd, so it must be a real one); under dma_buf_import_mutex
++    */
++   struct {
++      int fd;
++      uint32_t res_id;
++   } imports[32];
++
+    struct vn_renderer_shmem_cache shmem_cache;
+ };
+ 
+@@ -772,7 +783,7 @@ virtgpu_bo_map(struct vn_renderer *renderer, struct vn_renderer_bo *_bo)
+    return bo->base.mmap_ptr;
+ }
+ 
+-/* no dma-bufs (info.has_dma_buf_import is false) */
++/* no dma-bufs: exportable memory is shared through the kext (kVGUCShareSurface), by resource id */
+ static int
+ virtgpu_bo_export_dma_buf(struct vn_renderer *renderer,
+                           struct vn_renderer_bo *_bo)
+@@ -819,11 +830,14 @@ virtgpu_bo_blob_flags(struct virtgpu *gpu,
+    uint32_t blob_flags = 0;
+    if (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+       blob_flags |= VGPU_BLOB_FLAG_MAPPABLE;
+-   /* SHAREABLE and CROSS_DEVICE are for dma-bufs, which are not supported */
++   /* 5d: exportable memory can be imported by another process's context (the kext's surface sharing) */
++   if (external_handles)
++      blob_flags |= VGPU_BLOB_FLAG_SHAREABLE;
+ 
+    return blob_flags;
+ }
+ 
++/* 5d: an fd from vn_macos_renderer_import_surface stands for the resource it attached */
+ static VkResult
+ virtgpu_bo_create_from_dma_buf(struct vn_renderer *renderer,
+                                VkDeviceSize size,
+@@ -831,7 +845,75 @@ virtgpu_bo_create_from_dma_buf(struct vn_renderer *renderer,
+                                VkMemoryPropertyFlags flags,
+                                struct vn_renderer_bo **out_bo)
+ {
+-   return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   struct virtgpu *gpu = (struct virtgpu *)renderer;
++
++   mtx_lock(&gpu->dma_buf_import_mutex);
++   uint32_t res_id = 0;
++   for (unsigned i = 0; i < ARRAY_SIZE(gpu->imports); i++) {
++      if (gpu->imports[i].res_id && gpu->imports[i].fd == fd) {
++         res_id = gpu->imports[i].res_id;
++         gpu->imports[i].res_id = 0;
++         break;
++      }
++   }
++   if (!res_id) {
++      mtx_unlock(&gpu->dma_buf_import_mutex);
++      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   }
++
++   struct virtgpu_bo *bo = util_sparse_array_get(&gpu->bo_array, res_id);
++   if (bo->gem_handle == res_id) {
++      vn_refcount_fetch_add_relaxed(&bo->base.refcount, 1);
++   } else {
++      *bo = (struct virtgpu_bo){
++         .base = {
++            .refcount = VN_REFCOUNT_INIT(1),
++            .res_id = res_id,
++            .mmap_size = 0,
++         },
++         .gem_handle = res_id,
++         .blob_flags = VGPU_BLOB_FLAG_SHAREABLE,
++      };
++   }
++   mtx_unlock(&gpu->dma_buf_import_mutex);
++
++   *out_bo = &bo->base;
++   return VK_SUCCESS;
++}
++
++/* 5d: attaches the resource another process shared for an IOSurface and returns a placeholder fd for importing it
++ * (VkImportMemoryFdInfoKHR, dma-buf); out: resource id, size, VkFormat, width, height, usage, flags | tiling << 31.
++ * -1 when nothing is shared for the surface.
++ */
++int
++vn_macos_renderer_import_surface(struct vn_renderer *renderer,
++                                 uint32_t surface,
++                                 uint64_t out[7])
++{
++   struct virtgpu *gpu = (struct virtgpu *)renderer;
++   const uint64_t in[1] = { surface };
++   uint32_t n = 7;
++   if (IOConnectCallScalarMethod(gpu->conn, kVGUCImportSurface, in, 1, out,
++                                 &n) != KERN_SUCCESS)
++      return -1;
++   const int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
++   if (fd < 0)
++      return -1;
++   mtx_lock(&gpu->dma_buf_import_mutex);
++   bool kept = false;
++   for (unsigned i = 0; i < ARRAY_SIZE(gpu->imports) && !kept; i++) {
++      if (!gpu->imports[i].res_id) {
++         gpu->imports[i].fd = fd;
++         gpu->imports[i].res_id = (uint32_t)out[0];
++         kept = true;
++      }
++   }
++   mtx_unlock(&gpu->dma_buf_import_mutex);
++   if (!kept) {
++      close(fd);
++      return -1;
++   }
++   return fd;
+ }
+ 
+ static VkResult
+@@ -967,7 +1049,7 @@ virtgpu_init_renderer_info(struct virtgpu *gpu)
+    info->pci.device_id = gpu->pci_device;
+    info->pci.has_bus_info = false;
+ 
+-   info->has_dma_buf_import = false;
++   info->has_dma_buf_import = true;   /* 5d: resource ids through placeholder fds */
+    info->has_external_sync = false;
+ 
+    info->has_implicit_fencing = false;
+-- 
+2.54.0 (Apple Git-157)
+

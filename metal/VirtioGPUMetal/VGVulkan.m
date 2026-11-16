@@ -19,6 +19,12 @@ NSString *vg_resource_path(const char *name) {
 }
 
 static uint32_t (*gResIdOf)(VkDevice, VkDeviceMemory);
+static int (*gImportSurface)(VkDevice, uint32_t, uint64_t *);
+BOOL gVgSharing;
+
+int vg_import_surface(uint32_t surface, uint64_t out[7]) {
+    return gImportSurface && gVgSharing ? gImportSurface(gVk.device, surface, out) : -1;
+}
 
 uint32_t vg_memory_res_id(VkDeviceMemory memory) {
     return gResIdOf && memory ? gResIdOf(gVk.device, memory) : 0;
@@ -38,6 +44,7 @@ static int vg_vulkan_init_locked(void) {
         return -1;
     }
     gResIdOf = (uint32_t(*)(VkDevice, VkDeviceMemory))dlsym(lib, "vn_macos_device_memory_res_id");   // Mesa patch 0006
+    gImportSurface = (int (*)(VkDevice, uint32_t, uint64_t *))dlsym(lib, "vn_macos_import_surface");    // Mesa patch 0007
     PFN_negotiate negotiate = (PFN_negotiate)dlsym(lib, "vk_icdNegotiateLoaderICDInterfaceVersion");
     PFN_icdGetInstanceProcAddr gipa = (PFN_icdGetInstanceProcAddr)dlsym(lib, "vk_icdGetInstanceProcAddr");
     if (!negotiate || !gipa) {
@@ -131,12 +138,34 @@ static int vg_vulkan_init_locked(void) {
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, gVk.queueFamily, 1, &prio};
     // VK_EXT_calibrated_timestamps (5c round 4): GPU timestamps on the guest's clock, to split completion latency.
     // Each optional extension the device lacks is dropped and the device created again.
-    const char *exts[2] = {"VK_EXT_calibrated_timestamps", "VK_EXT_attachment_feedback_loop_layout"};
+    const char *exts[4] = {"VK_EXT_calibrated_timestamps", "VK_EXT_attachment_feedback_loop_layout"};
     uint32_t next = wantFeedback && ffl.attachmentFeedbackLoopLayout ? 2 : 1;
+    // Surface sharing between processes (5d): dma-buf external memory, when the device has it and Mesa can import.
+    uint32_t nde = 0;
+    gVk.vkEnumerateDeviceExtensionProperties(gVk.physical, NULL, &nde, NULL);
+    VkExtensionProperties *de = calloc(nde ? nde : 1, sizeof(*de));
+    gVk.vkEnumerateDeviceExtensionProperties(gVk.physical, NULL, &nde, de);
+    int haveExt = 0;
+    for (uint32_t i = 0; i < nde; i++) {
+        haveExt |= !strcmp(de[i].extensionName, "VK_KHR_external_memory_fd") ? 1
+                   : !strcmp(de[i].extensionName, "VK_EXT_external_memory_dma_buf") ? 2 : 0;
+    }
+    free(de);
+    BOOL share = haveExt == 3 && gImportSurface && access("/Library/GPUBundles/VirtioGPUMetal-noshare", F_OK) != 0;
+    const char *const *base = exts;
+    const char *withShare[4];
+    if (share) {   // ahead of the optional ones the loop below drops from the end
+        withShare[0] = "VK_KHR_external_memory_fd";
+        withShare[1] = "VK_EXT_external_memory_dma_buf";
+        withShare[2] = exts[0];
+        withShare[3] = exts[1];
+        base = withShare;
+        next += 2;
+    }
     if (wantFeedback && !ffl.attachmentFeedbackLoopLayout) {
         vglog("vulkan: no attachmentFeedbackLoopLayout: framebuffer fetch stays with copies");
     }
-    VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2, 0, 1, &qci, 0, NULL, next, exts, NULL};
+    VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2, 0, 1, &qci, 0, NULL, next, base, NULL};
     for (;;) {
         r = gVk.vkCreateDevice(gVk.physical, &dci, NULL, &gVk.device);
         if (r != VK_ERROR_EXTENSION_NOT_PRESENT || !dci.enabledExtensionCount) {
@@ -145,8 +174,10 @@ static int vg_vulkan_init_locked(void) {
         dci.enabledExtensionCount--;   // the feedback loop first, then the timestamps
     }
     if (r == VK_SUCCESS) {
-        gVk.calibrated = dci.enabledExtensionCount >= 1;
-        gVk.feedbackLoop = dci.enabledExtensionCount >= 2;
+        uint32_t k = share ? (dci.enabledExtensionCount > 2 ? dci.enabledExtensionCount - 2 : 0) : dci.enabledExtensionCount;
+        gVgSharing = share && dci.enabledExtensionCount >= 2;
+        gVk.calibrated = k >= 1;
+        gVk.feedbackLoop = k >= 2;
         if (wantFeedback) {
             vglog("vulkan: framebuffer fetch %s", gVk.feedbackLoop ? "in place (attachment feedback loop)" : "by copies");
         }

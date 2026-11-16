@@ -62,7 +62,7 @@ void vg_trace_sync(const char *after);
     X(vkCmdSetStencilReference) X(vkCmdSetDepthBiasEnable) X(vkCmdSetRasterizerDiscardEnable)                     \
     X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetDepthBoundsTestEnable) X(vkDeviceWaitIdle)                         \
     X(vkCreateQueryPool) X(vkResetDescriptorPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults) \
-    X(vkCmdBlitImage)
+    X(vkCmdBlitImage) X(vkEnumerateDeviceExtensionProperties)
 
 #define VG_DECLARE(name) PFN_##name name;
 struct vg_vulkan {
@@ -103,6 +103,10 @@ int vg_buffer_create(VkDeviceSize size, vg_buffer *out);
 void vg_buffer_destroy(vg_buffer *b);
 // The virtio-gpu blob resource behind a mapped allocation (Mesa's vn_macos_device_memory_res_id), 0 if none (5c).
 uint32_t vg_memory_res_id(VkDeviceMemory memory);
+// Mesa's vn_macos_import_surface (patch 0007): attaches the resource another process shared for an IOSurface and
+// returns a placeholder fd to import it with (dma-buf), -1 if none. out: res, size, format, width, height, usage, flags.
+int vg_import_surface(uint32_t surface, uint64_t out[7]);
+extern BOOL gVgSharing;   // the device has external memory (dma-buf) and Mesa can import: surfaces may be shared
 // Staging buffers recycled (5c): creating one through Venus is several round trips. get returns one at least size
 // bytes (out->size is its whole size); put takes it back, or destroys it when the pool is full.
 int vg_staging_get(VkDeviceSize size, vg_buffer *out);

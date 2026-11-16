@@ -53,6 +53,15 @@ enum {
      * is done). The display pipe flips to a twin only once the frame a transaction asked for is ready, so WindowServer
      * needn't wait for the GPU before presenting. */
     kVGUCTwinMark = 10,
+    /* 5d, core 0.5.6: the caller's image memory behind an IOSurface, for another process's Venus context to import
+     * instead of copying the surface through the CPU. scalar in: IOSurface id, blob resource id (0 = forget it),
+     * size, VkFormat, width, height, VkImageUsageFlags, VkImageCreateFlags | tiling << 31. The resource must be the
+     * caller's own (an exportable allocation). */
+    kVGUCShareSurface = 11,
+    /* 5d, core 0.5.6: attaches the resource shared for an IOSurface to the caller's context. scalar in: IOSurface id;
+     * scalar out: resource id, size, VkFormat, width, height, usage, flags | tiling << 31. The caller's destroy of it
+     * only detaches it (the owner's stays). kIOReturnNotFound when nothing is shared for that surface. */
+    kVGUCImportSurface = 12,
     kVGUCMethodCount
 };
 

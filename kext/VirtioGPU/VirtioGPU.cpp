@@ -1091,6 +1091,71 @@ IOReturn VirtioGPU::markTwin(task_t task, uint32_t surface, uint32_t frame, bool
     return r;
 }
 
+IOReturn VirtioGPU::setShare(task_t task, uint32_t surface, uint32_t resource, uint64_t size, const uint32_t params[5]) {
+    if (!twinLock_ || !surface) {
+        return kIOReturnBadArgument;
+    }
+    IOLockLock(twinLock_);
+    if (!shares_) {
+        shares_ = static_cast<Share *>(IOMallocZero(kMaxShares * sizeof(Share)));
+        if (!shares_) {
+            IOLockUnlock(twinLock_);
+            return kIOReturnNoMemory;
+        }
+    }
+    if (resource) {
+        bool owned = false;
+        for (unsigned i = 0; i < kMaxClients && !owned; i++) {
+            owned = clients_[i] && clients_[i]->owns(task, resource);
+        }
+        if (!owned || !size) {
+            IOLockUnlock(twinLock_);
+            return kIOReturnNotPermitted;
+        }
+    }
+    unsigned slot = kMaxShares, free = kMaxShares;
+    for (unsigned i = 0; i < kMaxShares; i++) {
+        if (shares_[i].surface == surface) {
+            slot = i;
+        } else if (!shares_[i].surface && free == kMaxShares) {
+            free = i;
+        }
+    }
+    IOReturn r = kIOReturnSuccess;
+    if (!resource) {
+        if (slot < kMaxShares && shares_[slot].task == task) {
+            shares_[slot] = {};
+        }
+    } else {
+        if (slot == kMaxShares) {
+            slot = free;
+        }
+        if (slot == kMaxShares) {
+            r = kIOReturnNoSpace;
+        } else {
+            shares_[slot] = {surface, resource, size, {params[0], params[1], params[2], params[3], params[4]}, task};
+        }
+    }
+    IOLockUnlock(twinLock_);
+    return r;
+}
+
+bool VirtioGPU::shareFor(uint32_t surface, Share *out) {
+    if (!twinLock_ || !surface) {
+        return false;
+    }
+    bool found = false;
+    IOLockLock(twinLock_);
+    for (unsigned i = 0; shares_ && i < kMaxShares && !found; i++) {
+        if (shares_[i].surface == surface) {
+            *out = shares_[i];
+            found = true;
+        }
+    }
+    IOLockUnlock(twinLock_);
+    return found;
+}
+
 void VirtioGPU::forgetResource(uint32_t resource) {
     if (!twinLock_ || !resource) {
         return;
@@ -1099,6 +1164,11 @@ void VirtioGPU::forgetResource(uint32_t resource) {
     for (unsigned i = 0; i < kMaxTwins; i++) {
         if (twins_[i].resource == resource) {
             twins_[i] = {};
+        }
+    }
+    for (unsigned i = 0; shares_ && i < kMaxShares; i++) {
+        if (shares_[i].resource == resource) {
+            shares_[i] = {};
         }
     }
     IOLockUnlock(twinLock_);

@@ -39,7 +39,8 @@ bool VirtioGPUUserClient::owns(task_t task, uint32_t res) {
         return false;
     }
     IOLockLock(lock_);
-    bool yes = find(res) != nullptr;
+    Resource *r = find(res);
+    bool yes = r && !r->imported;
     IOLockUnlock(lock_);
     return yes;
 }
@@ -147,6 +148,18 @@ IOReturn VirtioGPUUserClient::externalMethod(uint32_t selector, IOExternalMethod
         }
         return r;
     }
+    case kVGUCShareSurface: {
+        if (args->scalarInputCount < 8) {
+            return kIOReturnBadArgument;
+        }
+        uint32_t params[5];
+        for (int i = 0; i < 5; i++) {
+            params[i] = (uint32_t)args->scalarInput[3 + i];
+        }
+        return core_->setShare(task_, (uint32_t)args->scalarInput[0], (uint32_t)args->scalarInput[1],
+                               args->scalarInput[2], params);
+    }
+    case kVGUCImportSurface: return importSurface(args);
     case kVGUCScanoutBlob:
         if (args->scalarInputCount < 5) {
             return kIOReturnBadArgument;
@@ -252,7 +265,7 @@ IOReturn VirtioGPUUserClient::createBlob(IOExternalMethodArguments *args) {
         attach.hdr.ctxID = ctx_;
         attach.resourceID = id;
         core_->transact(&attach, sizeof(attach), &reply, sizeof(reply));
-        resources_[resourceCount_++] = {id, req.size, false, 0, 0};
+        resources_[resourceCount_++] = {id, req.size, false, 0, 0, false};
         args->scalarOutput[0] = id;
     } else {
         LOG("CREATE_BLOB res %u ctx %u mem %u flags 0x%x size %llu id %llu -> 0x%x", id, ctx_, req.blobMem,
@@ -393,12 +406,59 @@ IOReturn VirtioGPUUserClient::destroyResource(uint32_t id) {
     detach.hdr.ctxID = ctx_;
     detach.resourceID = id;
     core_->transact(&detach, sizeof(detach), &reply, sizeof(reply));
-    vgpu::CmdResourceUnref unref = {};
-    unref.hdr.type = vgpu::kCmdResourceUnref;
-    unref.resourceID = id;
-    core_->transact(&unref, sizeof(unref), &reply, sizeof(reply));
+    if (!r->imported) {   // another process's: it stays theirs
+        vgpu::CmdResourceUnref unref = {};
+        unref.hdr.type = vgpu::kCmdResourceUnref;
+        unref.resourceID = id;
+        core_->transact(&unref, sizeof(unref), &reply, sizeof(reply));
+    }
     *r = resources_[--resourceCount_];
     IOLockUnlock(lock_);
+    return kIOReturnSuccess;
+}
+
+// 5d: another process's image memory behind an IOSurface (kVGUCShareSurface), attached to this context so its Venus
+// allocation can import it. Attaching the same resource again only reports it.
+IOReturn VirtioGPUUserClient::importSurface(IOExternalMethodArguments *args) {
+    if (args->scalarInputCount < 1 || args->scalarOutputCount < 7) {
+        return kIOReturnBadArgument;
+    }
+    VirtioGPU::Share s = {};
+    if (!core_->shareFor((uint32_t)args->scalarInput[0], &s) || !s.resource) {
+        return kIOReturnNotFound;
+    }
+    if (s.task == task_) {
+        return kIOReturnNotFound;   // our own: nothing to import
+    }
+    IOLockLock(lock_);
+    if (!ctx_) {
+        IOLockUnlock(lock_);
+        return kIOReturnNotReady;
+    }
+    if (!find(s.resource)) {
+        if (resourceCount_ == kMaxResources) {
+            IOLockUnlock(lock_);
+            return kIOReturnNoResources;
+        }
+        vgpu::CmdCtxResource attach = {};
+        attach.hdr.type = vgpu::kCmdCtxAttachResource;
+        attach.hdr.ctxID = ctx_;
+        attach.resourceID = s.resource;
+        vgpu::CtrlHdr reply = {};
+        uint32_t type = core_->transact(&attach, sizeof(attach), &reply, sizeof(reply));
+        if (type != vgpu::kRespOkNoData) {
+            IOLockUnlock(lock_);
+            LOG("IMPORT surface 0x%x res %u ctx %u -> 0x%x", s.surface, s.resource, ctx_, type);
+            return kIOReturnError;
+        }
+        resources_[resourceCount_++] = {s.resource, s.size, false, 0, 0, true};
+    }
+    IOLockUnlock(lock_);
+    args->scalarOutput[0] = s.resource;
+    args->scalarOutput[1] = s.size;
+    for (int i = 0; i < 5; i++) {
+        args->scalarOutput[2 + i] = s.params[i];
+    }
     return kIOReturnSuccess;
 }
 

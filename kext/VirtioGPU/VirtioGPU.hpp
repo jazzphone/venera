@@ -59,6 +59,15 @@ public:
         bool shown;                  // a display transaction asked for it (twinFor): a real display surface
     };
     IOReturn markTwin(task_t task, uint32_t surface, uint32_t frame, bool ready, bool *shown);
+    // 5d: IOSurface image memory shared between processes' Venus contexts (kVGUCShareSurface / kVGUCImportSurface).
+    struct Share {
+        uint32_t surface, resource;
+        uint64_t size;
+        uint32_t params[5];   // VkFormat, width, height, usage, flags | tiling << 31
+        task_t task;
+    };
+    IOReturn setShare(task_t task, uint32_t surface, uint32_t resource, uint64_t size, const uint32_t params[5]);
+    bool shareFor(uint32_t surface, Share *out);
     bool twinFor(uint32_t surface, Twin *out);
     // Hardware cursor (cursor queue): 64x64 BGRA image + hot spot; position of the hot spot.
     bool setCursor(const uint32_t *pixels, uint32_t hotX, uint32_t hotY);
@@ -161,6 +170,8 @@ private:
     IOLock *twinLock_ = nullptr;
     class VirtioGPUUserClient *clients_[kMaxClients] = {};
     Twin twins_[kMaxTwins] = {};
+    static constexpr unsigned kMaxShares = 512;
+    Share *shares_ = nullptr;   // kMaxShares, under twinLock_
     uint32_t blobFlips_ = 0;
     IOService *display_ = nullptr; // VirtioGPUDisplay nub
     // Stage 3: host-visible memory window (VIRTIO_PCI_CAP_SHARED_MEMORY_CFG) and capsets

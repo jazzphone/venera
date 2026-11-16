@@ -1330,6 +1330,7 @@ static void vg_surface_debug(VGMTLTexture *t) {
             vg_perf(VG_PERF_WB_COPY, t->_surfaceBpr * t->_height, vg_now() - t0);
             t->_syncedSeed = seed;   // our own write: no pull needed for it
             t->_neverSynced = NO;
+            vg_surface_wrote_back(t, seed);   // and none for a process sharing this image (5d)
             vg_surface_debug(t);
         }
     }

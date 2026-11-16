@@ -565,6 +565,9 @@ BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
     if (_twin.buffer) {
         vg_twin_forget(self);
     }
+    if (!_parent && _shareRes) {
+        vg_texture_share_dealloc(self);   // its image memory goes with it: no longer offered to other processes
+    }
     if (_surface) {
         CFRelease(_surface);
     }
@@ -724,6 +727,12 @@ BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
 }
 @end
 
+static BOOL vg_surface_tagged(VGMTLTexture *t, uint32_t seed);
+// External memory for the next vg_new_texture on this thread (5d sharing): 0 none, 1 exportable, 2 imported from fd.
+static __thread int gVgExt;
+static __thread int gVgImportFd = -1;
+static __thread const uint64_t *gVgImportParams;
+
 id<MTLTexture> vg_new_texture(id<MTLDevice> device, MTLTextureDescriptor *d) {
     const vg_format *f = vg_format_of(d.pixelFormat);
     if (vg_vulkan_init() || !f) {
@@ -794,6 +803,11 @@ id<MTLTexture> vg_new_texture(id<MTLDevice> device, MTLTextureDescriptor *d) {
     t->_usage = d.usage;
     t->_storage = d.storageMode;
     VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    VkExternalMemoryImageCreateInfo emi = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, NULL,
+                                           VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+    if (gVgExt) {   // shared with another process (5d, vg_new_surface_texture)
+        ici.pNext = &emi;
+    }
     ici.imageType = itype;
     ici.format = f->vk;
     ici.extent = (VkExtent3D){(uint32_t)t->_width, (uint32_t)t->_height, (uint32_t)t->_depth};
@@ -811,6 +825,17 @@ id<MTLTexture> vg_new_texture(id<MTLDevice> device, MTLTextureDescriptor *d) {
     }
     t->_imageUsage = usage;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (gVgExt == 2) {   // importing: the creator's image exactly, or not at all
+        const uint64_t *p = gVgImportParams;
+        uint32_t fl = (uint32_t)ici.flags | (ici.tiling == VK_IMAGE_TILING_LINEAR ? 0x80000000u : 0);
+        if (p[2] != (uint64_t)ici.format || p[3] != ici.extent.width || p[4] != ici.extent.height || p[5] != usage ||
+            p[6] != fl) {
+            vglog("share: surface image differs from its creator's (format %llu/%d, %llux%llu/%ux%u, usage 0x%llx/0x%x, "
+                  "flags 0x%llx/0x%x): not imported",
+                  p[2], ici.format, p[3], p[4], ici.extent.width, ici.extent.height, p[5], usage, p[6], fl);
+            return nil;
+        }
+    }
     vgtrace("texture: vkCreateImage %lux%lu format %d usage 0x%x", (unsigned long)t->_width, (unsigned long)t->_height, f->vk, usage);
     VkResult r = gVk.vkCreateImage(gVk.device, &ici, NULL, &t->_image);
     if (r != VK_SUCCESS) {
@@ -821,9 +846,30 @@ id<MTLTexture> vg_new_texture(id<MTLDevice> device, MTLTextureDescriptor *d) {
     gVk.vkGetImageMemoryRequirements(gVk.device, t->_image, &req);
     VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size,
                                 vg_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
+    VkMemoryDedicatedAllocateInfo ded = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, NULL, t->_image, VK_NULL_HANDLE};
+    VkExportMemoryAllocateInfo exp = {VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO, &ded,
+                                      VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+    VkImportMemoryFdInfoKHR imp = {VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, &ded,
+                                   VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, gVgImportFd};
+    if (gVgExt == 1) {
+        mai.pNext = &exp;
+    } else if (gVgExt == 2) {
+        if (gVgImportParams[1] < req.size) {
+            vglog("share: the creator's memory (%llu B) is smaller than this image needs (%llu B)", gVgImportParams[1],
+                  (unsigned long long)req.size);
+            gVk.vkDestroyImage(gVk.device, t->_image, NULL);
+            t->_image = VK_NULL_HANDLE;
+            return nil;
+        }
+        mai.allocationSize = gVgImportParams[1];
+        mai.pNext = &imp;
+    }
     vgtrace("texture: %llu bytes, memory type bits 0x%x -> type %u", (unsigned long long)req.size, req.memoryTypeBits,
             mai.memoryTypeIndex);
     r = gVk.vkAllocateMemory(gVk.device, &mai, NULL, &t->_memory);
+    if (gVgExt == 2) {
+        gVgImportFd = r == VK_SUCCESS ? -1 : gVgImportFd;   // Venus closed it; on failure the caller does
+    }
     if (r == VK_SUCCESS) {
         r = gVk.vkBindImageMemory(gVk.device, t->_image, t->_memory, 0);
     }
@@ -847,6 +893,15 @@ id<MTLTexture> vg_new_texture(id<MTLDevice> device, MTLTextureDescriptor *d) {
     VkImage image = t->_image;
     VkImageAspectFlags aspect = f->aspect;
     uint32_t mips = (uint32_t)t->_mips, layers = (uint32_t)t->_layers;
+    if (gVgExt == 2) {   // the creator's image is already in GENERAL, holding its pixels: no transition
+        return t;
+    }
+    if (gVgExt == 1) {
+        t->_shareParams[0] = ici.format, t->_shareParams[1] = ici.extent.width, t->_shareParams[2] = ici.extent.height;
+        t->_shareParams[3] = usage;
+        t->_shareParams[4] = (uint32_t)ici.flags | (ici.tiling == VK_IMAGE_TILING_LINEAR ? 0x80000000u : 0);
+        t->_shareSize = mai.allocationSize;
+    }
     vg_pending_init_image(image, aspect, mips, layers);   // UNDEFINED -> GENERAL for life, ahead of the next submit
     return t;
 }
@@ -1151,6 +1206,11 @@ void vg_surface_pull(VGMTLTexture *t) {
     if (!t->_neverSynced && seed == t->_syncedSeed) {
         return;
     }
+    if (!t->_neverSynced && vg_surface_tagged(t, seed)) {   // the other process's GPU frame, already in our image (5d)
+        t->_syncedSeed = seed;
+        vg_perf(VG_PERF_PULL_COPY, 0, 0);
+        return;
+    }
     const vg_format *f = vg_format_of(t->_pixelFormat);
     NSUInteger rows = t->_height;
     static int logged;
@@ -1223,6 +1283,106 @@ static void vg_root_keep(NSString *key, VGMTLTexture *root) {
     }
 }
 
+// ---- surfaces shared between processes (5d, core 0.5.6) ------------------------------------------------------------
+// One image per IOSurface for the whole system instead of one per process: the first process to wrap a surface makes
+// its image on exportable memory and registers it with the kext (kVGUCShareSurface); every other process imports that
+// memory (vn_macos_import_surface) and makes the same image over it. WindowServer then reads an app's frames where the
+// app drew them, without pulling the surface's CPU memory (a memcpy and an upload per frame, per window). The CPU
+// write-back stays, for CPU readers; it tags the surface with its seed and resource, and a process whose image is that
+// resource skips the pull the new seed would otherwise cause. VirtioGPUMetal-noshare turns it off.
+static NSString *const kVgSeedTag = @"VeneraSeed";
+static void vg_surface_tag(VGMTLTexture *t, uint32_t seed) {
+    if (!t->_shareRes) {
+        return;
+    }
+    uint64_t v = (uint64_t)t->_shareRes << 32 | seed;
+    CFNumberRef n = CFNumberCreate(NULL, kCFNumberSInt64Type, &v);
+    IOSurfaceSetValue(t->_surface, (__bridge CFStringRef)kVgSeedTag, n);
+    CFRelease(n);
+}
+void vg_surface_wrote_back(VGMTLTexture *t, uint32_t seed) { vg_surface_tag(t, seed); }
+// YES when the surface's current contents are a frame our shared image already holds.
+static BOOL vg_surface_tagged(VGMTLTexture *t, uint32_t seed) {
+    if (!t->_shareRes) {
+        return NO;
+    }
+    CFTypeRef v = IOSurfaceCopyValue(t->_surface, (__bridge CFStringRef)kVgSeedTag);
+    uint64_t tag = 0;
+    BOOL ok = v && CFGetTypeID(v) == CFNumberGetTypeID() && CFNumberGetValue(v, kCFNumberSInt64Type, &tag);
+    if (v) {
+        CFRelease(v);
+    }
+    return ok && (uint32_t)(tag >> 32) == t->_shareRes && (uint32_t)tag == seed;
+}
+static BOOL vg_share_register(VGMTLTexture *t, uint32_t surface) {
+    uint32_t res = vg_memory_res_id(t->_memory);
+    io_connect_t c = vg_twin_conn();
+    if (!res || !c) {
+        return NO;
+    }
+    uint64_t in[8] = {surface, res, t->_shareSize, t->_shareParams[0], t->_shareParams[1], t->_shareParams[2],
+                      t->_shareParams[3], t->_shareParams[4]};
+    kern_return_t kr = IOConnectCallScalarMethod(c, 11 /* kVGUCShareSurface */, in, 8, NULL, NULL);
+    if (kr == kIOReturnUnsupported) {
+        static int said;
+        if (!said++) {
+            vglog("share: the kext can't share surfaces (core before 0.5.6)");
+        }
+        gVgSharing = NO;
+    }
+    if (kr != KERN_SUCCESS) {
+        return NO;
+    }
+    t->_shareRes = res;
+    return YES;
+}
+static void vg_share_forget(VGMTLTexture *t) {
+    if (t->_shareRes && !t->_shareImported && t->_surface) {
+        uint64_t in[8] = {IOSurfaceGetID(t->_surface), 0, 0, 0, 0, 0, 0, 0};
+        IOConnectCallScalarMethod(vg_twin_conn(), 11, in, 8, NULL, NULL);
+    }
+}
+void vg_texture_share_dealloc(VGMTLTexture *t) { vg_share_forget(t); }
+// The root image of a surface wrapper: imported, else made shareable and registered, else private.
+static VGMTLTexture *vg_surface_root_image(id<MTLDevice> device, MTLTextureDescriptor *rd, IOSurfaceRef surface,
+                                           NSUInteger plane) {
+    VGMTLTexture *t = nil;
+    uint32_t sid = IOSurfaceGetID(surface);
+    BOOL eligible = gVgSharing && plane == 0 && rd.sampleCount <= 1 && rd.width >= 16 && rd.height >= 16;
+    if (eligible) {
+        uint64_t out[7] = {0};
+        int fd = vg_import_surface(sid, out);
+        if (fd >= 0) {
+            gVgExt = 2, gVgImportFd = fd, gVgImportParams = out;
+            t = (VGMTLTexture *)vg_new_texture(device, rd);
+            if (gVgImportFd >= 0) {
+                close(gVgImportFd);   // not taken by Venus
+            }
+            gVgExt = 0, gVgImportFd = -1, gVgImportParams = NULL;
+            if (t) {
+                t->_shareRes = (uint32_t)out[0];
+                t->_shareImported = YES;
+                static int said;
+                if (said++ < 8) {
+                    vglog("share: surface %u imported (resource %u, %lux%lu)", sid, t->_shareRes,
+                          (unsigned long)t->_width, (unsigned long)t->_height);
+                }
+                return t;
+            }
+        }
+        gVgExt = 1;
+        t = (VGMTLTexture *)vg_new_texture(device, rd);
+        gVgExt = 0;
+        if (t && !vg_share_register(t, sid)) {
+            // a private image after all: fine, the pulls stay
+        }
+        if (t) {
+            return t;
+        }
+    }
+    return (VGMTLTexture *)vg_new_texture(device, rd);
+}
+
 id<MTLTexture> vg_new_surface_texture(id<MTLDevice> device, MTLTextureDescriptor *d, IOSurfaceRef surface, NSUInteger plane) {
     const vg_format *f = vg_format_of(d.pixelFormat);
     if (!surface || !f || (f->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT) || d.textureType != MTLTextureType2D ||
@@ -1265,7 +1425,7 @@ id<MTLTexture> vg_new_surface_texture(id<MTLDevice> device, MTLTextureDescriptor
     // The first wrapper: its image can be anything a later wrapper needs (render target, storage, other formats).
     MTLTextureDescriptor *rd = [d copy];
     rd.usage = d.usage | MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
-    VGMTLTexture *t = (VGMTLTexture *)vg_new_texture(device, rd);
+    VGMTLTexture *t = vg_surface_root_image(device, rd, surface, plane);
     if (!t) {   // its write-back staging comes from the pool when a command buffer first writes it (5c round 6)
         pthread_mutex_unlock(&rootsLock);
         return nil;
@@ -1278,6 +1438,10 @@ id<MTLTexture> vg_new_surface_texture(id<MTLDevice> device, MTLTextureDescriptor
     t->_plane = plane;
     t->_surfaceBpr = bpr;
     t->_neverSynced = YES;
+    if (t->_shareImported && vg_surface_tagged(t, IOSurfaceGetSeed(surface))) {
+        t->_neverSynced = NO;   // the creator's image holds what the surface does: nothing to pull
+        t->_syncedSeed = IOSurfaceGetSeed(surface);
+    }
     vg_surface_pull(t);
     vglog("surface texture: IOSurface %u plane %lu, %lux%lu, %zu bytes per row", IOSurfaceGetID(surface),
           (unsigned long)plane, (unsigned long)d.width, (unsigned long)d.height, bpr);

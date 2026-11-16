@@ -68,10 +68,20 @@ id<MTLBuffer> vg_new_buffer_nocopy(id<MTLDevice> device, void *pointer, NSUInteg
     BOOL _twinRefused;   // the kext said no (not the screen's size): no twin, the CPU write-back stays
     uint32_t _hotWrites;   // display command buffers in a row that wrote it, each within 100 ms of the last (5c round 6)
     uint64_t _hotLast;
+    // Shared with another process (5d, core 0.5.6): the image's memory is one blob resource both processes' contexts
+    // have, registered with the kext by its creator and imported by the other. Each process's write-back tags the
+    // surface (vg_surface_tag) so the other skips the pull of a frame its image already holds.
+    uint32_t _shareRes;
+    BOOL _shareImported;
+    uint32_t _shareParams[5];   // the creator's: VkFormat, width, height, usage, flags | tiling << 31
+    uint64_t _shareSize;
 }
 @property(readonly) id<MTLDevice> device;
 @property(copy, atomic) NSString *label;
 @end
+// Surface sharing (5d, VGMTLTexture.m): a write-back's new seed, tagged for the other process; a shared root's end.
+void vg_surface_wrote_back(VGMTLTexture *t, uint32_t seed);
+void vg_texture_share_dealloc(VGMTLTexture *t);
 
 // The surface's CPU contents -> the image, when the surface changed since the image last matched it (synchronous).
 void vg_surface_pull(VGMTLTexture *t);

@@ -36,6 +36,7 @@ private:
         bool mapped;
         uint64_t offset;
         uint32_t mapInfo;
+        bool imported;   // another process's (kVGUCImportSurface): destroying it only detaches it
     };
     static constexpr unsigned kMaxResources = 4096;
     static constexpr unsigned kMaxRings = 64;
@@ -46,6 +47,7 @@ private:
     IOReturn createBlob(IOExternalMethodArguments *args);
     IOReturn mapBlob(IOExternalMethodArguments *args);
     IOReturn destroyResource(uint32_t id);
+    IOReturn importSurface(IOExternalMethodArguments *args);
     IOReturn submit(IOExternalMethodArguments *args);
     IOReturn waitFence(IOExternalMethodArguments *args);
     Resource *find(uint32_t id);
