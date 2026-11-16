@@ -422,10 +422,11 @@ static const int kPendingMax = 8;
 static PendingFlip gPending[kPendingMax];   // oldest first
 static int gPendingCount = 0;
 static SInt64 gFlipNs = 0, gFlipMaxNs = 0, gFlips = 0, gFlipsSkipped = 0, gFlipsUnready = 0;
-// The shortest time between two flips, in ms (0 = no limit). 16 by default: evenly paced flips (at most ~60 a
-// second, the newest frame each time) judder less on VM 108's console than flips as they come (the tester, 2026-11-15).
-// Boot-arg vgpuflipms, or {"VirtioGPUFlipMs": n} at run time (root, `acceltest flipms N`).
-static volatile uint32_t gFlipMinMs = 16;
+// The shortest time between two flips, in ms (0 = no limit). 12 by default (5c round 6): with the newest ready frame
+// flipped, 16 dropped a quarter of WindowServer's ~56 frames a second during a drag (flips 22 ms apart on average);
+// 12 follows it (18.5 ms) and still never flips twice inside one 60 Hz frame's jitter. QEMU's VNC server sends at
+// most one update per 30 ms anyway. Boot-arg vgpuflipms, or {"VirtioGPUFlipMs": n} at run time (`acceltest flipms N`).
+static volatile uint32_t gFlipMinMs = 12;
 static uint64_t gLastFlipAbs = 0;
 
 // Pacing (5c round 3): how evenly frames come from WindowServer and go to the screen. Gaps between marks in ms,
@@ -433,17 +434,25 @@ static uint64_t gLastFlipAbs = 0;
 // {"VirtioGPUPaceReset": true} (root, `acceltest pacereset`) starts over.
 struct Pace {
     uint64_t last;
-    uint32_t bins[8];
+    uint32_t bins[10];
+    uint64_t sumUs, n;   // gaps under the idle edge: their mean (5c round 6)
 };
-static const uint32_t kGapEdges[7] = {10, 17, 25, 34, 50, 100, 200};   // ms; bin 7 = idle, not shown
-static const uint32_t kDurEdges[7] = {2, 4, 8, 12, 16, 24, 32};        // ms; bin 7 = over 32
+enum { kEdges = 9 };
+// ms; the last bin (over the last edge) is idle for gaps and not shown; for durations it is "more". Finer around a
+// 60 Hz frame (16.7 ms) since round 6.
+static const uint32_t kGapEdges[kEdges] = {12, 15, 18, 21, 25, 34, 50, 100, 200};
+static const uint32_t kDurEdges[kEdges] = {1, 2, 3, 4, 6, 8, 12, 16, 32};
 static Pace gPaceTxn, gPaceFlip, gFlipDur;
 static void paceBin(Pace *p, uint64_t ns, const uint32_t *edges) {
     uint32_t ms = (uint32_t)(ns / 1000000ULL), b = 0;
-    while (b < 7 && ms >= edges[b]) {
+    while (b < kEdges && ms >= edges[b]) {
         b++;
     }
     p->bins[b]++;
+    if (b < kEdges) {
+        p->sumUs += ns / 1000;
+        p->n++;
+    }
 }
 static void paceMark(Pace *p, uint64_t abs) {
     if (p->last) {
@@ -455,12 +464,15 @@ static void paceMark(Pace *p, uint64_t abs) {
 }
 static int paceLine(char *out, size_t n, const char *name, const Pace *p, const uint32_t *edges, bool lastBin) {
     int k = snprintf(out, n, "%s:", name);
-    for (int b = 0; b < (lastBin ? 8 : 7) && k < (int)n; b++) {
-        if (b < 7) {
+    for (int b = 0; b < (lastBin ? kEdges + 1 : kEdges) && k < (int)n; b++) {
+        if (b < kEdges) {
             k += snprintf(out + k, n - k, " <%u:%u", edges[b], p->bins[b]);
         } else {
             k += snprintf(out + k, n - k, " more:%u", p->bins[b]);
         }
+    }
+    if (p->n && k < (int)n) {
+        k += snprintf(out + k, n - k, " mean %llu.%llu", p->sumUs / p->n / 1000, p->sumUs / p->n % 1000 / 100);
     }
     return k;
 }
@@ -1062,7 +1074,7 @@ static void iopPublishCounts() {
              (long long)gFlips, gFlips ? (long long)(gFlipNs / gFlips / 1000) : 0LL, (long long)(gFlipMaxNs / 1000),
              (long long)gFlipsSkipped, (long long)gFlipsUnready);
     gAccel->setProperty("VirtioGPUBlobFlips", line);
-    char pace[400];
+    char pace[600];
     int k = paceLine(pace, sizeof(pace), "frame gaps ms", &gPaceTxn, kGapEdges, false);
     k += snprintf(pace + k, sizeof(pace) - k, " | ");
     k += paceLine(pace + k, sizeof(pace) - k, "flip gaps", &gPaceFlip, kGapEdges, false);
@@ -1593,6 +1605,7 @@ IOReturn VirtioGPUAccel::setProperties(OSObject *properties) {
             bzero(&gPaceTxn, sizeof(gPaceTxn));
             bzero(&gPaceFlip, sizeof(gPaceFlip));
             bzero(&gFlipDur, sizeof(gFlipDur));
+            gFlipsSkipped = gFlipsUnready = 0;   // per measurement too (5c round 6)
         }
         iopPublishCounts();   // the property shows this at once (it is otherwise renewed every 60 frames)
         return kIOReturnSuccess;

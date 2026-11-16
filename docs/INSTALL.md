@@ -118,12 +118,17 @@ Files in `/Library/GPUBundles` the Metal driver reads (root only; delete them to
   higher is smoother under load). Read again once a second.
 - `VirtioGPUMetal-gputime`: log GPU timings every 5 s (costs a little).
 
-The accelerator paces flips at least 16 ms apart by default (`vgpuflipms=N` boot-arg).
+The accelerator flips at most once per 12 ms by default (`vgpuflipms=N` boot-arg, 0 = no limit).
 
 ## Known limits
 
-- One display, the modes the host offers (1280x800 by default on Proxmox); no HDR, no multiple displays yet.
+- One display, in the modes the host offers (1024x768 to 1920x1080 on Proxmox; switching works with the Metal
+  desktop running); no HDR, no multiple displays yet.
+- **Proxmox's noVNC console shows at most ~33 fps**: QEMU's VNC server sends an update at most every 30 ms
+  (`VNC_REFRESH_INTERVAL_BASE`), however fast the guest draws. The guest runs 50-60 fps; to see that, view the VM
+  through a display that isn't VNC (QEMU's `gtk,gl=on` or `sdl,gl=on` on the host, or local SPICE with `gl=on`) or
+  stream it from inside the guest.
 - Apps get Metal only when allow-listed (the desktop itself always does); app Metal is the next stage.
-- Frame pacing is 40-60 fps for window drags, scrolling, resizing and minimizing on the tested host; the host's
-  display path (egl-headless + VNC readback) costs ~4 ms a frame on top of the GPU work.
+- WindowServer draws window drags, scrolling, resizing and minimizing at 45-60 fps on the tested host (mean frame
+  gap 17-20 ms); each flip costs QEMU ~2-4 ms (egl-headless reads the frame back for VNC).
 - `screencapture` from a shell needs Screen Recording permission for the app that runs it (Terminal), as usual.
