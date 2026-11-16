@@ -195,13 +195,6 @@ static BOOL vg_process_allowed(mach_port_t port) {
     if (!strcmp(me, "loginwindow") || !strcmp(me, "SecurityAgent")) {
         return NO;
     }
-    // Not yet by default: Spotlight. Its result icons (Calendar's, Shortcuts') are RenderBox composites whose image draws
-    // read an icon atlas and come out empty on this driver; the software renderer draws them. The Dock's helper, which
-    // draws the Calendar icon's date the same way, works since visible functions, render-target barriers and constexpr
-    // samplers did (5d) and is on by default; "Spotlight" in the allow list puts Spotlight on the driver too.
-    if (!strcmp(me, "Spotlight")) {
-        return NO;
-    }
     NSString *bp = [[NSBundle mainBundle] bundlePath];
     return [bp hasSuffix:@".app"] || [bp containsString:@".app/"];
 }

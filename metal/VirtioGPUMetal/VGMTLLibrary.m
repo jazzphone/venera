@@ -4,6 +4,7 @@
 // the !air.kernel / !air.vertex / !air.fragment metadata.
 #import "vg.h"
 #import <dlfcn.h>
+#import "vg_opaque_ir.h"
 #import <objc/message.h>
 #import <objc/runtime.h>
 
@@ -62,13 +63,29 @@ static NSString *vg_opaque_constant_access(NSString *ll) {
                                    withTemplate:@", ptr addrspace(2) @"];
 }
 static NSString *vg_air_to_text_typed(NSData *air);
+// The whole module with opaque pointers (vg_opaque_ir.h), unless VirtioGPUMetal-typedir asks for the typed text as
+// printed (then only constant-space accesses are respelled, the narrower first fix; VirtioGPUMetal-typedconst drops
+// that too).
 NSString *vg_air_to_text(NSData *air) {
     NSString *t = vg_air_to_text_typed(air);
-    static int on = -1;
-    if (on < 0) {
-        on = access("/Library/GPUBundles/VirtioGPUMetal-typedconst", F_OK) != 0;   // the flag file turns it off
+    static int mode = -1;
+    if (mode < 0) {
+        mode = access("/Library/GPUBundles/VirtioGPUMetal-typedir", F_OK) != 0                  ? 2
+               : access("/Library/GPUBundles/VirtioGPUMetal-typedconst", F_OK) != 0 ? 1
+                                                                                    : 0;
     }
-    return on && t ? vg_opaque_constant_access(t) : t;
+    if (!t || !mode) {
+        return t;
+    }
+    if (mode == 1) {
+        return vg_opaque_constant_access(t);
+    }
+    char *o = vg_opaque_ir(t.UTF8String);
+    if (!o) {
+        return t;
+    }
+    NSString *r = [[NSString alloc] initWithBytesNoCopy:o length:strlen(o) encoding:NSUTF8StringEncoding freeWhenDone:YES];
+    return r ?: t;
 }
 static NSString *vg_air_to_text_typed(NSData *air) {
     if (!vg_llvm_ready()) {
@@ -307,8 +324,47 @@ static void vg_disk_put(NSString *key, NSData *data) {
 static NSData *vg_translate_uncached(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc,
                                      const uint32_t *tgLengths, uint32_t tgCount, NSString **error);
 
+// IEEE infinities and NaNs kept (5d): the translator carries the AIR's fast-math flags over as FPFastMathMode NotNaN|NotInf
+// on each float instruction. Apple's GPUs compute infinities and NaNs either way, and shaders count on it -- RenderBox's
+// path coverage divides by a segment's dx, an infinite slope on every vertical edge -- while the host's compiler takes
+// the promise and optimizes them away: the coverage came out zero, and with it the Dock's icon shadow and Spotlight's
+// icons. The two bits are cleared; contraction, reciprocals and signed zeros stay relaxed. VirtioGPUMetal-fastinf keeps
+// the flags as translated.
+static NSData *vg_spirv_ieee(NSData *spv) {
+    static int keep = -1;
+    if (keep < 0) {
+        keep = access("/Library/GPUBundles/VirtioGPUMetal-fastinf", F_OK) == 0;
+    }
+    if (keep || spv.length < 20) {
+        return spv;
+    }
+    NSMutableData *m = nil;
+    const uint32_t *w = spv.bytes;
+    size_t n = spv.length / 4;
+    for (size_t i = 5; i < n;) {
+        uint32_t wc = w[i] >> 16, op = w[i] & 0xffff;
+        if (!wc || i + wc > n) {
+            break;
+        }
+        if (op == 71 /* OpDecorate */ && wc >= 4 && w[i + 2] == 40 /* FPFastMathMode */ && (w[i + 3] & 3)) {
+            if (!m) {
+                m = [spv mutableCopy];
+            }
+            ((uint32_t *)m.mutableBytes)[i + 3] &= ~3u;   // NotNaN | NotInf
+        }
+        i += wc;
+    }
+    return m ?: spv;
+}
+static NSData *vg_translate_flagged(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc,
+                                    const uint32_t *tgLengths, uint32_t tgCount, NSString **error);
 NSData *vg_translate(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc, const uint32_t *tgLengths,
                      uint32_t tgCount, NSString **error) {
+    NSData *spv = vg_translate_flagged(ll, stage, fc, tgLengths, tgCount, error);
+    return spv ? vg_spirv_ieee(spv) : nil;
+}
+static NSData *vg_translate_flagged(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc,
+                                    const uint32_t *tgLengths, uint32_t tgCount, NSString **error) {
     static NSMutableDictionary<NSString *, NSData *> *cache;
     static dispatch_once_t once;
     dispatch_once(&once, ^{ cache = [NSMutableDictionary dictionary]; });

@@ -338,6 +338,15 @@ VkDescriptorSet vg_write_set(VGMTLCommandBuffer *cmd, VkDescriptorSetLayout dsl,
                 binfo[i] = (VkDescriptorBufferInfo){vg_dummy_buffer(), 0, VK_WHOLE_SIZE};
             } else {
                 binfo[i] = (VkDescriptorBufferInfo){t->buf[b], t->off[b], range};
+                VkDeviceSize al = type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ? gVk.props.limits.minUniformBufferOffsetAlignment
+                                                                            : gVk.props.limits.minStorageBufferOffsetAlignment;
+                static int said;
+                if (al && t->off[b] % al && said < 20) {
+                    said++;
+                    vglog("%s: buffer(%u) at offset %llu, not a multiple of the device's %llu (%s)", who.UTF8String, b,
+                          (unsigned long long)t->off[b], (unsigned long long)al,
+                          type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ? "uniform" : "storage");
+                }
             }
             writes[i].pBufferInfo = &binfo[i];
             continue;
