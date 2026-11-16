@@ -1227,3 +1227,28 @@ priorities, namespaced functions, MSAA textures); (2) Core Image (reflection + s
   command-buffer encode call (lenient mode answers them).
 - The owner's direction (2026-11-16): every app through the driver, installed in `/System/Library/Extensions`, with a
   helper that notices a macOS update removed or changed the copy, asks before reinstalling, and says why when it can't.
+
+### Round 8, part 3: every app on the driver
+
+Measured on VM 108 (snapshots `pre-authroot`, `pre-watcher`, `pre-gl`), each fix with a test:
+
+- **Safari**: events signaled at completion (the dim, half-drawn canvas), fences, mipmaps, the staging pool evicting
+  its oldest (14 -> 56-59 fps), the translation cache writing without fsync (Safari's GPU process may not; each launch
+  re-translated), one-module function constants kept opt-in (`VirtioGPUMetal-fcspec` = 1: WebKit drew wrong with it).
+- **Core Image** (Preview, QuickTime): libraries without entry points (ci_stdlib), dynamic libraries and extern
+  linking, externFunctionNames; `tools/citest` 7 of 7 against the CPU renderer. Core Image's stitchable kernels
+  (`clampToEdges`, `fishEye`...) aren't functions of ours yet: it falls back to compiling source, slower the first time.
+- **Maps**: quoted (namespaced) entry names, default libraries, several viewports/scissors.
+- **Multisampling** and **stencil** (`tools/mtlsource`: 4x resolve, a stencil mask), binary archives of our own
+  (SwiftUI's RenderBox crashed in Apple's), priorities, viewports.
+- **The default**: every app (`.app` bundles) and WebKit's GPU process get the device; daemons don't; never
+  loginwindow or SecurityAgent. 22 system apps swept: no crashes; gestures unchanged (drag 19.7, resize 22.2, scroll
+  18.3, minimize 23.0 ms mean frame gap); 9 Venus contexts on the host, ~520 MB.
+- **Packaging**: kept copy in `/Library/GPUBundles/Venera` (WindowServer's sandbox refuses `/Library/Application
+  Support`: a first try left no desktop after a simulated update), system-volume copy, the watcher
+  (`local.venera.watch`) tested through a simulated update: kept copy at boot, dialog, reinstall, restart, system copy.
+- **OpenGL** (`vgpugl=1`, off): the renderer loads and its shaders translate, Chess's window stays white. Next:
+  what the renderer reads from reflection (bindings), as NullMoth's NVMTLGLBinding classes answer.
+- Safari's test page uses WindowServer ~150% and its GPU process ~120% of a guest core at 59 fps: app surfaces cross
+  processes through CPU memory (write-back, then upload). Sharing them on the host GPU (blob resources across Venus
+  contexts) is the big remaining performance lever for apps.
