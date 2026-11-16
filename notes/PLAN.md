@@ -1046,3 +1046,58 @@ narrower barriers save nothing. Sampling the attachment in place (VK_EXT_attachm
 the copies, but **the frame rate doesn't move even with no fetch work at all**: GPU time doesn't limit it here, so
 that rewrite is not worth its risk now. What limits the benchmark is the presentation chain (16 ms flip pacing, two
 frames in flight, QEMU's ~3-4 ms per flip), not the guest GPU or Venus.
+
+## Stage 5c, round 6 (2026-11-15, overnight): 40-60 fps for every gesture; screenshots; Venera 0.1.0
+
+Measured with injected input (`tools/qmpinput.py` through VM 108's own QMP socket: a window drag in circles, a live
+resize from the corner; `tools/dragtest` animates scrolling and minimizing itself), the kext's pacing histograms
+and the plugin's counters (`tools/gesture-bench.sh`, `tools/drag-perf.sh GESTURE`), WindowServer sampled during each
+(`tools/gesture-sample.sh`, `tools/sample-top.py`). Most frame gaps, before -> after:
+
+| gesture | start of the round | end of the round |
+|---|---|---|
+| drag | 25-50 ms | 10-25 ms |
+| live resize | 50-200 ms | 17-34 ms |
+| scroll | 34-100 ms | 10-25 ms |
+| minimize | 50-100 ms | 17-25 ms |
+
+(WindowServer paces to the 60 Hz VBL, so 16.7 ms is the floor; flips land 17-25 ms apart.)
+
+1. **The present throttle counted the wrong thing.** WindowServer calls `commitAndWaitUntilSubmitted` ~3 times per
+   display frame (its composite flush, then CoreDisplay's), so "depth 1" made each call wait ~10 ms for the call
+   before it: ~30 ms a frame, WindowServer's main thread mostly in `_dispatch_group_wait_slow`. The depth now counts
+   command buffers (default 6; 1/2/4/6/8 measured: 4-8 alike, 6 the best resize and scroll), waits for the fence only
+   (`_fenced`, not the handlers), and `/Library/GPUBundles/VirtioGPUMetal-depth` is read again once a second.
+2. **The flip loop starved** (accelerator 0.6.8): it waited for the *newest* frame to be ready, and while frames kept
+   coming the newest never was (flips 25-200 ms apart while WindowServer made one every ~16 ms). It now keeps the last
+   8 requested frames and flips the newest one that is ready.
+3. **Buffers from the pool**: while an app scrolled, ~35 % of WindowServer's thread was creating and mapping
+   host-visible buffers (`vn_MapMemory`) for Core Animation's per-frame buffers and new surface textures. Buffers and
+   surface write-back staging now come from the staging pool (160 buffers / 256 MB; small sizes in powers of two from
+   4 KB; staging taken only when a command buffer first writes the surface; pooled memory zeroed for new buffers).
+4. **Screenshots were blank** (core 0.5.5): Cmd-Shift-3 renders the screen into new screen-sized surfaces in display
+   command buffers; they got twins, and twins skipped the CPU write-back. The core's twin table now marks a surface
+   shown when a display transaction asks for it, `kVGUCTwinMark` returns that, and only shown surfaces skip the
+   write-back. Others (screenshots, and one GPU-only intermediate per frame) keep it, before the completion handlers
+   as Metal requires, without `commitAndWaitUntilSubmitted` waiting for it. `screencapture` from the guest agent is
+   refused by TCC (no Screen Recording permission for mac-guest-agent), not by the driver.
+5. Checked: display sleep and wake (`pmset displaysleepnow`, a click), the Dock's minimize preview, no crash reports,
+   2-4 "flipped unready" per boot (startup only).
+
+Still open: the GPU work per frame (~2.5 ms per command buffer, ~27 % of it framebuffer-fetch copies) and commit ->
+GPU start latency (~10 ms, the frame's own earlier command buffers queued ahead of it); a live resize is also paced
+by the app's own layout. Next would be sampling the attachment in place (`VK_EXT_attachment_feedback_loop_layout`,
+needs render-pass objects) and app Metal (the allow-list).
+
+**Packaging: Venera 0.1.0** (`packaging/`, `docs/INSTALL.md`). `packaging/make-dist.sh` builds
+`dist/Venera-VERSION.tar.gz`; in the guest `sudo ./install.sh [--set-security]` checks the guest (macOS 26 x86_64, the
+virtio-gpu device, SIP 0x203, `amfi_get_out_of_my_way=1`), finds OpenCore's EFI partition, backs up `config.plist`,
+adds/enables the `VirtioGPU.kext` entry and `vgpuaccel=4`, installs the Auxiliary KC kexts (kmutil, checked) and the
+Metal bundle; `uninstall.sh` removes all of it; `status.sh` shows what runs. Tested on VM 108: uninstall + reboot
+(firmware framebuffer, no driver), install + reboot (Metal desktop). Host requirements and recovery: INSTALL.md.
+
+**GitHub**: https://github.com/jazzphone/venera (private). Before the push the history was rewritten to drop the
+host's addresses, name and SSH key name and first names (the original history is the local branch
+`private-history-2026-11-15`; commit ids in this file before this section are from it). The host now comes from
+`tools/local.env` (ignored). License: PolyForm Noncommercial 1.0.0 (the accelerator is built with NullMoth's
+noncommercial headers); `NOTICE.md`. No release is published.
