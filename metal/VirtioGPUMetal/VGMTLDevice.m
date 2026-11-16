@@ -286,9 +286,20 @@ static id vg_refuse_before_init(id obj) {
         *error = nil;   // a warning from Apple's compiler isn't a failure of ours
     }
     id<MTLLibrary> mine = vg_new_library(self, container, error);
+    vg_library_set_dylibs(mine, options.libraries);   // its externs link against these (5d: Core Image)
     vglog("newLibraryWithSource: %lu chars -> %lu B container in %.1f ms -> %s", (unsigned long)source.length,
           (unsigned long)container.length, (vg_now() - t0) / 1e6, mine ? "ours" : "FAILED");
     return mine;
+}
+// Dynamic libraries (5d: Core Image's ci_stdlib).
+- (BOOL)supportsDynamicLibraries { return YES; }
+- (BOOL)supportsRenderDynamicLibraries { return YES; }
+- (id<MTLDynamicLibrary>)newDynamicLibrary:(id<MTLLibrary>)library error:(NSError **)error {
+    return vg_new_dynamic_library(library, error);
+}
+- (id<MTLDynamicLibrary>)newDynamicLibraryWithURL:(NSURL *)url error:(NSError **)error {
+    id<MTLLibrary> l = [self newLibraryWithURL:url error:error];
+    return l ? vg_new_dynamic_library(l, error) : nil;
 }
 - (void)newLibraryWithSource:(NSString *)source
                      options:(MTLCompileOptions *)options

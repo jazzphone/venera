@@ -116,6 +116,18 @@ void vg_pending_forget(VkImage image);   // an image going away: drop what waits
 BOOL vg_pending_record(VkCommandBuffer cb, NSMutableData **owned);
 void vg_pending_release(NSMutableData *owned);
 
+@class VGMTLLibrary;
+// A dynamic library (5d): one of our libraries other functions link against (Core Image's ci_stdlib).
+@interface VGMTLDynamicLibrary : NSObject <MTLDynamicLibrary> {
+@public
+    VGMTLLibrary *_lib;
+    NSString *_installName;
+}
+@property(copy, atomic) NSString *label;
+@end
+id<MTLDynamicLibrary> vg_new_dynamic_library(id<MTLLibrary> lib, NSError **error);
+void vg_library_set_dylibs(id<MTLLibrary> lib, NSArray *dylibs);
+
 // The translator (NV's metal2vulkan wrapper, Contents/Resources/libnvmtl_translate.dylib) and Apple's LLVM.
 NSString *vg_air_to_text(NSData *air);   // AIR bitcode -> LLVM IR text, nil on failure
 // fc: function-constant values (index -> bytes) the module is specialized with first; nil or empty for none.

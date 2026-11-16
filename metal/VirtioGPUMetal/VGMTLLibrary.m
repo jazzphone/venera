@@ -478,8 +478,13 @@ static NSDictionary *vg_reflect_uncached(NSString *ll, const char *stage, NSDict
 
 // ---- MTLLibrary / MTLFunction ----------------------------------------------------------------------------------
 
+@class VGMTLLibrary;
+static NSString *vg_linked_ll(VGMTLLibrary *lib, NSString *ll, NSString *name);
+static NSSet<NSString *> *vg_undefined_externs(NSArray<NSString *> *modules);
 @interface VGMTLFunction : NSObject <MTLFunction> {
 @public
+    __weak VGMTLLibrary *_lib;   // for its compile-time dynamic libraries (5d)
+    NSString *_linked;           // _ll with its externs linked in from them, made on first use
     NSString *_ll;      // LLVM IR text of this entry's module
     NSString *_stage;   // "kernel" | "vertex" | "fragment"
     NSDictionary<NSNumber *, NSData *> *_fc;   // function-constant values (newFunctionWithName:constantValues:)
@@ -508,12 +513,20 @@ static NSDictionary *vg_reflect_uncached(NSString *ll, const char *stage, NSDict
 - (NSDictionary<NSString *, MTLFunctionConstant *> *)functionConstantsDictionary { return @{}; }
 - (MTLFunctionOptions)options { return MTLFunctionOptionNone; }
 - (NSString *)description { return [NSString stringWithFormat:@"<VGMTLFunction %@ (%@)>", _name, _stage]; }
-- (NSString *)vgLL { return _ll; }
+- (NSString *)vgLL {
+    @synchronized(self) {
+        if (!_linked) {
+            _linked = vg_linked_ll(_lib, _ll, _name) ?: _ll;
+        }
+        return _linked;
+    }
+}
 - (NSString *)vgStage { return _stage; }
 - (NSDictionary<NSNumber *, NSData *> *)vgFC { return _fc; }
 - (VGMTLFunction *)specializedWith:(NSDictionary<NSNumber *, NSData *> *)fc {
     VGMTLFunction *f = [[VGMTLFunction alloc] initWithDevice:_device name:_name stage:_stage ll:_ll];
     f->_fc = [fc copy];
+    f->_lib = _lib;
     return f;
 }
 @end
@@ -540,7 +553,11 @@ static NSError *vg_lib_error(NSString *what) {
 }
 
 @interface VGMTLLibrary : NSObject <MTLLibrary> {
+@public
     NSDictionary<NSString *, VGMTLFunction *> *_functions;
+    NSArray<NSString *> *_modules;   // every module's IR text, entry points or not (a dynamic library's exports)
+    NSArray *_dylibs;                // VGMTLDynamicLibrary given when this library was compiled (5d)
+    NSData *_raw;                    // the metallib
 }
 @property(readonly) id<MTLDevice> device;
 @property(copy, atomic) NSString *label;
@@ -585,14 +602,37 @@ static BOOL vg_entry_of(NSString *ll, NSString **name, NSString **stage) {
     if ((self = [super init])) {
         _device = device;
         _functions = [functions copy];
+        for (VGMTLFunction *f in _functions.allValues) {
+            f->_lib = self;
+        }
     }
     return self;
 }
 - (NSArray<NSString *> *)functionNames { return _functions.allKeys; }
+// What the library calls and doesn't define, linked from dynamic libraries (Core Image asks).
+- (NSArray<NSString *> *)externFunctionNames { return vg_undefined_externs(_modules ?: @[]).allObjects; }
+// A name in a namespace ("Clear::clear_vertex", Maps) is the entry's C++ symbol: _ZN5Clear12clear_vertexE...
+static VGMTLFunction *vg_function_by_cxx_name(NSDictionary<NSString *, VGMTLFunction *> *fns, NSString *name) {
+    NSArray *parts = [name componentsSeparatedByString:@"::"];
+    if (parts.count < 2) {
+        return nil;
+    }
+    NSMutableString *prefix = [NSMutableString stringWithString:@"_ZN"];
+    for (NSString *p in parts) {
+        [prefix appendFormat:@"%lu%@", (unsigned long)p.length, p];
+    }
+    [prefix appendString:@"E"];
+    for (NSString *k in fns) {
+        if ([k hasPrefix:prefix]) {
+            return fns[k];
+        }
+    }
+    return nil;
+}
 - (MTLLibraryType)type { return MTLLibraryTypeExecutable; }
 - (NSString *)installName { return nil; }
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name {
-    VGMTLFunction *f = _functions[name];
+    VGMTLFunction *f = _functions[name] ?: vg_function_by_cxx_name(_functions, name);
     if (!f) {
         vglog("library: no function %s", name.UTF8String);
     }
@@ -712,6 +752,7 @@ id<MTLLibrary> vg_new_library(id<MTLDevice> device, NSData *lib, NSError **error
         *error = nil;
     }
     NSMutableDictionary *fns = [NSMutableDictionary dictionary];
+    NSMutableArray<NSString *> *modules = [NSMutableArray array];
     const uint8_t *b = lib.bytes;
     NSUInteger n = lib.length;
     NSUInteger blobs = 0;
@@ -728,6 +769,9 @@ id<MTLLibrary> vg_new_library(id<MTLDevice> device, NSData *lib, NSError **error
         }
         blobs++;
         NSString *ll = vg_air_to_text([NSData dataWithBytes:b + i length:off + size]);
+        if (ll) {
+            [modules addObject:ll];
+        }
         NSString *name = nil, *stage = nil;
         if (ll && vg_entry_of(ll, &name, &stage)) {
             fns[name] = [[VGMTLFunction alloc] initWithDevice:device name:name stage:stage ll:ll];
@@ -736,12 +780,121 @@ id<MTLLibrary> vg_new_library(id<MTLDevice> device, NSData *lib, NSError **error
     }
     vglog("library: %lu bytes, %lu bitcode blobs, entries: %s", (unsigned long)n, (unsigned long)blobs,
           [[fns.allKeys componentsJoinedByString:@", "] UTF8String]);
-    if (!fns.count) {
+    if (!modules.count) {
         if (error) {
             *error = [NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorUnsupported
-                                     userInfo:@{NSLocalizedDescriptionKey : @"no entry points could be read"}];
+                                     userInfo:@{NSLocalizedDescriptionKey : @"no modules could be read"}];
         }
         return nil;
     }
-    return [[VGMTLLibrary alloc] initWithDevice:device functions:fns];
+    // A library of functions without entry points is a library too (5d): Core Image's ci_stdlib, which its kernels
+    // link against as a dynamic library. Refusing it made Core Image fail to convert any kernel-language source.
+    VGMTLLibrary *l = [[VGMTLLibrary alloc] initWithDevice:device functions:fns];
+    l->_modules = modules;
+    l->_raw = lib;
+    return l;
+}
+
+// ---- dynamic libraries and extern linking (5d) -------------------------------------------------------------------
+// A dynamic library is one of our libraries whose modules other functions link against: Core Image compiles its
+// kernels with options.libraries = its ci_stdlib. Before translation, a function's undefined externs (declared, not
+// defined, not air./llvm. intrinsics) are linked in from the modules of the dynamic libraries its library was
+// compiled with (the translator's nvmtl_link_externs), after nullmoth/nvidia-macos-driver's NVMTLLibraryLoad.m.
+
+@implementation VGMTLDynamicLibrary
+@synthesize label = _label;
+- (id<MTLDevice>)device { return _lib.device; }
+- (NSString *)installName { return _installName ?: @""; }
+- (BOOL)serializeToURL:(NSURL *)url error:(NSError **)error {
+    return [_lib->_raw writeToURL:url options:NSDataWritingAtomic error:error];
+}
+@end
+
+id<MTLDynamicLibrary> vg_new_dynamic_library(id<MTLLibrary> lib, NSError **error) {
+    if (![(NSObject *)lib isKindOfClass:[VGMTLLibrary class]]) {
+        if (error) {
+            *error = vg_lib_error([NSString stringWithFormat:@"newDynamicLibrary: %s isn't one of ours", object_getClassName(lib)]);
+        }
+        return nil;
+    }
+    VGMTLDynamicLibrary *d = [VGMTLDynamicLibrary new];
+    d->_lib = (VGMTLLibrary *)lib;
+    d->_installName = lib.installName;
+    vglog("dynamic library: %lu module(s)", (unsigned long)d->_lib->_modules.count);
+    return d;
+}
+
+void vg_library_set_dylibs(id<MTLLibrary> lib, NSArray *dylibs) {
+    if ([(NSObject *)lib isKindOfClass:[VGMTLLibrary class]] && dylibs.count) {
+        ((VGMTLLibrary *)lib)->_dylibs = [dylibs copy];
+    }
+}
+
+typedef int (*xl_link_fn)(const char *, const char *const *, size_t, uint8_t **, size_t *, char *, size_t);
+static NSString *vg_linked_ll(VGMTLLibrary *lib, NSString *ll, NSString *name) {
+    if (!lib.class || !ll) {
+        return nil;
+    }
+    NSMutableArray *mods = [NSMutableArray array];
+    for (id d in lib->_dylibs) {
+        if ([d isKindOfClass:[VGMTLDynamicLibrary class]]) {
+            [mods addObjectsFromArray:((VGMTLDynamicLibrary *)d)->_lib->_modules ?: @[]];
+        }
+    }
+    if (!mods.count) {
+        return nil;
+    }
+    static dispatch_once_t once;
+    static xl_link_fn pLink;
+    dispatch_once(&once, ^{
+      NSString *path = vg_resource_path("libnvmtl_translate.dylib");
+      void *h = path ? dlopen(path.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL) : NULL;
+      pLink = h ? (xl_link_fn)dlsym(h, "nvmtl_link_externs") : NULL;
+    });
+    NSSet *decl = vg_undefined_externs(@[ ll ]);
+    if (!decl.count || !pLink) {
+        return nil;
+    }
+    const char **ms = calloc(mods.count, sizeof(*ms));
+    for (NSUInteger i = 0; i < mods.count; i++) {
+        ms[i] = [mods[i] UTF8String];
+    }
+    uint8_t *out = NULL;
+    size_t len = 0;
+    char err[1024] = "";
+    int r = pLink(ll.UTF8String, ms, mods.count, &out, &len, err, sizeof(err));
+    free(ms);
+    if (r || !out) {
+        vglog("link: %s needs %s: %s", name.UTF8String, [[decl.allObjects componentsJoinedByString:@","] UTF8String], err);
+        return nil;
+    }
+    NSString *linked = [[NSString alloc] initWithBytes:out length:(len && out[len - 1] == 0) ? len - 1 : len
+                                              encoding:NSUTF8StringEncoding];
+    pTranslateFree(out, len);
+    vglog("link: %s: %lu extern(s) from %lu module(s), %lu -> %lu B", name.UTF8String, (unsigned long)decl.count,
+          (unsigned long)mods.count, (unsigned long)ll.length, (unsigned long)linked.length);
+    return linked;
+}
+
+// Functions the modules declare and none of them defines (not air./llvm. intrinsics).
+static NSSet<NSString *> *vg_undefined_externs(NSArray<NSString *> *modules) {
+    static NSRegularExpression *re;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+      re = [NSRegularExpression regularExpressionWithPattern:@"^(declare|define)[^@\\n]*@(\"[^\"]+\"|[A-Za-z0-9_.$]+)\\("
+                                                     options:NSRegularExpressionAnchorsMatchLines
+                                                       error:NULL];
+    });
+    NSMutableSet *decl = [NSMutableSet set], *def = [NSMutableSet set];
+    for (NSString *ll in modules) {
+        for (NSTextCheckingResult *m in [re matchesInString:ll options:0 range:NSMakeRange(0, ll.length)]) {
+            NSString *sym = [ll substringWithRange:[m rangeAtIndex:2]];
+            if ([sym hasPrefix:@"air."] || [sym hasPrefix:@"llvm."] || [sym hasPrefix:@"\"air."]) {
+                continue;
+            }
+            [([[ll substringWithRange:[m rangeAtIndex:1]] isEqual:@"declare"] ? decl : def) addObject:sym];
+        }
+    }
+    [decl minusSet:def];
+    return decl;
 }

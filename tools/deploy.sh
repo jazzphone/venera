@@ -69,6 +69,14 @@ metal) # stage 4a: VirtioGPUMetal.bundle + mtlprobe/acceltest over the transfer 
   "${SCP[@]}" build/vgmetal.tgz tools/metal-vm.sh packaging/sysvol.sh $HOST:/root/vgpu/xfer/
   "${SSH[@]}" $HOST "bash /root/vgpu/vm-remote.sh xfer /root/vgpu/xfer/* >/dev/null; bash /root/vgpu/vm-remote.sh run 'sh /Volumes/VGPU/metal-vm.sh install' 300"
   ;;
+devmetal) # 5d: build, then the bundle in a writable folder the /Library/GPUBundles symlink points at (no reboot;
+  # unsandboxed processes only). `tools/deploy.sh mtl sysinstall` points it back at the system-volume copy.
+  tools/build-metal.sh >/dev/null && tools/build-tools.sh >/dev/null
+  tar -czf build/vgmetal.tgz -C build VirtioGPUMetal.bundle mtlprobe mtlcompute mtlrender mtlsurface mtlwindow mtlsource citest wininfo compute.metallib render.metallib acceltest
+  "${SSH[@]}" $HOST 'mkdir -p /root/vgpu/xfer && rm -rf /root/vgpu/xfer/*'
+  "${SCP[@]}" build/vgmetal.tgz tools/metal-vm.sh $HOST:/root/vgpu/xfer/
+  "${SSH[@]}" $HOST "bash /root/vgpu/vm-remote.sh xfer /root/vgpu/xfer/* >/dev/null; bash /root/vgpu/vm-remote.sh run 'sh /Volumes/VGPU/metal-vm.sh devinstall' 120"
+  ;;
 mtl) # tools/deploy.sh mtl arm|disarm|probe: run tools/metal-vm.sh in the VM
   shift
   "${SSH[@]}" $HOST "bash /root/vgpu/vm-remote.sh run 'sh /Volumes/VGPU/metal-vm.sh $*' 240"

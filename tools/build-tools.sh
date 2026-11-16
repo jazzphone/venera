@@ -19,6 +19,8 @@ $CC -fobjc-arc -framework Foundation -framework CoreGraphics tools/modetest.m -o
 $CC -fobjc-arc -framework Foundation -framework Metal -framework IOSurface tools/mtlsurface.m -o build/mtlsurface
 $CC -fobjc-arc -framework Foundation -framework Metal tools/mtlcaps.m -o build/mtlcaps
 $CC -fobjc-arc -framework Foundation -framework Metal tools/mtlsource.m -o build/mtlsource
+$CC -fobjc-arc -framework Foundation -framework CoreGraphics tools/wininfo.m -o build/wininfo
+$CC -fobjc-arc -Wno-deprecated-declarations -framework Foundation -framework Metal -framework CoreImage tools/citest.m -o build/citest
 $CC -fobjc-arc -framework Foundation -framework Metal -framework QuartzCore -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers tools/carender.m -o build/carender
 $CC -fobjc-arc -framework Cocoa -framework Metal -framework QuartzCore -framework IOSurface -framework ImageIO -framework UniformTypeIdentifiers tools/mtlwindow.m -o build/mtlwindow
 for s in compute render; do

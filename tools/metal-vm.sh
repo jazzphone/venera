@@ -23,6 +23,23 @@ install)
   sudo -u _windowserver test -r /Library/GPUBundles/VirtioGPUMetal.bundle/Contents/MacOS/VirtioGPUMetal && echo "readable by _windowserver"
   ls -la /Library/GPUBundles /Library/GPUBundles/VirtioGPUMetal.bundle/Contents/*
   ;;
+devinstall)   # 5d: the bundle in a writable folder, /Library/GPUBundles pointed at it: new processes load it, no reboot
+  # (sandboxed ones, Safari's GPU process, refuse it; `install` puts it on the system volume for them)
+  set -e
+  D="/Library/Application Support/Venera/dev"
+  rm -rf /tmp/vgmetal && mkdir -p /tmp/vgmetal "$D" $T && tar -xzf $X/vgmetal.tgz -C /tmp/vgmetal
+  rm -rf "$D/VirtioGPUMetal.bundle" && mv /tmp/vgmetal/VirtioGPUMetal.bundle "$D/"
+  chown -R root:wheel "$D/VirtioGPUMetal.bundle" && chmod -R go-w,a+rX "$D/VirtioGPUMetal.bundle"
+  for f in /tmp/vgmetal/*; do [ -d "$f" ] || cp "$f" $T/; done
+  [ -L /Library/GPUBundles/VirtioGPUMetal.bundle ] || [ ! -e /Library/GPUBundles/VirtioGPUMetal.bundle ] || {
+    echo "/Library/GPUBundles/VirtioGPUMetal.bundle is a folder: not replacing it"; exit 1; }
+  ln -sfn "$D/VirtioGPUMetal.bundle" /Library/GPUBundles/VirtioGPUMetal.bundle
+  ls -la /Library/GPUBundles/VirtioGPUMetal.bundle
+  ;;
+sysinstall)   # back to the system-volume copy (packaging/sysvol.sh install made it)
+  ln -sfn /System/Library/Extensions/VirtioGPUMetal.bundle /Library/GPUBundles/VirtioGPUMetal.bundle
+  ls -la /Library/GPUBundles/VirtioGPUMetal.bundle
+  ;;
 arm | disarm | wsarm | withdraw | legacy)
   $T/acceltest "$@"
   ;;
