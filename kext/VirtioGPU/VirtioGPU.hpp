@@ -190,7 +190,7 @@ private:
         uint64_t offset;
         uint64_t size;
     };
-    static constexpr unsigned kMaxHostmemRanges = 2048;
+    static constexpr unsigned kMaxHostmemRanges = 16384;   // the machine's mapped Venus allocations (5d: 2048 ran out)
     HostmemRange *hostmemRanges_ = nullptr; // sorted by offset
     unsigned hostmemRangeCount_ = 0;
     IOLock *hostmemLock_ = nullptr;

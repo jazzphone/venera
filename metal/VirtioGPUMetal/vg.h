@@ -95,9 +95,11 @@ uint32_t vg_memory_type(uint32_t bits, VkMemoryPropertyFlags want);   // first a
 // A Vulkan buffer in host-visible memory, mapped for its life.
 typedef struct {
     VkBuffer buffer;
-    VkDeviceMemory memory;
+    VkDeviceMemory memory;   // a sub-allocated buffer's is its chunk's (shared): never free it, never map it whole
     void *map;
     VkDeviceSize size;
+    uint32_t subChunk;       // 0: its own memory; else 1 + the chunk it was cut from (5d)
+    uint32_t subClass, subOffset;
 } vg_buffer;
 int vg_buffer_create(VkDeviceSize size, vg_buffer *out);
 void vg_buffer_destroy(vg_buffer *b);

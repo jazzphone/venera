@@ -237,6 +237,64 @@ uint32_t vg_memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
     return UINT32_MAX;
 }
 
+// Small buffers are cut from 4 MB mapped chunks (5d): every Venus allocation that is mapped takes one of the core's
+// 2048 host-memory ranges for the whole machine, one per MTLBuffer, and with WindowServer, Safari and a few apps open
+// they ran out -- Grapher's 4 KB vertex buffers failed to map (VK_ERROR_MEMORY_MAP_FAILED) and its 3D surface never
+// drew. Power-of-two classes from 256 bytes to 256 KB, a free list each; chunks are kept for the process's life.
+enum { kVgSubMin = 8, kVgSubMax = 18, kVgSubChunk = 4 << 20 };
+typedef struct {
+    VkDeviceMemory memory;
+    uint8_t *map;
+} vg_chunk;
+typedef struct {
+    uint32_t chunk, off;
+} vg_slot;
+static pthread_mutex_t gSubLock = PTHREAD_MUTEX_INITIALIZER;
+static vg_chunk *gChunks;
+static uint32_t gNChunks, gCapChunks;
+static vg_slot *gFree[kVgSubMax - kVgSubMin + 1];
+static uint32_t gNFree[kVgSubMax - kVgSubMin + 1], gCapFree[kVgSubMax - kVgSubMin + 1];
+
+static void vg_sub_push(uint32_t cls, vg_slot s) {
+    if (gNFree[cls] == gCapFree[cls]) {
+        gCapFree[cls] = gCapFree[cls] ? gCapFree[cls] * 2 : 256;
+        gFree[cls] = realloc(gFree[cls], gCapFree[cls] * sizeof(vg_slot));
+    }
+    gFree[cls][gNFree[cls]++] = s;
+}
+
+// A slot of class cls (2^(cls+kVgSubMin) bytes); NO when no chunk could be had.
+static BOOL vg_sub_get(uint32_t cls, vg_slot *out) {
+    pthread_mutex_lock(&gSubLock);
+    if (!gNFree[cls]) {
+        VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, kVgSubChunk, gVk.hostMemoryType};
+        VkDeviceMemory m = VK_NULL_HANDLE;
+        void *map = NULL;
+        if (gVk.vkAllocateMemory(gVk.device, &mai, NULL, &m) != VK_SUCCESS) {
+            pthread_mutex_unlock(&gSubLock);
+            return NO;
+        }
+        if (gVk.vkMapMemory(gVk.device, m, 0, VK_WHOLE_SIZE, 0, &map) != VK_SUCCESS) {
+            gVk.vkFreeMemory(gVk.device, m, NULL);
+            pthread_mutex_unlock(&gSubLock);
+            return NO;
+        }
+        if (gNChunks == gCapChunks) {
+            gCapChunks = gCapChunks ? gCapChunks * 2 : 16;
+            gChunks = realloc(gChunks, gCapChunks * sizeof(vg_chunk));
+        }
+        uint32_t idx = gNChunks++;
+        gChunks[idx] = (vg_chunk){m, map};
+        uint32_t slot = 1u << (cls + kVgSubMin);
+        for (uint32_t off = kVgSubChunk; off >= slot; off -= slot) {
+            vg_sub_push(cls, (vg_slot){idx, off - slot});
+        }
+    }
+    *out = gFree[cls][--gNFree[cls]];
+    pthread_mutex_unlock(&gSubLock);
+    return YES;
+}
+
 int vg_buffer_create(VkDeviceSize size, vg_buffer *out) {
     memset(out, 0, sizeof(*out));
     if (!size) {
@@ -256,6 +314,30 @@ int vg_buffer_create(VkDeviceSize size, vg_buffer *out) {
     }
     VkMemoryRequirements req;
     gVk.vkGetBufferMemoryRequirements(gVk.device, out->buffer, &req);
+    VkDeviceSize need = MAX(req.size, req.alignment);
+    if (need <= (1u << kVgSubMax) && (req.memoryTypeBits & (1u << gVk.hostMemoryType)) &&
+        access("/Library/GPUBundles/VirtioGPUMetal-nosuballoc", F_OK) != 0) {
+        uint32_t cls = 0;
+        while ((1ull << (cls + kVgSubMin)) < need) {
+            cls++;
+        }
+        vg_slot s;
+        if (vg_sub_get(cls, &s)) {
+            r = gVk.vkBindBufferMemory(gVk.device, out->buffer, gChunks[s.chunk].memory, s.off);
+            if (r == VK_SUCCESS) {
+                out->memory = gChunks[s.chunk].memory;
+                out->map = gChunks[s.chunk].map + s.off;
+                out->size = size;
+                out->subChunk = s.chunk + 1;
+                out->subClass = cls;
+                out->subOffset = s.off;
+                return 0;
+            }
+            pthread_mutex_lock(&gSubLock);
+            vg_sub_push(cls, s);
+            pthread_mutex_unlock(&gSubLock);
+        }
+    }
     VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, gVk.hostMemoryType};
     r = gVk.vkAllocateMemory(gVk.device, &mai, NULL, &out->memory);
     if (r == VK_SUCCESS) {
@@ -274,6 +356,16 @@ int vg_buffer_create(VkDeviceSize size, vg_buffer *out) {
 }
 
 void vg_buffer_destroy(vg_buffer *b) {
+    if (b->subChunk && b->memory) {   // cut from a chunk: the slot goes back, the chunk stays
+        if (b->buffer) {
+            gVk.vkDestroyBuffer(gVk.device, b->buffer, NULL);
+        }
+        pthread_mutex_lock(&gSubLock);
+        vg_sub_push(b->subClass, (vg_slot){b->subChunk - 1, b->subOffset});
+        pthread_mutex_unlock(&gSubLock);
+        memset(b, 0, sizeof(*b));
+        return;
+    }
     if (b->map) {
         gVk.vkUnmapMemory(gVk.device, b->memory);
     }

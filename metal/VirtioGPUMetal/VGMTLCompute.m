@@ -16,7 +16,7 @@
 @implementation VGMTLBuffer
 - (kern_return_t)setOwnerWithIdentity:(task_id_token_t)identity { return KERN_SUCCESS; }   // memory accounting (5d)
 // The blob resource of this buffer's memory, for tools (5c: tools/blobtest).
-- (uint32_t)vgResId { return vg_memory_res_id(_b.memory); }
+- (uint32_t)vgResId { return _b.subChunk ? 0 : vg_memory_res_id(_b.memory); }   // a shared chunk's is no buffer's
 @synthesize label = _label;
 - (id<MTLDevice>)device { return _dev; }
 - (void)dealloc {
