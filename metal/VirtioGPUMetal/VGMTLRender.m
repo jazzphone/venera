@@ -532,6 +532,18 @@ static void vg_set_sampler(VGMTLCommandBuffer *cmd, vg_stage_bindings *t, id<MTL
     _viewport = (VkViewport){(float)v.originX, (float)(v.originY + v.height), (float)v.width, -(float)v.height,
                              (float)v.znear, (float)v.zfar};
 }
+// Several viewports or scissors (5d: Maps) take effect for viewport 0 only: shaders that pick another
+// ([[viewport_array_index]]) would need multiViewport, and Maps passes one.
+- (void)setViewports:(const MTLViewport *)v count:(NSUInteger)n {
+    if (n) {
+        [self setViewport:v[0]];
+    }
+}
+- (void)setScissorRects:(const MTLScissorRect *)r count:(NSUInteger)n {
+    if (n) {
+        [self setScissorRect:r[0]];
+    }
+}
 - (void)setScissorRect:(MTLScissorRect)r {
     _scissor = (VkRect2D){{(int32_t)r.x, (int32_t)r.y}, {(uint32_t)r.width, (uint32_t)r.height}};
 }

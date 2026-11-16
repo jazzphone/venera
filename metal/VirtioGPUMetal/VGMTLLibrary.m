@@ -605,6 +605,15 @@ static BOOL vg_entry_of(NSString *ll, NSString **name, NSString **stage) {
         }
         NSCharacterSet *stop = [NSCharacterSet characterSetWithCharactersInString:@", )}\"\n"];
         NSString *rest = [l substringFromIndex:at.location + 1];
+        if ([rest hasPrefix:@"\""]) {   // a quoted symbol: an entry in a namespace, @"Grid::grid_vertex" (5d: Maps)
+            NSRange q = [rest rangeOfString:@"\"" options:0 range:NSMakeRange(1, rest.length - 1)];
+            if (q.location == NSNotFound) {
+                continue;
+            }
+            *name = [rest substringWithRange:NSMakeRange(1, q.location - 1)];
+            *stage = st;
+            return YES;
+        }
         NSRange end = [rest rangeOfCharacterFromSet:stop];
         *name = end.location == NSNotFound ? rest : [rest substringToIndex:end.location];
         *stage = st;

@@ -314,6 +314,22 @@ static id vg_refuse_before_init(id obj) {
         });
     }
 }
+// An app's own shaders (5d: Maps/VectorKit): the bundle's default.metallib through our loader. Apple's base class
+// made an Apple library of it, whose functions no pipeline of ours can take.
+- (id<MTLLibrary>)newDefaultLibraryWithBundle:(NSBundle *)bundle error:(NSError **)error {
+    NSURL *u = [bundle URLForResource:@"default" withExtension:@"metallib"];
+    if (!u) {
+        if (error) {
+            *error = [NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorFileNotFound
+                                     userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"%@ has no default.metallib", bundle.bundlePath]}];
+        }
+        return nil;
+    }
+    return [self newLibraryWithURL:u error:error];
+}
+- (id<MTLLibrary>)newDefaultLibrary {
+    return [self newDefaultLibraryWithBundle:[NSBundle mainBundle] error:NULL];
+}
 - (id<MTLLibrary>)newLibraryWithFile:(NSString *)path error:(NSError **)error {
     return [self newLibraryWithURL:[NSURL fileURLWithPath:path] error:error];
 }
