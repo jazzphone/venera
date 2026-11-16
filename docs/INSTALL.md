@@ -116,6 +116,9 @@ Files in `/Library/GPUBundles` the Metal driver reads (root only; delete them to
 
 - `VirtioGPUMetal-depth`: how many display command buffers may be in flight, 1-16 (default 6; lower is less lag,
   higher is smoother under load). Read again once a second.
+- `VirtioGPUMetal-fetchmode`: `0` emulates Metal's framebuffer fetch with copies instead of sampling the
+  attachment in place (the default since 0.1.0's last round; in place needs Venus' `VK_EXT_attachment_feedback_loop_layout`
+  and falls back to copies without it). Read when WindowServer starts: reboot after changing it.
 - `VirtioGPUMetal-gputime`: log GPU timings every 5 s (costs a little).
 
 The accelerator flips at most once per 12 ms by default (`vgpuflipms=N` boot-arg, 0 = no limit).

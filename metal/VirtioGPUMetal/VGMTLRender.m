@@ -663,15 +663,19 @@ static void vg_set_sampler(VGMTLCommandBuffer *cmd, vg_stage_bindings *t, id<MTL
 // Framebuffer fetch by copies: end the pass, copy each read color attachment to its scratch image, resume the pass
 // (load), and return set 3 naming the copies. The command buffer's full barrier orders draw -> copy -> sample.
 // How a fetch split is done, for measurements (5c round 5; /Library/GPUBundles/VirtioGPUMetal-fetchmode holds the
-// digit): 0 full barriers (the default), 1 no copy and 2 no split at all (both draw wrong pixels: they only show what
-// the copies and the splits cost), 3 targeted barriers, 4 in place (5c round 6: the pass still ends and resumes, but
+// digit): 0 copies with full barriers (the default until round 6), 1 no copy and 2 no split at all (both draw wrong pixels: they only show what
+// the copies and the splits cost), 3 targeted barriers, 4 in place (the default; 5c round 6: the pass still ends and resumes, but
 // the draw samples the attachment itself, in VK_EXT_attachment_feedback_loop_layout's layout, instead of a copy). Measured in WindowServer under mtlwindow: GPU time per
 // command buffer 2.55 / 1.85 / 1.77 / 2.52 ms, frame rate the same in all four (the copies are ~27 % of the GPU time,
 // the splits and barriers almost nothing, and GPU time doesn't limit the frame rate).
+// Default 4 since 5c round 6 (falls back to copies when Venus lacks the extension): visually the same as copies in
+// pixel comparisons, deterministic, WindowServer's command buffers done ~8 ms sooner (12 vs 20 ms commit -> done
+// during a drag), ~70 MB less memory (no scratch copies); a 10-minute soak without a crash. A file holding 0 goes
+// back to copies.
 int vg_fetch_mode(void) {
     static int mode = -1;
     if (mode < 0) {
-        mode = 0;
+        mode = 4;
         FILE *f = fopen("/Library/GPUBundles/VirtioGPUMetal-fetchmode", "r");
         if (f) {
             int m = fgetc(f) - '0';
