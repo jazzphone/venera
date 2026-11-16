@@ -36,6 +36,7 @@ id<MTLBuffer> vg_new_buffer_nocopy(id<MTLDevice> device, void *pointer, NSUInteg
     VkImage _image;
     VkDeviceMemory _memory;
     VkImageView _view;
+    VkImageView _attView;   // depth and stencil together, for a depth-stencil attachment (5d); else null
     VkFormat _format;
     VkImageAspectFlags _aspect;
     MTLPixelFormat _pixelFormat;
@@ -100,6 +101,8 @@ id<MTLTexture> vg_new_buffer_texture(id<MTLBuffer> buffer, MTLTextureDescriptor 
 @public
     BOOL _test, _write;
     VkCompareOp _compare;
+    BOOL _stencil;                     // 5d: a stencil descriptor on either face
+    VkStencilOpState _sfront, _sback;  // ops, compare, masks (the reference is the encoder's)
     id<MTLDevice> _dev;
 }
 @property(readonly) id<MTLDevice> device;

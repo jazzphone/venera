@@ -4,7 +4,8 @@
 # Writes the allow-list (/Library/GPUBundles/VirtioGPUMetal-allow.txt) with the PROCESS names (default: the app's
 # name), relaunches APP as the console user, waits SECONDS (default 12), takes a screenshot with Cmd-Shift-3 (QMP, so
 # no Screen Recording permission is involved) and pulls it to build/apptest/APP.png, then prints the Metal driver's
-# log for those processes and any new crash reports. `tools/apptest.sh none` empties the allow-list.
+# log for those processes and any new crash reports. `tools/apptest.sh none` empties the allow-list (the default:
+# every app); PROCESS `default` leaves the list empty for this run too.
 set -u
 APP=$1; shift
 PROCS=(); WAIT=12
@@ -23,7 +24,9 @@ if [ "$APP" = none ]; then
 fi
 LIST=$(printf '%s\\n' "${PROCS[@]}")
 RX=$(IFS='|'; echo "${PROCS[*]}")
-run "printf \"$LIST\" > /Library/GPUBundles/VirtioGPUMetal-allow.txt; pkill -x \"$APP\"; rm -f /Users/dev/Desktop/Screenshot*; date +%s > /var/tmp/apptest.t0; sleep 1; U=\$(id -u dev); launchctl asuser \$U sudo -u dev open -a \"$APP\" ${OPEN:-}" 30 >/dev/null
+if [ "${PROCS[0]}" = default ]; then LISTCMD="rm -f /Library/GPUBundles/VirtioGPUMetal-allow.txt"; PROCS=("$APP"); RX="$APP"
+else LISTCMD="printf \"$LIST\" > /Library/GPUBundles/VirtioGPUMetal-allow.txt"; fi
+run "$LISTCMD; pkill -x \"$APP\"; rm -f /Users/dev/Desktop/Screenshot*; date +%s > /var/tmp/apptest.t0; sleep 1; U=\$(id -u dev); launchctl asuser \$U sudo -u dev open -a \"$APP\" ${OPEN:-}" 30 >/dev/null
 sleep "$WAIT"
 "${SSH[@]}" $H "qm sendkey 108 meta_l-shift-3"
 sleep 8

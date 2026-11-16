@@ -156,6 +156,75 @@ int main(void) {
         } else {
             printf("msaa: the device says it doesn't do 4 samples\n");
         }
+        // stencil (5d): a mask written by one draw, tested by the next, on a Stencil8 attachment
+        {
+            MTLTextureDescriptor *sd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatStencil8
+                                                                                        width:64 height:64 mipmapped:NO];
+            sd.usage = MTLTextureUsageRenderTarget;
+            sd.storageMode = MTLStorageModePrivate;
+            id<MTLTexture> stex = [dev newTextureWithDescriptor:sd];
+            MTLTextureDescriptor *cd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                         width:64 height:64 mipmapped:NO];
+            cd.usage = MTLTextureUsageRenderTarget;
+            cd.storageMode = MTLStorageModeManaged;
+            id<MTLTexture> ctex = [dev newTextureWithDescriptor:cd];
+            MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+            pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+            pd.stencilAttachmentPixelFormat = MTLPixelFormatStencil8;
+            pd.vertexFunction = [lib newFunctionWithName:@"vs_half"];
+            pd.fragmentFunction = [lib newFunctionWithName:@"fs"];
+            pd.colorAttachments[0].writeMask = MTLColorWriteMaskNone;
+            id<MTLRenderPipelineState> maskp = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
+            pd.vertexFunction = [lib newFunctionWithName:@"vs"];
+            pd.colorAttachments[0].writeMask = MTLColorWriteMaskAll;
+            id<MTLRenderPipelineState> fillp = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
+            MTLDepthStencilDescriptor *wd = [MTLDepthStencilDescriptor new];
+            MTLStencilDescriptor *w = [MTLStencilDescriptor new];
+            w.stencilCompareFunction = MTLCompareFunctionAlways;
+            w.depthStencilPassOperation = MTLStencilOperationReplace;
+            wd.frontFaceStencil = w;
+            wd.backFaceStencil = w;
+            MTLDepthStencilDescriptor *td = [MTLDepthStencilDescriptor new];
+            MTLStencilDescriptor *t = [MTLStencilDescriptor new];
+            t.stencilCompareFunction = MTLCompareFunctionEqual;
+            td.frontFaceStencil = t;
+            td.backFaceStencil = t;
+            if (!stex || !ctex || !maskp || !fillp) {
+                printf("stencil: FAILED to make %s\n", !stex ? "the Stencil8 texture" : !ctex ? "the color texture" : "a pipeline");
+                failures++;
+            } else {
+                MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor new];
+                rp.colorAttachments[0].texture = ctex;
+                rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+                rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+                rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+                rp.stencilAttachment.texture = stex;
+                rp.stencilAttachment.loadAction = MTLLoadActionClear;
+                rp.stencilAttachment.clearStencil = 0;
+                cb = [q commandBuffer];
+                id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
+                [re setRenderPipelineState:maskp];
+                [re setDepthStencilState:[dev newDepthStencilStateWithDescriptor:wd]];
+                [re setStencilReferenceValue:1];
+                [re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+                [re setRenderPipelineState:fillp];
+                [re setDepthStencilState:[dev newDepthStencilStateWithDescriptor:td]];
+                [re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+                [re endEncoding];
+                id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+                [be synchronizeResource:ctex];
+                [be endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+                uint8_t in[4], outp[4];
+                [ctex getBytes:in bytesPerRow:64 * 4 fromRegion:MTLRegionMake2D(8, 56, 1, 1) mipmapLevel:0];
+                [ctex getBytes:outp bytesPerRow:64 * 4 fromRegion:MTLRegionMake2D(56, 8, 1, 1) mipmapLevel:0];
+                BOOL ok = in[2] == 255 && in[1] >= 127 && outp[0] == 0 && outp[1] == 0 && outp[2] == 0;
+                printf("stencil mask: %s (inside %u %u %u, outside %u %u %u)\n", ok ? "ok" : "FAIL", in[0], in[1], in[2],
+                       outp[0], outp[1], outp[2]);
+                failures += !ok;
+            }
+        }
         printf("%s\n", failures ? "FAILED" : "PASS");
         return failures ? 1 : 0;
     }

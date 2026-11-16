@@ -47,7 +47,17 @@ static const vg_format kFormats[] = {
     {MTLPixelFormatDepth32Float, VK_FORMAT_D32_SFLOAT, 4, VK_IMAGE_ASPECT_DEPTH_BIT},
     {MTLPixelFormatDepth32Float_Stencil8, VK_FORMAT_D32_SFLOAT_S8_UINT, 8,
      VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT},
+    // stencil (5d: Core Animation's masks in apps, Spotlight, the Dock); the X formats are stencil views of the combined
+    {MTLPixelFormatStencil8, VK_FORMAT_S8_UINT, 1, VK_IMAGE_ASPECT_STENCIL_BIT},
+    {MTLPixelFormatDepth24Unorm_Stencil8, VK_FORMAT_D24_UNORM_S8_UINT, 4, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT},
+    {MTLPixelFormatX32_Stencil8, VK_FORMAT_D32_SFLOAT_S8_UINT, 8, VK_IMAGE_ASPECT_STENCIL_BIT},
+    {MTLPixelFormatX24_Stencil8, VK_FORMAT_D24_UNORM_S8_UINT, 4, VK_IMAGE_ASPECT_STENCIL_BIT},
 };
+
+// What a sampling view (and a copy) of a format covers: depth of a depth-stencil format, stencil of a stencil-only one.
+static VkImageAspectFlags vg_view_aspect(VkImageAspectFlags a) {
+    return (a & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT : a;
+}
 
 static const vg_format *vg_format_of(MTLPixelFormat f) {
     for (size_t i = 0; i < sizeof(kFormats) / sizeof(*kFormats); i++) {
@@ -526,6 +536,9 @@ BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
     if (_view) {
         gVk.vkDestroyImageView(gVk.device, _view, NULL);
     }
+    if (_attView) {
+        gVk.vkDestroyImageView(gVk.device, _attView, NULL);
+    }
     if (_parent) {
         return;   // a view: the image and its memory are the parent's
     }
@@ -608,7 +621,7 @@ BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
         memcpy(staging.map, bytes, size);
     }
     VkBufferImageCopy c = {0, (uint32_t)(bpr / f->bytes), (uint32_t)(bpi / bpr),
-                           {f->aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT, (uint32_t)level, (uint32_t)slice, 1},
+                           {vg_view_aspect(f->aspect), (uint32_t)level, (uint32_t)slice, 1},
                            {(int32_t)region.origin.x, (int32_t)region.origin.y, (int32_t)region.origin.z},
                            {(uint32_t)region.size.width, (uint32_t)rows, (uint32_t)depth}};
     VkImage image = _image;
@@ -771,10 +784,15 @@ id<MTLTexture> vg_new_texture(id<MTLDevice> device, MTLTextureDescriptor *d) {
                                   alpha8 ? VK_COMPONENT_SWIZZLE_ZERO : VK_COMPONENT_SWIZZLE_IDENTITY,
                                   alpha8 ? VK_COMPONENT_SWIZZLE_ZERO : VK_COMPONENT_SWIZZLE_IDENTITY,
                                   alpha8 ? VK_COMPONENT_SWIZZLE_R : VK_COMPONENT_SWIZZLE_IDENTITY},
-                                 {f->aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT, 0, (uint32_t)t->_mips, 0, (uint32_t)t->_layers}};
+                                 {vg_view_aspect(f->aspect), 0, (uint32_t)t->_mips, 0, (uint32_t)t->_layers}};
     if (r == VK_SUCCESS) {
         vgtrace("texture: bound (%d), vkCreateImageView", r);
         r = gVk.vkCreateImageView(gVk.device, &vci, NULL, &t->_view);
+    }
+    if (r == VK_SUCCESS && (f->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && (f->aspect & VK_IMAGE_ASPECT_STENCIL_BIT)) {
+        // a depth-stencil attachment views both aspects (5d); sampling views depth only
+        vci.subresourceRange.aspectMask = f->aspect;
+        r = gVk.vkCreateImageView(gVk.device, &vci, NULL, &t->_attView);
     }
     vgtrace("texture: view %d, layout transition", r);
     if (r != VK_SUCCESS) {
@@ -868,8 +886,18 @@ id<MTLDepthStencilState> vg_new_depth_stencil(id<MTLDevice> device, MTLDepthSten
     s->_write = d.depthWriteEnabled;
     s->_compare = vg_compare(d.depthCompareFunction);
     s->_test = d.depthCompareFunction != MTLCompareFunctionAlways || d.depthWriteEnabled;
-    if (d.frontFaceStencil || d.backFaceStencil) {
-        vglog("depth-stencil: stencil isn't supported yet (ignored)");
+    // Stencil (5d). MTLStencilOperation and VkStencilOp number their operations alike; a face without a descriptor
+    // always passes and keeps.
+    s->_stencil = d.frontFaceStencil || d.backFaceStencil;
+    MTLStencilDescriptor *faces[2] = {d.frontFaceStencil, d.backFaceStencil};
+    VkStencilOpState *out[2] = {&s->_sfront, &s->_sback};
+    for (int i = 0; i < 2; i++) {
+        MTLStencilDescriptor *f = faces[i];
+        *out[i] = f ? (VkStencilOpState){(VkStencilOp)f.stencilFailureOperation, (VkStencilOp)f.depthStencilPassOperation,
+                                         (VkStencilOp)f.depthFailureOperation, vg_compare(f.stencilCompareFunction),
+                                         f.readMask, f.writeMask, 0}
+                    : (VkStencilOpState){VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP,
+                                         VK_COMPARE_OP_ALWAYS, 0xff, 0, 0};
     }
     return s;
 }
@@ -926,7 +954,7 @@ id<MTLTexture> vg_texture_view(VGMTLTexture *p, MTLPixelFormat pf, MTLTextureTyp
                                   alpha8 ? VK_COMPONENT_SWIZZLE_ZERO : VK_COMPONENT_SWIZZLE_IDENTITY,
                                   alpha8 ? VK_COMPONENT_SWIZZLE_ZERO : VK_COMPONENT_SWIZZLE_IDENTITY,
                                   alpha8 ? VK_COMPONENT_SWIZZLE_R : VK_COMPONENT_SWIZZLE_IDENTITY},
-                                 {f->aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT, (uint32_t)levels.location, (uint32_t)levels.length,
+                                 {vg_view_aspect(f->aspect), (uint32_t)levels.location, (uint32_t)levels.length,
                                   (uint32_t)slices.location, (uint32_t)slices.length}};
     VGMTLTexture *t = [VGMTLTexture new];
     if (gVk.vkCreateImageView(gVk.device, &vci, NULL, &t->_view) != VK_SUCCESS) {

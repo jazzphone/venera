@@ -213,6 +213,8 @@ enum { kVGMaxColor = 8 };
             VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
             VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
             VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE, VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
+            VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+            VK_DYNAMIC_STATE_STENCIL_REFERENCE,
             VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE};
         VkPipelineDynamicStateCreateInfo dyn = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0,
                                                 sizeof(kDynamic) / sizeof(*kDynamic), kDynamic};
@@ -423,11 +425,12 @@ id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRende
     VkCullModeFlags _cull;
     VkFrontFace _front;
     VGMTLDepthStencilState *_ds;
+    uint32_t _stencilRef[2];   // front, back (5d)
     float _blend[4];
     BOOL _open;
     // the pass, kept so rendering can be ended and resumed around a framebuffer-fetch copy
-    VGMTLTexture *_colorTex[kVGMaxColor], *_depthTex;
-    VkRenderingAttachmentInfo _colorInfo[kVGMaxColor], _depthInfo;
+    VGMTLTexture *_colorTex[kVGMaxColor], *_depthTex, *_stencilTex;
+    VkRenderingAttachmentInfo _colorInfo[kVGMaxColor], _depthInfo, _stencilInfo;
     uint32_t _ncolor;
     VGMTLTexture *_fetchCopy[kVGMaxColor];   // scratch copies, made at the first fetch draw of the encoder
     BOOL _feedback[kVGMaxColor];             // in the feedback loop layout since a fetch split (mode 4)
@@ -446,6 +449,8 @@ id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRende
         VkFrontFace front;
         VkBool32 dtest, dwrite;
         VkCompareOp dcmp;
+        VGMTLDepthStencilState *sds;   // the stencil state last sent (5d)
+        uint32_t sref[2];
         BOOL stencilSet;
         float blend[4];
         VkBuffer vb[kVGMaxBufferSlots];
@@ -567,7 +572,8 @@ static void vg_set_sampler(VGMTLCommandBuffer *cmd, vg_stage_bindings *t, id<MTL
         vglog("render: line fill mode not supported yet (filled)");
     }
 }
-- (void)setStencilReferenceValue:(uint32_t)v { }
+- (void)setStencilReferenceValue:(uint32_t)v { _stencilRef[0] = _stencilRef[1] = v; }
+- (void)setStencilFrontReferenceValue:(uint32_t)f backReferenceValue:(uint32_t)b { _stencilRef[0] = f, _stencilRef[1] = b; }
 - (void)setDepthBias:(float)b slopeScale:(float)s clamp:(float)c { }
 - (void)setDepthClipMode:(MTLDepthClipMode)m { }
 - (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u stages:(MTLRenderStages)s { }
@@ -670,9 +676,27 @@ static void vg_set_sampler(VGMTLCommandBuffer *cmd, vg_stage_bindings *t, id<MTL
         gVk.vkCmdSetDepthCompareOp(cb, dcmp);
         _last.dcmp = dcmp;
     }
-    if (VG_CHANGED(!_last.stencilSet)) {
-        gVk.vkCmdSetStencilTestEnable(cb, VK_FALSE);
+    // stencil (5d): test, ops and masks from the depth-stencil state, the reference from the encoder
+    VGMTLDepthStencilState *sds = _ds && _ds->_stencil ? _ds : nil;
+    if (VG_CHANGED(!_last.stencilSet || _last.sds != sds)) {
+        gVk.vkCmdSetStencilTestEnable(cb, sds ? VK_TRUE : VK_FALSE);
+        if (sds) {
+            const VkStencilOpState *f = &sds->_sfront, *b = &sds->_sback;
+            gVk.vkCmdSetStencilOp(cb, VK_STENCIL_FACE_FRONT_BIT, f->failOp, f->passOp, f->depthFailOp, f->compareOp);
+            gVk.vkCmdSetStencilOp(cb, VK_STENCIL_FACE_BACK_BIT, b->failOp, b->passOp, b->depthFailOp, b->compareOp);
+            gVk.vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_FRONT_BIT, f->compareMask);
+            gVk.vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_BACK_BIT, b->compareMask);
+            gVk.vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_BIT, f->writeMask);
+            gVk.vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_BACK_BIT, b->writeMask);
+        }
         _last.stencilSet = YES;
+        _last.sds = sds;
+        _last.sref[0] = _stencilRef[0] + 1;   // the reference goes again below
+    }
+    if (sds && VG_CHANGED(_last.sref[0] != _stencilRef[0] || _last.sref[1] != _stencilRef[1])) {
+        gVk.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_BIT, _stencilRef[0]);
+        gVk.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_BACK_BIT, _stencilRef[1]);
+        _last.sref[0] = _stencilRef[0], _last.sref[1] = _stencilRef[1];
     }
     if (VG_CHANGED(memcmp(_last.blend, _blend, sizeof(_blend)))) {
         gVk.vkCmdSetBlendConstants(cb, _blend);
@@ -777,9 +801,11 @@ static void vg_fetch_barrier(VkCommandBuffer cb, BOOL beforeCopy) {
             color[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         }
     }
-    VkRenderingAttachmentInfo depth = _depthInfo;
+    VkRenderingAttachmentInfo depth = _depthInfo, stencil = _stencilInfo;
     depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-    VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, _area, 1, 0, _ncolor, color, _depthTex ? &depth : NULL, NULL};
+    stencil.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, _area, 1, 0, _ncolor, color, _depthTex ? &depth : NULL,
+                          _stencilTex ? &stencil : NULL};
     gVk.vkCmdBeginRendering(cb, &ri);
     VkDescriptorImageInfo ii[8];
     VkWriteDescriptorSet wr[8];
@@ -905,9 +931,11 @@ static void vg_fetch_barrier(VkCommandBuffer cb, BOOL beforeCopy) {
             color[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         }
     }
-    VkRenderingAttachmentInfo depth = _depthInfo;
+    VkRenderingAttachmentInfo depth = _depthInfo, stencil = _stencilInfo;
     depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-    VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, _area, 1, 0, _ncolor, color, _depthTex ? &depth : NULL, NULL};
+    stencil.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, _area, 1, 0, _ncolor, color, _depthTex ? &depth : NULL,
+                          _stencilTex ? &stencil : NULL};
     if (mode != 2) {
         gVk.vkCmdBeginRendering(cb, &ri);
     }
@@ -1102,7 +1130,7 @@ static VkAttachmentStoreOp vg_store(MTLStoreAction a) {
     VGMTLTexture *dt = (VGMTLTexture *)d.depthAttachment.texture;
     if (dt) {
         [_keep addObject:dt];
-        depth.imageView = dt->_view;
+        depth.imageView = dt->_attView ? dt->_attView : dt->_view;
         depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         depth.loadOp = vg_load(d.depthAttachment.loadAction);
         depth.storeOp = vg_store(d.depthAttachment.storeAction);
@@ -1118,6 +1146,28 @@ static VkAttachmentStoreOp vg_store(MTLStoreAction a) {
         }
         w = MIN(w, (uint32_t)dt->_width);
         h = MIN(h, (uint32_t)dt->_height);
+    }
+    // the stencil attachment (5d): Vulkan wants the depth attachment's view when both are the same image
+    VkRenderingAttachmentInfo stencil = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    VGMTLTexture *st = (VGMTLTexture *)d.stencilAttachment.texture;
+    if (st && (![st isKindOfClass:[VGMTLTexture class]] || (dt && st != dt))) {
+        static int logged;
+        if (logged++ < 3) {
+            vglog("render pass: a stencil texture apart from the depth texture isn't supported (stencil ignored)");
+        }
+        st = nil;
+    }
+    if (st) {
+        [_keep addObject:st];
+        stencil.imageView = st->_attView ? st->_attView : st->_view;
+        stencil.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        stencil.loadOp = vg_load(d.stencilAttachment.loadAction);
+        stencil.storeOp = vg_store(d.stencilAttachment.storeAction);
+        stencil.clearValue.depthStencil = (VkClearDepthStencilValue){(float)d.depthAttachment.clearDepth,
+                                                                     d.stencilAttachment.clearStencil};
+        depth.clearValue.depthStencil.stencil = d.stencilAttachment.clearStencil;
+        w = MIN(w, (uint32_t)st->_width);
+        h = MIN(h, (uint32_t)st->_height);
     }
     if (w == UINT32_MAX) {
         w = (uint32_t)MAX(d.renderTargetWidth, 1);
@@ -1136,7 +1186,10 @@ static VkAttachmentStoreOp vg_store(MTLStoreAction a) {
     e->_ncolor = ncolor;
     e->_depthInfo = depth;
     e->_depthTex = dt;
-    VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, e->_area, 1, 0, ncolor, color, dt ? &depth : NULL, NULL};
+    e->_stencilInfo = stencil;
+    e->_stencilTex = st;
+    VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, e->_area, 1, 0, ncolor, color, dt ? &depth : NULL,
+                          st ? &stencil : NULL};
     gVk.vkCmdBeginRendering(_cb, &ri);
     e->_open = YES;
     return e;

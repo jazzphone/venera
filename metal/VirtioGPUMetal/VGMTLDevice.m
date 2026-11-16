@@ -5,11 +5,11 @@
 // private base class) opens the family's user clients itself. We add the Vulkan side: Mesa's Venus ICD
 // (Contents/Resources/libvulkan_virtio.dylib, loaded directly, no Vulkan loader) on the host's GPU.
 //
-// Allow-list: only listed processes get a device; everyone else gets none, as before the arm. WindowServer gets it only
-// when the accelerator says so (VirtioGPUWindowServer = true, published by the kext's own arm at vgpuaccel=4, never by
-// the late arm) and the list has no "-WindowServer" line. /Library/GPUBundles/VirtioGPUMetal-allow.txt: one process
-// name per line, `*` = all, `-name` = never; mtlprobe is always allowed; VGMTL_ENABLE=1 in the environment allows the
-// process.
+// Who gets a device: WindowServer only when the accelerator says so (VirtioGPUWindowServer = true, published by the
+// kext's own arm at vgpuaccel=4, never by the late arm) and the list has no "-WindowServer" line; every app (a process
+// running from an .app bundle, and WebKit's GPU process) by default since 5d; daemons only when listed.
+// /Library/GPUBundles/VirtioGPUMetal-allow.txt: one process name per line, `*` = all, `-name` = never, `apps-off` = no
+// apps by default; mtlprobe is always allowed; VGMTL_ENABLE=1 in the environment allows the process.
 //
 // Shape after nullmoth/nvidia-macos-driver's NVMTLDevice (plugin/NVMTLDevice.m): the refusal before super's init and
 // the initLimits call are theirs.
@@ -164,7 +164,27 @@ static BOOL vg_process_allowed(mach_port_t port) {
     }
     char deny[260];
     snprintf(deny, sizeof(deny), "-%s", me);
-    return !vg_allow_file_has(deny, NO) && vg_allow_file_has(me, YES);
+    if (vg_allow_file_has(deny, NO)) {
+        return NO;
+    }
+    if (vg_allow_file_has(me, YES)) {
+        return YES;
+    }
+    // 5d, the default: apps. A process running from an .app bundle (and the GPU process WebKit starts for one) gets
+    // the device; background daemons (Spotlight's, photo and media analysis...) don't, unless the list names them:
+    // there a driver gap would cost without anyone seeing it. The list's "apps-off" line turns the default off.
+    if (vg_allow_file_has("apps-off", NO)) {
+        return NO;
+    }
+    if (!strncmp(me, "com.apple.WebKit.GPU", 20)) {
+        return YES;
+    }
+    // Never by default: the processes that let you log in and unlock (a driver fault there would lock the user out).
+    if (!strcmp(me, "loginwindow") || !strcmp(me, "SecurityAgent")) {
+        return NO;
+    }
+    NSString *bp = [[NSBundle mainBundle] bundlePath];
+    return [bp hasSuffix:@".app"] || [bp containsString:@".app/"];
 }
 
 // A refusal before [super initWithAcceleratorPort:] must not free the object: under ARC returning nil releases self,
