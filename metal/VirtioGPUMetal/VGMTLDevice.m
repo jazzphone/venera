@@ -77,6 +77,18 @@ BOOL vg_calltrace(void) {
     return on;
 }
 
+// A debugging flag file in /Library/GPUBundles: on when it exists and is empty or names this process (one name a line).
+BOOL vg_debug_flag(const char *name) {
+    char path[256];
+    snprintf(path, sizeof(path), "/Library/GPUBundles/VirtioGPUMetal-%s", name);
+    NSString *s = [NSString stringWithContentsOfFile:@(path) encoding:NSUTF8StringEncoding error:NULL];
+    if (!s) {
+        return NO;
+    }
+    s = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return !s.length || [[s componentsSeparatedByString:@"\n"] containsObject:@(getprogname())];
+}
+
 void vg_callstack(const char *what) {
     if (!vg_calltrace()) {
         return;
@@ -183,9 +195,11 @@ static BOOL vg_process_allowed(mach_port_t port) {
     if (!strcmp(me, "loginwindow") || !strcmp(me, "SecurityAgent")) {
         return NO;
     }
-    // Not yet by default: processes whose SwiftUI shader effects need visible (stitchable) functions we don't have yet.
-    // The Dock's helper draws the Calendar icon's date with them (it came out blank); Spotlight its glow.
-    if (!strcmp(me, "com.apple.dock.extra") || !strcmp(me, "Spotlight")) {
+    // Not yet by default: Spotlight. Its result icons (Calendar's, Shortcuts') are RenderBox composites whose image draws
+    // read an icon atlas and come out empty on this driver; the software renderer draws them. The Dock's helper, which
+    // draws the Calendar icon's date the same way, works since visible functions, render-target barriers and constexpr
+    // samplers did (5d) and is on by default; "Spotlight" in the allow list puts Spotlight on the driver too.
+    if (!strcmp(me, "Spotlight")) {
         return NO;
     }
     NSString *bp = [[NSBundle mainBundle] bundlePath];
@@ -281,7 +295,7 @@ id vg_compute_reflection(id<MTLFunction> fn);   // VGMTLReflection.m
 }
 - (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(NSError **)error {
     NSData *d = [NSData dataWithContentsOfURL:url options:0 error:error];
-    return d ? vg_new_library(self, d, error) : nil;
+    return d ? vg_new_library_from_url(self, d, url, error) : nil;
 }
 // Metal shading language source (5d: ANGLE, i.e. WebGL in Safari and Chrome, writes its shaders as source at run time).
 // Apple's base class compiles it (MTLCompilerService) into an Apple library; its container (libraryDataContents, the
@@ -319,6 +333,139 @@ id vg_compute_reflection(id<MTLFunction> fn);   // VGMTLReflection.m
           (unsigned long)container.length, (vg_now() - t0) / 1e6, mine ? "ours" : "FAILED");
     return mine;
 }
+// ---- stitching and Core Image's linker (5d) -------------------------------------------------------------------------
+// SwiftUI's shader effects (RenderBox) and Core Image combine visible functions with Metal's stitcher. Apple's stitcher
+// and linker read Apple's own function objects, so each of our libraries gets an Apple "twin" (Apple's base class
+// loading the same metallib), the call goes to the base class with the twins' functions, and the library Apple makes
+// comes back through our loader. After nullmoth/nvidia-macos-driver's newLibraryWithStitchedDescriptor bridge.
+static char kVGTwinKey;
+- (id<MTLLibrary>)vgAppleTwinOf:(id)lib {
+    if (![lib respondsToSelector:@selector(vgRaw)]) {
+        return nil;
+    }
+    @synchronized(lib) {
+        id t = objc_getAssociatedObject(lib, &kVGTwinKey);
+        if (t) {
+            return t == [NSNull null] ? nil : t;
+        }
+        NSData *raw = [lib performSelector:@selector(vgRaw)];
+        struct objc_super sup = {self, class_getSuperclass(object_getClass(self))};
+        NSError *e = nil;
+        // a real dispatch_data_t (Apple's loader reads it as one; an NSData read as "unexpected end of file")
+        dispatch_data_t dd = raw ? dispatch_data_create(raw.bytes, raw.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT) : nil;
+        id apple = dd ? ((id(*)(struct objc_super *, SEL, id, NSError **))objc_msgSendSuper)(
+                            &sup, @selector(newLibraryWithData:error:), dd, &e)
+                      : nil;
+        if (!apple) {
+            vglog("stitching: no Apple twin of a %lu-byte library: %s", (unsigned long)raw.length,
+                  e.localizedDescription.UTF8String ?: "(no reason)");
+        }
+        objc_setAssociatedObject(lib, &kVGTwinKey, apple ?: [NSNull null], OBJC_ASSOCIATION_RETAIN);
+        return apple;
+    }
+}
+- (NSArray *)vgAppleFunctions:(NSArray *)fns what:(const char *)what {
+    NSMutableArray *out = [NSMutableArray arrayWithCapacity:fns.count];
+    for (id f in fns) {
+        if (![f respondsToSelector:@selector(vgLibrary)]) {
+            [out addObject:f];
+            continue;
+        }
+        id<MTLLibrary> twin = [self vgAppleTwinOf:[f performSelector:@selector(vgLibrary)]];
+        id<MTLFunction> af = [twin newFunctionWithName:[(id<MTLFunction>)f name]];
+        if (!af) {
+            vglog("%s: no Apple twin function for %s", what, [(id<MTLFunction>)f name].UTF8String);
+            return nil;
+        }
+        [out addObject:af];
+    }
+    return out;
+}
+- (id<MTLLibrary>)vgBridge:(id)apple what:(const char *)what error:(NSError **)error {
+    if (!apple) {
+        return nil;
+    }
+    SEL contents = sel_registerName("libraryDataContents");
+    NSData *c = [apple respondsToSelector:contents] ? ((id(*)(id, SEL))objc_msgSend)(apple, contents) : nil;
+    if (![c isKindOfClass:[NSData class]] || c.length < 4) {
+        vglog("%s: Apple's %s has no metallib container", what, object_getClassName(apple));
+        if (error) {
+            *error = [NSError errorWithDomain:@"VirtioGPUMetal" code:1
+                                     userInfo:@{NSLocalizedDescriptionKey : @"no metallib container to load"}];
+        }
+        return nil;
+    }
+    if (error) {
+        *error = nil;
+    }
+    id<MTLLibrary> mine = vg_new_library(self, c, error);
+    // Every entry must translate now, or the caller gets an error while it can still take another way: Core Image
+    // falls back to compiling its kernels from source, which our translator handles where its stitched modules
+    // sometimes aren't (lanczos: "owned Load violates its pointer-pointee contract").
+    for (NSString *n in mine.functionNames) {
+        id f = [mine newFunctionWithName:n];
+        NSString *st = [f respondsToSelector:@selector(vgStage)] ? [f performSelector:@selector(vgStage)] : nil;
+        if (![st isEqual:@"kernel"] && ![st isEqual:@"vertex"] && ![st isEqual:@"fragment"]) {
+            continue;
+        }
+        NSString *why = nil;
+        if (!vg_translate([f performSelector:@selector(vgLL)], st.UTF8String, nil, NULL, 0, &why)) {
+            vglog("%s: %s doesn't translate (%s): refused, so the caller can take another way", what, n.UTF8String,
+                  why.UTF8String ?: "?");
+            if (error) {
+                *error = [NSError errorWithDomain:@"VirtioGPUMetal" code:2
+                                         userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"%@ doesn't translate", n]}];
+            }
+            return nil;
+        }
+    }
+    vglog("%s: Apple's library (%lu B) -> %s", what, (unsigned long)c.length, mine ? "ours" : "FAILED");
+    return mine;
+}
+- (id<MTLLibrary>)newLibraryWithStitchedDescriptor:(MTLStitchedLibraryDescriptor *)desc error:(NSError **)error {
+    NSArray *fns = [self vgAppleFunctions:desc.functions what:"stitching"];
+    if (!fns) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"VirtioGPUMetal" code:1
+                                     userInfo:@{NSLocalizedDescriptionKey : @"stitching: a function has no Apple twin"}];
+        }
+        return nil;
+    }
+    MTLStitchedLibraryDescriptor *d = [desc copy];
+    d.functions = fns;
+    struct objc_super sup = {self, class_getSuperclass(object_getClass(self))};
+    id apple = ((id(*)(struct objc_super *, SEL, id, NSError **))objc_msgSendSuper)(
+        &sup, @selector(newLibraryWithStitchedDescriptor:error:), d, error);
+    if (!apple) {
+        vglog("stitching: Apple's stitcher failed: %s", error && *error ? (*error).localizedDescription.UTF8String : "?");
+    }
+    return [self vgBridge:apple what:"stitching" error:error];
+}
+- (void)newLibraryWithStitchedDescriptor:(MTLStitchedLibraryDescriptor *)desc
+                       completionHandler:(MTLNewLibraryCompletionHandler)handler {
+    NSError *e = nil;
+    id<MTLLibrary> lib = [self newLibraryWithStitchedDescriptor:desc error:&e];
+    if (handler) {
+        handler(lib, lib ? nil : e);
+    }
+}
+- (id)vgLinkCI:(SEL)s functions:(NSArray *)fns info:(const void *)info error:(NSError **)error {
+    NSArray *apple = [self vgAppleFunctions:fns what:sel_getName(s)] ?: fns;
+    struct objc_super sup = {self, class_getSuperclass(object_getClass(self))};
+    id lib = ((id(*)(struct objc_super *, SEL, id, const void *, NSError **))objc_msgSendSuper)(&sup, s, apple, info, error);
+    if (!lib) {
+        vglog("%s: Apple's linker failed: %s", sel_getName(s), error && *error ? (*error).localizedDescription.UTF8String : "?");
+        return nil;
+    }
+    return [self vgBridge:lib what:sel_getName(s) error:error];
+}
+- (id)newLibraryWithCIFilters:(id)fns imageFilterFunctionInfo:(const void *)info error:(NSError **)error {
+    return [self vgLinkCI:_cmd functions:fns info:info error:error];
+}
+- (id)newLibraryWithImageFilterFunctionsSPI:(id)fns imageFilterFunctionInfo:(const void *)info error:(NSError **)error {
+    return [self vgLinkCI:_cmd functions:fns info:info error:error];
+}
+
 // Dynamic libraries (5d: Core Image's ci_stdlib).
 - (BOOL)supportsDynamicLibraries { return YES; }
 - (id<MTLBinaryArchive>)newBinaryArchiveWithDescriptor:(MTLBinaryArchiveDescriptor *)d error:(NSError **)error {
@@ -448,8 +595,28 @@ MTLRenderPipelineDescriptor *vg_gl_rewrite_descriptor(id<MTLDevice> device, MTLR
 void vg_gl_tag_reflection(id r, MTLRenderPipelineDescriptor *d);
 id vg_render_reflection(MTLRenderPipelineDescriptor *d);   // VGMTLReflection.m
 id vg_compute_reflection(id<MTLFunction> fn);
+// A stage with linked visible functions is linked with them first (5d, VGMTLLibrary.m).
+id<MTLFunction> vg_function_with_linked(id<MTLFunction> f, MTLLinkedFunctions *lf, NSError **error);
+static MTLRenderPipelineDescriptor *vg_link_descriptor(MTLRenderPipelineDescriptor *d, NSError **error) {
+    MTLLinkedFunctions *vl = d.vertexLinkedFunctions, *fl = d.fragmentLinkedFunctions;
+    BOOL any = vl.functions.count || vl.privateFunctions.count || vl.groups.count || fl.functions.count ||
+               fl.privateFunctions.count || fl.groups.count;
+    if (!any) {
+        return d;
+    }
+    id<MTLFunction> v = vg_function_with_linked(d.vertexFunction, vl, error);
+    id<MTLFunction> f = d.fragmentFunction ? vg_function_with_linked(d.fragmentFunction, fl, error) : nil;
+    if (!v || (d.fragmentFunction && !f)) {
+        return nil;
+    }
+    MTLRenderPipelineDescriptor *c = [d copy];
+    c.vertexFunction = v;
+    c.fragmentFunction = f;
+    return c;
+}
 - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)error {
-    d = vg_gl_rewrite_descriptor(self, d, error);
+    d = vg_link_descriptor(d, error);
+    d = d ? vg_gl_rewrite_descriptor(self, d, error) : nil;
     return d ? vg_new_render_pipeline(self, d, error) : nil;
 }
 - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d
@@ -459,7 +626,8 @@ id vg_compute_reflection(id<MTLFunction> fn);
     if (r) {
         *r = nil;
     }
-    d = vg_gl_rewrite_descriptor(self, d, error);
+    d = vg_link_descriptor(d, error);
+    d = d ? vg_gl_rewrite_descriptor(self, d, error) : nil;
     if (!d) {
         return nil;
     }

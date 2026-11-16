@@ -43,7 +43,34 @@ static BOOL vg_llvm_ready(void) {
     return ready;
 }
 
+// The translator folds function constants by evaluating the module's air.static_init text, and that evaluator (like
+// its other constant-space readers) knows only opaque-pointer loads and stores: `load i32, ptr addrspace(2) @g`. Apple's
+// LLVM prints typed pointers (`load i32, i32 addrspace(2)* @g`), so values computed there -- RenderBox's render target
+// index and argument predicates, all derived from its _shader_state constant -- weren't folded. Loads and stores of a
+// scalar or vector straight from or to a constant-space global are spelled the opaque way (5d); nothing else changes.
+static NSString *vg_opaque_constant_access(NSString *ll) {
+    static NSRegularExpression *re;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+      re = [NSRegularExpression regularExpressionWithPattern:@", (?:<[0-9]+ x [a-z0-9]+>|i[0-9]+|half|float|double) addrspace\\(2\\)\\* @"
+                                                     options:0 error:NULL];
+    });
+    if ([ll rangeOfString:@"addrspace(2)* @"].location == NSNotFound) {
+        return ll;
+    }
+    return [re stringByReplacingMatchesInString:ll options:0 range:NSMakeRange(0, ll.length)
+                                   withTemplate:@", ptr addrspace(2) @"];
+}
+static NSString *vg_air_to_text_typed(NSData *air);
 NSString *vg_air_to_text(NSData *air) {
+    NSString *t = vg_air_to_text_typed(air);
+    static int on = -1;
+    if (on < 0) {
+        on = access("/Library/GPUBundles/VirtioGPUMetal-typedconst", F_OK) != 0;   // the flag file turns it off
+    }
+    return on && t ? vg_opaque_constant_access(t) : t;
+}
+static NSString *vg_air_to_text_typed(NSData *air) {
     if (!vg_llvm_ready()) {
         return nil;
     }
@@ -176,7 +203,7 @@ static NSString *vg_translate_key(NSString *ll, const char *stage, NSDictionary<
 #include <sys/stat.h>
 #include <unistd.h>
 
-static NSString *vg_disk_dir(void) {
+NSString *vg_disk_dir(void) {
     static NSString *dir;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -496,15 +523,20 @@ static NSDictionary *vg_reflect_uncached(NSString *ll, const char *stage, NSDict
 // ---- MTLLibrary / MTLFunction ----------------------------------------------------------------------------------
 
 @class VGMTLLibrary;
+NSDictionary *vg_ci_entry(id fn);          // VGMTLReflection.m
+NSDictionary *vg_ci_stitch_entry(id fn);
 static NSString *vg_linked_ll(VGMTLLibrary *lib, NSString *ll, NSString *name);
 static NSSet<NSString *> *vg_undefined_externs(NSArray<NSString *> *modules);
 @interface VGMTLFunction : NSObject <MTLFunction> {
 @public
     __weak VGMTLLibrary *_lib;   // for its compile-time dynamic libraries (5d)
     NSString *_linked;           // _ll with its externs linked in from them, made on first use
+    unsigned char _bcHash[32];   // bitCodeHash (5d: Core Image keys its kernels by it)
+    BOOL _bcHashed;
     NSString *_ll;      // LLVM IR text of this entry's module
     NSString *_stage;   // "kernel" | "vertex" | "fragment"
     NSDictionary<NSNumber *, NSData *> *_fc;   // function-constant values (newFunctionWithName:constantValues:)
+    NSString *_specName;   // MTLFunctionDescriptor.specializedName: the name a linking caller refers to it by
 }
 @property(readonly) id<MTLDevice> device;
 @property(readonly) NSString *name;
@@ -523,10 +555,16 @@ static NSSet<NSString *> *vg_undefined_externs(NSArray<NSString *> *modules);
     return self;
 }
 - (MTLFunctionType)functionType {
+    if ([_stage isEqualToString:@"visible"]) {   // a Core Image kernel is Core Image's own type 4 (NullMoth's reading)
+        return vg_ci_entry(self) ? (MTLFunctionType)4 : MTLFunctionTypeVisible;
+    }
     return [_stage isEqualToString:@"vertex"]     ? MTLFunctionTypeVertex
            : [_stage isEqualToString:@"fragment"] ? MTLFunctionTypeFragment
                                                   : MTLFunctionTypeKernel;
 }
+// Core Image's reflection of a visible function (VGMTLReflection.m)
+- (NSArray *)arguments { return (vg_ci_entry(self) ?: vg_ci_stitch_entry(self))[@"args"]; }
+- (id)returnType { return (vg_ci_entry(self) ?: vg_ci_stitch_entry(self))[@"ret"]; }
 - (NSDictionary<NSString *, MTLFunctionConstant *> *)functionConstantsDictionary { return @{}; }
 - (MTLFunctionOptions)options { return MTLFunctionOptionNone; }
 - (NSString *)description { return [NSString stringWithFormat:@"<VGMTLFunction %@ (%@)>", _name, _stage]; }
@@ -539,11 +577,30 @@ static NSSet<NSString *> *vg_undefined_externs(NSArray<NSString *> *modules);
     }
 }
 - (NSString *)vgStage { return _stage; }
+- (id)vgLibrary { return _lib; }
+- (NSArray *)importedLibraries { return @[]; }
+// A 32-byte digest of the function (name, IR, constants): Core Image keys its kernel caches by it (5d; nil crashed).
+- (const void *)bitCodeHash {
+    @synchronized(self) {
+        if (!_bcHashed) {
+            NSMutableData *d = [NSMutableData data];
+            [d appendData:[(_name ?: @"") dataUsingEncoding:NSUTF8StringEncoding]];
+            [d appendData:[(_ll ?: @"") dataUsingEncoding:NSUTF8StringEncoding]];
+            if (_fc.count) {
+                [d appendData:[[_fc description] dataUsingEncoding:NSUTF8StringEncoding]];
+            }
+            CC_SHA256(d.bytes, (CC_LONG)d.length, _bcHash);
+            _bcHashed = YES;
+        }
+        return _bcHash;
+    }
+}
 - (NSDictionary<NSNumber *, NSData *> *)vgFC { return _fc; }
 - (VGMTLFunction *)specializedWith:(NSDictionary<NSNumber *, NSData *> *)fc {
     VGMTLFunction *f = [[VGMTLFunction alloc] initWithDevice:_device name:_name stage:_stage ll:_ll];
     f->_fc = [fc copy];
     f->_lib = _lib;
+    f->_specName = _specName;
     return f;
 }
 @end
@@ -635,6 +692,8 @@ static BOOL vg_entry_of(NSString *ll, NSString **name, NSString **stage) {
     return self;
 }
 - (NSArray<NSString *> *)functionNames { return _functions.allKeys; }
+- (NSData *)vgRaw { return _raw; }
+- (VGMTLLibrary *)vgSelf { return self; }
 // What the library calls and doesn't define, linked from dynamic libraries (Core Image asks).
 - (NSArray<NSString *> *)externFunctionNames { return vg_undefined_externs(_modules ?: @[]).allObjects; }
 // A name in a namespace ("Clear::clear_vertex", Maps) is the entry's C++ symbol: _ZN5Clear12clear_vertexE...
@@ -759,19 +818,141 @@ static VGMTLFunction *vg_function_by_cxx_name(NSDictionary<NSString *, VGMTLFunc
     return fc.count ? [f specializedWith:fc] : f;
 }
 - (id<MTLFunction>)newFunctionWithDescriptor:(MTLFunctionDescriptor *)d error:(NSError **)error {
+    id<MTLFunction> f;
     if (d.constantValues) {
-        return [self newFunctionWithName:d.name constantValues:d.constantValues error:error];
+        f = [self newFunctionWithName:d.name constantValues:d.constantValues error:error];
+    } else {
+        if (error) {
+            *error = nil;
+        }
+        f = [self newFunctionWithName:d.name];
+        if (!f && error) {
+            *error = vg_lib_error([NSString stringWithFormat:@"no function %@", d.name]);
+        }
     }
-    if (error) {
-        *error = nil;
-    }
-    id<MTLFunction> f = [self newFunctionWithName:d.name];
-    if (!f && error) {
-        *error = vg_lib_error([NSString stringWithFormat:@"no function %@", d.name]);
+    // RenderBox asks for each custom shader (clampToEdges_v1, glow_v1, ...) with specializedName "custom_fn" and links
+    // it into a pipeline whose fragment refers to "custom_fn" (5d): kept on a copy, applied when it is linked.
+    if (d.specializedName.length && [(NSObject *)f isKindOfClass:[VGMTLFunction class]] &&
+        ![d.specializedName isEqualToString:f.name]) {
+        VGMTLFunction *o = (VGMTLFunction *)f, *c = [o specializedWith:o->_fc];
+        c->_specName = [d.specializedName copy];
+        f = c;
     }
     return f;
 }
 @end
+
+// Libraries loaded with this set list no visible functions (see vg_new_library_from_url).
+static __thread BOOL gNoVisible;
+
+// Functions a module defines with external linkage (not internal/private, not intrinsics).
+static NSArray<NSString *> *vg_exported_defs(NSString *ll) {
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSString *line in [ll componentsSeparatedByString:@"\n"]) {
+        if (![line hasPrefix:@"define "] || [line hasPrefix:@"define internal"] || [line hasPrefix:@"define private"] ||
+            [line rangeOfString:@" internal "].location != NSNotFound) {
+            continue;
+        }
+        NSRange at = [line rangeOfString:@"@"];
+        if (at.location == NSNotFound) {
+            continue;
+        }
+        NSUInteger s = at.location + 1, e;
+        BOOL q = s < line.length && [line characterAtIndex:s] == '"';
+        if (q) {
+            s++;
+        }
+        for (e = s; e < line.length; e++) {
+            unichar c = [line characterAtIndex:e];
+            if (q ? c == '"' : c == '(') {
+                break;
+            }
+        }
+        NSString *nm = e > s ? [line substringWithRange:NSMakeRange(s, e - s)] : nil;
+        if (nm && ![nm hasPrefix:@"air."] && ![nm hasPrefix:@"llvm."]) {
+            [out addObject:nm];
+        }
+    }
+    return out;
+}
+
+// The functions a module lists as visible (!air.visible, and Core Image's !air.ci) and defines (after NullMoth's
+// nvmtl_visible_of).
+static NSArray<NSString *> *vg_visible_of(NSString *ll) {
+    NSMutableArray *ids = [NSMutableArray array];
+    NSMutableDictionary *node = [NSMutableDictionary dictionary];
+    NSMutableSet *defined = [NSMutableSet set];
+    for (NSString *line in [ll componentsSeparatedByString:@"\n"]) {
+        if ([line hasPrefix:@"define"]) {
+            NSRange at = [line rangeOfString:@"@"];
+            if (at.location == NSNotFound) {
+                continue;
+            }
+            NSUInteger s = at.location + 1, e;
+            BOOL q = s < line.length && [line characterAtIndex:s] == '"';
+            if (q) {
+                s++;
+            }
+            for (e = s; e < line.length; e++) {
+                unichar c = [line characterAtIndex:e];
+                if (q ? c == '"' : c == '(') {
+                    break;
+                }
+            }
+            if (e > s) {
+                [defined addObject:[line substringWithRange:NSMakeRange(s, e - s)]];
+            }
+            continue;
+        }
+        if (![line hasPrefix:@"!"]) {
+            continue;
+        }
+        if ([line hasPrefix:@"!air.visible = "] || [line hasPrefix:@"!air.ci = "]) {
+            NSRange eq = [line rangeOfString:@"="];
+            for (NSString *tok in [[line substringFromIndex:eq.location] componentsSeparatedByString:@"!"]) {
+                NSUInteger d = 0;
+                while (d < tok.length && [tok characterAtIndex:d] >= '0' && [tok characterAtIndex:d] <= '9') {
+                    d++;
+                }
+                if (d) {
+                    [ids addObject:[tok substringToIndex:d]];
+                }
+            }
+            continue;
+        }
+        NSRange eq = [line rangeOfString:@" = !{"];
+        if (eq.location == NSNotFound || eq.location < 2) {
+            continue;
+        }
+        NSString *idn = [line substringWithRange:NSMakeRange(1, eq.location - 1)];
+        NSRange at = [line rangeOfString:@"@" options:0 range:NSMakeRange(eq.location, line.length - eq.location)];
+        if (at.location == NSNotFound) {
+            continue;
+        }
+        NSUInteger s = at.location + 1, e;
+        BOOL q = s < line.length && [line characterAtIndex:s] == '"';
+        if (q) {
+            s++;
+        }
+        for (e = s; e < line.length; e++) {
+            unichar c = [line characterAtIndex:e];
+            if (q ? c == '"' : (c == ',' || c == ')' || c == '}' || c == ' ')) {
+                break;
+            }
+        }
+        if (e > s) {
+            node[idn] = [line substringWithRange:NSMakeRange(s, e - s)];
+        }
+    }
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSString *i in ids) {
+        NSString *nm = node[i];
+        if (nm && [defined containsObject:nm] && ![out containsObject:nm]) {
+            [out addObject:nm];
+        }
+    }
+    return out;
+}
 
 id<MTLLibrary> vg_new_library(id<MTLDevice> device, NSData *lib, NSError **error) {
     if (error) {
@@ -801,6 +982,16 @@ id<MTLLibrary> vg_new_library(id<MTLDevice> device, NSData *lib, NSError **error
         NSString *name = nil, *stage = nil;
         if (ll && vg_entry_of(ll, &name, &stage)) {
             fns[name] = [[VGMTLFunction alloc] initWithDevice:device name:name stage:stage ll:ll];
+        } else if (ll && !gNoVisible) {
+            // visible / stitchable functions (5d: SwiftUI's shader effects, Core Image's kernels): functions of the
+            // library too, for stitching and linking
+            NSArray *vis = vg_visible_of(ll);
+            if (!vis.count) {
+                vis = vg_exported_defs(ll);   // Apple's stitched output: the stitched function, no visible metadata
+            }
+            for (NSString *v in vis) {
+                fns[v] = [[VGMTLFunction alloc] initWithDevice:device name:v stage:@"visible" ll:ll];
+            }
         }
         i += off + size - 1;
     }
@@ -878,7 +1069,7 @@ static NSString *vg_linked_ll(VGMTLLibrary *lib, NSString *ll, NSString *name) {
       pLink = h ? (xl_link_fn)dlsym(h, "nvmtl_link_externs") : NULL;
     });
     NSSet *decl = vg_undefined_externs(@[ ll ]);
-    if (!decl.count || !pLink) {
+    if (!decl.count || !pLink || !vg_translator_ready()) {
         return nil;
     }
     const char **ms = calloc(mods.count, sizeof(*ms));
@@ -969,4 +1160,220 @@ id<MTLFunction> vg_function_from_ll(id<MTLDevice> device, NSString *ll, NSString
         stage = st;
     }
     return [[VGMTLFunction alloc] initWithDevice:device name:name stage:stage ll:ll];
+}
+
+// A library from a file. Core Image's own libraries (its framework's ci_*_stitchable.metallib) list no visible
+// functions (5d): with them Core Image stitches its filters, and our translator refuses some stitched modules
+// (lanczos: "owned Load violates its pointer-pointee contract") while Core Image doesn't fall back; without them it
+// compiles its filters from source, which translates.
+id<MTLLibrary> vg_new_library_from_url(id<MTLDevice> device, NSData *lib, NSURL *url, NSError **error) {
+    gNoVisible = [url.path containsString:@"/CoreImage.framework/"];
+    id<MTLLibrary> l = vg_new_library(device, lib, error);
+    gNoVisible = NO;
+    return l;
+}
+
+// ---- linked visible functions (5d) ---------------------------------------------------------------------------------
+// A pipeline stage that calls visible functions handed to it in its MTLLinkedFunctions (SwiftUI's and RenderBox's
+// shader effects: the Dock's Calendar icon, Spotlight) is linked with their modules before translation (the
+// translator's nvmtl_link_visible). After NullMoth's nvmtl_link_stage (NVMTLLibraryLoad.m): the references come from
+// the translator (nvmtl_visible_refs), each is supplied by the linked function that defines it, under its
+// specializedName when it has one, and the linked functions' constants join the stage's. Direct calls only: a stage
+// that reads a visible function table is left to fail with the translator's reason.
+typedef int (*xl_linkvis_fn)(const char *, const char *, const char *const *, const char *const *, size_t, uint8_t **,
+                             size_t *, char *, size_t);
+typedef int (*xl_vrefs_fn)(const char *, uint8_t **, size_t *, char *, size_t);
+static BOOL vg_llvm_plain(unichar c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '.' ||
+           c == '$' || c == '-';
+}
+// The global's spelling in LLVM text: @name, or @"name" with \ and " escaped.
+static NSString *vg_llvm_global(NSString *sym) {
+    if (!sym.length) {
+        return nil;
+    }
+    BOOL plain = YES;
+    for (NSUInteger i = 0; i < sym.length; i++) {
+        plain = plain && vg_llvm_plain([sym characterAtIndex:i]);
+    }
+    if (plain) {
+        return [@"@" stringByAppendingString:sym];
+    }
+    NSString *q = [[sym stringByReplacingOccurrencesOfString:@"\\" withString:@"\\5C"]
+        stringByReplacingOccurrencesOfString:@"\"" withString:@"\\22"];
+    return [NSString stringWithFormat:@"@\"%@\"", q];
+}
+static BOOL vg_module_defines(NSString *ll, NSString *sym) {
+    NSString *g = vg_llvm_global(sym);
+    if (!g || !ll.length) {
+        return NO;
+    }
+    NSString *call = [g stringByAppendingString:@"("];
+    for (NSString *line in [ll componentsSeparatedByString:@"\n"]) {
+        if ([line hasPrefix:@"define "] && [line rangeOfString:call options:NSLiteralSearch].location != NSNotFound) {
+            return YES;
+        }
+    }
+    return NO;
+}
+// Every whole-token use of global `from` becomes `to`; nil when nothing changed or `to` is already defined.
+static NSString *vg_rename_global(NSString *ll, NSString *from, NSString *to) {
+    NSString *gf = vg_llvm_global(from), *gt = vg_llvm_global(to);
+    if (!gf || !gt || vg_module_defines(ll, to)) {
+        return nil;
+    }
+    BOOL quoted = [gf hasPrefix:@"@\""];
+    NSMutableString *o = [NSMutableString stringWithCapacity:ll.length + 64];
+    NSUInteger pos = 0, n = ll.length, hits = 0;
+    for (;;) {
+        NSRange r = [ll rangeOfString:gf options:NSLiteralSearch range:NSMakeRange(pos, n - pos)];
+        if (r.location == NSNotFound) {
+            break;
+        }
+        NSUInteger end = NSMaxRange(r);
+        unichar next = end < n ? [ll characterAtIndex:end] : 0;
+        BOOL whole = quoted || end >= n || next >= 128 || !vg_llvm_plain(next);
+        [o appendString:[ll substringWithRange:NSMakeRange(pos, r.location - pos)]];
+        [o appendString:whole ? gt : gf];
+        hits += whole;
+        pos = end;
+    }
+    if (!hits) {
+        return nil;
+    }
+    [o appendString:[ll substringFromIndex:pos]];
+    return o;
+}
+// The translator reads a reference as !{!"air.visible_function_reference", ptr @stub, ...} (opaque pointers); AIR
+// built with typed pointers names the stub's whole function-pointer type there instead, so that type becomes `ptr`.
+static NSString *vg_opaque_vrefs(NSString *ll) {
+    static NSString *const marker = @"!\"air.visible_function_reference\", ";
+    if ([ll rangeOfString:marker].location == NSNotFound) {
+        return ll;
+    }
+    NSMutableArray *lines = [[ll componentsSeparatedByString:@"\n"] mutableCopy];
+    for (NSUInteger i = 0; i < lines.count; i++) {
+        NSString *line = lines[i];
+        NSRange m = [line rangeOfString:marker];
+        if (m.location == NSNotFound) {
+            continue;
+        }
+        NSUInteger from = NSMaxRange(m);
+        NSRange at = [line rangeOfString:@"@" options:0 range:NSMakeRange(from, line.length - from)];
+        if (at.location == NSNotFound || [[line substringWithRange:NSMakeRange(from, at.location - from)] isEqualToString:@"ptr "]) {
+            continue;
+        }
+        lines[i] = [NSString stringWithFormat:@"%@ptr %@", [line substringToIndex:from], [line substringFromIndex:at.location]];
+    }
+    return [lines componentsJoinedByString:@"\n"];
+}
+id<MTLFunction> vg_function_with_linked(id<MTLFunction> f, MTLLinkedFunctions *lf, NSError **error) {
+    if (![(NSObject *)f isKindOfClass:[VGMTLFunction class]] || !lf) {
+        return f;
+    }
+    NSMutableArray *cands = [NSMutableArray array];
+    [cands addObjectsFromArray:lf.functions ?: @[]];
+    [cands addObjectsFromArray:lf.privateFunctions ?: @[]];
+    for (NSArray *g in lf.groups.allValues) {
+        if ([g isKindOfClass:[NSArray class]]) {
+            [cands addObjectsFromArray:g];
+        }
+    }
+    if (!cands.count) {
+        return f;
+    }
+    static xl_linkvis_fn pLinkVis;
+    static xl_vrefs_fn pVRefs;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+      NSString *path = vg_resource_path("libnvmtl_translate.dylib");
+      void *h = path ? dlopen(path.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL) : NULL;
+      pLinkVis = h ? (xl_linkvis_fn)dlsym(h, "nvmtl_link_visible") : NULL;
+      pVRefs = h ? (xl_vrefs_fn)dlsym(h, "nvmtl_visible_refs") : NULL;
+    });
+    if (!vg_translator_ready() || !pLinkVis || !pVRefs) {   // ready: pTranslateFree (cached pipelines skip it)
+        return f;
+    }
+    VGMTLFunction *fn = (VGMTLFunction *)f;
+    NSString *entry = vg_opaque_vrefs([fn vgLL]);
+    uint8_t *out = NULL;
+    size_t len = 0;
+    char err[1024] = "";
+    NSArray *refs = nil;
+    if (pVRefs(entry.UTF8String, &out, &len, err, sizeof(err)) == 0 && out) {
+        refs = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:out length:len] options:0 error:NULL];
+        pTranslateFree(out, len);
+        out = NULL;
+    }
+    if (![refs isKindOfClass:[NSArray class]] || !refs.count) {
+        static int said;
+        if (said++ < 4) {
+            vglog("link: %s: %s", fn.name.UTF8String, refs ? "no visible references" : err);
+            NSString *dir = vg_disk_dir();
+            if (dir && [[NSFileManager defaultManager] fileExistsAtPath:@"/Library/GPUBundles/VirtioGPUMetal-dumplink"]) {
+                [entry writeToFile:[dir stringByAppendingFormat:@"/link-%@.ll", fn.name] atomically:YES
+                          encoding:NSUTF8StringEncoding error:NULL];
+            }
+        }
+        return f;   // nothing to link (or unreadable: the translator gives its own reason)
+    }
+    NSMutableDictionary<NSString *, NSString *> *mods = [NSMutableDictionary dictionary];
+    NSMutableDictionary *fc = [NSMutableDictionary dictionary];
+    for (id c in cands) {
+        if (![c isKindOfClass:[VGMTLFunction class]]) {
+            continue;
+        }
+        VGMTLFunction *cf = c;
+        NSString *ll = vg_opaque_vrefs([cf vgLL]);
+        if (cf->_specName.length && !vg_module_defines(ll, cf->_specName)) {
+            ll = vg_rename_global(ll, cf.name, cf->_specName) ?: ll;
+        }
+        for (NSString *nm in @[ cf->_specName ?: @"", cf.name ?: @"" ]) {
+            if (nm.length && !mods[nm] && vg_module_defines(ll, nm)) {
+                mods[nm] = ll;
+            }
+        }
+        [cf->_fc enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop) {
+          if (!fc[k]) {
+              fc[k] = v;
+          }
+        }];
+    }
+    [fc addEntriesFromDictionary:fn->_fc ?: @{}];
+    NSMutableArray *missing = [NSMutableArray array];
+    for (NSString *r in refs) {
+        if ([r isKindOfClass:[NSString class]] && !mods[r]) {
+            [missing addObject:r];
+        }
+    }
+    NSArray *keys = mods.allKeys;
+    const char **syms = calloc(keys.count + 1, sizeof(*syms)), **mls = calloc(keys.count + 1, sizeof(*mls));
+    for (NSUInteger i = 0; i < keys.count; i++) {
+        syms[i] = [keys[i] UTF8String];
+        mls[i] = [mods[keys[i]] UTF8String];
+    }
+    int r = pLinkVis(entry.UTF8String, fn->_stage.UTF8String, syms, mls, keys.count, &out, &len, err, sizeof(err));
+    free(syms);
+    free(mls);
+    if (r || !out) {
+        vglog("link: %s (refs %s) failed: %s", fn.name.UTF8String, [[refs componentsJoinedByString:@","] UTF8String], err);
+        if (error) {
+            *error = vg_lib_error([NSString stringWithFormat:@"linking visible functions into %@: %s", fn.name, err]);
+        }
+        return nil;
+    }
+    NSString *linked = [[NSString alloc] initWithBytes:out length:(len && out[len - 1] == 0) ? len - 1 : len
+                                              encoding:NSUTF8StringEncoding];
+    pTranslateFree(out, len);
+    VGMTLFunction *lfn = [[VGMTLFunction alloc] initWithDevice:fn.device name:fn.name stage:fn->_stage ll:linked];
+    lfn->_fc = fc.count ? fc : nil;
+    lfn->_lib = fn->_lib;
+    lfn->_linked = linked;   // already linked: no dylib pass over it
+    static int logged;
+    if (logged++ < 10 || missing.count) {
+        vglog("link: %s refs %s, linked %s%s%s", fn.name.UTF8String, [[refs componentsJoinedByString:@","] UTF8String],
+              [[keys componentsJoinedByString:@","] UTF8String], missing.count ? "; nothing supplies " : "",
+              [[missing componentsJoinedByString:@","] UTF8String]);
+    }
+    return lfn;
 }

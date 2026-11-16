@@ -191,7 +191,7 @@ int vg_spirv_bindings(NSData *spv, uint32_t wantSet, vg_binding *out, int max, N
             break;
         }
         if (count < max) {
-            out[count++] = (vg_binding){bind[id], t};
+            out[count++] = (vg_binding){bind[id], t, VK_NULL_HANDLE};
         }
     }
     free(set), free(bind), free(ptrType), free(block), free(hasBind), free(kind), free(vars);
@@ -343,7 +343,9 @@ VkDescriptorSet vg_write_set(VGMTLCommandBuffer *cmd, VkDescriptorSetLayout dsl,
             continue;
         }
         uint32_t slot;
-        if (type == VK_DESCRIPTOR_TYPE_SAMPLER) {
+        if (type == VK_DESCRIPTOR_TYPE_SAMPLER && bindings[i].fixed) {
+            iinfo[i] = (VkDescriptorImageInfo){bindings[i].fixed, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+        } else if (type == VK_DESCRIPTOR_TYPE_SAMPLER) {
             slot = b - kVGSamplerBase;
             if (b < kVGSamplerBase || slot >= kVGMaxSamplerSlots || !t->smp[slot]) {
                 vg_unbound(who, "sampler", (int)b - kVGSamplerBase);
@@ -475,6 +477,12 @@ VkDescriptorSet vg_write_set(VGMTLCommandBuffer *cmd, VkDescriptorSetLayout dsl,
         if (v->nbindings < 0) {
             return nil;
         }
+        for (int i = 0; i < v->nbindings; i++) {
+            if (v->bindings[i].type == VK_DESCRIPTOR_TYPE_SAMPLER) {   // constexpr samplers, from the (cached) reflection
+                vg_apply_static_samplers(vg_reflect(_ll, "kernel", _fc, &(NSString *__autoreleasing){nil}), v->bindings, v->nbindings);
+                break;
+            }
+        }
         VkShaderModuleCreateInfo smci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, spv.length, spv.bytes};
         VkResult r = gVk.vkCreateShaderModule(gVk.device, &smci, NULL, &v->module);
         VkDescriptorSetLayoutBinding lb[64];
@@ -571,7 +579,7 @@ id<MTLComputePipelineState> vg_new_compute_pipeline(id<MTLDevice> device, id<MTL
         }
         for (NSDictionary *b in refl[@"bindings"]) {
             NSString *kind = b[@"kind"];
-            if (p && ![@[ @"Buffer", @"ThreadgroupBuffer", @"Texture", @"StorageImage", @"Sampler" ] containsObject:kind]) {
+            if (p && ![@[ @"Buffer", @"ThreadgroupBuffer", @"Texture", @"StorageImage", @"Sampler", @"StaticSampler" ] containsObject:kind]) {
                 why = [NSString stringWithFormat:@"binding kind %@ not supported yet", kind];
                 p = nil;
             }
@@ -1201,6 +1209,50 @@ static void vg_events_wait(NSArray *waits) {
         }
     }
 }
+// Debugging (flag file /Library/GPUBundles/VirtioGPUMetal-dumpsurf): what each written surface holds, logged, and
+// its pixels saved into the translation cache's folder (raw, 4 bytes a pixel) for the first 40.
+NSString *vg_disk_dir(void);
+static void vg_surface_debug(VGMTLTexture *t) {
+    static int on = -1, n;
+    if (on < 0) {
+        BOOL vg_debug_flag(const char *name);
+        on = vg_debug_flag("dumpsurf");
+    }
+    size_t pe = IOSurfaceGetBytesPerElementOfPlane(t->_surface, t->_plane);
+    if (!on || n >= 40 || (pe != 4 && pe != 8)) {
+        return;
+    }
+    n++;
+    const uint8_t *p = t->_staging.map;
+    size_t w = t->_width, h = t->_height, bpr = t->_surfaceBpr, opaque = 0;
+    uint64_t sum[4] = {0};
+    for (size_t y = 0; y < h; y++) {
+        for (size_t x = 0; x < w; x++) {
+            const uint8_t *q = p + y * bpr + x * pe;
+            if (pe == 8) {   // half floats: the high byte of each, enough to see what's there
+                opaque += (q[6] | q[7]) != 0;
+                for (int c = 0; c < 4; c++) {
+                    sum[c] += q[2 * c + 1];
+                }
+                continue;
+            }
+            opaque += q[3] != 0;
+            for (int c = 0; c < 4; c++) {
+                sum[c] += q[c];
+            }
+        }
+    }
+    size_t px = w * h ? w * h : 1;
+    vglog("dumpsurf %d: IOSurface %u %zux%zu fmt %lu: %zu%% non-transparent, mean %llu %llu %llu %llu", n,
+          IOSurfaceGetID(t->_surface), w, h, (unsigned long)t->_format, opaque * 100 / px, sum[0] / px, sum[1] / px,
+          sum[2] / px, sum[3] / px);
+    NSString *dir = vg_disk_dir();
+    if (dir) {
+        NSData *d = [NSData dataWithBytes:p length:bpr * h];
+        [d writeToFile:[dir stringByAppendingFormat:@"/surf-%d-%u-%zux%zu-%zu.raw", n, IOSurfaceGetID(t->_surface), w, h, bpr]
+            atomically:NO];
+    }
+}
 - (void)finishWith:(MTLCommandBufferStatus)status fence:(VkFence)fence {
     VGCALL("cb %p completing, status %lu", self, (unsigned long)status);
     uint64_t dequeued = vg_now();
@@ -1278,6 +1330,7 @@ static void vg_events_wait(NSArray *waits) {
             vg_perf(VG_PERF_WB_COPY, t->_surfaceBpr * t->_height, vg_now() - t0);
             t->_syncedSeed = seed;   // our own write: no pull needed for it
             t->_neverSynced = NO;
+            vg_surface_debug(t);
         }
     }
     [_surfacesWritten removeAllObjects];

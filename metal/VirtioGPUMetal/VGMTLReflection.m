@@ -784,3 +784,261 @@ void vg_reflection_set_plugin_data(id r, NSData *v, NSData *f) {
         ((VGMTLRenderPipelineReflection *)r)->_fpr = f;
     }
 }
+
+// ---- Core Image's reflection of visible functions (5d) -------------------------------------------------------------
+// Core Image reads a kernel function's arguments and return type (its CIKernelReflection) from the function: for a CI
+// kernel (!air.ci) from that metadata, for a stitchable one from air.stitching_info. Without them it dereferenced
+// nothing (Preview, kernelWithString:). After NullMoth's nvmtl_ci_entry / nvmtl_ci_stitch_entry and NVMTLCIBinding.
+@interface VGReflCIBinding : NSObject {
+@public
+    NSString *_name;
+    VGReflType *_t;
+}
+@end
+@implementation VGReflCIBinding
+- (NSString *)name { return _name ?: @""; }
+- (NSUInteger)type { return 18; }
+- (MTLBindingAccess)access { return MTLBindingAccessReadOnly; }
+- (NSUInteger)index { return 0; }
+- (BOOL)isUsed { return YES; }
+- (BOOL)isActive { return YES; }
+- (BOOL)isArgument { return NO; }
+- (NSUInteger)arrayLength { return 1; }
+- (id)dataTypeDescription { return _t; }
+- (MTLDataType)dataType { return _t ? _t->_dataType : MTLDataTypeNone; }
+@end
+@interface VGReflCIStructType : VGReflStructType {
+@public
+    NSString *_typeName;
+}
+@end
+@implementation VGReflCIStructType
+- (NSString *)typeName { return _typeName ?: @""; }
+@end
+@interface VGReflCIStitchBinding : VGReflCIBinding {
+@public
+    NSUInteger _bt;
+}
+@end
+@implementation VGReflCIStitchBinding
+- (NSUInteger)type { return _bt; }
+- (BOOL)isUsed { return NO; }
+- (BOOL)isActive { return NO; }
+@end
+
+static NSString *vg_ci_trim(NSString *t) {
+    return [t stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"!\" "]];
+}
+static NSString *vg_ci_wtrim(NSString *t) { return [t stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]]; }
+static NSString *vg_ci_body(NSDictionary *nodes, NSString *ref) { return [ref isKindOfClass:[NSString class]] ? nodes[ref] : nil; }
+static NSString *vg_ci_quoted(NSString *body, NSString *tag) {
+    NSRange r = [body rangeOfString:[NSString stringWithFormat:@"!\"%@\", !\"", tag]];
+    if (r.location == NSNotFound) {
+        return nil;
+    }
+    NSUInteger from = NSMaxRange(r);
+    NSRange q = [body rangeOfString:@"\"" options:0 range:NSMakeRange(from, body.length - from)];
+    return q.location == NSNotFound ? nil : [body substringWithRange:NSMakeRange(from, q.location - from)];
+}
+static NSArray *vg_ci_refs(NSString *body) {
+    NSMutableArray *out = [NSMutableArray new];
+    for (NSString *p in [body componentsSeparatedByString:@","]) {
+        NSString *t = vg_ci_wtrim(p);
+        if ([t hasPrefix:@"!"] && ![t hasPrefix:@"!\""]) {
+            [out addObject:t];
+        }
+    }
+    return out;
+}
+static MTLDataType vg_ci_air_dtype(NSDictionary *nodes, NSString *ref) {
+    NSString *b = ref ? nodes[ref] : nil;
+    if (!b) {
+        return MTLDataTypeNone;
+    }
+    NSArray *p = [b componentsSeparatedByString:@", "];
+    NSUInteger n = 1;
+    NSString *el = b;
+    if ([b hasPrefix:@"!\"air.vector_type\""] && p.count >= 6) {
+        n = (NSUInteger)[[p[5] stringByReplacingOccurrencesOfString:@"i32 " withString:@""] integerValue];
+        el = nodes[vg_ci_wtrim(p[4])] ?: @"";
+    }
+    NSArray *q = [el componentsSeparatedByString:@", "];
+    NSInteger sz = q.count > 1 ? [[q[1] stringByReplacingOccurrencesOfString:@"i32 " withString:@""] integerValue] : 0;
+    if (n < 1 || n > 4) {
+        return MTLDataTypeNone;
+    }
+    if ([el hasPrefix:@"!\"air.float_type\""]) {
+        return (MTLDataType)((sz == 2 ? MTLDataTypeHalf : MTLDataTypeFloat) + n - 1);
+    }
+    return MTLDataTypeNone;
+}
+// the metadata lines of a module: "!N = !{...}" bodies by "!N", and the body of `listKey` (e.g. "!air.ci")
+static NSDictionary *vg_ci_nodes(NSString *ll, NSString *listKey, NSString **list) {
+    NSMutableDictionary *nodes = [NSMutableDictionary new];
+    for (NSString *line in [ll componentsSeparatedByString:@"\n"]) {
+        if (![line hasPrefix:@"!"]) {
+            continue;
+        }
+        NSRange eq = [line rangeOfString:@" = !{"];
+        if (eq.location == NSNotFound || ![line hasSuffix:@"}"]) {
+            continue;
+        }
+        NSString *body = [line substringWithRange:NSMakeRange(NSMaxRange(eq), line.length - NSMaxRange(eq) - 1)];
+        NSString *key = [line substringToIndex:eq.location];
+        if ([key isEqualToString:listKey]) {
+            *list = body;
+        } else {
+            nodes[key] = body;
+        }
+    }
+    return nodes;
+}
+static char kCIKey, kCIStitchKey;
+NSDictionary *vg_ci_entry(id fn) {
+    if (![[fn vgStage] isEqualToString:@"visible"]) {
+        return nil;
+    }
+    @synchronized(fn) {
+        id have = objc_getAssociatedObject(fn, &kCIKey);
+        if (have) {
+            return have == [NSNull null] ? nil : have;
+        }
+        NSDictionary *found = nil;
+        NSString *ll = [fn vgLL], *fname = [(id<MTLFunction>)fn name];
+        if (ll.length && fname.length && [ll rangeOfString:@"\n!air.ci = "].location != NSNotFound) {
+            NSString *list = nil;
+            NSDictionary *nodes = vg_ci_nodes(ll, @"!air.ci", &list);
+            // "ptr @name, ..." or, in typed-pointer IR, "<4 x float> (...)* @name, ..."
+            NSString *head = [NSString stringWithFormat:@"@%@,", fname];
+            for (NSString *ref in vg_ci_refs(list ?: @"")) {
+                NSString *entry = nodes[ref];
+                NSRange at = entry ? [entry rangeOfString:head] : (NSRange){NSNotFound, 0};
+                if (at.location == NSNotFound) {
+                    continue;
+                }
+                NSArray *parts = vg_ci_refs([entry substringFromIndex:NSMaxRange(at)]);
+                if (parts.count < 2) {
+                    break;
+                }
+                NSString *retBody = vg_ci_body(nodes, parts[0]);
+                if (retBody && !vg_ci_quoted(retBody, @"air.arg_type_name")) {
+                    retBody = vg_ci_body(nodes, vg_ci_refs(retBody).firstObject);
+                }
+                VGReflType *ret = [VGReflType new];
+                NSString *rtn = retBody ? vg_ci_quoted(retBody, @"air.arg_type_name") : nil;
+                ret->_dataType = rtn ? vg_datatype_for_air_name(rtn) : MTLDataTypeFloat4;
+                NSMutableArray *args = [NSMutableArray new];
+                for (NSString *aref in vg_ci_refs(vg_ci_body(nodes, parts[1]) ?: @"")) {
+                    NSString *ab = nodes[aref];
+                    if (!ab) {
+                        continue;
+                    }
+                    NSString *tn = vg_ci_quoted(ab, @"air.arg_type_name") ?: @"";
+                    BOOL builtin = [ab rangeOfString:@"!\"air.ci_builtin\""].location != NSNotFound;
+                    VGReflCIBinding *b = [VGReflCIBinding new];
+                    b->_t = [VGReflType new];
+                    b->_name = vg_ci_quoted(ab, @"air.arg_name") ?: [NSString stringWithFormat:@"arg%lu", (unsigned long)args.count];
+                    MTLDataType dt = vg_datatype_for_air_name(tn);
+                    if (!builtin && dt != MTLDataTypeTexture && dt != MTLDataTypeSampler) {
+                        dt = MTLDataTypePointer;
+                    }
+                    b->_t->_dataType = dt;
+                    [args addObject:b];
+                }
+                found = @{@"args" : args, @"ret" : ret};
+                break;
+            }
+        }
+        objc_setAssociatedObject(fn, &kCIKey, found ?: [NSNull null], OBJC_ASSOCIATION_RETAIN);
+        return found;
+    }
+}
+NSDictionary *vg_ci_stitch_entry(id fn) {
+    if (![[fn vgStage] isEqualToString:@"visible"]) {
+        return nil;
+    }
+    @synchronized(fn) {
+        id have = objc_getAssociatedObject(fn, &kCIStitchKey);
+        if (have) {
+            return have == [NSNull null] ? nil : have;
+        }
+        NSDictionary *found = nil;
+        NSString *ll = [fn vgLL], *fname = [(id<MTLFunction>)fn name];
+        if (ll.length && fname.length && [ll rangeOfString:@"\n!air.visible = "].location != NSNotFound &&
+            [ll rangeOfString:@"!\"air.stitching_info\""].location != NSNotFound) {
+            NSString *list = nil;
+            NSDictionary *nodes = vg_ci_nodes(ll, @"!air.visible", &list);
+            // "ptr @name, ..." or, in typed-pointer IR, "<4 x float> (...)* @name, ..."
+            NSString *head = [NSString stringWithFormat:@"@%@,", fname];
+            for (NSString *ref in vg_ci_refs(list ?: @"")) {
+                NSString *entry = nodes[ref];
+                NSRange at = entry ? [entry rangeOfString:head] : (NSRange){NSNotFound, 0};
+                if (at.location == NSNotFound) {
+                    continue;
+                }
+                NSArray *parts = vg_ci_refs([entry substringFromIndex:NSMaxRange(at)]);
+                if (parts.count < 3) {
+                    break;
+                }
+                NSString *outs = vg_ci_body(nodes, parts[0]), *ins = vg_ci_body(nodes, parts[1]), *si = vg_ci_body(nodes, parts[2]);
+                if (![si hasPrefix:@"!\"air.stitching_info\""]) {
+                    break;
+                }
+                NSString *ob = vg_ci_body(nodes, vg_ci_refs(outs ?: @"").firstObject);
+                VGReflType *ret = [VGReflType new];
+                NSString *rtn = ob ? vg_ci_quoted(ob, @"air.arg_type_name") : nil;
+                ret->_dataType = rtn ? vg_datatype_for_air_name(rtn) : MTLDataTypeFloat4;
+                NSArray *inRefs = vg_ci_refs(ins ?: @""), *siRefs = vg_ci_refs(si);
+                NSMutableArray *args = [NSMutableArray new];
+                for (NSUInteger k = 1; k < siRefs.count; k++) {
+                    NSString *sa = vg_ci_body(nodes, siRefs[k]);
+                    if (![sa hasPrefix:@"!\"air.stitching_argument\""]) {
+                        continue;
+                    }
+                    NSArray *sp = [sa componentsSeparatedByString:@", "];
+                    NSString *nm = sp.count >= 3 ? vg_ci_trim(sp[2]) : nil;
+                    NSString *st = vg_ci_body(nodes, sp.count >= 2 ? vg_ci_wtrim(sp[1]) : nil);
+                    NSString *tt = vg_ci_body(nodes, vg_ci_refs(st ?: @"").firstObject);
+                    VGReflCIStitchBinding *b = [VGReflCIStitchBinding new];
+                    b->_t = [VGReflType new];
+                    b->_name = nm.length ? nm : [NSString stringWithFormat:@"arg%lu", (unsigned long)args.count];
+                    if ([tt hasPrefix:@"!\"air.struct_type\""]) {
+                        b->_bt = 29;
+                        VGReflCIStructType *T = [VGReflCIStructType new];
+                        T->_dataType = MTLDataTypeStruct;
+                        NSArray *tp = [tt componentsSeparatedByString:@", "];
+                        T->_typeName = tp.count >= 5 ? vg_ci_trim(tp[4]) : @"";
+                        NSString *fl = tp.count >= 6 ? vg_ci_body(nodes, vg_ci_wtrim(tp[5])) : nil;
+                        NSMutableArray *ms = [NSMutableArray array];
+                        for (NSString *fr in vg_ci_refs(fl ?: @"")) {
+                            NSString *fb = vg_ci_body(nodes, fr);
+                            if (![fb hasPrefix:@"!\"air.record_field\""]) {
+                                continue;
+                            }
+                            NSArray *fp = [fb componentsSeparatedByString:@", "];
+                            VGReflStructMember *m = [VGReflStructMember new];
+                            m->_offset = fp.count > 1 ? (NSUInteger)[[fp[1] stringByReplacingOccurrencesOfString:@"i32 " withString:@""] integerValue] : 0;
+                            m->_name = fp.count > 4 ? vg_ci_trim(fp[4]) : @"";
+                            m->_dataType = vg_ci_air_dtype(nodes, fp.count > 3 ? vg_ci_wtrim(fp[3]) : nil);
+                            m->_argIndex = ms.count;
+                            [ms addObject:m];
+                        }
+                        T->_members = ms;
+                        b->_t = T;
+                    } else {
+                        NSUInteger pos = args.count;
+                        NSString *ib = pos < inRefs.count ? vg_ci_body(nodes, inRefs[pos]) : nil;
+                        NSString *tn = ib ? vg_ci_quoted(ib, @"air.arg_type_name") : nil;
+                        b->_bt = 18;
+                        b->_t->_dataType = tn ? vg_datatype_for_air_name(tn) : MTLDataTypeNone;
+                    }
+                    [args addObject:b];
+                }
+                found = @{@"args" : args, @"ret" : ret};
+                break;
+            }
+        }
+        objc_setAssociatedObject(fn, &kCIStitchKey, found ?: [NSNull null], OBJC_ASSOCIATION_RETAIN);
+        return found;
+    }
+}

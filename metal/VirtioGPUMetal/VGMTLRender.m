@@ -264,6 +264,7 @@ static VkShaderModule vg_module(NSData *spv) {
     return m;
 }
 
+static BOOL vg_passlog(void);
 id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRenderPipelineDescriptor *d, NSError **error) {
     if (error) {
         *error = nil;
@@ -320,6 +321,18 @@ id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRende
                    (fs && (p->_nfb = vg_spirv_bindings(fs, 1, p->_fb, 64, &why)) < 0)) {
             p = nil;
         } else {
+            for (int i = 0; i < p->_nvb; i++) {   // constexpr samplers, from the (cached) reflection
+                if (p->_vb[i].type == VK_DESCRIPTOR_TYPE_SAMPLER) {
+                    vg_apply_static_samplers(vg_reflect([vf vgLL], "vertex", [vf vgFC], &(NSString *__autoreleasing){nil}), p->_vb, p->_nvb);
+                    break;
+                }
+            }
+            for (int i = 0; i < p->_nfb; i++) {
+                if (p->_fb[i].type == VK_DESCRIPTOR_TYPE_SAMPLER) {
+                    vg_apply_static_samplers(vg_reflect([ff vgLL], "fragment", [ff vgFC], &(NSString *__autoreleasing){nil}), p->_fb, p->_nfb);
+                    break;
+                }
+            }
             p->_vs = vg_module(vs);
             p->_fs = fs ? vg_module(fs) : VK_NULL_HANDLE;
             p->_dsl[0] = vg_set_layout(p->_vb, p->_nvb, VK_SHADER_STAGE_VERTEX_BIT);
@@ -402,6 +415,26 @@ id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRende
                                                                                 : vg_vk_format(d.depthAttachmentPixelFormat);
         p->_stencilFormat = d.stencilAttachmentPixelFormat == MTLPixelFormatInvalid ? VK_FORMAT_UNDEFINED
                                                                                     : vg_vk_format(d.stencilAttachmentPixelFormat);
+        if (vg_passlog()) {   // debugging: the attachments' blending
+            NSMutableString *bl = [NSMutableString string];
+            for (uint32_t i = 0; i < p->_ncolor; i++) {
+                MTLRenderPipelineColorAttachmentDescriptor *c = d.colorAttachments[i];
+                [bl appendFormat:@" c%u pf%lu wm%lx blend%d rgb(%lu,%lu op%lu) a(%lu,%lu op%lu)", i, (unsigned long)c.pixelFormat,
+                                 (unsigned long)c.writeMask, c.blendingEnabled, (unsigned long)c.sourceRGBBlendFactor,
+                                 (unsigned long)c.destinationRGBBlendFactor, (unsigned long)c.rgbBlendOperation,
+                                 (unsigned long)c.sourceAlphaBlendFactor, (unsigned long)c.destinationAlphaBlendFactor,
+                                 (unsigned long)c.alphaBlendOperation];
+            }
+            vglog("pipelog %s+%s:%s fetch 0x%x", d.vertexFunction.name.UTF8String, d.fragmentFunction.name.UTF8String,
+                  bl.UTF8String, p->_fetchMask);
+            NSString *vg_disk_dir(void);
+            NSString *dir = vg_disk_dir();
+            id ff = d.fragmentFunction;
+            if (dir && [ff respondsToSelector:@selector(vgLL)]) {
+                [(NSString *)[ff performSelector:@selector(vgLL)] writeToFile:[dir stringByAppendingFormat:@"/frag-%@.ll", [ff name]]
+                                                                   atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+            }
+        }
         // Build the triangle pipeline now, so a bad combination fails here rather than at the first draw.
         if (![p pipelineForClass:2 error:&why]) {
             p = nil;
@@ -437,6 +470,9 @@ id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRende
     uint32_t _ncolor;
     VGMTLTexture *_fetchCopy[kVGMaxColor];   // scratch copies, made at the first fetch draw of the encoder
     BOOL _feedback[kVGMaxColor];             // in the feedback loop layout since a fetch split (mode 4)
+    NSMutableOrderedSet *_dbgPipes;          // debugging (VirtioGPUMetal-passlog): what this pass drew with
+    uint32_t _dbgDraws, _dbgRefused, _dbgSplits;
+    NSMutableString *_dbgSeq;
     // What this encoder last put into the command buffer (5c round 4): a draw sends state only when it changes. Vulkan
     // keeps dynamic state, the bound pipeline, sets and vertex buffers across render pass instances (the fetch
     // copies' end/resume), so this stays valid for the whole encoder.
@@ -589,9 +625,95 @@ static void vg_set_sampler(VGMTLCommandBuffer *cmd, vg_stage_bindings *t, id<MTL
 - (void)setDepthClipMode:(MTLDepthClipMode)m { }
 - (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u stages:(MTLRenderStages)s { }
 - (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u { }
-- (void)memoryBarrierWithScope:(MTLBarrierScope)scope afterStages:(MTLRenderStages)a beforeStages:(MTLRenderStages)b { }
+// A render-target barrier (5d): what the pass has drawn so far becomes readable as a texture by the draws after it.
+// RenderBox on a GPU without framebuffer reads (ours: isFramebufferReadSupported NO) binds its coverage attachment as
+// texture(5) and asks for this between draws; a no-op here left those reads seeing nothing, so the Dock's Calendar
+// icon, drawn by RenderBox in com.apple.dock.extra, came out fully transparent. The pass is ended, everything it wrote
+// is made visible to every later stage, and it resumes loading each attachment.
+- (void)vgSplitPass {
+    if (!_open) {
+        return;
+    }
+    VkCommandBuffer cb = _owner->_cb;
+    _dbgSplits++;
+    [_dbgSeq appendString:@" |"];
+    gVk.vkCmdEndRendering(cb);
+    [_owner barrier];
+    VkRenderingAttachmentInfo color[kVGMaxColor];
+    for (uint32_t i = 0; i < _ncolor; i++) {
+        color[i] = _colorInfo[i];
+        if (color[i].imageView) {
+            color[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        }
+    }
+    VkRenderingAttachmentInfo depth = _depthInfo, stencil = _stencilInfo;
+    depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    stencil.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, _area, 1, 0, _ncolor, color, _depthTex ? &depth : NULL,
+                          _stencilTex ? &stencil : NULL};
+    gVk.vkCmdBeginRendering(cb, &ri);
+    static int said;
+    if (said++ < 3) {
+        vglog("render: render-target barrier: pass split (%ux%u)", _area.extent.width, _area.extent.height);
+    }
+}
+- (void)memoryBarrierWithScope:(MTLBarrierScope)scope afterStages:(MTLRenderStages)a beforeStages:(MTLRenderStages)b {
+    if (scope & (MTLBarrierScopeRenderTargets | MTLBarrierScopeTextures)) {
+        [self vgSplitPass];
+    }
+}
+- (void)memoryBarrierWithResources:(const id<MTLResource> __unsafe_unretained *)resources count:(NSUInteger)count
+                       afterStages:(MTLRenderStages)a beforeStages:(MTLRenderStages)b {
+    for (NSUInteger i = 0; i < count; i++) {
+        for (uint32_t k = 0; k < _ncolor; k++) {
+            if (resources[i] == (id)_colorTex[k]) {
+                [self vgSplitPass];
+                return;
+            }
+        }
+    }
+}
+- (void)textureBarrier { [self vgSplitPass]; }
 
+static BOOL vg_passlog(void) {
+    static int on = -1;
+    if (on < 0) {
+        BOOL vg_debug_flag(const char *name);
+        on = vg_debug_flag("passlog");
+    }
+    return on;
+}
 - (BOOL)prepareDraw:(MTLPrimitiveType)type {
+    if (vg_passlog()) {
+        if (!_dbgPipes) {
+            _dbgPipes = [NSMutableOrderedSet orderedSet];
+        }
+        [_dbgPipes addObject:_pso->_name ?: @"(none)"];
+        _dbgDraws++;
+        if (!_dbgSeq) {
+            _dbgSeq = [NSMutableString string];
+        }
+        NSUInteger pi = [_dbgPipes indexOfObject:_pso->_name ?: @"(none)"];
+        uint32_t wm = 0;
+        for (uint32_t i = 0; i < _pso->_ncolor && i < 2; i++) {
+            wm |= (uint32_t)_pso->_blend[i].colorWriteMask << (4 * i);
+        }
+        [_dbgSeq appendFormat:@" d%lu/wm%x", (unsigned long)pi, wm];
+        for (int k = 0; k < _pso->_nfb; k++) {
+            uint32_t b = _pso->_fb[k].binding;
+            if (_pso->_fb[k].type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE && b >= 32 && b < 160) {
+                VGMTLTexture *tx = _ft.tex[b - 32];
+                [_dbgSeq appendFormat:@"[t%u=%p %lux%lu]", b - 32, tx, tx ? (unsigned long)tx->_width : 0,
+                                      tx ? (unsigned long)tx->_height : 0];
+            }
+        }
+        BOOL ok = [self prepareDrawInner:type];
+        _dbgRefused += !ok;
+        return ok;
+    }
+    return [self prepareDrawInner:type];
+}
+- (BOOL)prepareDrawInner:(MTLPrimitiveType)type {
     if (!_open || !_pso) {
         [_owner fail:_open ? @"draw without a render pipeline" : @"draw after endEncoding"];
         return NO;
@@ -1005,7 +1127,82 @@ static void vg_fetch_barrier(VkCommandBuffer cb, BOOL beforeCopy) {
                   instanceCount:1 baseVertex:0 baseInstance:0];
 }
 
+static float vg_half(uint16_t h) {
+    uint32_t e = (h >> 10) & 31, m = h & 1023;
+    float v = e == 0 ? ldexpf((float)m, -24) : e == 31 ? INFINITY : ldexpf((float)(m | 1024), (int)e - 25);
+    return (h & 0x8000) ? -v : v;
+}
+// Debugging (VirtioGPUMetal-passlog): each color attachment's pixels after the pass, summarized at completion.
+- (void)dbgReadBack {
+    static int n;
+    for (uint32_t i = 0; i < _ncolor && n < 400; i++) {
+        VGMTLTexture *t = _colorTex[i];
+        if (!t || _colorInfo[i].storeOp != VK_ATTACHMENT_STORE_OP_STORE) {
+            continue;
+        }
+        NSUInteger pf = t->_pixelFormat;
+        size_t bpp = pf == MTLPixelFormatRGBA16Float ? 8 : (pf == MTLPixelFormatRG16Float || pf == 70 || pf == 71 || pf == 80 || pf == 81 || pf == 90) ? 4 : 0;
+        if (!bpp) {
+            continue;
+        }
+        vg_buffer *b = calloc(1, sizeof(*b));
+        if (vg_buffer_create(t->_width * t->_height * bpp, b)) {
+            free(b);
+            continue;
+        }
+        int k = ++n;
+        [_owner barrier];
+        VkBufferImageCopy c = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {(uint32_t)t->_width, (uint32_t)t->_height, 1}};
+        gVk.vkCmdCopyImageToBuffer(_owner->_cb, t->_image, VK_IMAGE_LAYOUT_GENERAL, b->buffer, 1, &c);
+        [_owner barrier];
+        size_t w = t->_width, h = t->_height;
+        [_owner addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+          double sum[4] = {0};
+          size_t nz = 0;
+          for (size_t p = 0; p < w * h; p++) {
+              float v[4] = {0};
+              if (pf == MTLPixelFormatRGBA16Float) {
+                  const uint16_t *q = (const uint16_t *)b->map + p * 4;
+                  for (int j = 0; j < 4; j++) v[j] = vg_half(q[j]);
+              } else if (pf == MTLPixelFormatRG16Float) {
+                  const uint16_t *q = (const uint16_t *)b->map + p * 2;
+                  v[0] = vg_half(q[0]), v[1] = vg_half(q[1]), v[3] = 1;
+              } else {
+                  const uint8_t *q = (const uint8_t *)b->map + p * 4;
+                  for (int j = 0; j < 4; j++) v[j] = q[j] / 255.f;
+              }
+              nz += v[3] != 0 && (v[0] != 0 || v[1] != 0 || v[2] != 0 || pf != MTLPixelFormatRG16Float);
+              for (int j = 0; j < 4; j++) sum[j] += v[j];
+          }
+          double px = w * h;
+          vglog("passread %d: c%u %p pf%lu %zux%zu: %.0f%% nonzero, mean %.3f %.3f %.3f %.3f", k, i, t, (unsigned long)pf,
+                w, h, nz * 100 / px, sum[0] / px, sum[1] / px, sum[2] / px, sum[3] / px);
+          vg_buffer_destroy(b);
+          free(b);
+        }];
+    }
+}
 - (void)endEncoding {
+    if (_open && vg_passlog()) {
+        static int n;
+        if (n++ < 400) {
+            NSMutableString *a = [NSMutableString string];
+            for (uint32_t i = 0; i < _ncolor; i++) {
+                VGMTLTexture *t = _colorTex[i];
+                if (!t) {
+                    continue;
+                }
+                VkClearColorValue cc = _colorInfo[i].clearValue.color;
+                [a appendFormat:@" c%u=%p %lux%lu pf%lu%@ load%d store%d clear(%.2f %.2f %.2f %.2f)", i, t,
+                                (unsigned long)t->_width, (unsigned long)t->_height, (unsigned long)t->_pixelFormat,
+                                t->_surface ? [NSString stringWithFormat:@" surf%u", IOSurfaceGetID(t->_surface)] : @"",
+                                (int)_colorInfo[i].loadOp, (int)_colorInfo[i].storeOp, cc.float32[0], cc.float32[1],
+                                cc.float32[2], cc.float32[3]];
+            }
+            vglog("passlog %d: cb %p%s; %u draws (%u refused, %u barriers):%s: %s", n, _owner, a.UTF8String, _dbgDraws,
+                  _dbgRefused, _dbgSplits, _dbgSeq.UTF8String, [[_dbgPipes.array componentsJoinedByString:@","] UTF8String]);
+        }
+    }
     if (_open) {
         gVk.vkCmdEndRendering(_owner->_cb);
         [_owner barrier];
@@ -1029,6 +1226,9 @@ static void vg_fetch_barrier(VkCommandBuffer cb, BOOL beforeCopy) {
         if (nb) {
             gVk.vkCmdPipelineBarrier(_owner->_cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
                                      0, NULL, 0, NULL, nb, ib);
+        }
+        if (vg_passlog()) {
+            [self dbgReadBack];
         }
         _open = NO;
     }

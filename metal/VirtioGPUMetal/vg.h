@@ -88,6 +88,7 @@ extern struct vg_vulkan gVk;
 int vg_vulkan_init(void);   // 0 = up
 // Multisampling (5d): the raster sample count the next translations on this thread are for (1 or 0 = one sample).
 void vg_translate_set_samples(uint32_t n);
+id<MTLLibrary> vg_new_library_from_url(id<MTLDevice> device, NSData *lib, NSURL *url, NSError **error);
 id<MTLBinaryArchive> vg_new_binary_archive(id<MTLDevice> device, MTLBinaryArchiveDescriptor *d, NSError **error);
 uint32_t vg_memory_type(uint32_t bits, VkMemoryPropertyFlags want);   // first allowed type with `want`, else any
 

@@ -909,12 +909,109 @@ id<MTLSamplerState> vg_new_sampler(id<MTLDevice> device, MTLSamplerDescriptor *d
                       : d.borderColor == MTLSamplerBorderColorOpaqueBlack ? VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK
                                                                           : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
     sci.unnormalizedCoordinates = !d.normalizedCoordinates;
+    if (sci.unnormalizedCoordinates) {
+        static int said;
+        if (said++ < 3) {
+            vglog("sampler: an app sampler in pixel coordinates (%s)", d.label.UTF8String ?: "unlabeled");
+        }   // what Vulkan allows with pixel coordinates (Metal's own rules are the same)
+        sci.minFilter = sci.magFilter;
+        sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sci.minLod = sci.maxLod = 0;
+        sci.anisotropyEnable = VK_FALSE;
+        sci.compareEnable = VK_FALSE;
+        VkSamplerAddressMode *m[2] = {&sci.addressModeU, &sci.addressModeV};
+        for (int k = 0; k < 2; k++) {
+            if (*m[k] != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE && *m[k] != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER) {
+                *m[k] = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            }
+        }
+    }
     VGMTLSamplerState *s = [VGMTLSamplerState new];
     s->_dev = device;
     if (gVk.vkCreateSampler(gVk.device, &sci, NULL, &s->_sampler) != VK_SUCCESS) {
         return nil;
     }
     return s;
+}
+
+// A shader's constexpr sampler (5d), as the translator reflects it (its StaticSampler bindings): one immutable sampler per
+// distinct state, kept for the process. Before this, such a binding read whatever sampler the app had bound at that
+// index, or a placeholder: RenderBox's blur samples in pixel coordinates through one, read off the image with a
+// normalized placeholder, and drew nothing (the Dock's and Spotlight's Calendar icons, among others).
+static MTLSamplerAddressMode vg_ss_address(NSString *m) {
+    return [m isEqual:@"Repeat"]               ? MTLSamplerAddressModeRepeat
+           : [m isEqual:@"MirroredRepeat"]     ? MTLSamplerAddressModeMirrorRepeat
+           : [m isEqual:@"ClampToBorder"]      ? MTLSamplerAddressModeClampToBorderColor
+           : [m isEqual:@"ClampToZero"]        ? MTLSamplerAddressModeClampToZero
+           : [m isEqual:@"MirrorClampToEdge"]  ? MTLSamplerAddressModeMirrorClampToEdge
+                                               : MTLSamplerAddressModeClampToEdge;
+}
+static MTLCompareFunction vg_ss_compare(NSString *c) {
+    NSArray *names = @[ @"Never", @"Less", @"Equal", @"LessEqual", @"Greater", @"NotEqual", @"GreaterEqual", @"Always" ];
+    NSUInteger i = [names indexOfObject:c ?: @"Never"];
+    return i == NSNotFound ? MTLCompareFunctionNever : (MTLCompareFunction)i;
+}
+static VkSampler vg_static_sampler(NSDictionary *ss) {
+    static NSMutableDictionary *cache;
+    static NSObject *lock;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+      cache = [NSMutableDictionary dictionary];
+      lock = [NSObject new];
+    });
+    NSString *key = [ss[@"raw_words"] description] ?: [ss description];
+    @synchronized(lock) {
+        VGMTLSamplerState *hit = cache[key];
+        if (hit) {
+            return hit->_sampler;
+        }
+        MTLSamplerDescriptor *d = [MTLSamplerDescriptor new];
+        d.minFilter = [ss[@"min_filter"] isEqual:@"Linear"] ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+        d.magFilter = [ss[@"mag_filter"] isEqual:@"Linear"] ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+        NSString *mip = ss[@"mip_filter"];
+        d.mipFilter = [mip isEqual:@"Linear"]    ? MTLSamplerMipFilterLinear
+                      : [mip isEqual:@"Nearest"] ? MTLSamplerMipFilterNearest
+                                                 : MTLSamplerMipFilterNotMipmapped;
+        d.sAddressMode = vg_ss_address(ss[@"address_mode_s"]);
+        d.tAddressMode = vg_ss_address(ss[@"address_mode_t"]);
+        d.rAddressMode = vg_ss_address(ss[@"address_mode_r"]);
+        // Always normalized: for a pixel-coordinate sampler the translator divides by the texture's size itself and
+        // samples through a normalized sampler with the same filter and addressing.
+        d.normalizedCoordinates = YES;
+        d.compareFunction = vg_ss_compare(ss[@"compare_function"]);
+        d.maxAnisotropy = MAX([ss[@"max_anisotropy"] unsignedIntegerValue], 1);
+        d.lodMinClamp = [ss[@"lod_min_clamp"] floatValue];
+        d.lodMaxClamp = ss[@"lod_max_clamp"] ? [ss[@"lod_max_clamp"] floatValue] : FLT_MAX;
+        NSString *bc = ss[@"border_color"];
+        d.borderColor = [bc isEqual:@"OpaqueWhite"]   ? MTLSamplerBorderColorOpaqueWhite
+                        : [bc isEqual:@"OpaqueBlack"] ? MTLSamplerBorderColorOpaqueBlack
+                                                      : MTLSamplerBorderColorTransparentBlack;
+        VGMTLSamplerState *s = (VGMTLSamplerState *)vg_new_sampler(nil, d);
+        if (!s) {
+            return VK_NULL_HANDLE;
+        }
+        cache[key] = s;
+        static int said;
+        if (said++ < 4) {
+            vglog("sampler: a shader's constexpr sampler (%s, %s coordinates)", [ss[@"min_filter"] UTF8String],
+                  [ss[@"coordinates"] UTF8String]);
+        }
+        return s->_sampler;
+    }
+}
+void vg_apply_static_samplers(NSDictionary *refl, vg_binding *bindings, int n) {
+    for (NSDictionary *b in refl[@"bindings"]) {
+        if (![b isKindOfClass:[NSDictionary class]] || ![b[@"kind"] isEqual:@"StaticSampler"] ||
+            ![b[@"static_sampler"] isKindOfClass:[NSDictionary class]]) {
+            continue;
+        }
+        uint32_t at = [b[@"descriptor"][@"binding"] unsignedIntValue];
+        for (int i = 0; i < n; i++) {
+            if (bindings[i].binding == at && bindings[i].type == VK_DESCRIPTOR_TYPE_SAMPLER) {
+                bindings[i].fixed = vg_static_sampler(b[@"static_sampler"]);
+            }
+        }
+    }
 }
 
 // ---- MTLDepthStencilState ----------------------------------------------------------------------------------------

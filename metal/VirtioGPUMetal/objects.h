@@ -117,7 +117,10 @@ id<MTLTexture> vg_new_buffer_texture(id<MTLBuffer> buffer, MTLTextureDescriptor 
 typedef struct {
     uint32_t binding;
     VkDescriptorType type;
+    VkSampler fixed;   // a constexpr sampler of the shader's own (the translator's StaticSampler), else VK_NULL_HANDLE
 } vg_binding;
+// The shader's constexpr samplers onto its bindings, from the translator's reflection (VGMTLTexture.m).
+void vg_apply_static_samplers(NSDictionary *refl, vg_binding *bindings, int n);
 int vg_spirv_bindings(NSData *spv, uint32_t set, vg_binding *out, int max, NSString **error);
 NSData *vg_spirv_retarget_set(NSData *spv, uint32_t newSet);
 BOOL vg_spirv_has_push_constants(NSData *spv);   // DescriptorSet 0 -> newSet (NV's fragment move)
