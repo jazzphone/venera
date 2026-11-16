@@ -282,9 +282,23 @@ static NSString *vg_disk_key(const char *kind, NSString *ll, const char *stage, 
     return hex;
 }
 
+// The translations every process made, pooled by the watcher (packaging/venera-watch.sh, as root): a process's own
+// cache misses fall back to it, so Safari's GPU process or a new app doesn't translate again what WindowServer or the
+// Dock already did (5d). Read only; keys are content hashes, so any process's entry is right for any other.
+static NSString *const kVgSharedCache = @"/Library/GPUBundles/Venera/cache";
 static NSData *vg_disk_get(NSString *key) {
     NSString *dir = vg_disk_dir();
-    return dir ? [NSData dataWithContentsOfFile:[dir stringByAppendingPathComponent:key]] : nil;
+    NSData *d = dir ? [NSData dataWithContentsOfFile:[dir stringByAppendingPathComponent:key]] : nil;
+    if (!d && key.length == 64) {
+        d = [NSData dataWithContentsOfFile:[kVgSharedCache stringByAppendingPathComponent:key]];
+        if (d && dir) {
+            static int said;
+            if (said++ < 3) {
+                vglog("translation cache: %s from the shared pool", key.UTF8String);
+            }
+        }
+    }
+    return d;
 }
 
 static void vg_disk_put(NSString *key, NSData *data) {

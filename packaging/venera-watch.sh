@@ -42,6 +42,39 @@ dialog() {
 }
 
 mkdir -p "$V"
+
+# The translation pool (5d): every process keeps its own cache of translated shaders (in its own, often sandboxed,
+# cache folder), so WindowServer, Safari's GPU process and each app translated the same Core Animation and RenderBox
+# shaders again. Entries are named by a hash of what was translated, so any process's is right for any other: they go
+# into one pool every process reads on a miss, and back into each process's own folder (for sandboxes that can't read
+# the pool). Kept under 256 MB, oldest first.
+POOL=/Library/GPUBundles/Venera/cache
+pool_caches() {
+  [ -d /Library/GPUBundles/Venera ] || return 0
+  mkdir -p "$POOL" && chmod 755 "$POOL"
+  local dirs d n=0
+  dirs=$(find /private/var/folders /Users/*/Library/Containers -type d -path '*local.homelab.VirtioGPUMetal/spirv' 2>/dev/null)
+  [ -n "$dirs" ] || return 0
+  while IFS= read -r d; do
+    find -E "$d" -maxdepth 1 -type f -regex '.*/[0-9a-f]{64}' -exec cp -n {} "$POOL"/ \; 2>/dev/null
+  done <<<"$dirs"
+  chmod 644 "$POOL"/* 2>/dev/null
+  while IFS= read -r d; do
+    for f in "$POOL"/*; do
+      [ -e "$d/${f##*/}" ] || { cp "$f" "$d/" 2>/dev/null && n=$((n + 1)); }
+    done
+  done <<<"$dirs"
+  # the cap: oldest entries out first
+  while [ "$(du -sk "$POOL" | cut -f1)" -gt 262144 ]; do
+    f=$(ls -tr "$POOL" | head -1)
+    [ -n "$f" ] || break
+    rm -f "$POOL/$f"
+  done
+  [ "$n" -gt 0 ] && log "translation pool: $(ls "$POOL" | wc -l | tr -d ' ') entries, $n copied into process caches"
+  return 0
+}
+pool_caches
+
 ASK=0
 [ "${1:-}" = --ask ] && ASK=1
 if [ ! -d "$KEEP" ]; then

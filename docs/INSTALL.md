@@ -111,8 +111,11 @@ asks again. Its log is `/Library/Application Support/Venera/watch.log`; `./statu
 After the reboot the desktop looks the same, but `sudo ./status.sh` should show the three kexts loaded,
 `MetalPluginName` `VirtioGPUMetal`, a growing flip count (`VirtioGPUBlobFlips`) and the driver's location.
 
-The first minutes after the first boot are slower: the driver translates each new shader the first time a process
-needs it (a few seconds for large ones) and keeps it on disk, so this happens once per shader and app.
+The first minutes after the first boot are slower: the driver translates each new shader the first time it is needed
+(a few seconds for large ones) and keeps it on disk. The watcher also gathers every process's translations into one
+pool, `/Library/GPUBundles/Venera/cache` (under 256 MB), which every process reads on a miss, so a shader is translated
+once for the whole machine, not once per app: a new app, or Safari's GPU process after an update, starts with what
+WindowServer and the Dock already translated.
 
 ## Uninstall
 
