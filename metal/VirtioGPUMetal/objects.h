@@ -61,6 +61,8 @@ id<MTLBuffer> vg_new_buffer_nocopy(id<MTLDevice> device, void *pointer, NSUInteg
     // kext shows with SET_SCANOUT_BLOB instead of copying the surface through the CPU.
     vg_buffer _twin;
     uint32_t _twinRes;
+    uint32_t _twinGen;   // frames copied into the twin so far (kVGUCTwinMark)
+    BOOL _twinRefused;   // the kext said no (not the screen's size): no twin, the CPU write-back stays
 }
 @property(readonly) id<MTLDevice> device;
 @property(copy, atomic) NSString *label;
@@ -73,6 +75,7 @@ void vg_cmd_wrote(id cmd, VGMTLTexture *t);
 // Display-surface twins (5c): make and register one for a root surface texture that qualifies (WindowServer, BGRA,
 // screen-sized); forget it (the kext first) before the texture goes.
 BOOL vg_twin_ensure(VGMTLTexture *t);
+void vg_twin_mark(uint32_t surface, uint32_t frame, BOOL ready);
 void vg_twin_forget(VGMTLTexture *t);
 id<MTLTexture> vg_new_surface_texture(id<MTLDevice> device, MTLTextureDescriptor *d, IOSurfaceRef surface, NSUInteger plane);
 id<MTLTexture> vg_texture_view(VGMTLTexture *p, MTLPixelFormat pf, MTLTextureType type, NSRange levels, NSRange slices);
@@ -115,6 +118,7 @@ BOOL vg_spirv_has_push_constants(NSData *spv);   // DescriptorSet 0 -> newSet (N
     BOOL _present;          // committed by commitAndWaitUntilSubmitted (Core Animation's display frames)
     BOOL _allTwinned;       // every IOSurface it wrote got a twin copy: waiting for the GPU is enough
     dispatch_semaphore_t _gpuDone;   // signaled once the fence is (before the CPU write-backs)
+    NSMutableData *_twinFrames;      // (surface id, frame) pairs to mark ready once the GPU is done (5c round 3)
     VkDescriptorPool _pools[64];
     int _npools;
     uint32_t _setsInPool;

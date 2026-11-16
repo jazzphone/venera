@@ -12,7 +12,8 @@ static const char *const kNames[VG_PERF_N] = {"pull copy", "pull GPU", "write-ba
                                               "framebuffer fetch copy (bytes ~ pixels x 4)", "completion: in line after commit",
                                               "completion: fence wait", "GPU time (timestamps)", "staging pool hit", "staging pool miss (new buffer)",
                                               "commitAndWaitUntilSubmitted: waited (GPU, or the write-back)",
-                                              "shader translated", "shader from the disk cache"};
+                                              "shader translated", "shader from the disk cache",
+                                              "waitUntilCompleted: blocked"};
 
 void vg_perf(int kind, uint64_t bytes, uint64_t ns) {
     atomic_fetch_add_explicit(&gCount[kind], 1, memory_order_relaxed);
@@ -21,23 +22,13 @@ void vg_perf(int kind, uint64_t bytes, uint64_t ns) {
 }
 
 static void vg_perf_report(void) {
-    char line[900];
-    size_t n = 0;
-    BOOL any = NO;
+    // one line per kind: the unified log cuts long messages
     for (int k = 0; k < VG_PERF_N; k++) {
         uint64_t c = atomic_exchange(&gCount[k], 0), b = atomic_exchange(&gBytes[k], 0), t = atomic_exchange(&gNs[k], 0);
-        if (!c) {
-            continue;
+        if (c) {
+            vglog("perf 5 s: %s %llu x, %.1f MB, %.1f ms total, %.2f ms each", kNames[k], c, b / 1048576.0, t / 1e6,
+                  t / 1e6 / c);
         }
-        any = YES;
-        n += snprintf(line + n, sizeof(line) - n, "%s%s %llu x, %.1f MB, %.1f ms total, %.2f ms each", n ? " | " : "",
-                      kNames[k], c, b / 1048576.0, t / 1e6, t / 1e6 / c);
-        if (n >= sizeof(line)) {
-            break;
-        }
-    }
-    if (any) {
-        vglog("perf 5 s: %s", line);
     }
 }
 

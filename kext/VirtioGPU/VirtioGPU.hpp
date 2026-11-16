@@ -54,7 +54,10 @@ public:
     void forgetResource(uint32_t resource);
     struct Twin {
         uint32_t surface, resource, width, height, stride;
+        uint32_t submitted, ready;   // frame numbers (kVGUCTwinMark)
+        task_t task;                 // whose it is
     };
+    IOReturn markTwin(task_t task, uint32_t surface, uint32_t frame, bool ready);
     bool twinFor(uint32_t surface, Twin *out);
     // Hardware cursor (cursor queue): 64x64 BGRA image + hot spot; position of the hot spot.
     bool setCursor(const uint32_t *pixels, uint32_t hotX, uint32_t hotY);

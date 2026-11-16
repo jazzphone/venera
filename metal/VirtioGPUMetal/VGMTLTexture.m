@@ -105,8 +105,8 @@ BOOL vg_twin_ensure(VGMTLTexture *t) {
         (t->_pixelFormat != MTLPixelFormatBGRA8Unorm && t->_pixelFormat != MTLPixelFormatBGRA8Unorm_sRGB)) {
         return NO;
     }
-    if (t->_twin.buffer) {
-        return NO;   // made before and refused: don't try every frame
+    if (t->_twinRefused) {
+        return NO;   // refused before: don't try every frame
     }
     const uint32_t stride = (uint32_t)t->_width * 4;
     if (vg_buffer_create((VkDeviceSize)stride * t->_height, &t->_twin)) {
@@ -119,10 +119,20 @@ BOOL vg_twin_ensure(VGMTLTexture *t) {
     vglog("twin for surface %u (%lux%lu): blob %u -> 0x%x", IOSurfaceGetID(t->_surface), (unsigned long)t->_width,
           (unsigned long)t->_height, res, kr);
     if (kr != KERN_SUCCESS) {
+        vg_buffer_destroy(&t->_twin);   // not the screen's: keep the write-back, and don't hold 4 MB for nothing
+        t->_twinRefused = YES;
         return NO;
     }
     t->_twinRes = res;
     return YES;
+}
+
+void vg_twin_mark(uint32_t surface, uint32_t frame, BOOL ready) {
+    io_connect_t c = vg_twin_conn();
+    if (c) {
+        uint64_t in[3] = {surface, frame, ready ? 1 : 0};
+        IOConnectCallScalarMethod(c, kVGUCTwinMark, in, 3, NULL, NULL);
+    }
 }
 
 void vg_twin_forget(VGMTLTexture *t) {

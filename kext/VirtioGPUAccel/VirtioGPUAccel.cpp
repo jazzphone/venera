@@ -412,13 +412,51 @@ static volatile bool gBlobShown = false;                                 // a tw
 static IOWorkLoop *gPresentLoop;
 static IOTimerEventSource *gPresentTimer;
 static IOLock *gPresentLock;
-static uint32_t gPendingTwin[4];   // resource, width, height, stride; resource 0 = nothing pending
-static SInt64 gFlipNs = 0, gFlipMaxNs = 0, gFlips = 0, gFlipsSkipped = 0;
+static uint32_t gPendingTwin[6];   // resource, width, height, stride, the frame wanted, surface; resource 0 = none
+static uint64_t gPendingSinceAbs;  // when the wanted frame was asked for (a frame never marked ready flips anyway)
+static SInt64 gFlipNs = 0, gFlipMaxNs = 0, gFlips = 0, gFlipsSkipped = 0, gFlipsUnready = 0;
 // The shortest time between two flips, in ms (0 = no limit). 16 by default: evenly paced flips (at most ~60 a
 // second, the newest frame each time) judder less on VM 108's console than flips as they come (the tester, 2026-11-15).
 // Boot-arg vgpuflipms, or {"VirtioGPUFlipMs": n} at run time (root, `acceltest flipms N`).
 static volatile uint32_t gFlipMinMs = 16;
 static uint64_t gLastFlipAbs = 0;
+
+// Pacing (5c round 3): how evenly frames come from WindowServer and go to the screen. Gaps between marks in ms,
+// counted in bins (gaps over 200 ms are idle time, not counted); flip durations likewise. VirtioGPUPacing;
+// {"VirtioGPUPaceReset": true} (root, `acceltest pacereset`) starts over.
+struct Pace {
+    uint64_t last;
+    uint32_t bins[8];
+};
+static const uint32_t kGapEdges[7] = {10, 17, 25, 34, 50, 100, 200};   // ms; bin 7 = idle, not shown
+static const uint32_t kDurEdges[7] = {2, 4, 8, 12, 16, 24, 32};        // ms; bin 7 = over 32
+static Pace gPaceTxn, gPaceFlip, gFlipDur;
+static void paceBin(Pace *p, uint64_t ns, const uint32_t *edges) {
+    uint32_t ms = (uint32_t)(ns / 1000000ULL), b = 0;
+    while (b < 7 && ms >= edges[b]) {
+        b++;
+    }
+    p->bins[b]++;
+}
+static void paceMark(Pace *p, uint64_t abs) {
+    if (p->last) {
+        uint64_t ns = 0;
+        absolutetime_to_nanoseconds(abs - p->last, &ns);
+        paceBin(p, ns, kGapEdges);
+    }
+    p->last = abs;
+}
+static int paceLine(char *out, size_t n, const char *name, const Pace *p, const uint32_t *edges, bool lastBin) {
+    int k = snprintf(out, n, "%s:", name);
+    for (int b = 0; b < (lastBin ? 8 : 7) && k < (int)n; b++) {
+        if (b < 7) {
+            k += snprintf(out + k, n - k, " <%u:%u", edges[b], p->bins[b]);
+        } else {
+            k += snprintf(out + k, n - k, " more:%u", p->bins[b]);
+        }
+    }
+    return k;
+}
 
 static void presentTick(OSObject *, IOTimerEventSource *) {
     for (;;) {
@@ -430,15 +468,35 @@ static void presentTick(OSObject *, IOTimerEventSource *) {
                 return;
             }
         }
-        uint32_t t[4];
+        uint32_t t[6];
         IOLockLock(gPresentLock);
         memcpy(t, gPendingTwin, sizeof(t));
-        gPendingTwin[0] = 0;
+        uint64_t since = gPendingSinceAbs;
         IOLockUnlock(gPresentLock);
         if (!t[0]) {
             return;
         }
         IOService *core = coreService();
+        // The frame the transaction asked for must be in the twin (its GPU copy done): until the plugin marks it
+        // ready, look again every ms, up to 100 ms (a frame never marked flips anyway).
+        uint32_t now[6] = {};
+        if (core && t[4] &&
+            core->callPlatformFunction(gSymTwinFor, false, (void *)(uintptr_t)t[5], now, nullptr, nullptr) ==
+                kIOReturnSuccess &&
+            (int32_t)(now[5] - t[4]) < 0) {
+            uint64_t waited = 0;
+            absolutetime_to_nanoseconds(mach_absolute_time() - since, &waited);
+            if (waited < 100000000ULL) {
+                gPresentTimer->setTimeoutUS(1000);
+                return;
+            }
+            gFlipsUnready++;
+        }
+        IOLockLock(gPresentLock);
+        if (gPendingTwin[0] == t[0] && gPendingTwin[4] == t[4]) {
+            gPendingTwin[0] = 0;   // taken (a newer request that came meanwhile stays)
+        }
+        IOLockUnlock(gPresentLock);
         uint64_t t0 = mach_absolute_time(), ns = 0;
         if (core) {
             core->callPlatformFunction(gSymScanoutBlob, false, (void *)(uintptr_t)t[0], (void *)(uintptr_t)t[1],
@@ -446,6 +504,8 @@ static void presentTick(OSObject *, IOTimerEventSource *) {
         }
         gLastFlipAbs = mach_absolute_time();
         absolutetime_to_nanoseconds(gLastFlipAbs - t0, &ns);
+        paceMark(&gPaceFlip, gLastFlipAbs);
+        paceBin(&gFlipDur, ns, kDurEdges);
         gFlipNs += (SInt64)ns;
         gFlips++;
         if ((SInt64)ns > gFlipMaxNs) {
@@ -455,7 +515,7 @@ static void presentTick(OSObject *, IOTimerEventSource *) {
 }
 
 // Queues a flip (performTransaction); false when there is no present loop (then the caller flips itself).
-static bool queueFlip(const uint32_t twin[4]) {
+static bool queueFlip(const uint32_t twin[6], uint32_t surface) {
     if (!gPresentTimer || !gPresentLock) {
         return false;
     }
@@ -463,7 +523,10 @@ static bool queueFlip(const uint32_t twin[4]) {
     if (gPendingTwin[0]) {
         gFlipsSkipped++;   // an older frame not shown yet: the newer one replaces it
     }
-    memcpy(gPendingTwin, twin, sizeof(gPendingTwin));
+    memcpy(gPendingTwin, twin, 4 * sizeof(uint32_t));
+    gPendingTwin[4] = twin[4];   // the frame last submitted into this twin: the one this transaction shows
+    gPendingTwin[5] = surface;
+    gPendingSinceAbs = mach_absolute_time();
     IOLockUnlock(gPresentLock);
     gPresentTimer->setTimeoutUS(1);
     return true;
@@ -674,7 +737,7 @@ IOReturn VGDisplayPipe::performTransactionTimed(IOAccelDisplayPipeTransaction2 *
         noBlob = off;
     }
     if (!noBlob && fmt == NV_IOP_FMT_BGRA) {
-        uint32_t twin[4] = {};
+        uint32_t twin[6] = {};
         IOService *core = coreService();
         VGPUScanoutInfo qi = {};
         if (core && core->callPlatformFunction(gSymTwinFor, false, (void *)(uintptr_t)s->getSurfaceID(), twin, nullptr,
@@ -682,7 +745,8 @@ IOReturn VGDisplayPipe::performTransactionTimed(IOAccelDisplayPipeTransaction2 *
             twin[1] == W && twin[2] == H &&
             fb->callPlatformFunction(gSymScanoutInfo, false, &qi, nullptr, nullptr, nullptr) == kIOReturnSuccess &&
             qi.width == W && qi.height == H) {
-            IOReturn br = queueFlip(twin) ? kIOReturnSuccess
+            paceMark(&gPaceTxn, mach_absolute_time());
+            IOReturn br = queueFlip(twin, s->getSurfaceID()) ? kIOReturnSuccess
                                           : core->callPlatformFunction(gSymScanoutBlob, false, (void *)(uintptr_t)twin[0],
                                                                        (void *)(uintptr_t)twin[1],
                                                                        (void *)(uintptr_t)twin[2],
@@ -954,10 +1018,18 @@ static void iopPublishCounts() {
              (long long)(span / 1000000), span ? (long long)(gIopCalls * 1000000000LL / (SInt64)span) : 0LL,
              span ? (long long)((gIopCalls * 10000000000LL / (SInt64)span) % 10) : 0LL);
     gAccel->setProperty("VirtioGPUPipeTiming", line);
-    snprintf(line, sizeof(line), "%lld flips, avg %lld us, max %lld us; %lld frames replaced before their flip",
+    snprintf(line, sizeof(line), "%lld flips, avg %lld us, max %lld us; %lld frames replaced before their flip, %lld "
+             "flipped unready",
              (long long)gFlips, gFlips ? (long long)(gFlipNs / gFlips / 1000) : 0LL, (long long)(gFlipMaxNs / 1000),
-             (long long)gFlipsSkipped);
+             (long long)gFlipsSkipped, (long long)gFlipsUnready);
     gAccel->setProperty("VirtioGPUBlobFlips", line);
+    char pace[400];
+    int k = paceLine(pace, sizeof(pace), "frame gaps ms", &gPaceTxn, kGapEdges, false);
+    k += snprintf(pace + k, sizeof(pace) - k, " | ");
+    k += paceLine(pace + k, sizeof(pace) - k, "flip gaps", &gPaceFlip, kGapEdges, false);
+    k += snprintf(pace + k, sizeof(pace) - k, " | ");
+    paceLine(pace + k, sizeof(pace) - k, "flip took", &gFlipDur, kDurEdges, true);
+    gAccel->setProperty("VirtioGPUPacing", pace);
 }
 
 void VirtioGPUAccel::populateAccelConfig(IOAccelConfig *c) {
@@ -1474,6 +1546,15 @@ void VirtioGPUAccel::stop(IOService *provider) {
 // sees it). Nothing persists: every boot starts unarmed. Anything else goes to the family's own setProperties.
 IOReturn VirtioGPUAccel::setProperties(OSObject *properties) {
     OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
+    if (dict && dict->getObject("VirtioGPUPaceReset")) {
+        if (IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator) != kIOReturnSuccess) {
+            return kIOReturnNotPrivileged;
+        }
+        bzero(&gPaceTxn, sizeof(gPaceTxn));
+        bzero(&gPaceFlip, sizeof(gPaceFlip));
+        bzero(&gFlipDur, sizeof(gFlipDur));
+        return kIOReturnSuccess;
+    }
     if (dict && dict->getObject("VirtioGPUFlipMs")) {
         if (IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator) != kIOReturnSuccess) {
             return kIOReturnNotPrivileged;

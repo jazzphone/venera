@@ -962,3 +962,35 @@ console itself (VNC/noVNC encoding full-screen changes) may add its own uneven p
 or a cheaper fetch (e.g. copy once per pass and only re-copy when a draw writes what a later fetch reads), a look at
 the console path (SPICE vs VNC, egl-headless readback), and translating faster or ahead of time (warm the cache from
 Core Animation's library at install).
+
+## Stage 5c, round 3 (2026-11-15): the judder found and gone; the desktop keeps up
+
+Measured first: the kext now histograms the gaps between WindowServer's frames (transactions), between flips, and
+how long flips take (`VirtioGPUPacing`; `acceltest pacereset` / `acceltest pace`), and the plugin's perf counters log
+one line per kind (the unified log cut the long lines). Recorded while the tester dragged and scrolled.
+
+1. **The judder came from WindowServer, not the display**: 91 of 116 frame gaps were 50-100 ms and the flips followed
+   them exactly. WindowServer sat in `commitAndWaitUntilSubmitted` 666 times in a 40 s scroll, 18.5 ms each (12.3 s),
+   for ~5 ms of GPU work: round 2's wait for the twin copy, Venus' completion latency on top.
+2. **No wait, frames numbered** (core 0.5.3 `kVGUCTwinMark`, accelerator 0.6.5): the plugin numbers each twin copy,
+   marks it submitted at commit and ready after the fence; a transaction asks for the frame last submitted into that
+   twin and the flip loop flips once it is ready (1 ms polls, at most 100 ms, then anyway: "flipped unready").
+   the tester: "the judder seems gone, but things are slower and jerky".
+3. **Completions at USER_INTERACTIVE** (the completion queue and the fallback global queues): Venus waits for fences
+   in short sleeps that macOS stretches at lower classes. `mtlwindow` ~30 -> ~47 fps; completions in line 32 -> ~2 ms.
+   Fence feedback on or off measured the same (~12 ms fence wait for ~3 ms of GPU time); it stays off, and
+   `/Library/GPUBundles/VirtioGPUMetal-fencefeedback` turns it back on.
+4. **Two display frames in flight** (`VGMTL_PRESENT_DEPTH`, default 2): with no wait at all WindowServer ran ahead of
+   the GPU and a dragged window trailed far behind the pointer. Now a display frame waits for the one before it.
+   the tester: "way better, probably better than it's been".
+5. **Twins only at the screen's size** (core 0.5.4 refuses others; the plugin then keeps the CPU write-back): a window
+   snapshot drawn in a display frame had become a twin and lost its write-back, so the Dock's minimize preview was
+   blank. The tester: preview shows, still good.
+
+State: `mtlwindow` ~48 fps while WindowServer composites it. GPU timestamps and fence feedback are off again (flag
+files removed).
+
+**Next**: the ~12 ms between the GPU finishing and the guest seeing it (Venus host side: ring thread, fence
+signaling) is now the floor under every frame; the framebuffer-fetch splits (~40 per command buffer); shader
+translation stalls for new variants; and "flipped unready" (27 in one boot, likely startup translations: check it
+stays 0 in normal use).

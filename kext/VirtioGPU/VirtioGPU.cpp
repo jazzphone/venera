@@ -1025,9 +1025,13 @@ IOReturn VirtioGPU::setTwin(task_t task, uint32_t surface, uint32_t resource, ui
         for (unsigned i = 0; i < kMaxClients && !owned; i++) {
             owned = clients_[i] && clients_[i]->owns(task, resource);
         }
-        if (!owned || !width || !height || stride < width * 4) {
+        // Only the screen's own size (5c round 3): a window snapshot (the Dock's minimize preview) written in a
+        // display frame qualified too, lost its CPU write-back to the twin, and the Dock read blank memory.
+        bool screenSized = width == scanoutWidth_ && height == scanoutHeight_;
+        if (!owned || !width || !height || stride < width * 4 || !screenSized) {
             IOLockUnlock(twinLock_);
-            LOG("twin for surface 0x%x: resource %u refused (%s)", surface, resource, owned ? "size" : "not the caller's");
+            LOG("twin for surface 0x%x (%ux%u): resource %u refused (%s)", surface, width, height, resource,
+                !owned ? "not the caller's" : !screenSized ? "not the screen's size" : "size");
             return kIOReturnNotPermitted;
         }
     }
@@ -1052,13 +1056,34 @@ IOReturn VirtioGPU::setTwin(task_t task, uint32_t surface, uint32_t resource, ui
             IOLockUnlock(twinLock_);
             return kIOReturnNoSpace;
         }
-        twins_[slot] = {surface, resource, width, height, stride};
+        twins_[slot] = {surface, resource, width, height, stride, 0, 0, task};
     }
     IOLockUnlock(twinLock_);
     if (old && old != resource && scanoutBlob_ == old) {
         setScanoutBlob(0, 0, 0, 0, 0);   // what was on screen is going away
     }
     return kIOReturnSuccess;
+}
+
+IOReturn VirtioGPU::markTwin(task_t task, uint32_t surface, uint32_t frame, bool ready) {
+    if (!twinLock_ || !surface) {
+        return kIOReturnBadArgument;
+    }
+    IOReturn r = kIOReturnNotFound;
+    IOLockLock(twinLock_);
+    for (unsigned i = 0; i < kMaxTwins; i++) {
+        if (twins_[i].surface == surface) {
+            if (twins_[i].task != task) {
+                r = kIOReturnNotPermitted;
+            } else {
+                (ready ? twins_[i].ready : twins_[i].submitted) = frame;
+                r = kIOReturnSuccess;
+            }
+            break;
+        }
+    }
+    IOLockUnlock(twinLock_);
+    return r;
 }
 
 void VirtioGPU::forgetResource(uint32_t resource) {
@@ -1198,7 +1223,7 @@ IOReturn VirtioGPU::callPlatformFunction(const OSSymbol *name, bool wait, void *
             return kIOReturnNotFound;
         }
         uint32_t *out = static_cast<uint32_t *>(p2);
-        out[0] = t.resource, out[1] = t.width, out[2] = t.height, out[3] = t.stride;
+        out[0] = t.resource, out[1] = t.width, out[2] = t.height, out[3] = t.stride, out[4] = t.submitted, out[5] = t.ready;
         return kIOReturnSuccess;
     }
     if (name->isEqualTo(kVGPUScanoutBlob)) {

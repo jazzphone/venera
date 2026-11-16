@@ -5,6 +5,7 @@
 //   acceltest legacy on|off        stage 5b probe: legacy IOAccelSurfaces for an armed WindowServer
 //   acceltest wsarm | withdraw     stage 5a: arm the display for WindowServer / withdraw it (needs vgpuaccel=3 or 4)
 //   acceltest flipms N             stage 5c: blob flips at least N ms apart (0 = as they come)
+//   acceltest pacereset | pace     stage 5c: start the pacing histograms over / print them
 //   acceltest T...       for each user-client type T: IOServiceOpen, print the class the family made, close;
 //                        on an IOAccelDevice2 also call get_config (sel 0) and get_name (sel 1) -- nothing else
 //                        is called on any client
@@ -101,6 +102,28 @@ int main(int argc, char **argv) {
         CFRelease(d);
         say("legacy %s -> 0x%x\n", argv[2], kr);
         return kr == KERN_SUCCESS ? 0 : 1;
+    }
+    if (argc > 1 && (!strcmp(argv[1], "pacereset") || !strcmp(argv[1], "pace"))) {
+        // stage 5c: the pacing histograms (VirtioGPUPacing): start over, or print them
+        if (!strcmp(argv[1], "pacereset")) {
+            CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+                                                                 &kCFTypeDictionaryValueCallBacks);
+            CFDictionarySetValue(d, CFSTR("VirtioGPUPaceReset"), kCFBooleanTrue);
+            kern_return_t kr = IORegistryEntrySetCFProperties(svc, d);
+            CFRelease(d);
+            say("pacereset -> 0x%x\n", kr);
+            return kr == KERN_SUCCESS ? 0 : 1;
+        }
+        CFTypeRef v = IORegistryEntryCreateCFProperty(svc, CFSTR("VirtioGPUPacing"), NULL, 0);
+        char buf[512] = "";
+        if (v && CFGetTypeID(v) == CFStringGetTypeID()) {
+            CFStringGetCString(v, buf, sizeof(buf), kCFStringEncodingUTF8);
+        }
+        say("%s\n", buf);
+        if (v) {
+            CFRelease(v);
+        }
+        return 0;
     }
     if (argc > 2 && !strcmp(argv[1], "flipms")) {
         // stage 5c: the shortest time between two blob flips (0 = no limit)

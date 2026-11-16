@@ -43,8 +43,8 @@ struct VGPUScanoutInfo {
 // param1: task_t owner, param2: IOUserClient ** (retained; the caller attaches and starts it under its own service)
 #define kVGPUNewClient "vgpu.newClient"
 
-// Stage 5c, accelerator -> core: the blob twin of an IOSurface (p1 = surface id as uintptr_t, p2 = uint32_t[4]
-// {resource, width, height, stride} out; kIOReturnNotFound when it has none).
+// Stage 5c, accelerator -> core: the blob twin of an IOSurface (p1 = surface id as uintptr_t, p2 = uint32_t[6]
+// {resource, width, height, stride, submitted frame, ready frame} out; kIOReturnNotFound when it has none).
 #define kVGPUTwinFor "vgpu.twinFor"
 // Stage 5c: show a blob on scanout 0 (p1 resource, p2 width, p3 height, p4 stride), or the framebuffer again (p1 0).
 #define kVGPUScanoutBlob "vgpu.scanoutBlob"

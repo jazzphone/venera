@@ -134,6 +134,12 @@ IOReturn VirtioGPUUserClient::externalMethod(uint32_t selector, IOExternalMethod
                               (uint32_t)args->scalarInput[2], (uint32_t)args->scalarInput[3],
                               (uint32_t)args->scalarInput[4]);
     }
+    case kVGUCTwinMark:
+        if (args->scalarInputCount < 3) {
+            return kIOReturnBadArgument;
+        }
+        return core_->markTwin(task_, (uint32_t)args->scalarInput[0], (uint32_t)args->scalarInput[1],
+                               args->scalarInput[2] != 0);
     case kVGUCScanoutBlob:
         if (args->scalarInputCount < 5) {
             return kIOReturnBadArgument;

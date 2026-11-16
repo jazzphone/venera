@@ -49,6 +49,10 @@ enum {
      * The blob (one of this process's Venus allocations) holds a copy of that surface's frames: the display pipe
      * scans it out instead of copying the surface through the CPU. */
     kVGUCSetTwin = 9,
+    /* stage 5c, the twin's owner only: scalar in: IOSurface id, frame number, 0 = submitted / 1 = ready (its GPU copy
+     * is done). The display pipe flips to a twin only once the frame a transaction asked for is ready, so WindowServer
+     * needn't wait for the GPU before presenting. */
+    kVGUCTwinMark = 10,
     kVGUCMethodCount
 };
 

@@ -533,7 +533,11 @@ id<MTLComputePipelineState> vg_new_compute_pipeline(id<MTLDevice> device, id<MTL
 - (instancetype)initWithDevice:(id<MTLDevice>)device {
     if ((self = [super init])) {
         _device = device;
-        _serial = dispatch_queue_create("local.homelab.VirtioGPUMetal.completion", DISPATCH_QUEUE_SERIAL);
+        // USER_INTERACTIVE (5c round 3): Venus waits for a fence with short sleeps, which macOS stretches at lower
+        // classes; completions gate what WindowServer shows next.
+        _serial = dispatch_queue_create("local.homelab.VirtioGPUMetal.completion",
+                                        dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,
+                                                                                QOS_CLASS_USER_INTERACTIVE, 0));
     }
     return self;
 }
@@ -1018,7 +1022,7 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
             return;
         }
     }
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
         block(self);   // already scheduled: still not on the caller's thread
     });
 }
@@ -1058,8 +1062,15 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
             vg_gpu_time_collect(_timePair);
         }
     }
+    if (_twinFrames) {   // the twins are written: the kext may flip to these frames
+        const uint32_t *pair = _twinFrames.bytes;
+        for (NSUInteger i = 0; i < _twinFrames.length / (2 * sizeof(uint32_t)); i++) {
+            vg_twin_mark(pair[2 * i], pair[2 * i + 1], YES);
+        }
+        _twinFrames = nil;
+    }
     if (_gpuDone) {
-        dispatch_semaphore_signal(_gpuDone);   // the twins are written: a display frame may go to the screen
+        dispatch_semaphore_signal(_gpuDone);
     }
     _completed = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     if (_cb) {
@@ -1156,6 +1167,13 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
                 VkBufferImageCopy tc = {0, (uint32_t)t->_width, (uint32_t)t->_height, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                                         {0, 0, 0}, {(uint32_t)t->_width, (uint32_t)t->_height, 1}};
                 gVk.vkCmdCopyImageToBuffer(_cb, t->_image, VK_IMAGE_LAYOUT_GENERAL, t->_twin.buffer, 1, &tc);
+                // number this copy: submitted now, ready when the fence is (the kext flips only to a ready frame)
+                uint32_t pair[2] = {IOSurfaceGetID(t->_surface), ++t->_twinGen};
+                vg_twin_mark(pair[0], pair[1], NO);
+                if (!_twinFrames) {
+                    _twinFrames = [NSMutableData data];
+                }
+                [_twinFrames appendBytes:pair length:sizeof(pair)];
                 if (!writeBackTwins) {
                     if (!noWriteBack) {
                         noWriteBack = [NSMutableSet set];
@@ -1233,7 +1251,7 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
     // Animation releases surfaces from them (set_surface_volatile), which must not happen inside its own frame on the
     // committing thread (5b).
     if (scheduled.count) {
-        dispatch_queue_t sq = q && q->_userCompletion ? q->_userCompletion : dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+        dispatch_queue_t sq = q && q->_userCompletion ? q->_userCompletion : dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
         dispatch_async(sq, ^{
             for (MTLCommandBufferHandler h in scheduled) {
                 h(self);
@@ -1242,7 +1260,7 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
     }
     // In order on the queue's serial queue when the caller named a completion queue; otherwise as before (a handler
     // that waits for a later command buffer of the same queue must not deadlock behind it).
-    dispatch_async(q && q->_userCompletion ? q->_serial : dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    dispatch_async(q && q->_userCompletion ? q->_serial : dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
         [self finishWith:end fence:fence];
         dispatch_group_leave(self->_done);
     });
@@ -1254,6 +1272,32 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
 // must have landed by then (5c: when it returned at once, the pipe could show a surface before its last frame was in
 // it, and pieces of old frames stayed on screen). So a command buffer that wrote IOSurfaces returns only once they
 // are written back. VGMTL_NOWAIT_SUBMIT=1 returns at once again.
+// Display frames in flight (5c round 3): the oldest beyond the depth is waited for (completion, not just commit).
+static void vg_present_throttle(VGMTLCommandBuffer *cb) {
+    static NSMutableArray<VGMTLCommandBuffer *> *inflight;
+    static int depth;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        inflight = [NSMutableArray array];
+        const char *e = getenv("VGMTL_PRESENT_DEPTH");
+        depth = e ? atoi(e) : 2;
+        if (depth < 1) {
+            depth = 1;
+        }
+    });
+    VGMTLCommandBuffer *oldest = nil;
+    @synchronized(inflight) {
+        [inflight addObject:cb];
+        if ((int)inflight.count > depth) {
+            oldest = inflight[0];
+            [inflight removeObjectAtIndex:0];
+        }
+    }
+    if (oldest) {
+        dispatch_group_wait(oldest->_done, DISPATCH_TIME_FOREVER);
+    }
+}
+
 - (void)commitAndWaitUntilSubmitted {
     static int nowait = -1;
     if (nowait < 0) {
@@ -1264,12 +1308,25 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
     _present = YES;
     _gpuDone = wroteSurfaces ? dispatch_semaphore_create(0) : nil;
     [self commit];
+    static int twinWait = -1;
+    if (twinWait < 0) {
+        const char *e = getenv("VGMTL_TWIN_WAIT");
+        twinWait = e && e[0] == '1';
+    }
     if (wroteSurfaces && !nowait) {
         uint64_t t0 = vg_now();
         if (_allTwinned) {
-            // every surface has a twin the kext scans out: the GPU being done is enough (5c); the CPU write-backs
-            // follow on the completion queue for whoever reads the surfaces on the CPU
-            dispatch_semaphore_wait(_gpuDone, DISPATCH_TIME_FOREVER);
+            // every surface has a twin the kext scans out, and the kext flips to a frame only once it is marked
+            // ready (finishWith), so this frame needn't be waited for (5c round 3: that wait was 18.5 ms per frame,
+            // 12 s of WindowServer's thread in a 40 s scroll). But without any wait WindowServer ran ahead of the GPU
+            // and the screen fell further and further behind (a dragged window trailing the pointer): at most
+            // VGMTL_PRESENT_DEPTH (default 2) display frames in flight, i.e. wait for the one before this.
+            // VGMTL_TWIN_WAIT=1 waits for this frame as before.
+            if (twinWait) {
+                dispatch_semaphore_wait(_gpuDone, DISPATCH_TIME_FOREVER);
+            } else {
+                vg_present_throttle(self);
+            }
         } else {
             dispatch_group_wait(_done, DISPATCH_TIME_FOREVER);
         }
@@ -1288,7 +1345,9 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
 }
 - (void)waitUntilCompleted {
     if (_status >= MTLCommandBufferStatusCommitted) {
+        uint64_t t0 = vg_now();
         dispatch_group_wait(_done, DISPATCH_TIME_FOREVER);
+        vg_perf(VG_PERF_WAIT_COMPLETED, 0, vg_now() - t0);
     }
 }
 @end

@@ -20,7 +20,7 @@ void vg_callstack(const char *what);   // with the call trace on: the caller's f
 void vglog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 // 5c timing (VGMTLPerf.m): what each kind of work cost, summed and logged every 5 s in WindowServer (or with
 // VGMTL_PERF=1) while anything happened.
-enum { VG_PERF_PULL_COPY, VG_PERF_PULL_GPU, VG_PERF_WB_COPY, VG_PERF_CB, VG_PERF_ONESHOT, VG_PERF_UPLOAD, VG_PERF_DEFERRED, VG_PERF_FETCH, VG_PERF_CB_QUEUE, VG_PERF_CB_WAIT, VG_PERF_GPU, VG_PERF_POOL_HIT, VG_PERF_POOL_MISS, VG_PERF_SUBMIT_WAIT, VG_PERF_TRANSLATE, VG_PERF_DISK_HIT, VG_PERF_N };
+enum { VG_PERF_PULL_COPY, VG_PERF_PULL_GPU, VG_PERF_WB_COPY, VG_PERF_CB, VG_PERF_ONESHOT, VG_PERF_UPLOAD, VG_PERF_DEFERRED, VG_PERF_FETCH, VG_PERF_CB_QUEUE, VG_PERF_CB_WAIT, VG_PERF_GPU, VG_PERF_POOL_HIT, VG_PERF_POOL_MISS, VG_PERF_SUBMIT_WAIT, VG_PERF_TRANSLATE, VG_PERF_DISK_HIT, VG_PERF_WAIT_COMPLETED, VG_PERF_N };
 BOOL vg_perf_on(void);
 // GPU timestamps around a command buffer (5c, only while timing is on): begin returns a pair index or -1.
 int vg_gpu_time_begin(VkCommandBuffer cb);
