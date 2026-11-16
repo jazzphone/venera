@@ -75,6 +75,14 @@ typedef int (*xl_fc_fn)(const char *, const char *, const uint32_t *, const uint
                         uint8_t **, size_t *, char *, size_t);
 static xl_fn pTranslate, pReflect;
 static xl_fc_fn pTranslateFC, pReflectFC;
+// One translation per function whatever its function constants (5d): nvmtl_translate_spec makes a module whose function
+// constants are specialization constants (plus a table of them), nvmtl_spec_apply fixes one set of values in it in a
+// single pass. WebKit's canvas fragment shader has 60 constants and took 5-8 s for each new combination.
+typedef int (*xl_spec_fn)(const char *, const char *, uint8_t **, size_t *, uint8_t **, size_t *, char *, size_t);
+typedef int (*xl_spec_apply_fn)(const uint8_t *, size_t, const uint8_t *, size_t, const uint32_t *, const uint32_t *,
+                                const uint8_t *const *, size_t, uint8_t **, size_t *, char *, size_t);
+static xl_spec_fn pTranslateSpec;
+static xl_spec_apply_fn pSpecApply;
 static void (*pTranslateFree)(uint8_t *, size_t);
 static void (*pSetTgLengths)(const uint32_t *, uint32_t);
 
@@ -97,6 +105,8 @@ static BOOL vg_translator_ready(void) {
         pTranslateFC = (xl_fc_fn)dlsym(h, "nvmtl_translate_fc");
         pReflectFC = (xl_fc_fn)dlsym(h, "nvmtl_reflect_fc");
         pSetTgLengths = dlsym(h, "nvmtl_translate_set_threadgroup_lengths");
+        pTranslateSpec = (xl_spec_fn)dlsym(h, "nvmtl_translate_spec");   // optional
+        pSpecApply = (xl_spec_apply_fn)dlsym(h, "nvmtl_spec_apply");
         void (*setCaps)(uint32_t) = dlsym(h, "nvmtl_translate_set_caps");
         ready = pTranslate && pReflect && pTranslateFree && pSetTgLengths && setCaps && pTranslateFC && pReflectFC;
         // bits 0/1: the device reads/writes storage images without a declared format, so a typeless Metal
@@ -224,8 +234,33 @@ static void vg_disk_put(NSString *key, NSData *data) {
     if (!dir || !data.length) {
         return;
     }
+    // A temporary file renamed into place, so a reader never sees half of one; no fsync (5d: Safari's GPU process may
+    // not call it, so NSData's atomic write failed there and every new GPU process translated everything again).
     NSString *path = [dir stringByAppendingPathComponent:key];
-    [data writeToFile:path atomically:YES];   // a temporary file, renamed: readers never see half of it
+    char tmp[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "%s.%d.%llx.tmp", path.fileSystemRepresentation, getpid(), (unsigned long long)vg_now());
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    const char *why = NULL;
+    if (fd < 0) {
+        why = "create";
+    } else {
+        ssize_t w = write(fd, data.bytes, data.length);
+        close(fd);
+        if (w != (ssize_t)data.length) {
+            why = "write";
+        } else if (rename(tmp, path.fileSystemRepresentation)) {
+            why = "rename";
+        }
+        if (why) {
+            unlink(tmp);
+        }
+    }
+    if (why) {
+        static int logged;
+        if (logged++ < 3) {
+            vglog("translation cache: can't %s %s: %s", why, key.UTF8String, strerror(errno));
+        }
+    }
 }
 
 static NSData *vg_translate_uncached(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc,
@@ -266,6 +301,70 @@ NSData *vg_translate(NSString *ll, const char *stage, NSDictionary<NSNumber *, N
     return spv;
 }
 
+// Opt-in (/Library/GPUBundles/VirtioGPUMetal-fcspec holding 1), as in NullMoth's driver (NVMTL_FC_SPEC=1): on VM 108
+// WebKit's pages drew wrong with it (white page, black WebGL, no backdrop blur) and right with a translation per set.
+// A set is translated once and kept in the disk cache, so the cost is the first time only.
+static BOOL vg_fc_spec_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = 0;
+        FILE *f = fopen("/Library/GPUBundles/VirtioGPUMetal-fcspec", "r");
+        if (f) {
+            on = fgetc(f) == '1';
+            fclose(f);
+        }
+        vglog("function constants: %s", on ? "one translation per function (specialization constants)"
+                                            : "a translation per set of values");
+    }
+    return on;
+}
+
+// The function's specialization-constant module: from memory, the disk cache, or translated now. The entry is
+// 'SPC1', the table's length, the table, the module. Called with the threadgroup lengths already set (they're part of
+// the key, as for any translation).
+static NSData *vg_spec_entry(NSString *ll, const char *stage, const uint32_t *tgLengths, uint32_t tgCount,
+                             NSString **why) {
+    static NSCache *memo;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+      memo = [NSCache new];
+      memo.totalCostLimit = 64 << 20;
+    });
+    NSString *key = [@"spec|" stringByAppendingString:vg_translate_key(ll, stage, nil, tgLengths, tgCount)];
+    NSData *entry = [memo objectForKey:key];
+    if (entry) {
+        return entry;
+    }
+    NSString *dkey = vg_disk_dir() ? vg_disk_key("spec", ll, stage, nil, tgLengths, tgCount) : nil;
+    entry = dkey ? vg_disk_get(dkey) : nil;
+    if (!entry) {
+        uint8_t *mod = NULL, *tab = NULL;
+        size_t modLen = 0, tabLen = 0;
+        char err[1024] = "";
+        uint64_t t0 = vg_now();
+        if (pTranslateSpec(ll.UTF8String, stage, &mod, &modLen, &tab, &tabLen, err, sizeof(err)) || !mod) {
+            *why = [NSString stringWithFormat:@"no specialization-constant module: %s", err];
+            return nil;
+        }
+        NSMutableData *made = [NSMutableData dataWithCapacity:8 + tabLen + modLen];
+        uint32_t hdr[2] = {0x31435053u, (uint32_t)tabLen};
+        [made appendBytes:hdr length:8];
+        [made appendBytes:tab length:tabLen];
+        [made appendBytes:mod length:modLen];
+        pTranslateFree(mod, modLen);
+        pTranslateFree(tab, tabLen);
+        entry = made;
+        vg_perf(VG_PERF_TRANSLATE, modLen, vg_now() - t0);
+        vglog("function constants: one module for this %s function, %zu B, %zu constants, %.0f ms", stage, modLen,
+              tabLen / 20, (vg_now() - t0) / 1e6);
+        if (dkey) {
+            vg_disk_put(dkey, entry);
+        }
+    }
+    [memo setObject:entry forKey:key cost:entry.length];
+    return entry;
+}
+
 static NSData *vg_translate_uncached(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc,
                                      const uint32_t *tgLengths, uint32_t tgCount, NSString **error) {
     if (!vg_translator_ready()) {
@@ -279,6 +378,30 @@ static NSData *vg_translate_uncached(NSString *ll, const char *stage, NSDictiona
     char err[2048] = "";
     pSetTgLengths(tgLengths, tgCount);   // per thread, read by the next translation on this thread
     int r;
+    if (fc.count && pTranslateSpec && pSpecApply && vg_fc_spec_on()) {
+        NSString *why = nil;
+        NSData *entry = vg_spec_entry(ll, stage, tgLengths, tgCount, &why);
+        const uint32_t *hdr = entry.bytes;
+        if (entry && entry.length >= 8 && hdr[0] == 0x31435053u && entry.length >= 8 + (size_t)hdr[1]) {
+            vg_fc_args a;
+            vg_fc_unpack(fc, &a);
+            const uint8_t *tab = (const uint8_t *)entry.bytes + 8, *mod = tab + hdr[1];
+            if (!pSpecApply(mod, entry.length - 8 - hdr[1], tab, hdr[1], a.idx, a.sz, a.pay, a.n, &out, &len, err,
+                            sizeof(err)) &&
+                out) {
+                pSetTgLengths(NULL, 0);
+                NSData *spv = [NSData dataWithBytes:out length:len];
+                pTranslateFree(out, len);
+                return spv;
+            }
+            why = [NSString stringWithFormat:@"applying the values failed: %s", err];
+        }
+        static int logged;
+        if (logged++ < 10) {
+            vglog("function constants: the one-module path declined (%s): translating this set", why.UTF8String);
+        }
+        out = NULL, len = 0, err[0] = 0;
+    }
     if (fc.count) {
         vg_fc_args a;
         vg_fc_unpack(fc, &a);

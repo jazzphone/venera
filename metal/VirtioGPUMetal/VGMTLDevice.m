@@ -53,10 +53,18 @@ void vglog(const char *fmt, ...) {
     if (e && e[0] == '1') {
         fprintf(stderr, "VirtioGPUMetal[%d %s]: %s\n", getpid(), getprogname(), line);
     }
+    // The file only while it can be had (5d): a sandboxed process (Safari's GPU process) is refused it, and each refusal
+    // is a sandbox report of its own.
+    static _Atomic int noFile;
+    if (noFile) {
+        return;
+    }
     FILE *f = fopen("/var/tmp/VirtioGPUMetal.log", "a");
     if (f) {
         fprintf(f, "[%d %s] %s\n", getpid(), getprogname(), line);
         fclose(f);
+    } else {
+        noFile = 1;
     }
 }
 
