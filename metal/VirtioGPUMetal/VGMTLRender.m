@@ -227,6 +227,9 @@ enum { kVGMaxColor = 8 };
         gci.pColorBlendState = &cb;
         gci.pDynamicState = &dyn;
         gci.layout = _layout;
+        if (_fetchMask && gVk.feedbackLoop) {
+            gci.flags |= VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;   // samples its attachment (mode 4)
+        }
         VkResult r = gVk.vkCreateGraphicsPipelines(gVk.device, VK_NULL_HANDLE, 1, &gci, NULL, &_pipelines[cls]);
         vg_trace_sync("vkCreateGraphicsPipelines");
         if (r != VK_SUCCESS) {
@@ -420,6 +423,7 @@ id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRende
     VkRenderingAttachmentInfo _colorInfo[kVGMaxColor], _depthInfo;
     uint32_t _ncolor;
     VGMTLTexture *_fetchCopy[kVGMaxColor];   // scratch copies, made at the first fetch draw of the encoder
+    BOOL _feedback[kVGMaxColor];             // in the feedback loop layout since a fetch split (mode 4)
     // What this encoder last put into the command buffer (5c round 4): a draw sends state only when it changes. Vulkan
     // keeps dynamic state, the bound pipeline, sets and vertex buffers across render pass instances (the fetch
     // copies' end/resume), so this stays valid for the whole encoder.
@@ -660,10 +664,11 @@ static void vg_set_sampler(VGMTLCommandBuffer *cmd, vg_stage_bindings *t, id<MTL
 // (load), and return set 3 naming the copies. The command buffer's full barrier orders draw -> copy -> sample.
 // How a fetch split is done, for measurements (5c round 5; /Library/GPUBundles/VirtioGPUMetal-fetchmode holds the
 // digit): 0 full barriers (the default), 1 no copy and 2 no split at all (both draw wrong pixels: they only show what
-// the copies and the splits cost), 3 targeted barriers. Measured in WindowServer under mtlwindow: GPU time per
+// the copies and the splits cost), 3 targeted barriers, 4 in place (5c round 6: the pass still ends and resumes, but
+// the draw samples the attachment itself, in VK_EXT_attachment_feedback_loop_layout's layout, instead of a copy). Measured in WindowServer under mtlwindow: GPU time per
 // command buffer 2.55 / 1.85 / 1.77 / 2.52 ms, frame rate the same in all four (the copies are ~27 % of the GPU time,
 // the splits and barriers almost nothing, and GPU time doesn't limit the frame rate).
-static int vg_fetch_mode(void) {
+int vg_fetch_mode(void) {
     static int mode = -1;
     if (mode < 0) {
         mode = 0;
@@ -671,7 +676,7 @@ static int vg_fetch_mode(void) {
         if (f) {
             int m = fgetc(f) - '0';
             fclose(f);
-            if (m >= 0 && m <= 3) {
+            if (m >= 0 && m <= 4) {
                 mode = m;
             }
         }
@@ -700,9 +705,109 @@ static void vg_fetch_barrier(VkCommandBuffer cb, BOOL beforeCopy) {
     gVk.vkCmdPipelineBarrier(cb, src, dst, 0, 1, &mb, 0, NULL, 0, NULL);
 }
 
+// Mode 4: end the pass, move each read attachment into the feedback loop layout (its writes so far -> the fragment
+// shader's reads), resume the pass in that layout and point set 3 at the attachments themselves. A fragment reads its
+// own pixel before this draw writes it, as with a copy; later draws are ordered by the next split's barrier.
+- (VkDescriptorSet)fetchInPlace:(uint32_t)mask {
+    VkCommandBuffer cb = _owner->_cb;
+    gVk.vkCmdEndRendering(cb);
+    VkImageMemoryBarrier ib[kVGMaxColor];
+    uint32_t nb = 0;
+    for (uint32_t i = 0; i < _ncolor; i++) {
+        VGMTLTexture *t = _colorTex[i];
+        if (!(mask & (1u << i)) || !t || !_colorInfo[i].imageView) {
+            continue;
+        }
+        ib[nb++] = (VkImageMemoryBarrier){VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+                                          VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                                          VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                                              VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                                          _feedback[i] ? VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+                                                       : VK_IMAGE_LAYOUT_GENERAL,
+                                          VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT,
+                                          VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, t->_image,
+                                          {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0,
+                                           VK_REMAINING_ARRAY_LAYERS}};
+        _feedback[i] = YES;
+        _colorInfo[i].imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
+    }
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL,
+                          VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                          VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                              VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                              VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT};
+    gVk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                 VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                             VK_DEPENDENCY_BY_REGION_BIT, 1, &mb, 0, NULL, nb, ib);
+    VkRenderingAttachmentInfo color[kVGMaxColor];
+    for (uint32_t i = 0; i < _ncolor; i++) {
+        color[i] = _colorInfo[i];
+        if (color[i].imageView) {
+            color[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        }
+    }
+    VkRenderingAttachmentInfo depth = _depthInfo;
+    depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, _area, 1, 0, _ncolor, color, _depthTex ? &depth : NULL, NULL};
+    gVk.vkCmdBeginRendering(cb, &ri);
+    VkDescriptorImageInfo ii[8];
+    VkWriteDescriptorSet wr[8];
+    uint32_t nw = 0;
+    for (uint32_t i = 0; i < 8; i++) {
+        if (!(mask & (1u << i))) {
+            continue;
+        }
+        VkImageView view = VK_NULL_HANDLE;
+        VkImageLayout layout = VK_IMAGE_LAYOUT_GENERAL;
+        if (i < _ncolor && _feedback[i]) {
+            view = _colorInfo[i].imageView;
+            layout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
+        } else {   // no attachment for this [[color(n)]]: a zeroed scratch image, as with copies
+            if (!_fetchCopy[i]) {
+                MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                             width:_area.extent.width
+                                                                                            height:_area.extent.height
+                                                                                         mipmapped:NO];
+                td.usage = MTLTextureUsageShaderRead;
+                td.storageMode = MTLStorageModePrivate;
+                _fetchCopy[i] = (VGMTLTexture *)vg_new_texture(_owner.device, td);
+                if (!_fetchCopy[i]) {
+                    [_owner fail:@"framebuffer fetch: no scratch image"];
+                    return VK_NULL_HANDLE;
+                }
+                [_owner->_keep addObject:_fetchCopy[i]];
+            }
+            view = _fetchCopy[i]->_view;
+        }
+        ii[nw] = (VkDescriptorImageInfo){VK_NULL_HANDLE, view, layout};
+        wr[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, VK_NULL_HANDLE, 192 + i, 0, 1,
+                                        VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &ii[nw], NULL, NULL};
+        nw++;
+    }
+    VkDescriptorSet set = [_owner allocSet:gFetchLayout];
+    if (!set) {
+        [_owner fail:@"framebuffer fetch: no descriptor set"];
+        return VK_NULL_HANDLE;
+    }
+    for (uint32_t k = 0; k < nw; k++) {
+        wr[k].dstSet = set;
+    }
+    gVk.vkUpdateDescriptorSets(gVk.device, nw, wr, 0, NULL);
+    static int logged = 0;
+    if (logged++ < 3) {
+        vglog("render: framebuffer fetch in place (mask 0x%x, %ux%u)", mask, _area.extent.width, _area.extent.height);
+    }
+    vg_perf(VG_PERF_FETCH, 0, 0);
+    return set;
+}
+
 - (VkDescriptorSet)fetchCopy:(uint32_t)mask {
     VkCommandBuffer cb = _owner->_cb;
     const int mode = vg_fetch_mode();
+    if (mode == 4 && gVk.feedbackLoop) {
+        return [self fetchInPlace:mask];
+    }
     if (mode != 2) {
         gVk.vkCmdEndRendering(cb);
         if (mode == 3) {
@@ -835,6 +940,27 @@ static void vg_fetch_barrier(VkCommandBuffer cb, BOOL beforeCopy) {
     if (_open) {
         gVk.vkCmdEndRendering(_owner->_cb);
         [_owner barrier];
+        // attachments a fetch split moved into the feedback loop layout go back to GENERAL, where everything else
+        // expects them (mode 4)
+        VkImageMemoryBarrier ib[kVGMaxColor];
+        uint32_t nb = 0;
+        for (uint32_t i = 0; i < _ncolor; i++) {
+            if (_feedback[i] && _colorTex[i]) {
+                ib[nb++] = (VkImageMemoryBarrier){VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+                                                  VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
+                                                  VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                                                  VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT,
+                                                  VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED,
+                                                  VK_QUEUE_FAMILY_IGNORED, _colorTex[i]->_image,
+                                                  {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0,
+                                                   VK_REMAINING_ARRAY_LAYERS}};
+                _feedback[i] = NO;
+            }
+        }
+        if (nb) {
+            gVk.vkCmdPipelineBarrier(_owner->_cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                                     0, NULL, 0, NULL, nb, ib);
+        }
         _open = NO;
     }
 }

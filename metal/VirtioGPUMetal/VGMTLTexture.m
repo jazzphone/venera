@@ -681,6 +681,10 @@ id<MTLTexture> vg_new_texture(id<MTLDevice> device, MTLTextureDescriptor *d) {
     if ((d.usage & MTLTextureUsageShaderWrite) && !(usage & VK_IMAGE_USAGE_STORAGE_BIT)) {
         vglog("texture: pixel format %lu can't be a storage image here (shaderWrite will fail)", (unsigned long)d.pixelFormat);
     }
+    const VkImageUsageFlags rw = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (gVk.feedbackLoop && (usage & rw) == rw && (d.usage & MTLTextureUsageRenderTarget)) {
+        usage |= VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;   // framebuffer fetch in place (mode 4)
+    }
     VGMTLTexture *t = [VGMTLTexture new];
     t->_dev = device;
     t->_pixelFormat = d.pixelFormat;
@@ -874,7 +878,7 @@ id<MTLTexture> vg_texture_view(VGMTLTexture *p, MTLPixelFormat pf, MTLTextureTyp
         usage |= p->_imageUsage & VK_IMAGE_USAGE_STORAGE_BIT;
     }
     if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) {
-        usage |= p->_imageUsage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        usage |= p->_imageUsage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT);
     }
     VkImageViewUsageCreateInfo uci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, NULL, usage};
     const BOOL alpha8 = pf == MTLPixelFormatA8Unorm;

@@ -75,6 +75,7 @@ struct vg_vulkan {
     VkPhysicalDeviceMemoryProperties memory;
     BOOL formatlessStorage;    // shaderStorageImageRead/WriteWithoutFormat: typeless storage textures
     BOOL calibrated;           // VK_EXT_calibrated_timestamps enabled
+    BOOL feedbackLoop;         // VK_EXT_attachment_feedback_loop_layout enabled (framebuffer fetch mode 4)
     VkCommandPool pool;
     pthread_mutex_t lock;      // the queue and the command pool
     VG_VK_FUNCS(VG_DECLARE)
@@ -134,3 +135,5 @@ id<MTLComputePipelineState> vg_new_compute_pipeline(id<MTLDevice> device, id<MTL
 - (NSString *)vgStage;   // "kernel" | "vertex" | "fragment"
 - (NSDictionary<NSNumber *, NSData *> *)vgFC;   // function-constant values, nil if none were given
 @end
+
+int vg_fetch_mode(void);   // framebuffer fetch: 0 copies (default), 4 in place (VGMTLRender.m)

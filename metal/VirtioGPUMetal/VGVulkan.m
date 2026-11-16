@@ -113,7 +113,13 @@ static int vg_vulkan_init_locked(void) {
     // Translated shaders declare what they use (descriptor indexing, formatless storage images, 8/16-bit types,
     // the memory model...), and Vulkan needs each feature enabled: turn on everything the device has, except
     // robustBufferAccess (bounds checks on every access, which Metal doesn't promise).
-    VkPhysicalDeviceVulkan13Features f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    // Framebuffer fetch in place (5c round 6, mode 4): sampling a color attachment inside its own pass needs
+    // VK_EXT_attachment_feedback_loop_layout; asked for only in that mode.
+    VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT ffl = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT};
+    const BOOL wantFeedback = vg_fetch_mode() == 4;
+    VkPhysicalDeviceVulkan13Features f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+                                            wantFeedback ? &ffl : NULL};
     VkPhysicalDeviceVulkan12Features f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13};
     VkPhysicalDeviceVulkan11Features f11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &f12};
     VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f11};
@@ -124,15 +130,26 @@ static int vg_vulkan_init_locked(void) {
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, gVk.queueFamily, 1, &prio};
     // VK_EXT_calibrated_timestamps (5c round 4): GPU timestamps on the guest's clock, to split completion latency.
-    const char *exts[] = {"VK_EXT_calibrated_timestamps"};
-    VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2, 0, 1, &qci, 0, NULL, 1, exts, NULL};
-    r = gVk.vkCreateDevice(gVk.physical, &dci, NULL, &gVk.device);
-    if (r == VK_ERROR_EXTENSION_NOT_PRESENT) {
-        dci.enabledExtensionCount = 0;
-        dci.ppEnabledExtensionNames = NULL;
+    // Each optional extension the device lacks is dropped and the device created again.
+    const char *exts[2] = {"VK_EXT_calibrated_timestamps", "VK_EXT_attachment_feedback_loop_layout"};
+    uint32_t next = wantFeedback && ffl.attachmentFeedbackLoopLayout ? 2 : 1;
+    if (wantFeedback && !ffl.attachmentFeedbackLoopLayout) {
+        vglog("vulkan: no attachmentFeedbackLoopLayout: framebuffer fetch stays with copies");
+    }
+    VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2, 0, 1, &qci, 0, NULL, next, exts, NULL};
+    for (;;) {
         r = gVk.vkCreateDevice(gVk.physical, &dci, NULL, &gVk.device);
-    } else if (r == VK_SUCCESS) {
-        gVk.calibrated = YES;
+        if (r != VK_ERROR_EXTENSION_NOT_PRESENT || !dci.enabledExtensionCount) {
+            break;
+        }
+        dci.enabledExtensionCount--;   // the feedback loop first, then the timestamps
+    }
+    if (r == VK_SUCCESS) {
+        gVk.calibrated = dci.enabledExtensionCount >= 1;
+        gVk.feedbackLoop = dci.enabledExtensionCount >= 2;
+        if (wantFeedback) {
+            vglog("vulkan: framebuffer fetch %s", gVk.feedbackLoop ? "in place (attachment feedback loop)" : "by copies");
+        }
     }
     if (r != VK_SUCCESS) {
         vglog("vulkan: vkCreateDevice %d", r);

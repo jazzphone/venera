@@ -1,5 +1,5 @@
 #!/bin/zsh
-# User-space tools for the VM (x86_64): build/vgputest, build/vkprobe, build/vkexec, build/acceltest, build/llvmprobe, build/mtlprobe, build/mtlcompute, build/mtlrender, build/mtllat, build/blobtest, build/dragtest, build/modetest (+ metallibs)
+# User-space tools for the VM (x86_64): build/vgputest, build/vkprobe, build/vkexec, build/acceltest, build/llvmprobe, build/mtlprobe, build/mtlcompute, build/mtlrender, build/mtllat, build/blobtest, build/dragtest, build/modetest (tools/pngdiff.m runs on the Mac: build it by hand) (+ metallibs)
 set -euo pipefail
 cd "${0:A:h}/.."
 mkdir -p build
