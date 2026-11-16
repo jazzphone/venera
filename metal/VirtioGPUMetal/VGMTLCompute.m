@@ -1387,7 +1387,7 @@ static int vg_present_depth(void) {
     static uint64_t checked;
     if (envDepth < 0) {
         const char *e = getenv("VGMTL_PRESENT_DEPTH");
-        envDepth = e && atoi(e) > 0 ? atoi(e) : 4;
+        envDepth = e && atoi(e) > 0 ? atoi(e) : 6;   // 6: the best drag, scroll and resize pacing (5c round 6)
     }
     uint64_t now = vg_now();
     if (!checked || now - checked > 1000000000ull) {
