@@ -85,6 +85,8 @@ struct vg_vulkan {
 extern struct vg_vulkan gVk;
 
 int vg_vulkan_init(void);   // 0 = up
+// Multisampling (5d): the raster sample count the next translations on this thread are for (1 or 0 = one sample).
+void vg_translate_set_samples(uint32_t n);
 uint32_t vg_memory_type(uint32_t bits, VkMemoryPropertyFlags want);   // first allowed type with `want`, else any
 
 // A Vulkan buffer in host-visible memory, mapped for its life.

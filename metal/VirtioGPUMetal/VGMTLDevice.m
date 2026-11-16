@@ -245,7 +245,9 @@ static id vg_refuse_before_init(id obj) {
     return vg_new_buffer_nocopy(self, pointer, length, options, deallocator);
 }
 - (id<MTLCommandQueue>)newCommandQueue { return vg_new_queue(self); }
-- (BOOL)supportsSampleCount:(NSUInteger)count { return count == 1; }   // no multisampling yet (5d)
+- (BOOL)supportsSampleCount:(NSUInteger)count {   // 5d: what the host renders color and depth with
+    return count == 1 || (gVk.props.limits.framebufferColorSampleCounts & gVk.props.limits.framebufferDepthSampleCounts & count);
+}
 - (id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)n { return vg_new_queue(self); }
 - (id<MTLCommandQueue>)newCommandQueueWithDescriptor:(MTLCommandQueueDescriptor *)d { return vg_new_queue(self); }
 - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {

@@ -554,7 +554,7 @@ BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
 - (NSUInteger)depth { return _depth; }
 - (NSUInteger)mipmapLevelCount { return _mips; }
 - (NSUInteger)arrayLength { return _layers; }
-- (NSUInteger)sampleCount { return 1; }
+- (NSUInteger)sampleCount { return _parent ? MAX(_parent->_samples, 1) : MAX(_samples, 1); }
 - (MTLTextureUsage)usage { return _usage; }
 - (MTLStorageMode)storageMode { return _storage; }
 - (MTLCPUCacheMode)cpuCacheMode { return MTLCPUCacheModeDefaultCache; }
@@ -677,13 +677,22 @@ id<MTLTexture> vg_new_texture(id<MTLDevice> device, MTLTextureDescriptor *d) {
     case MTLTextureType2D: itype = VK_IMAGE_TYPE_2D, vtype = VK_IMAGE_VIEW_TYPE_2D; break;
     case MTLTextureType2DArray: itype = VK_IMAGE_TYPE_2D, vtype = VK_IMAGE_VIEW_TYPE_2D_ARRAY; break;
     case MTLTextureType3D: itype = VK_IMAGE_TYPE_3D, vtype = VK_IMAGE_VIEW_TYPE_3D; break;
+    case MTLTextureType2DMultisample: itype = VK_IMAGE_TYPE_2D, vtype = VK_IMAGE_VIEW_TYPE_2D; break;   // 5d
+    case MTLTextureType2DMultisampleArray: itype = VK_IMAGE_TYPE_2D, vtype = VK_IMAGE_VIEW_TYPE_2D_ARRAY; break;
     default:
         vglog("texture: type %lu not supported yet", (unsigned long)d.textureType);
         return nil;
     }
+    // Multisampling (5d): a sample count the device renders with for this kind of attachment.
+    NSUInteger samples = 0;
     if (d.sampleCount > 1) {
-        vglog("texture: multisampling not supported yet");
-        return nil;
+        VkSampleCountFlags have = (f->aspect & VK_IMAGE_ASPECT_COLOR_BIT) ? gVk.props.limits.framebufferColorSampleCounts
+                                                                           : gVk.props.limits.framebufferDepthSampleCounts;
+        if (!(have & d.sampleCount) || d.mipmapLevelCount > 1) {
+            vglog("texture: %lu samples not supported for format %lu", (unsigned long)d.sampleCount, (unsigned long)d.pixelFormat);
+            return nil;
+        }
+        samples = d.sampleCount;
     }
     VkFormatProperties fp;
     gVk.vkGetPhysicalDeviceFormatProperties(gVk.physical, f->vk, &fp);
@@ -709,6 +718,7 @@ id<MTLTexture> vg_new_texture(id<MTLDevice> device, MTLTextureDescriptor *d) {
         usage |= VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;   // framebuffer fetch in place (mode 4)
     }
     VGMTLTexture *t = [VGMTLTexture new];
+    t->_samples = samples;
     t->_dev = device;
     t->_pixelFormat = d.pixelFormat;
     t->_format = f->vk;
@@ -727,7 +737,11 @@ id<MTLTexture> vg_new_texture(id<MTLDevice> device, MTLTextureDescriptor *d) {
     ici.extent = (VkExtent3D){(uint32_t)t->_width, (uint32_t)t->_height, (uint32_t)t->_depth};
     ici.mipLevels = (uint32_t)t->_mips;
     ici.arrayLayers = (uint32_t)t->_layers;
-    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.samples = t->_samples > 1 ? (VkSampleCountFlagBits)t->_samples : VK_SAMPLE_COUNT_1_BIT;
+    if (t->_samples > 1) {
+        usage &= ~VK_IMAGE_USAGE_STORAGE_BIT;   // no multisample storage images
+        ici.usage = usage;
+    }
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
     ici.usage = usage;
     if (f->aspect == VK_IMAGE_ASPECT_COLOR_BIT) {
@@ -882,6 +896,8 @@ id<MTLTexture> vg_texture_view(VGMTLTexture *p, MTLPixelFormat pf, MTLTextureTyp
     case MTLTextureType2D: vtype = VK_IMAGE_VIEW_TYPE_2D; break;
     case MTLTextureType2DArray: vtype = VK_IMAGE_VIEW_TYPE_2D_ARRAY; break;
     case MTLTextureType3D: vtype = VK_IMAGE_VIEW_TYPE_3D; break;
+    case MTLTextureType2DMultisample: vtype = VK_IMAGE_VIEW_TYPE_2D; break;
+    case MTLTextureType2DMultisampleArray: vtype = VK_IMAGE_VIEW_TYPE_2D_ARRAY; break;
     default: vtype = VK_IMAGE_VIEW_TYPE_MAX_ENUM; break;
     }
     if (!f || vtype == VK_IMAGE_VIEW_TYPE_MAX_ENUM || levels.location + levels.length > p->_mips ||

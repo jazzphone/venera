@@ -157,6 +157,8 @@ enum { kVGMaxColor = 8 };
     uint32_t _fetchMask;             // [[color(n)]] the fragment stage reads
     uint32_t _fetchDeclared;         // ... and declares (set 3 in the layout; no copies for declared-only ones)
     VkPipelineLayout _layout;
+    NSUInteger _samples;             // raster sample count (5d)
+    BOOL _alphaToCoverage;
     vg_binding _vb[64], _fb[64];
     int _nvb, _nfb;
     VkVertexInputBindingDescription _vbind[kVGMaxBufferSlots];
@@ -201,7 +203,8 @@ enum { kVGMaxColor = 8 };
         rs.polygonMode = VK_POLYGON_MODE_FILL;
         rs.lineWidth = 1.0f;
         VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0,
-                                                   VK_SAMPLE_COUNT_1_BIT};
+                                                   _samples > 1 ? (VkSampleCountFlagBits)_samples : VK_SAMPLE_COUNT_1_BIT};
+        ms.alphaToCoverageEnable = _alphaToCoverage;
         VkPipelineDepthStencilStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
         ds.maxDepthBounds = 1.0f;
         VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0,
@@ -269,8 +272,8 @@ id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRende
     if (![vf respondsToSelector:@selector(vgLL)] || ![[vf vgStage] isEqual:@"vertex"] ||
         (ff && (![ff respondsToSelector:@selector(vgLL)] || ![[ff vgStage] isEqual:@"fragment"]))) {
         why = @"not VirtioGPUMetal vertex/fragment functions";
-    } else if (d.rasterSampleCount > 1) {
-        why = @"multisampling isn't supported yet";
+    } else if (d.rasterSampleCount > 1 && !(gVk.props.limits.framebufferColorSampleCounts & d.rasterSampleCount)) {
+        why = [NSString stringWithFormat:@"%lu samples aren't supported", (unsigned long)d.rasterSampleCount];
     } else if (vg_vulkan_init()) {
         why = @"Venus is down";
     } else {
@@ -278,8 +281,12 @@ id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRende
         p->_dev = device;
         p->_name = [NSString stringWithFormat:@"%@+%@", d.vertexFunction.name, d.fragmentFunction.name ?: @"-"];
         uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        p->_samples = MAX(d.rasterSampleCount, 1);
+        p->_alphaToCoverage = d.alphaToCoverageEnabled;
+        vg_translate_set_samples((uint32_t)p->_samples);
         NSData *vs = vg_translate([vf vgLL], "vertex", [vf vgFC], NULL, 0, &why);
         NSData *fs = ff && vs ? vg_translate([ff vgLL], "fragment", [ff vgFC], NULL, 0, &why) : nil;
+        vg_translate_set_samples(0);
         uint32_t declared = 0, fetch = fs ? vg_spirv_fetch_mask(fs, &declared) : 0;
         if (declared) {
             vglog("render pipeline %s: framebuffer inputs declared 0x%x, read 0x%x%s", p->_name.UTF8String, declared, fetch,
@@ -987,6 +994,18 @@ static VkAttachmentLoadOp vg_load(MTLLoadAction a) {
                                     : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
 }
 // Always store: a pass may be ended and resumed for a framebuffer-fetch copy, and "don't care" allows storing anyway.
+static BOOL vg_integer_format(MTLPixelFormat f) {
+    switch ((NSUInteger)f) {
+    case MTLPixelFormatR8Uint: case MTLPixelFormatR8Sint: case MTLPixelFormatR16Uint: case MTLPixelFormatR16Sint:
+    case MTLPixelFormatRG8Uint: case MTLPixelFormatRG8Sint: case MTLPixelFormatR32Uint: case MTLPixelFormatR32Sint:
+    case MTLPixelFormatRG16Uint: case MTLPixelFormatRG16Sint: case MTLPixelFormatRGBA8Uint: case MTLPixelFormatRGBA8Sint:
+    case MTLPixelFormatRGB10A2Uint: case MTLPixelFormatRG32Uint: case MTLPixelFormatRG32Sint: case MTLPixelFormatRGBA16Uint:
+    case MTLPixelFormatRGBA16Sint: case MTLPixelFormatRGBA32Uint: case MTLPixelFormatRGBA32Sint:
+        return YES;
+    default:
+        return NO;
+    }
+}
 static VkAttachmentStoreOp vg_store(MTLStoreAction a) {
     (void)a;
     return VK_ATTACHMENT_STORE_OP_STORE;
@@ -1008,7 +1027,8 @@ static VkAttachmentStoreOp vg_store(MTLStoreAction a) {
         if (!t) {
             continue;
         }
-        if (![t isKindOfClass:[VGMTLTexture class]] || c.depthPlane || c.resolveTexture ||
+        if (![t isKindOfClass:[VGMTLTexture class]] || c.depthPlane ||
+            (c.resolveTexture && ![(NSObject *)c.resolveTexture isKindOfClass:[VGMTLTexture class]]) ||
             ((c.level || c.slice) && t->_parent)) {
             [self fail:[NSString stringWithFormat:@"color attachment %u: %@ level %lu slice %lu depth plane %lu resolve %@ "
                                                   @"(only our own textures, levels and slices of a texture that is not a "
@@ -1041,6 +1061,25 @@ static VkAttachmentStoreOp vg_store(MTLStoreAction a) {
         color[i].imageView = target->_view;
         color[i].loadOp = vg_load(c.loadAction);
         color[i].storeOp = vg_store(c.storeAction);
+        // Multisample resolve (5d): into the resolve texture (its level and slice), averaged, or sample 0 for integers
+        if (c.resolveTexture && (c.storeAction == MTLStoreActionMultisampleResolve ||
+                                 c.storeAction == MTLStoreActionStoreAndMultisampleResolve)) {
+            VGMTLTexture *rt = (VGMTLTexture *)c.resolveTexture, *rv = rt;
+            if (c.resolveLevel || c.resolveSlice) {
+                rv = (VGMTLTexture *)vg_texture_view(rt, rt->_pixelFormat, MTLTextureType2D, NSMakeRange(c.resolveLevel, 1),
+                                                     NSMakeRange(c.resolveSlice, 1));
+            }
+            if (!rv) {
+                [self fail:@"color attachment: no view of the resolve level and slice"];
+                return nil;
+            }
+            [_keep addObject:rt];
+            [_keep addObject:rv];
+            color[i].resolveMode = vg_integer_format(t->_pixelFormat) ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : VK_RESOLVE_MODE_AVERAGE_BIT;
+            color[i].resolveImageView = rv->_view;
+            color[i].resolveImageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            vg_cmd_wrote(self, rt);
+        }
         MTLClearColor cc = c.clearColor;
         color[i].clearValue.color = (VkClearColorValue){{(float)cc.red, (float)cc.green, (float)cc.blue, (float)cc.alpha}};
         ncolor = i + 1;
@@ -1056,6 +1095,15 @@ static VkAttachmentStoreOp vg_store(MTLStoreAction a) {
         depth.loadOp = vg_load(d.depthAttachment.loadAction);
         depth.storeOp = vg_store(d.depthAttachment.storeAction);
         depth.clearValue.depthStencil = (VkClearDepthStencilValue){(float)d.depthAttachment.clearDepth, 0};
+        VGMTLTexture *drt = (VGMTLTexture *)d.depthAttachment.resolveTexture;
+        if ([drt isKindOfClass:[VGMTLTexture class]] &&
+            (d.depthAttachment.storeAction == MTLStoreActionMultisampleResolve ||
+             d.depthAttachment.storeAction == MTLStoreActionStoreAndMultisampleResolve)) {
+            [_keep addObject:drt];
+            depth.resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;   // Metal's default depth resolve filter
+            depth.resolveImageView = drt->_view;
+            depth.resolveImageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        }
         w = MIN(w, (uint32_t)dt->_width);
         h = MIN(h, (uint32_t)dt->_height);
     }

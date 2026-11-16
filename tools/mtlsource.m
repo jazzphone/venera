@@ -15,7 +15,11 @@ static NSString *const kSource = @"#include <metal_stdlib>\n"
                                   "    float2 p[3] = {float2(-1, -1), float2(3, -1), float2(-1, 3)};\n"
                                   "    V o; o.p = float4(p[vid], 0, 1); o.c = float4(0.25, 0.5, 1.0, 1.0); return o;\n"
                                   "}\n"
-                                  "fragment float4 fs(V in [[stage_in]]) { return in.c; }\n";
+                                  "fragment float4 fs(V in [[stage_in]]) { return in.c; }\n"
+                                  "vertex V vs_half(uint vid [[vertex_id]]) {\n"
+                                  "    float2 p[3] = {float2(-1, -1), float2(1, -1), float2(-1, 1)};\n"
+                                  "    V o; o.p = float4(p[vid], 0, 1); o.c = float4(1, 1, 1, 1); return o;\n"
+                                  "}\n";
 
 int main(void) {
     @autoreleasepool {
@@ -96,6 +100,61 @@ int main(void) {
             failures += !ok;
         } else {
             failures++;
+        }
+        // 4x multisampling (5d): a triangle over half the target, resolved; its diagonal edge gets partial coverage
+        if ([dev supportsTextureSampleCount:4]) {
+            MTLTextureDescriptor *md = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                         width:64 height:64 mipmapped:NO];
+            md.textureType = MTLTextureType2DMultisample;
+            md.sampleCount = 4;
+            md.usage = MTLTextureUsageRenderTarget;
+            md.storageMode = MTLStorageModePrivate;
+            id<MTLTexture> ms = [dev newTextureWithDescriptor:md];
+            MTLTextureDescriptor *rdsc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                           width:64 height:64 mipmapped:NO];
+            rdsc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            rdsc.storageMode = MTLStorageModeManaged;
+            id<MTLTexture> res = [dev newTextureWithDescriptor:rdsc];
+            MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+            pd.vertexFunction = [lib newFunctionWithName:@"vs_half"];
+            pd.fragmentFunction = [lib newFunctionWithName:@"fs"];
+            pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+            pd.rasterSampleCount = 4;
+            id<MTLRenderPipelineState> mps = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
+            if (!ms || !res || !mps) {
+                printf("msaa: FAILED to make %s\n", !ms ? "the 4x texture" : !res ? "the resolve texture" : "the pipeline");
+                failures++;
+            } else {
+                MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor new];
+                rp.colorAttachments[0].texture = ms;
+                rp.colorAttachments[0].resolveTexture = res;
+                rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+                rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+                rp.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+                cb = [q commandBuffer];
+                id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
+                [re setRenderPipelineState:mps];
+                [re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+                [re endEncoding];
+                id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+                [be synchronizeResource:res];
+                [be endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+                uint8_t px[64 * 64 * 4];
+                [res getBytes:px bytesPerRow:64 * 4 fromRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0];
+                int inside = px[(56 * 64 + 8) * 4], outside = px[(8 * 64 + 56) * 4], partial = 0;
+                for (int y = 0; y < 64; y++) {
+                    int v = px[(y * 64 + y) * 4];   // the edge: pixel centers on it are half covered
+                    partial += v > 20 && v < 235;
+                }
+                BOOL ok = inside == 255 && outside == 0 && partial > 0;
+                printf("msaa 4x resolve: %s (inside %d, outside %d, %d partially covered edge pixels)\n", ok ? "ok" : "FAIL",
+                       inside, outside, partial);
+                failures += !ok;
+            }
+        } else {
+            printf("msaa: the device says it doesn't do 4 samples\n");
         }
         printf("%s\n", failures ? "FAILED" : "PASS");
         return failures ? 1 : 0;

@@ -41,6 +41,7 @@ id<MTLBuffer> vg_new_buffer_nocopy(id<MTLDevice> device, void *pointer, NSUInteg
     MTLPixelFormat _pixelFormat;
     MTLTextureType _type;
     NSUInteger _width, _height, _depth, _mips, _layers;
+    NSUInteger _samples;   // multisample images (5d); 0 or 1 = one sample
     MTLTextureUsage _usage;
     MTLStorageMode _storage;
     id<MTLDevice> _dev;

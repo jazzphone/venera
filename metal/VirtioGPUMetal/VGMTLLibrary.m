@@ -84,6 +84,7 @@ typedef int (*xl_spec_apply_fn)(const uint8_t *, size_t, const uint8_t *, size_t
 static xl_spec_fn pTranslateSpec;
 static xl_spec_apply_fn pSpecApply;
 static void (*pTranslateFree)(uint8_t *, size_t);
+static void (*pSetSamples)(uint32_t);   // nvmtl_translate_set_raster_sample_count (5d)
 static void (*pSetTgLengths)(const uint32_t *, uint32_t);
 
 static BOOL vg_translator_ready(void) {
@@ -105,6 +106,7 @@ static BOOL vg_translator_ready(void) {
         pTranslateFC = (xl_fc_fn)dlsym(h, "nvmtl_translate_fc");
         pReflectFC = (xl_fc_fn)dlsym(h, "nvmtl_reflect_fc");
         pSetTgLengths = dlsym(h, "nvmtl_translate_set_threadgroup_lengths");
+        pSetSamples = dlsym(h, "nvmtl_translate_set_raster_sample_count");   // optional
         pTranslateSpec = (xl_spec_fn)dlsym(h, "nvmtl_translate_spec");   // optional
         pSpecApply = (xl_spec_apply_fn)dlsym(h, "nvmtl_spec_apply");
         void (*setCaps)(uint32_t) = dlsym(h, "nvmtl_translate_set_caps");
@@ -142,9 +144,17 @@ static void vg_fc_unpack(NSDictionary<NSNumber *, NSData *> *fc, vg_fc_args *a) 
 
 // Translations are cached by (module text object -- the function keeps it for the library's life -- its hash, stage, constants, threadgroup lengths): Core Animation's fixed-function
 // shaders are ~690 KB of SPIR-V and ~4 s each, asked again for every pipeline that uses them (5b).
+// The pipeline's raster sample count for the next translations on this thread (5d, multisampling): shaders that read
+// it (air.get_num_samples, ANGLE's) translate differently, so it is part of every cache key when it isn't 1.
+static __thread uint32_t gSamples;
+void vg_translate_set_samples(uint32_t n) { gSamples = n > 1 ? n : 0; }
+
 static NSString *vg_translate_key(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc,
                                   const uint32_t *tg, uint32_t tgCount) {
     NSMutableString *k = [NSMutableString stringWithFormat:@"%p:%lx:%lu:%s", ll, (unsigned long)ll.hash, (unsigned long)ll.length, stage];
+    if (gSamples) {
+        [k appendFormat:@"|samples=%u", gSamples];
+    }
     for (NSNumber *i in [fc.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
         [k appendFormat:@"|%@=%@", i, fc[i]];
     }
@@ -212,6 +222,10 @@ static NSString *vg_disk_key(const char *kind, NSString *ll, const char *stage, 
     }
     for (uint32_t i = 0; tg && i < tgCount; i++) {
         CC_SHA256_Update(&c, &tg[i], 4);
+    }
+    if (gSamples) {
+        CC_SHA256_Update(&c, "samples", 8);
+        CC_SHA256_Update(&c, &gSamples, 4);
     }
     const char *text = ll.UTF8String;
     CC_SHA256_Update(&c, text, (CC_LONG)strlen(text));
@@ -377,6 +391,9 @@ static NSData *vg_translate_uncached(NSString *ll, const char *stage, NSDictiona
     size_t len = 0;
     char err[2048] = "";
     pSetTgLengths(tgLengths, tgCount);   // per thread, read by the next translation on this thread
+    if (pSetSamples) {
+        pSetSamples(gSamples ? gSamples : 1);
+    }
     int r;
     if (fc.count && pTranslateSpec && pSpecApply && vg_fc_spec_on()) {
         NSString *why = nil;
