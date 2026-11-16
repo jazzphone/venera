@@ -14,6 +14,7 @@
 // ---- MTLBuffer ---------------------------------------------------------------------------------------------------
 
 @implementation VGMTLBuffer
+- (kern_return_t)setOwnerWithIdentity:(task_id_token_t)identity { return KERN_SUCCESS; }   // memory accounting (5d)
 // The blob resource of this buffer's memory, for tools (5c: tools/blobtest).
 - (uint32_t)vgResId { return vg_memory_res_id(_b.memory); }
 @synthesize label = _label;
@@ -603,6 +604,8 @@ id<MTLComputePipelineState> vg_new_compute_pipeline(id<MTLDevice> device, id<MTL
 
 @implementation VGMTLCommandQueue
 @synthesize device = _device, label = _label;
+// Priorities (5d: Core Image, WebKit): one Vulkan queue, so accepted and not applied.
+- (BOOL)setBackgroundGPUPriority:(NSUInteger)priority { return YES; }
 - (instancetype)initWithDevice:(id<MTLDevice>)device {
     if ((self = [super init])) {
         _device = device;
@@ -647,6 +650,12 @@ id<MTLCommandQueue> vg_new_queue(id<MTLDevice> device) {
     VGCALL("encoder %p (%s) endEncoding", self, object_getClassName(self));
     vg_callstack("endEncoding");
 }
+// Fences (5d): nothing to do. Every encoder ends with a full barrier and every queue submits to the one Vulkan queue in
+// order, so whatever a fence orders is already ordered.
+- (void)updateFence:(id<MTLFence>)fence { }
+- (void)waitForFence:(id<MTLFence>)fence { }
+- (void)updateFence:(id<MTLFence>)fence afterStages:(MTLRenderStages)stages { }
+- (void)waitForFence:(id<MTLFence>)fence beforeStages:(MTLRenderStages)stages { }
 - (uint64_t)globalTraceObjectID { return 0; }
 - (void)insertDebugSignpost:(NSString *)s { }
 - (void)pushDebugGroup:(NSString *)s { }
@@ -859,10 +868,25 @@ VkBuffer vg_vkbuffer(id<MTLBuffer> b) {
 }
 - (void)synchronizeResource:(id<MTLResource>)r { VGCALL("cb %p synchronizeResource %p", _owner, r); }   // coherent memory
 - (void)synchronizeTexture:(id<MTLTexture>)t slice:(NSUInteger)s level:(NSUInteger)l { }
+// Each level from the one above with a linear blit (5d: WebKit's canvas and WebGL). Images live in GENERAL; a barrier
+// between levels orders each read after the previous write.
+static VGMTLTexture *vg_blit_texture(VGMTLCommandBuffer *cmd, id<MTLTexture> t, BOOL writes);
 - (void)generateMipmapsForTexture:(id<MTLTexture>)t {
-    static int logged = 0;
-    if (logged++ < 3) {
-        vglog("blit: generateMipmapsForTexture not supported yet (ignored)");
+    VGMTLTexture *x = vg_blit_texture(_owner, t, YES);
+    if (!x || x->_mips < 2 || ![_owner begin]) {
+        return;
+    }
+    VkCommandBuffer cb = _owner->_cb;
+    [_owner barrier];
+    int32_t w = (int32_t)x->_width, h = (int32_t)x->_height, d = (int32_t)MAX(x->_depth, 1);
+    for (uint32_t l = 1; l < x->_mips; l++) {
+        int32_t nw = MAX(w / 2, 1), nh = MAX(h / 2, 1), nd = MAX(d / 2, 1);
+        VkImageBlit b = {{x->_aspect, l - 1, 0, (uint32_t)x->_layers}, {{0, 0, 0}, {w, h, d}},
+                         {x->_aspect, l, 0, (uint32_t)x->_layers}, {{0, 0, 0}, {nw, nh, nd}}};
+        gVk.vkCmdBlitImage(cb, x->_image, VK_IMAGE_LAYOUT_GENERAL, x->_image, VK_IMAGE_LAYOUT_GENERAL, 1, &b,
+                           VK_FILTER_LINEAR);
+        [_owner barrier];
+        w = nw, h = nh, d = nd;
     }
 }
 - (uint64_t)globalTraceObjectID { return 0; }
@@ -1123,6 +1147,58 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
 - (void)pushDebugGroup:(NSString *)s { }
 - (void)popDebugGroup { }
 
+// Events (5d). A signal is set when the command buffer completes, after its surfaces are written back: WebKit signals a
+// shared event when a canvas frame is done, and the consumer reads the IOSurface once it sees the value. A wait on a
+// shared event that isn't there yet holds the commit (at most a second, then it goes on and says so); a plain MTLEvent
+// needs nothing, since every queue submits to the one Vulkan queue in order.
+- (void)encodeSignalEvent:(id<MTLEvent>)event value:(uint64_t)value {
+    if (!event) {
+        return;
+    }
+    if (!_signals) {
+        _signals = [NSMutableArray array];
+    }
+    [_signals addObject:@[ event, @(value) ]];
+}
+- (void)encodeWaitForEvent:(id<MTLEvent>)event value:(uint64_t)value {
+    if (!event || ![(NSObject *)event respondsToSelector:@selector(signaledValue)]) {
+        return;
+    }
+    if (!_waits) {
+        _waits = [NSMutableArray array];
+    }
+    [_waits addObject:@[ event, @(value) ]];
+}
+static void vg_events_signal(NSArray *signals) {
+    for (NSArray *s in signals) {
+        id e = s[0];
+        uint64_t v = [s[1] unsignedLongLongValue];
+        if ([e respondsToSelector:@selector(setSignaledValue:)]) {
+            if ([(id<MTLSharedEvent>)e signaledValue] < v) {
+                [(id<MTLSharedEvent>)e setSignaledValue:v];
+            }
+        } else {
+            static int logged = 0;
+            if (logged++ < 3) {
+                vglog("event: %s can't be signaled from the CPU (value %llu)", object_getClassName(e), v);
+            }
+        }
+    }
+}
+static void vg_events_wait(NSArray *waits) {
+    for (NSArray *w in waits) {
+        id<MTLSharedEvent> e = w[0];
+        uint64_t v = [w[1] unsignedLongLongValue], t0 = vg_now();
+        while (e.signaledValue < v) {
+            if (vg_now() - t0 > 1000000000ull) {
+                vglog("event: waited 1 s for %s to reach %llu (at %llu): going on", object_getClassName(e), v,
+                      e.signaledValue);
+                break;
+            }
+            usleep(200);
+        }
+    }
+}
 - (void)finishWith:(MTLCommandBufferStatus)status fence:(VkFence)fence {
     VGCALL("cb %p completing, status %lu", self, (unsigned long)status);
     uint64_t dequeued = vg_now();
@@ -1207,6 +1283,10 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
         [d present];
     }
     [_drawables removeAllObjects];
+    if (_signals) {
+        vg_events_signal(_signals);
+        _signals = nil;
+    }
     _status = status;
     NSArray *handlers;
     @synchronized(self) {
@@ -1235,6 +1315,10 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
     VGCALL("cb %p commit (%lu completed, %lu scheduled handlers, error %s)", self, (unsigned long)_handlers.count,
            (unsigned long)_scheduledHandlers.count, _error ? _error.localizedDescription.UTF8String : "none");
     vg_callstack("commit");
+    if (_waits) {
+        vg_events_wait(_waits);
+        _waits = nil;
+    }
     [self enqueue];
     _status = MTLCommandBufferStatusCommitted;
     dispatch_group_enter(_done);

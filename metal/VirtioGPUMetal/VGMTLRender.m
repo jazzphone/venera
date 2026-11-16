@@ -514,6 +514,13 @@ static void vg_set_sampler(VGMTLCommandBuffer *cmd, vg_stage_bindings *t, id<MTL
 - (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { vg_set_texture(_owner, &_ft, t, i); }
 - (void)setVertexSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { vg_set_sampler(_owner, &_vt, s, i); }
 - (void)setFragmentSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { vg_set_sampler(_owner, &_ft, s, i); }
+// LOD clamps from the encoder (5d: WebKit): the sampler's own clamps apply; these are rarely narrower.
+- (void)setVertexSamplerState:(id<MTLSamplerState>)s lodMinClamp:(float)a lodMaxClamp:(float)b atIndex:(NSUInteger)i {
+    vg_set_sampler(_owner, &_vt, s, i);
+}
+- (void)setFragmentSamplerState:(id<MTLSamplerState>)s lodMinClamp:(float)a lodMaxClamp:(float)b atIndex:(NSUInteger)i {
+    vg_set_sampler(_owner, &_ft, s, i);
+}
 - (void)setViewport:(MTLViewport)v {
     _viewport = (VkViewport){(float)v.originX, (float)(v.originY + v.height), (float)v.width, -(float)v.height,
                              (float)v.znear, (float)v.zfar};

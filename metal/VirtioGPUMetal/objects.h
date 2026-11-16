@@ -145,6 +145,8 @@ BOOL vg_spirv_has_push_constants(NSData *spv);   // DescriptorSet 0 -> newSet (N
     uint64_t _submitted, _completed;
     NSMutableSet *_surfacesWritten;   // VGMTLTexture with an IOSurface, copied out at completion
     NSMutableArray *_drawables;       // presented after the copy-out
+    NSMutableArray *_signals;         // [event, value]: signaled at completion, after the write-back (5d)
+    NSMutableArray *_waits;           // [event, value]: shared events waited for at commit (5d)
 }
 @property(readonly) id<MTLDevice> device;
 @property(readonly) id<MTLCommandQueue> commandQueue;

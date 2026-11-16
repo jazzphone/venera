@@ -292,12 +292,20 @@ int vg_staging_get(VkDeviceSize size, vg_buffer *out) {
     if (best >= 0) {
         *out = gPool[best];
         gPoolBytes -= out->size;
-        gPool[best] = gPool[--gPoolN];
+        memmove(&gPool[best], &gPool[best + 1], sizeof(gPool[0]) * (size_t)(--gPoolN - best));
         pthread_mutex_unlock(&gPoolLock);
         vg_perf(VG_PERF_POOL_HIT, size, 0);
         return 0;
     }
+    int poolN = gPoolN;
+    VkDeviceSize poolBytes = gPoolBytes;
     pthread_mutex_unlock(&gPoolLock);
+    static _Atomic int missLogged;
+    if (missLogged < 30 && vg_perf_on()) {
+        missLogged++;
+        vglog("pool miss: %llu bytes (pool %d buffers, %llu MB)", (unsigned long long)size, poolN,
+              (unsigned long long)(poolBytes >> 20));
+    }
     // sizes repeat (surfaces, glyph uploads): round, small ones to a power of two from 4 KB
     VkDeviceSize rounded = (size + 65535) & ~(VkDeviceSize)65535;
     if (size < 65536) {
@@ -316,12 +324,25 @@ void vg_staging_put(vg_buffer *b) {
     if (!b->buffer) {
         return;
     }
+    // A full pool makes room by dropping its oldest buffers (5d): it used to destroy the one coming back, so once an
+    // app's mix of sizes had filled it (WebKit's GPU process), the sizes it needed every frame were made again each
+    // time (~9 ms each through Venus) while ones nobody asked for sat in the pool.
+    vg_buffer evict[kPoolMax];
+    int nevict = 0;
     pthread_mutex_lock(&gPoolLock);
-    if (gPoolN < kPoolMax && gPoolBytes + b->size <= kPoolBytesMax) {
-        gPool[gPoolN++] = *b;
+    if (b->size <= kPoolBytesMax / 4) {
+        while (gPoolN > 0 && (gPoolN >= kPoolMax || gPoolBytes + b->size > kPoolBytesMax)) {
+            evict[nevict++] = gPool[0];
+            gPoolBytes -= gPool[0].size;
+            memmove(&gPool[0], &gPool[1], sizeof(gPool[0]) * (size_t)(--gPoolN));
+        }
+        gPool[gPoolN++] = *b;   // newest last: eviction takes from the front
         gPoolBytes += b->size;
         pthread_mutex_unlock(&gPoolLock);
         memset(b, 0, sizeof(*b));
+        for (int i = 0; i < nevict; i++) {
+            vg_buffer_destroy(&evict[i]);
+        }
         return;
     }
     pthread_mutex_unlock(&gPoolLock);
@@ -491,6 +512,8 @@ BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
 
 @implementation VGMTLTexture
 @synthesize label = _label;
+- (kern_return_t)setOwnerWithIdentity:(task_id_token_t)identity { return KERN_SUCCESS; }   // memory accounting (5d)
+- (void)didModifyData { }   // IOSurface contents are pulled by seed anyway
 - (id<MTLDevice>)device { return _dev; }
 - (void)dealloc {
     if (_twin.buffer) {

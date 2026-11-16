@@ -60,7 +60,8 @@ void vg_trace_sync(const char *after);
     X(vkCmdSetBlendConstants) X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) X(vkCmdDraw) X(vkCmdDrawIndexed)   \
     X(vkCmdSetStencilTestEnable) X(vkCmdSetDepthBiasEnable) X(vkCmdSetRasterizerDiscardEnable)                     \
     X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetDepthBoundsTestEnable) X(vkDeviceWaitIdle)                         \
-    X(vkCreateQueryPool) X(vkResetDescriptorPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
+    X(vkCreateQueryPool) X(vkResetDescriptorPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults) \
+    X(vkCmdBlitImage)
 
 #define VG_DECLARE(name) PFN_##name name;
 struct vg_vulkan {

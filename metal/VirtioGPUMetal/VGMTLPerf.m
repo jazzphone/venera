@@ -122,7 +122,10 @@ void vg_gpu_time_collect(int pair, uint64_t submittedNs, uint64_t observedNs) {
 
 __attribute__((constructor)) static void vg_perf_start(void) {
     const char *e = getenv("VGMTL_PERF");
-    if (!((e && (e[0] == '1' || e[0] == '2')) || !strcmp(getprogname(), "WindowServer"))) {
+    // 5d: /Library/GPUBundles/VirtioGPUMetal-perf turns it on in every process (an app's XPC service has no environment
+    // of ours)
+    if (!((e && (e[0] == '1' || e[0] == '2')) || !strcmp(getprogname(), "WindowServer") ||
+          access("/Library/GPUBundles/VirtioGPUMetal-perf", F_OK) == 0)) {
         return;
     }
     gPerfOn = YES;
