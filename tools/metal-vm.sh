@@ -26,7 +26,7 @@ install)
 devinstall)   # 5d: the bundle in a writable folder, /Library/GPUBundles pointed at it: new processes load it, no reboot
   # (sandboxed ones, Safari's GPU process, refuse it; `install` puts it on the system volume for them)
   set -e
-  D="/Library/Application Support/Venera/dev"
+  D=/Library/GPUBundles/Venera/dev   # under /Library/GPUBundles: WindowServer (at the next boot) can load it too
   rm -rf /tmp/vgmetal && mkdir -p /tmp/vgmetal "$D" $T && tar -xzf $X/vgmetal.tgz -C /tmp/vgmetal
   rm -rf "$D/VirtioGPUMetal.bundle" && mv /tmp/vgmetal/VirtioGPUMetal.bundle "$D/"
   chown -R root:wheel "$D/VirtioGPUMetal.bundle" && chmod -R go-w,a+rX "$D/VirtioGPUMetal.bundle"

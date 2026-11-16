@@ -87,9 +87,9 @@ install)
   bless_new
   G=/Library/GPUBundles/$NAME
   if [ ! -L "$G" ]; then
-    mkdir -p "/Library/Application Support/Venera"
-    rm -rf "/Library/Application Support/Venera/$NAME"
-    [ -d "$G" ] && mv "$G" "/Library/Application Support/Venera/$NAME"   # kept for remove
+    mkdir -p /Library/GPUBundles/Venera
+    rm -rf "/Library/GPUBundles/Venera/$NAME"
+    [ -d "$G" ] && mv "$G" "/Library/GPUBundles/Venera/$NAME"   # kept (WindowServer can load it from there)
     ln -s "/System/Library/Extensions/$NAME" "$G"
     say "$G -> /System/Library/Extensions/$NAME"
   fi
@@ -98,11 +98,15 @@ remove)
   [ "$(authroot)" = off ] || die "authenticated root is on: nothing of ours can be on the system volume"
   mount_system
   G=/Library/GPUBundles/$NAME
+  K="/Library/GPUBundles/Venera/$NAME"
   if [ -L "$G" ]; then
-    K="/Library/Application Support/Venera/$NAME"
-    [ -d "$K" ] || ditto "$MNT/System/Library/Extensions/$NAME" "$K"
-    rm "$G" && mv "$K" "$G"
-    say "$G is a folder again"
+    if [ -d "$K" ]; then   # install.sh keeps a copy (and the watcher uses it): point at it
+      ln -sfn "$K" "$G"
+      say "$G -> $K"
+    else
+      rm "$G" && ditto "$MNT/System/Library/Extensions/$NAME" "$G"
+      say "$G is a folder again"
+    fi
   fi
   rm -rf "$MNT/System/Library/Extensions/$NAME"
   say "removed the copy"

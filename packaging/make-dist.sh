@@ -9,11 +9,12 @@ D=dist/$NAME
 [[ -f build/translator/libnvmtl_translate.dylib ]] || { echo "build the translator first: tools/build-translator.sh"; exit 1; }
 tools/build.sh >/dev/null
 tools/build-metal.sh >/dev/null
-rm -rf $D && mkdir -p $D/payload/OpenCore $D/payload/Extensions $D/payload/GPUBundles $D/licenses
+rm -rf $D && mkdir -p $D/payload/OpenCore $D/payload/Extensions $D/payload/GPUBundles $D/payload/Support $D/licenses
 cp -R build/VirtioGPU.kext $D/payload/OpenCore/
 cp -R build/VirtioGPUFramebuffer.kext build/VirtioGPUAccel.kext $D/payload/Extensions/
 cp -R build/VirtioGPUMetal.bundle $D/payload/GPUBundles/
 cp packaging/install.sh packaging/uninstall.sh packaging/status.sh $D/
+cp packaging/sysvol.sh packaging/venera-watch.sh packaging/local.venera.watch.plist $D/payload/Support/
 chmod 755 $D/*.sh
 cp docs/INSTALL.md VERSION LICENSE NOTICE.md $D/
 cp vendor/nullmoth/LICENSE $D/licenses/NullMoth-PolyForm-Noncommercial-1.0.0.txt

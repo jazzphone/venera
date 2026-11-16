@@ -38,8 +38,22 @@ while [ $# -gt 0 ]; do
 done
 [ "$(id -u)" = 0 ] || die "run as root: sudo $0"
 
-# ---- the Metal driver and its files --------------------------------------------------------------------------------
-run rm -rf /Library/GPUBundles/VirtioGPUMetal.bundle
+# ---- the watcher, the Metal driver and its files ---------------------------------------------------------------------
+if [ -f /Library/LaunchDaemons/local.venera.watch.plist ]; then
+  [ $DRY = 1 ] || launchctl bootout system/local.venera.watch 2>/dev/null
+  run rm -f /Library/LaunchDaemons/local.venera.watch.plist
+fi
+if [ -d /System/Library/Extensions/VirtioGPUMetal.bundle ]; then
+  if [ -x "/Library/Application Support/Venera/sysvol.sh" ] &&
+    csrutil authenticated-root status 2>/dev/null | grep -qi disabled; then
+    say "system volume: taking the driver out (a new snapshot, after the reboot)"
+    run "/Library/Application Support/Venera/sysvol.sh" remove
+  else
+    say "warning: the driver stays in /System/Library/Extensions until authenticated root is off (then:"
+    say "  sudo sysvol.sh remove); nothing loads it with the rest gone"
+  fi
+fi
+run rm -rf /Library/GPUBundles/VirtioGPUMetal.bundle /Library/GPUBundles/Venera
 for f in /Library/GPUBundles/VirtioGPUMetal-*; do [ -e "$f" ] && run rm -f "$f"; done
 # translated shaders and display snapshots WindowServer kept (its Darwin cache folder)
 for d in /private/var/folders/*/*/C/WindowServer/local.homelab.VirtioGPUMetal; do

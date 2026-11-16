@@ -5,8 +5,20 @@ echo "macOS $(sw_vers -productVersion) ($(sw_vers -buildVersion)); boot-args: $(
 echo
 echo "== kexts"
 kmutil showloaded 2>/dev/null | grep -E 'homelab\.VirtioGPU' | awk '{print "  " $6, $7}' || true
-[ -d /Library/GPUBundles/VirtioGPUMetal.bundle ] && echo "  Metal driver: /Library/GPUBundles/VirtioGPUMetal.bundle" ||
+G=/Library/GPUBundles/VirtioGPUMetal.bundle
+if [ -L "$G" ]; then
+  echo "  Metal driver: $G -> $(readlink "$G")$([ -e "$G" ] || echo ' (MISSING)')"
+elif [ -d "$G" ]; then
+  echo "  Metal driver: $G"
+else
   echo "  Metal driver: not installed"
+fi
+[ -d /System/Library/Extensions/VirtioGPUMetal.bundle ] && echo "  system-volume copy: yes (Safari's WebGL can load it)" ||
+  echo "  system-volume copy: no (every app but Safari's WebGL)"
+echo "  authenticated root: $(csrutil authenticated-root status 2>/dev/null | grep -qi disabled && echo off || echo on)"
+launchctl print system/local.venera.watch >/dev/null 2>&1 && echo "  watcher: local.venera.watch loaded" ||
+  echo "  watcher: not loaded"
+tail -2 "/Library/Application Support/Venera/watch.log" 2>/dev/null | sed 's/^/    /' 
 echo
 echo "== display"
 ioreg -w0 -rc VirtioGPUAccel -d1 2>/dev/null | grep -E '"(VirtioGPUArmState|VirtioGPUGuard|VirtioGPUGuardWhy|MetalPluginName|VirtioGPUBlobFlips|VirtioGPUPipeTiming)"' |

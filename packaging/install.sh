@@ -1,15 +1,22 @@
 #!/bin/bash
 # Venera installer: run inside the macOS guest, as root, from the unpacked release folder.
 #
-#   sudo ./install.sh [--level 4|2] [--oc /Volumes/EFI] [--no-opencore] [--set-security] [--dry-run]
+#   sudo ./install.sh [--level 4|2] [--oc /Volumes/EFI] [--no-opencore] [--set-security] [--no-system-volume] [--dry-run]
 #
 # What it does (each step says what it changed; nothing is downloaded):
 #   1. checks the guest: x86_64 macOS 26, a virtio-gpu device, SIP and AMFI as the driver needs them
 #   2. OpenCore: copies VirtioGPU.kext (the core, which must load from the Boot KC) into EFI/OC/Kexts, adds or enables
 #      its Kernel > Add entry and sets vgpuaccel=LEVEL in OpenCore's boot-args (config.plist is backed up first)
 #   3. /Library/Extensions: VirtioGPUFramebuffer.kext and VirtioGPUAccel.kext, then rebuilds the Auxiliary KC
-#   4. /Library/GPUBundles: VirtioGPUMetal.bundle (the Metal driver over Venus)
+#   4. the Metal driver (over Venus): kept in /Library/GPUBundles/Venera, copied onto the system volume
+#      (/System/Library/Extensions, a new blessed snapshot: sysvol.sh) where Safari's sandboxed graphics process can
+#      load it, and /Library/GPUBundles/VirtioGPUMetal.bundle pointing at it; and the watcher (local.venera.watch),
+#      which keeps it there across macOS updates, asking before it reinstalls
 # Then reboot. ./uninstall.sh undoes all of it; ./status.sh shows what runs.
+#
+# The system-volume copy needs SIP's authenticated root off (csr bit 0x800): --set-security sets it with the rest
+# (0xA03). Without it the driver runs from the kept copy (every app but Safari's WebGL), and the watcher offers the
+# system-volume copy once authenticated root is off. --no-system-volume skips it (and leaves authenticated root on).
 #
 # Levels (boot-arg vgpuaccel): 4 = WindowServer composites the desktop with Metal on the host GPU (default);
 # 2 = the virtio-gpu framebuffer with the software compositor, Metal only for allow-listed test tools.
@@ -20,6 +27,7 @@ LEVEL=4
 OC_ROOT=
 NO_OC=0
 SET_SECURITY=0
+NO_SYSVOL=0
 DRY=0
 FORCE=0
 GUID=7C436110-AB2A-4BBB-A880-FE41995C9F82
@@ -44,9 +52,10 @@ while [ $# -gt 0 ]; do
   --oc) OC_ROOT=$2; shift ;;
   --no-opencore) NO_OC=1 ;;
   --set-security) SET_SECURITY=1 ;;
+  --no-system-volume) NO_SYSVOL=1 ;;
   --dry-run) DRY=1 ;;
   --force) FORCE=1 ;;
-  -h | --help) sed -n '2,19p' "$0"; exit 0 ;;
+  -h | --help) sed -n '2,27p' "$0"; exit 0 ;;
   *) die "unknown option $1 (--help)" ;;
   esac
   shift
@@ -56,8 +65,8 @@ case $LEVEL in 2 | 4) ;; *) die "--level is 4 (Metal desktop) or 2 (software des
 # ---- 1. the guest --------------------------------------------------------------------------------------------------
 [ "$(id -u)" = 0 ] || die "run as root: sudo $0"
 for d in OpenCore/VirtioGPU.kext Extensions/VirtioGPUFramebuffer.kext Extensions/VirtioGPUAccel.kext \
-  GPUBundles/VirtioGPUMetal.bundle; do
-  [ -d "$PAYLOAD/$d" ] || die "payload/$d is missing: run this from the unpacked release folder"
+  GPUBundles/VirtioGPUMetal.bundle Support/sysvol.sh Support/venera-watch.sh Support/local.venera.watch.plist; do
+  [ -e "$PAYLOAD/$d" ] || die "payload/$d is missing: run this from the unpacked release folder"
 done
 [ "$(uname -m)" = x86_64 ] || die "x86_64 macOS only (this is $(uname -m))"
 VER=$(sw_vers -productVersion)
@@ -82,10 +91,15 @@ echo "$CSR" | grep -q 'System Integrity Protection status: disabled' && SIP_OK=1
 ARGS=$(nvram boot-args 2>/dev/null | cut -f2-)
 AMFI_OK=0
 case " $ARGS " in *" amfi_get_out_of_my_way=1 "*) AMFI_OK=1 ;; esac
+AUTHROOT_OFF=0
+csrutil authenticated-root status 2>/dev/null | grep -qi disabled && AUTHROOT_OFF=1
+if [ $SET_SECURITY = 1 ] && [ $NO_SYSVOL = 0 ] && [ $AUTHROOT_OFF = 0 ]; then
+  SIP_OK=0   # write the csr value with the authenticated-root bit
+fi
 if [ $SIP_OK = 0 ] || [ $AMFI_OK = 0 ]; then
   if [ $SET_SECURITY = 1 ]; then
     [ $NO_OC = 1 ] && die "--set-security writes OpenCore's config.plist; it can't go with --no-opencore"
-    say "security: will set csr-active-config 0x203 and amfi_get_out_of_my_way=1 in OpenCore (effective at reboot)"
+    say "security: will set csr-active-config $([ $NO_SYSVOL = 1 ] && echo 0x203 || echo 0xA03) and amfi_get_out_of_my_way=1 in OpenCore (effective at reboot)"
   else
     [ $SIP_OK = 0 ] && warn "SIP must allow unsigned kexts and an unrestricted file system (csr-active-config 0x203)"
     [ $AMFI_OK = 0 ] && warn "boot-args need amfi_get_out_of_my_way=1 (WindowServer loads the ad-hoc signed Metal bundle)"
@@ -144,7 +158,11 @@ if [ $NO_OC = 0 ]; then
   done
   if [ $SET_SECURITY = 1 ]; then
     case " $NEW " in *" amfi_get_out_of_my_way=1 "*) ;; *) NEW="$NEW amfi_get_out_of_my_way=1" ;; esac
-    run pl -replace "NVRAM.Add.$GUID.csr-active-config" -data AwIAAA==   # 0x00000203, little-endian
+    if [ $NO_SYSVOL = 1 ]; then
+      run pl -replace "NVRAM.Add.$GUID.csr-active-config" -data AwIAAA==   # 0x00000203, little-endian
+    else
+      run pl -replace "NVRAM.Add.$GUID.csr-active-config" -data AwoAAA==   # 0x00000A03: and authenticated root off
+    fi
   fi
   NEW="${NEW# } vgpuaccel=$LEVEL"
   run pl -replace "NVRAM.Add.$GUID.boot-args" -string "${NEW# }"
@@ -192,14 +210,37 @@ fi
 say "Auxiliary KC: VirtioGPUFramebuffer and VirtioGPUAccel in"
 
 # ---- 4. the Metal driver -------------------------------------------------------------------------------------------
-run mkdir -p /Library/GPUBundles
-run rm -rf /Library/GPUBundles/VirtioGPUMetal.bundle
-run cp -R "$PAYLOAD/GPUBundles/VirtioGPUMetal.bundle" /Library/GPUBundles/
-run chown -R root:wheel /Library/GPUBundles/VirtioGPUMetal.bundle
-run chmod -R go-w,a+rX /Library/GPUBundles/VirtioGPUMetal.bundle
-mkdir -p /Library/Application\ Support/Venera 2>/dev/null
-[ $DRY = 1 ] || cp "$HERE/VERSION" /Library/Application\ Support/Venera/VERSION 2>/dev/null
-say "Metal driver: /Library/GPUBundles/VirtioGPUMetal.bundle"
+V="/Library/Application Support/Venera"
+# the kept copy lives under /Library/GPUBundles: WindowServer's sandbox maps code from there, not from $V
+K=/Library/GPUBundles/Venera
+run mkdir -p "$V" "$K"
+run rm -rf "$K/VirtioGPUMetal.bundle"
+run cp -R "$PAYLOAD/GPUBundles/VirtioGPUMetal.bundle" "$K/"
+run chown -R root:wheel "$K/VirtioGPUMetal.bundle"
+run chmod -R go-w,a+rX "$K/VirtioGPUMetal.bundle"
+for f in sysvol.sh venera-watch.sh; do run cp "$PAYLOAD/Support/$f" "$V/" && run chmod 755 "$V/$f"; done
+[ $DRY = 1 ] || { cp "$HERE/VERSION" "$V/VERSION" 2>/dev/null; echo 25G342 >"$V/TESTED_BUILD"; }
+# /Library/GPUBundles' bundle is a symlink from now on: to the kept copy until the system-volume copy is in
+[ -L /Library/GPUBundles/VirtioGPUMetal.bundle ] || run rm -rf /Library/GPUBundles/VirtioGPUMetal.bundle
+run ln -sfn "$K/VirtioGPUMetal.bundle" /Library/GPUBundles/VirtioGPUMetal.bundle
+SYSVOL="kept copy only (--no-system-volume)"
+if [ $NO_SYSVOL = 0 ]; then
+  if [ $AUTHROOT_OFF = 1 ]; then
+    say "system volume: copying the driver into /System/Library/Extensions and blessing a new snapshot"
+    run "$V/sysvol.sh" install "$K/VirtioGPUMetal.bundle" || die "the system-volume copy failed (sysvol.sh above)"
+    run ln -sfn "$K/VirtioGPUMetal.bundle" /Library/GPUBundles/VirtioGPUMetal.bundle   # the system copy is there after the reboot; the watcher switches
+    SYSVOL="on the system volume after the reboot"
+  else
+    SYSVOL="kept copy until authenticated root is off (then the watcher offers the system-volume copy; Safari's WebGL needs it)"
+  fi
+fi
+# the watcher
+run cp "$PAYLOAD/Support/local.venera.watch.plist" /Library/LaunchDaemons/
+run chown root:wheel /Library/LaunchDaemons/local.venera.watch.plist
+run chmod 644 /Library/LaunchDaemons/local.venera.watch.plist
+[ $DRY = 1 ] || launchctl bootout system/local.venera.watch 2>/dev/null
+run launchctl bootstrap system /Library/LaunchDaemons/local.venera.watch.plist
+say "Metal driver: kept in $K; $SYSVOL; watcher local.venera.watch running"
 
 say ""
 say "Installed Venera $(cat "$HERE/VERSION" 2>/dev/null) (level $LEVEL). Reboot to start it: sudo shutdown -r now"

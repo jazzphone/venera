@@ -75,18 +75,44 @@ next to it (`config.plist.venera-DATE`), and then:
 2. sets `vgpuaccel=4` in OpenCore's boot-args;
 3. puts `VirtioGPUFramebuffer.kext` and `VirtioGPUAccel.kext` in `/Library/Extensions` and rebuilds the Auxiliary
    kernel collection (no approval prompt with SIP as above);
-4. puts the Metal driver in `/Library/GPUBundles/VirtioGPUMetal.bundle`.
+4. installs the Metal driver: a copy kept in `/Library/GPUBundles/Venera`, a copy on the system volume
+   (`/System/Library/Extensions`, with a new blessed system snapshot) when authenticated root is off, and
+   `/Library/GPUBundles/VirtioGPUMetal.bundle` pointing at it;
+5. starts the watcher (`local.venera.watch`, below).
 
 Options: `--level 2` installs everything with the software desktop (the framebuffer and the accelerator, Metal only
 for allow-listed test tools); `--no-opencore` skips step 1 and 2 for people who manage `config.plist` themselves (add
-`VirtioGPU.kext` with `ExecutablePath` `Contents/MacOS/VirtioGPU`, and `vgpuaccel=4` to boot-args); `--dry-run`
-prints every change without making it.
+`VirtioGPU.kext` with `ExecutablePath` `Contents/MacOS/VirtioGPU`, and `vgpuaccel=4` to boot-args);
+`--no-system-volume` leaves the system volume (and authenticated root) alone; `--dry-run` prints every change without
+making it.
+
+### Which processes use the driver
+
+WindowServer (the desktop) and every app: a process running from an `.app` bundle, and the graphics process WebKit
+starts for Safari and other web views. Background daemons (Spotlight's indexers, photo and media analysis...) don't,
+and neither do `loginwindow` and `SecurityAgent`, the processes that let you log in. `/Library/GPUBundles/VirtioGPUMetal-allow.txt`
+changes that, one line each: a process name adds it, `-name` excludes it, `*` adds every process, `apps-off` turns
+the apps default off.
+
+### Why the system volume, and the watcher
+
+Safari's graphics process is sandboxed: it may only load code from the sealed system volume, so WebGL (and Safari's
+GPU-drawn canvas and page effects) can use the driver only when a copy is in `/System/Library/Extensions`. Writing
+there needs SIP's authenticated root off (csr bit `0x800`; `--set-security` sets `0xA03`, which includes it), and a
+new system snapshot, as OpenCore Legacy Patcher does for its root patches.
+
+A macOS update replaces the system volume and takes that copy with it. The watcher (a LaunchDaemon, at boot, every
+30 minutes and when its folders change) notices, points `/Library/GPUBundles` at the kept copy at once so the desktop
+and every app keep Metal (only Safari's WebGL waits), and asks the logged-in user whether to reinstall the system
+copy; on yes it does, and offers to restart. If it can't (authenticated root is on again), it says why and what to
+run. "Not now" is remembered until the macOS build changes; `sudo "/Library/Application Support/Venera/venera-watch.sh" --ask`
+asks again. Its log is `/Library/Application Support/Venera/watch.log`; `./status.sh` shows where the driver is loaded from.
 
 After the reboot the desktop looks the same, but `sudo ./status.sh` should show the three kexts loaded,
-`MetalPluginName` `VirtioGPUMetal` and a growing flip count (`VirtioGPUBlobFlips`).
+`MetalPluginName` `VirtioGPUMetal`, a growing flip count (`VirtioGPUBlobFlips`) and the driver's location.
 
-The first minutes after the first boot are slower: the driver translates each new Core Animation shader the first
-time the desktop needs it (a few seconds each) and keeps it on disk, so this happens once.
+The first minutes after the first boot are slower: the driver translates each new shader the first time a process
+needs it (a few seconds for large ones) and keeps it on disk, so this happens once per shader and app.
 
 ## Uninstall
 
@@ -131,7 +157,9 @@ The accelerator flips at most once per 12 ms by default (`vgpuflipms=N` boot-arg
   (`VNC_REFRESH_INTERVAL_BASE`), however fast the guest draws. The guest runs 50-60 fps; to see that, view the VM
   through a display that isn't VNC (QEMU's `gtk,gl=on` or `sdl,gl=on` on the host, or local SPICE with `gl=on`) or
   stream it from inside the guest.
-- Apps get Metal only when allow-listed (the desktop itself always does); app Metal is the next stage.
+- Apps: tested on VM 108 with Safari (WebGL, canvas, CSS effects at 60 fps), Preview and QuickTime (Core Image,
+  video), Maps, Photos, Freeform, Calendar, Contacts, Notes, Music, TV, System Settings and others. OpenGL apps
+  (Chess) still draw with macOS's software OpenGL; Core Image's stitched kernels fall back to its source path.
 - WindowServer draws window drags, scrolling, resizing and minimizing at 45-60 fps on the tested host (mean frame
   gap 17-20 ms); each flip costs QEMU ~2-4 ms (egl-headless reads the frame back for VNC).
 - `screencapture` from a shell needs Screen Recording permission for the app that runs it (Terminal), as usual.
