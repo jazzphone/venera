@@ -76,6 +76,9 @@ void vg_cmd_wrote(id cmd, VGMTLTexture *t);
 // screen-sized); forget it (the kext first) before the texture goes.
 BOOL vg_twin_ensure(VGMTLTexture *t);
 void vg_twin_mark(uint32_t surface, uint32_t frame, BOOL ready);
+int vg_snap_wanted(void);
+VGMTLTexture *vg_twinned_shown(void);   // the twinned surface the kext flipped to last
+void vg_snap_write(VGMTLTexture *t, int number);
 void vg_twin_forget(VGMTLTexture *t);
 id<MTLTexture> vg_new_surface_texture(id<MTLDevice> device, MTLTextureDescriptor *d, IOSurfaceRef surface, NSUInteger plane);
 id<MTLTexture> vg_texture_view(VGMTLTexture *p, MTLPixelFormat pf, MTLTextureType type, NSRange levels, NSRange slices);
@@ -118,7 +121,11 @@ BOOL vg_spirv_has_push_constants(NSData *spv);   // DescriptorSet 0 -> newSet (N
     BOOL _present;          // committed by commitAndWaitUntilSubmitted (Core Animation's display frames)
     BOOL _allTwinned;       // every IOSurface it wrote got a twin copy: waiting for the GPU is enough
     dispatch_semaphore_t _gpuDone;   // signaled once the fence is (before the CPU write-backs)
+    dispatch_group_t _fenced;        // left once the fence is (vg_present_throttle waits on it)
+    BOOL _fencedEntered;
     NSMutableData *_twinFrames;      // (surface id, frame) pairs to mark ready once the GPU is done (5c round 3)
+    VGMTLTexture *_snapTex;          // a display snapshot asked for (vg_snap_wanted), written once the GPU is done
+    int _snapNumber;
     VkDescriptorPool _pools[64];
     void *_setMemo;   // recent descriptor sets by binding contents (5c round 4), see vg_write_set
     unsigned _setMemoNext;

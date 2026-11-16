@@ -408,12 +408,19 @@ static SInt64 gIopBlob = 0;                                              // fram
 static volatile bool gBlobShown = false;                                 // a twin is on scanout 0
 // Blob flips run on a work loop of their own (5c): QEMU answers SET_SCANOUT_BLOB / RESOURCE_FLUSH only after it has
 // drawn the frame and read it back for VNC (~9 ms with egl-headless), which must not stall WindowServer's present.
-// The newest frame wins; Core Animation rotates 3-4 surfaces, so a twin isn't rewritten before its flip.
+// The newest *ready* frame wins (5c round 6): with frames asked for faster than the GPU finishes them, waiting for the
+// newest one starved the screen (each became ready only after a newer one had replaced it: flips 25-200 ms apart while
+// WindowServer made a frame every ~16 ms). Core Animation rotates 3-4 surfaces, so a twin isn't rewritten before its flip.
 static IOWorkLoop *gPresentLoop;
 static IOTimerEventSource *gPresentTimer;
 static IOLock *gPresentLock;
-static uint32_t gPendingTwin[6];   // resource, width, height, stride, the frame wanted, surface; resource 0 = none
-static uint64_t gPendingSinceAbs;  // when the wanted frame was asked for (a frame never marked ready flips anyway)
+struct PendingFlip {
+    uint32_t twin[6];   // resource, width, height, stride, the frame wanted, surface
+    uint64_t sinceAbs;  // when it was asked for (a frame never marked ready flips anyway after 100 ms)
+};
+static const int kPendingMax = 8;
+static PendingFlip gPending[kPendingMax];   // oldest first
+static int gPendingCount = 0;
 static SInt64 gFlipNs = 0, gFlipMaxNs = 0, gFlips = 0, gFlipsSkipped = 0, gFlipsUnready = 0;
 // The shortest time between two flips, in ms (0 = no limit). 16 by default: evenly paced flips (at most ~60 a
 // second, the newest frame each time) judder less on VM 108's console than flips as they come (the tester, 2026-11-15).
@@ -458,6 +465,7 @@ static int paceLine(char *out, size_t n, const char *name, const Pace *p, const 
     return k;
 }
 
+static void publishShown(uint32_t surface);
 static void presentTick(OSObject *, IOTimerEventSource *) {
     for (;;) {
         if (gFlipMinMs && gLastFlipAbs) {
@@ -468,33 +476,52 @@ static void presentTick(OSObject *, IOTimerEventSource *) {
                 return;
             }
         }
-        uint32_t t[6];
+        PendingFlip q[kPendingMax];
         IOLockLock(gPresentLock);
-        memcpy(t, gPendingTwin, sizeof(t));
-        uint64_t since = gPendingSinceAbs;
+        int n = gPendingCount;
+        memcpy(q, gPending, sizeof(PendingFlip) * (size_t)n);
         IOLockUnlock(gPresentLock);
-        if (!t[0]) {
+        if (!n) {
             return;
         }
         IOService *core = coreService();
-        // The frame the transaction asked for must be in the twin (its GPU copy done): until the plugin marks it
-        // ready, look again every ms, up to 100 ms (a frame never marked flips anyway).
-        uint32_t now[6] = {};
-        if (core && t[4] &&
-            core->callPlatformFunction(gSymTwinFor, false, (void *)(uintptr_t)t[5], now, nullptr, nullptr) ==
-                kIOReturnSuccess &&
-            (int32_t)(now[5] - t[4]) < 0) {
+        // A frame must be in its twin (its GPU copy done) before it is shown: the newest one the plugin has marked
+        // ready goes, older ones are dropped. None ready: look again every ms; after 100 ms the newest goes anyway.
+        int pick = -1;
+        for (int i = n - 1; i >= 0 && pick < 0; i--) {
+            uint32_t now[6] = {};
+            if (!core || !q[i].twin[4] ||
+                core->callPlatformFunction(gSymTwinFor, false, (void *)(uintptr_t)q[i].twin[5], now, nullptr,
+                                           nullptr) != kIOReturnSuccess ||
+                (int32_t)(now[5] - q[i].twin[4]) >= 0) {
+                pick = i;
+            }
+        }
+        if (pick < 0) {
             uint64_t waited = 0;
-            absolutetime_to_nanoseconds(mach_absolute_time() - since, &waited);
+            absolutetime_to_nanoseconds(mach_absolute_time() - q[0].sinceAbs, &waited);
             if (waited < 100000000ULL) {
                 gPresentTimer->setTimeoutUS(1000);
                 return;
             }
             gFlipsUnready++;
+            pick = n - 1;
         }
+        uint32_t t[6];
+        memcpy(t, q[pick].twin, sizeof(t));
         IOLockLock(gPresentLock);
-        if (gPendingTwin[0] == t[0] && gPendingTwin[4] == t[4]) {
-            gPendingTwin[0] = 0;   // taken (a newer request that came meanwhile stays)
+        // taken, with everything older (requests that came meanwhile stay; the queue only grows at its end, and only
+        // scanoutFramebufferAgain empties it)
+        int drop = 0;
+        while (drop < gPendingCount && !(gPending[drop].twin[0] == t[0] && gPending[drop].twin[4] == t[4] &&
+                                         gPending[drop].sinceAbs == q[pick].sinceAbs)) {
+            drop++;
+        }
+        if (drop < gPendingCount) {
+            gFlipsSkipped += drop;
+            drop++;
+            memmove(gPending, gPending + drop, sizeof(PendingFlip) * (size_t)(gPendingCount - drop));
+            gPendingCount -= drop;
         }
         IOLockUnlock(gPresentLock);
         uint64_t t0 = mach_absolute_time(), ns = 0;
@@ -503,6 +530,7 @@ static void presentTick(OSObject *, IOTimerEventSource *) {
                                        (void *)(uintptr_t)t[2], (void *)(uintptr_t)t[3]);
         }
         gLastFlipAbs = mach_absolute_time();
+        publishShown(t[5]);   // what the screen shows now (the plugin's display snapshots read it)
         absolutetime_to_nanoseconds(gLastFlipAbs - t0, &ns);
         paceMark(&gPaceFlip, gLastFlipAbs);
         paceBin(&gFlipDur, ns, kDurEdges);
@@ -520,13 +548,16 @@ static bool queueFlip(const uint32_t twin[6], uint32_t surface) {
         return false;
     }
     IOLockLock(gPresentLock);
-    if (gPendingTwin[0]) {
-        gFlipsSkipped++;   // an older frame not shown yet: the newer one replaces it
+    if (gPendingCount == kPendingMax) {   // full: the oldest goes unshown
+        gFlipsSkipped++;
+        memmove(gPending, gPending + 1, sizeof(PendingFlip) * (kPendingMax - 1));
+        gPendingCount--;
     }
-    memcpy(gPendingTwin, twin, 4 * sizeof(uint32_t));
-    gPendingTwin[4] = twin[4];   // the frame last submitted into this twin: the one this transaction shows
-    gPendingTwin[5] = surface;
-    gPendingSinceAbs = mach_absolute_time();
+    PendingFlip *p = &gPending[gPendingCount++];
+    memcpy(p->twin, twin, 4 * sizeof(uint32_t));
+    p->twin[4] = twin[4];   // the frame last submitted into this twin: the one this transaction shows
+    p->twin[5] = surface;
+    p->sinceAbs = mach_absolute_time();
     IOLockUnlock(gPresentLock);
     gPresentTimer->setTimeoutUS(1);
     return true;
@@ -536,7 +567,7 @@ static bool queueFlip(const uint32_t twin[6], uint32_t surface) {
 static void scanoutFramebufferAgain() {
     if (gPresentLock) {   // a queued flip must not land after this
         IOLockLock(gPresentLock);
-        gPendingTwin[0] = 0;
+        gPendingCount = 0;
         IOLockUnlock(gPresentLock);
     }
     if (gBlobShown || gPresentTimer) {   // with flips on their own loop, one may have just landed: ask the core
@@ -992,6 +1023,14 @@ static void enableFrom(const char *why) {
 
 static IOService *displayFramebuffer() {
     return gAccel ? gAccel->fb_ : nullptr;
+}
+
+static void publishShown(uint32_t surface) {
+    static uint32_t shown;
+    if (gAccel && surface && shown != surface) {
+        shown = surface;
+        gAccel->setProperty("VirtioGPUShownSurface", surface, 32);
+    }
 }
 
 static IOService *coreService() {
@@ -1546,13 +1585,16 @@ void VirtioGPUAccel::stop(IOService *provider) {
 // sees it). Nothing persists: every boot starts unarmed. Anything else goes to the family's own setProperties.
 IOReturn VirtioGPUAccel::setProperties(OSObject *properties) {
     OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
-    if (dict && dict->getObject("VirtioGPUPaceReset")) {
+    if (dict && (dict->getObject("VirtioGPUPaceReset") || dict->getObject("VirtioGPUPacePublish"))) {
         if (IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator) != kIOReturnSuccess) {
             return kIOReturnNotPrivileged;
         }
-        bzero(&gPaceTxn, sizeof(gPaceTxn));
-        bzero(&gPaceFlip, sizeof(gPaceFlip));
-        bzero(&gFlipDur, sizeof(gFlipDur));
+        if (dict->getObject("VirtioGPUPaceReset")) {
+            bzero(&gPaceTxn, sizeof(gPaceTxn));
+            bzero(&gPaceFlip, sizeof(gPaceFlip));
+            bzero(&gFlipDur, sizeof(gFlipDur));
+        }
+        iopPublishCounts();   // the property shows this at once (it is otherwise renewed every 60 frames)
         return kIOReturnSuccess;
     }
     if (dict && dict->getObject("VirtioGPUFlipMs")) {

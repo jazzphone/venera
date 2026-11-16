@@ -97,6 +97,34 @@ static BOOL vg_twins_on(void) {
     return on;
 }
 
+// Twinned surfaces by id (weak), for snapshots of what the screen shows.
+static NSMapTable<NSNumber *, VGMTLTexture *> *gTwinned;
+static void vg_twinned_add(VGMTLTexture *t) {
+    @synchronized([VGMTLTexture class]) {
+        if (!gTwinned) {
+            gTwinned = [NSMapTable strongToWeakObjectsMapTable];
+        }
+        [gTwinned setObject:t forKey:@(IOSurfaceGetID(t->_surface))];
+    }
+}
+VGMTLTexture *vg_twinned_shown(void) {
+    static io_service_t accel;
+    if (!accel) {
+        accel = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching(kVGUCAccelClass));
+    }
+    CFTypeRef v = accel ? IORegistryEntryCreateCFProperty(accel, CFSTR("VirtioGPUShownSurface"), NULL, 0) : NULL;
+    uint32_t id = 0;
+    if (v && CFGetTypeID(v) == CFNumberGetTypeID()) {
+        CFNumberGetValue(v, kCFNumberSInt32Type, &id);
+    }
+    if (v) {
+        CFRelease(v);
+    }
+    @synchronized([VGMTLTexture class]) {
+        return id ? [gTwinned objectForKey:@(id)] : nil;
+    }
+}
+
 BOOL vg_twin_ensure(VGMTLTexture *t) {
     if (t->_twinRes) {
         return YES;
@@ -124,7 +152,95 @@ BOOL vg_twin_ensure(VGMTLTexture *t) {
         return NO;
     }
     t->_twinRes = res;
+    vg_twinned_add(t);
     return YES;
+}
+
+// ---- display snapshots (5c round 6) --------------------------------------------------------------------------------
+// What the display scans out, as a PNG, for checking a change without anyone looking at the screen: write a number
+// to /Library/GPUBundles/VirtioGPUMetal-snap, and at the next display frame the twin the kext flipped to last
+// (VirtioGPUShownSurface) is saved as <WindowServer's Darwin cache dir>/local.homelab.VirtioGPUMetal/snap-<number>.png.
+#include <zlib.h>
+
+static void vg_png_chunk(FILE *f, const char *type, const uint8_t *data, uint32_t len) {
+    uint8_t be[4] = {len >> 24, len >> 16, len >> 8, len};
+    fwrite(be, 1, 4, f);
+    fwrite(type, 1, 4, f);
+    if (len) {
+        fwrite(data, 1, len, f);
+    }
+    uLong crc = crc32(0, (const Bytef *)type, 4);
+    crc = crc32(crc, data, len);
+    uint8_t c[4] = {crc >> 24, crc >> 16, crc >> 8, crc};
+    fwrite(c, 1, 4, f);
+}
+
+static void vg_write_png(const char *path, const uint8_t *bgra, uint32_t w, uint32_t h, uint32_t stride) {
+    size_t rowBytes = 1 + (size_t)w * 3, rawLen = rowBytes * h;
+    uint8_t *raw = malloc(rawLen);
+    if (!raw) {
+        return;
+    }
+    for (uint32_t y = 0; y < h; y++) {
+        uint8_t *o = raw + y * rowBytes;
+        const uint8_t *in = bgra + (size_t)y * stride;
+        *o++ = 0;
+        for (uint32_t x = 0; x < w; x++, in += 4) {
+            *o++ = in[2], *o++ = in[1], *o++ = in[0];
+        }
+    }
+    uLongf zlen = compressBound(rawLen);
+    uint8_t *z = malloc(zlen);
+    if (z && compress2(z, &zlen, raw, rawLen, 3) == Z_OK) {
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            static const uint8_t sig[8] = {0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a};
+            fwrite(sig, 1, 8, f);
+            uint8_t ihdr[13] = {w >> 24, w >> 16, w >> 8, w, h >> 24, h >> 16, h >> 8, h, 8, 2, 0, 0, 0};
+            vg_png_chunk(f, "IHDR", ihdr, 13);
+            vg_png_chunk(f, "IDAT", z, (uint32_t)zlen);
+            vg_png_chunk(f, "IEND", NULL, 0);
+            fclose(f);
+        }
+    }
+    free(z);
+    free(raw);
+}
+
+// The number asked for (0: none), looked at no more than 4 times a second.
+int vg_snap_wanted(void) {
+    static uint64_t lastCheck;
+    static int served = -1;
+    uint64_t now = vg_now();
+    if (now - lastCheck < 250000000ull) {
+        return 0;
+    }
+    lastCheck = now;
+    FILE *f = fopen("/Library/GPUBundles/VirtioGPUMetal-snap", "r");
+    if (!f) {
+        return 0;
+    }
+    int n = 0;
+    if (fscanf(f, "%d", &n) != 1) {
+        n = 0;
+    }
+    fclose(f);
+    if (n <= 0 || n == served) {
+        return 0;
+    }
+    served = n;
+    return n;
+}
+
+void vg_snap_write(VGMTLTexture *t, int number) {
+    char base[PATH_MAX];
+    if (!t->_twin.map || !confstr(_CS_DARWIN_USER_CACHE_DIR, base, sizeof(base))) {
+        return;
+    }
+    char path[PATH_MAX + 80];
+    snprintf(path, sizeof(path), "%slocal.homelab.VirtioGPUMetal/snap-%d.png", base, number);
+    vg_write_png(path, t->_twin.map, (uint32_t)t->_width, (uint32_t)t->_height, (uint32_t)t->_width * 4);
+    vglog("snapshot %d: surface %u -> %s", number, IOSurfaceGetID(t->_surface), path);
 }
 
 void vg_twin_mark(uint32_t surface, uint32_t frame, BOOL ready) {
@@ -149,8 +265,10 @@ void vg_twin_forget(VGMTLTexture *t) {
 
 // ---- staging pool (5c) ---------------------------------------------------------------------------------------------
 
-enum { kPoolMax = 48 };
-static const VkDeviceSize kPoolBytesMax = 192ull << 20;
+// Buffers too (5c round 6): Core Animation makes and drops buffers and surface textures every frame while an app
+// scrolls, and creating one costs a host-visible allocation plus a map (vn_MapMemory, ~35 % of WindowServer's thread).
+enum { kPoolMax = 160 };
+static const VkDeviceSize kPoolBytesMax = 256ull << 20;
 static pthread_mutex_t gPoolLock = PTHREAD_MUTEX_INITIALIZER;
 static vg_buffer gPool[kPoolMax];
 static int gPoolN;
@@ -160,7 +278,8 @@ int vg_staging_get(VkDeviceSize size, vg_buffer *out) {
     pthread_mutex_lock(&gPoolLock);
     int best = -1;
     for (int i = 0; i < gPoolN; i++) {   // the smallest that fits, and not more than twice the size
-        if (gPool[i].size >= size && gPool[i].size <= 2 * size + 65536 && (best < 0 || gPool[i].size < gPool[best].size)) {
+        if (gPool[i].size >= size && gPool[i].size <= 2 * size + (size < 65536 ? 4096 : 65536) &&
+            (best < 0 || gPool[i].size < gPool[best].size)) {
             best = i;
         }
     }
@@ -173,7 +292,14 @@ int vg_staging_get(VkDeviceSize size, vg_buffer *out) {
         return 0;
     }
     pthread_mutex_unlock(&gPoolLock);
-    VkDeviceSize rounded = (size + 65535) & ~(VkDeviceSize)65535;   // sizes repeat (surfaces, glyph uploads): round
+    // sizes repeat (surfaces, glyph uploads): round, small ones to a power of two from 4 KB
+    VkDeviceSize rounded = (size + 65535) & ~(VkDeviceSize)65535;
+    if (size < 65536) {
+        rounded = 4096;
+        while (rounded < size) {
+            rounded <<= 1;
+        }
+    }
     uint64_t t0 = vg_now();
     int r = vg_buffer_create(rounded, out);
     vg_perf(VG_PERF_POOL_MISS, rounded, vg_now() - t0);
@@ -367,7 +493,7 @@ BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
     if (_surface) {
         CFRelease(_surface);
     }
-    vg_buffer_destroy(&_staging);
+    vg_staging_put(&_staging);   // back to the pool (5c round 6)
     if (_view) {
         gVk.vkDestroyImageView(gVk.device, _view, NULL);
     }
@@ -916,7 +1042,7 @@ id<MTLTexture> vg_new_surface_texture(id<MTLDevice> device, MTLTextureDescriptor
     MTLTextureDescriptor *rd = [d copy];
     rd.usage = d.usage | MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
     VGMTLTexture *t = (VGMTLTexture *)vg_new_texture(device, rd);
-    if (!t || vg_buffer_create(bpr * d.height, &t->_staging)) {
+    if (!t) {   // its write-back staging comes from the pool when a command buffer first writes it (5c round 6)
         pthread_mutex_unlock(&rootsLock);
         return nil;
     }

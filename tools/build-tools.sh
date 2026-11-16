@@ -1,5 +1,5 @@
 #!/bin/zsh
-# User-space tools for the VM (x86_64): build/vgputest, build/vkprobe, build/vkexec, build/acceltest, build/llvmprobe, build/mtlprobe, build/mtlcompute, build/mtlrender, build/mtllat, build/blobtest (+ metallibs)
+# User-space tools for the VM (x86_64): build/vgputest, build/vkprobe, build/vkexec, build/acceltest, build/llvmprobe, build/mtlprobe, build/mtlcompute, build/mtlrender, build/mtllat, build/blobtest, build/dragtest (+ metallibs)
 set -euo pipefail
 cd "${0:A:h}/.."
 mkdir -p build
@@ -14,6 +14,7 @@ $CC -fobjc-arc -framework Foundation -framework Metal tools/mtlcompute.m -o buil
 $CC -fobjc-arc -framework Foundation -framework Metal tools/mtlrender.m -o build/mtlrender
 $CC -fobjc-arc -framework Foundation -framework Metal tools/mtllat.m -o build/mtllat
 $CC -fobjc-arc -framework Foundation -framework Metal -framework IOKit tools/blobtest.m -o build/blobtest
+$CC -fobjc-arc -framework Cocoa tools/dragtest.m -o build/dragtest
 $CC -fobjc-arc -framework Foundation -framework Metal -framework IOSurface tools/mtlsurface.m -o build/mtlsurface
 $CC -fobjc-arc -framework Foundation -framework Metal tools/mtlcaps.m -o build/mtlcaps
 $CC -fobjc-arc -framework Foundation -framework Metal -framework QuartzCore -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers tools/carender.m -o build/carender

@@ -114,6 +114,11 @@ int main(int argc, char **argv) {
             say("pacereset -> 0x%x\n", kr);
             return kr == KERN_SUCCESS ? 0 : 1;
         }
+        CFMutableDictionaryRef pd = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+                                                              &kCFTypeDictionaryValueCallBacks);
+        CFDictionarySetValue(pd, CFSTR("VirtioGPUPacePublish"), kCFBooleanTrue);
+        IORegistryEntrySetCFProperties(svc, pd);   // publish now, not at the next 60th frame
+        CFRelease(pd);
         CFTypeRef v = IORegistryEntryCreateCFProperty(svc, CFSTR("VirtioGPUPacing"), NULL, 0);
         char buf[512] = "";
         if (v && CFGetTypeID(v) == CFStringGetTypeID()) {

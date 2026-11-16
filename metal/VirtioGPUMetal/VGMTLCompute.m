@@ -19,7 +19,7 @@
 @synthesize label = _label;
 - (id<MTLDevice>)device { return _dev; }
 - (void)dealloc {
-    vg_buffer_destroy(&_b);
+    vg_staging_put(&_b);   // back to the pool: a command buffer that used it holds it until it is done (5c round 6)
     if (_deallocator) {
         _deallocator(_host, _length);
     }
@@ -40,7 +40,7 @@
 - (instancetype)initStandinWithDevice:(id<MTLDevice>)device bytesNoCopy:(void *)pointer length:(NSUInteger)length
                           deallocator:(void (^)(void *, NSUInteger))deallocator {
     if ((self = [super init])) {
-        if (vg_vulkan_init() || vg_buffer_create(length, &_b)) {
+        if (vg_vulkan_init() || vg_staging_get(length ? length : 4, &_b)) {
             return nil;
         }
         _length = length;
@@ -49,6 +49,8 @@
         _deallocator = deallocator;
         if (pointer) {
             memcpy(_b.map, pointer, length);
+        } else {
+            memset(_b.map, 0, length);   // pooled memory: as new
         }
     }
     return self;
@@ -73,7 +75,7 @@ id<MTLBuffer> vg_new_buffer(id<MTLDevice> device, NSUInteger length, MTLResource
         return nil;
     }
     VGMTLBuffer *b = [VGMTLBuffer new];
-    if (vg_buffer_create(length, &b->_b)) {
+    if (vg_staging_get(length ? length : 4, &b->_b)) {   // pooled (5c round 6)
         return nil;
     }
     b->_length = length;
@@ -81,6 +83,8 @@ id<MTLBuffer> vg_new_buffer(id<MTLDevice> device, NSUInteger length, MTLResource
     b->_dev = device;
     if (bytes) {
         memcpy(b->_b.map, bytes, length);
+    } else {
+        memset(b->_b.map, 0, length);   // pooled memory: as new (Metal's new buffers read as zeros)
     }
     return b;
 }
@@ -964,6 +968,7 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
         _handlers = [NSMutableArray array];
         _scheduledHandlers = [NSMutableArray array];
         _done = dispatch_group_create();
+        _fenced = dispatch_group_create();
         _status = MTLCommandBufferStatusNotEnqueued;
         _surfacesWritten = [NSMutableSet set];
         _drawables = [NSMutableArray array];
@@ -1133,6 +1138,13 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
             vg_gpu_time_collect(_timePair, _submitted, observed);
         }
     }
+    if (_snapNumber) {
+        VGMTLTexture *shown = vg_twinned_shown();
+        if (shown) {
+            vg_snap_write(shown, _snapNumber);
+        }
+        _snapNumber = 0;
+    }
     if (_twinFrames) {   // the twins are written: the kext may flip to these frames
         const uint32_t *pair = _twinFrames.bytes;
         for (NSUInteger i = 0; i < _twinFrames.length / (2 * sizeof(uint32_t)); i++) {
@@ -1142,6 +1154,10 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
     }
     if (_gpuDone) {
         dispatch_semaphore_signal(_gpuDone);
+    }
+    if (_fencedEntered) {
+        _fencedEntered = NO;
+        dispatch_group_leave(_fenced);   // vg_present_throttle waits for this, not for the handlers
     }
     _completed = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     if (_cb) {
@@ -1173,6 +1189,9 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
     }
     if (status == MTLCommandBufferStatusCompleted) {
         for (VGMTLTexture *t in _surfacesWritten) {
+            if (!t->_staging.map) {
+                continue;   // its staging couldn't be had at commit
+            }
             uint64_t t0 = vg_now();
             IOSurfaceLock(t->_surface, 0, NULL);
             memcpy(IOSurfaceGetBaseAddressOfPlane(t->_surface, t->_plane), t->_staging.map, t->_surfaceBpr * t->_height);
@@ -1219,6 +1238,8 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
     [self enqueue];
     _status = MTLCommandBufferStatusCommitted;
     dispatch_group_enter(_done);
+    dispatch_group_enter(_fenced);
+    _fencedEntered = YES;
     _submitted = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     VkFence fence = VK_NULL_HANDLE;
     if (_cb && !_error) {
@@ -1247,6 +1268,9 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
                     _twinFrames = [NSMutableData data];
                 }
                 [_twinFrames appendBytes:pair length:sizeof(pair)];
+                if (_present && !_snapNumber) {
+                    _snapNumber = vg_snap_wanted();   // served at completion, from what the screen shows then
+                }
                 if (!writeBackTwins) {
                     if (!noWriteBack) {
                         noWriteBack = [NSMutableSet set];
@@ -1256,6 +1280,9 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
                 }
             } else {
                 _allTwinned = NO;
+            }
+            if (!t->_staging.buffer && vg_staging_get(t->_surfaceBpr * t->_height, &t->_staging)) {
+                continue;   // no memory for its write-back (logged by the pool)
             }
             NSUInteger px = IOSurfaceGetBytesPerElementOfPlane(t->_surface, t->_plane);
             VkBufferImageCopy c = {0, (uint32_t)(t->_surfaceBpr / px), (uint32_t)t->_height,
@@ -1345,29 +1372,55 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
 // must have landed by then (5c: when it returned at once, the pipe could show a surface before its last frame was in
 // it, and pieces of old frames stayed on screen). So a command buffer that wrote IOSurfaces returns only once they
 // are written back. VGMTL_NOWAIT_SUBMIT=1 returns at once again.
-// Display frames in flight (5c round 3): the oldest beyond the depth is waited for (completion, not just commit).
+// Display frames in flight (5c round 3): the oldest present beyond the depth is waited for (its fence, not its
+// completion handlers). WindowServer makes ~3 such calls per display frame (its composite flush, then the display
+// surface's), so the depth counts command buffers, not frames: at depth 1 each call waited ~10 ms for the call before
+// it and a frame took ~30 ms (5c round 6). VGMTL_PRESENT_DEPTH sets the start; /Library/GPUBundles/VirtioGPUMetal-depth
+// (a number, 1-16) overrides it and is read again at most once a second, so it can be tuned without a restart.
+static int vg_present_depth(void) {
+    static int envDepth = -1, fileDepth = 0;
+    static uint64_t checked;
+    if (envDepth < 0) {
+        const char *e = getenv("VGMTL_PRESENT_DEPTH");
+        envDepth = e && atoi(e) > 0 ? atoi(e) : 4;
+    }
+    uint64_t now = vg_now();
+    if (!checked || now - checked > 1000000000ull) {
+        checked = now;
+        int d = 0;
+        FILE *f = fopen("/Library/GPUBundles/VirtioGPUMetal-depth", "r");
+        if (f) {
+            if (fscanf(f, "%d", &d) != 1) {
+                d = 0;
+            }
+            fclose(f);
+        }
+        d = d >= 1 && d <= 16 ? d : 0;
+        if (d != fileDepth) {
+            fileDepth = d;
+            vglog("present: at most %d display command buffer(s) in flight", fileDepth ? fileDepth : envDepth);
+        }
+    }
+    return fileDepth ? fileDepth : envDepth;
+}
+
 static void vg_present_throttle(VGMTLCommandBuffer *cb) {
     static NSMutableArray<VGMTLCommandBuffer *> *inflight;
-    static int depth;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         inflight = [NSMutableArray array];
-        const char *e = getenv("VGMTL_PRESENT_DEPTH");
-        depth = e ? atoi(e) : 2;
-        if (depth < 1) {
-            depth = 1;
-        }
     });
-    VGMTLCommandBuffer *oldest = nil;
+    NSMutableArray<VGMTLCommandBuffer *> *wait = [NSMutableArray array];
     @synchronized(inflight) {
+        int depth = vg_present_depth();
         [inflight addObject:cb];
-        if ((int)inflight.count > depth) {
-            oldest = inflight[0];
+        while ((int)inflight.count > depth) {
+            [wait addObject:inflight[0]];
             [inflight removeObjectAtIndex:0];
         }
     }
-    if (oldest) {
-        dispatch_group_wait(oldest->_done, DISPATCH_TIME_FOREVER);
+    for (VGMTLCommandBuffer *oldest in wait) {
+        dispatch_group_wait(oldest->_fenced, DISPATCH_TIME_FOREVER);
     }
 }
 
