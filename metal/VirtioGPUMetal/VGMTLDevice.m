@@ -183,6 +183,11 @@ static BOOL vg_process_allowed(mach_port_t port) {
     if (!strcmp(me, "loginwindow") || !strcmp(me, "SecurityAgent")) {
         return NO;
     }
+    // Not yet by default: processes whose SwiftUI shader effects need visible (stitchable) functions we don't have yet.
+    // The Dock's helper draws the Calendar icon's date with them (it came out blank); Spotlight its glow.
+    if (!strcmp(me, "com.apple.dock.extra") || !strcmp(me, "Spotlight")) {
+        return NO;
+    }
     NSString *bp = [[NSBundle mainBundle] bundlePath];
     return [bp hasSuffix:@".app"] || [bp containsString:@".app/"];
 }
