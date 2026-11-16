@@ -1,0 +1,57 @@
+From 1ba4bcc74bdca5dd191a3386fe0488861f3df5fe Mon Sep 17 00:00:00 2001
+From: build <build@localhost>
+Date: Mon, 16 Nov 2026 18:11:10 -0500
+Subject: [PATCH] venus: macOS: a grace period before aborting on an expired
+ ring alive status
+
+A host that stalls for a few seconds (a GPU reset on the host, a long pipeline compile) took down every app that was
+only waiting: eight watchdog checks in a row (~30 s) must find the ring not alive before vn_relax aborts, each one
+logged.
+---
+ src/virtio/vulkan/vn_common.c | 16 +++++++++++++---
+ src/virtio/vulkan/vn_common.h |  1 +
+ 2 files changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/src/virtio/vulkan/vn_common.c b/src/virtio/vulkan/vn_common.c
+index 038cd13..ff34358 100644
+--- a/src/virtio/vulkan/vn_common.c
++++ b/src/virtio/vulkan/vn_common.c
+@@ -281,10 +281,20 @@ vn_relax(struct vn_relax_state *state)
+       if (vn_watchdog_acquire(watchdog, alive))
+          vn_ring_unset_status_bits(ring, VK_RING_STATUS_ALIVE_BIT_MESA);
+ 
++      /* macOS: a host that stalls for a few seconds (a GPU reset on the host, a long pipeline compile) used to take
++       * down every app that was only waiting (Chess, once, in a fence wait): eight missed checks in a row (~30 s)
++       * before giving up, each one logged.
++       */
+       if (vn_watchdog_timeout(watchdog) && !VN_DEBUG(NO_ABORT)) {
+-         vn_log(instance, "aborting on expired ring alive status at iter %d",
+-                *iter);
+-         abort();
++         if (++state->missed >= 8) {
++            vn_log(instance, "aborting on expired ring alive status at iter %d",
++                   *iter);
++            abort();
++         }
++         vn_log(instance, "ring alive status expired (%u of 8) at iter %d: "
++                "still waiting", state->missed, *iter);
++      } else {
++         state->missed = 0;
+       }
+ 
+       if (*iter >= (1 << abort_order) && !VN_DEBUG(NO_ABORT)) {
+diff --git a/src/virtio/vulkan/vn_common.h b/src/virtio/vulkan/vn_common.h
+index dac2f2b..ac4191e 100644
+--- a/src/virtio/vulkan/vn_common.h
++++ b/src/virtio/vulkan/vn_common.h
+@@ -244,6 +244,7 @@ struct vn_relax_state {
+    uint32_t iter;
+    const struct vn_relax_profile profile;
+    const char *reason_str;
++   uint32_t missed; /* macOS: watchdog checks in a row that found the ring not alive */
+ };
+ 
+ /* TLS ring
+-- 
+2.54.0 (Apple Git-157)
+
