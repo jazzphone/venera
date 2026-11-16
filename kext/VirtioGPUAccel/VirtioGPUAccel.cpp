@@ -1394,9 +1394,10 @@ void VirtioGPUAccel::armForWindowServer(const char *why) {
     setProperty("MetalPluginName", "VirtioGPUMetal");
     setProperty("MetalPluginClassName", "VGMTLDevice");
     setProperty("VirtioGPUWindowServer", kOSBooleanTrue);
-    // OpenGL over Metal (5d, boot-arg vgpugl=1): new OpenGL processes get Apple's AppleMetalOpenGLRenderer, which runs on
-    // this accelerator's Metal device, instead of the software renderer (GLRendererFloat). After nullmoth's nvrm-accel.
-    if (int gl = 0; PE_parse_boot_argn("vgpugl", &gl, sizeof(gl)) && gl) {
+    // OpenGL over Metal (5d; boot-arg vgpugl=0 turns it off): new OpenGL processes get Apple's AppleMetalOpenGLRenderer,
+    // which runs on this accelerator's Metal device, instead of the software renderer (GLRendererFloat). After
+    // nullmoth's nvrm-accel.
+    if (int gl = 1; !PE_parse_boot_argn("vgpugl", &gl, sizeof(gl)) || gl) {
         setProperty("IOGLBundleName", "AppleMetalOpenGLRenderer");
         vlog("arm: IOGLBundleName AppleMetalOpenGLRenderer (vgpugl)");
     }

@@ -16,6 +16,11 @@ static NSString *const kSource = @"#include <metal_stdlib>\n"
                                   "    V o; o.p = float4(p[vid], 0, 1); o.c = float4(0.25, 0.5, 1.0, 1.0); return o;\n"
                                   "}\n"
                                   "fragment float4 fs(V in [[stage_in]]) { return in.c; }\n"
+                                  "struct U { float4 color; float scale; float4x4 m; };\n"
+                                  "fragment float4 fs_refl(V in [[stage_in]], constant U &u [[buffer(2)]],\n"
+                                  "                        texture2d<float> t [[texture(1)]], sampler smp [[sampler(0)]]) {\n"
+                                  "    return u.color * u.scale + t.sample(smp, float2(0.5)) + u.m[0];\n"
+                                  "}\n"
                                   "vertex V vs_half(uint vid [[vertex_id]]) {\n"
                                   "    float2 p[3] = {float2(-1, -1), float2(1, -1), float2(-1, 1)};\n"
                                   "    V o; o.p = float4(p[vid], 0, 1); o.c = float4(1, 1, 1, 1); return o;\n"
@@ -224,6 +229,36 @@ int main(void) {
                        outp[0], outp[1], outp[2]);
                 failures += !ok;
             }
+        }
+        // reflection (5d): the fragment stage's buffer (struct members by name and offset), texture and sampler
+        {
+            MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+            pd.vertexFunction = [lib newFunctionWithName:@"vs"];
+            pd.fragmentFunction = [lib newFunctionWithName:@"fs_refl"];
+            pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+            MTLAutoreleasedRenderPipelineReflection refl = nil;
+            id<MTLRenderPipelineState> rp2 = [dev newRenderPipelineStateWithDescriptor:pd options:MTLPipelineOptionBindingInfo
+                                                                            reflection:&refl error:&err];
+            NSMutableString *got = [NSMutableString string];
+            BOOL buf = NO, tex = NO, smp = NO, members = NO;
+            for (id<MTLBinding> b in refl.fragmentBindings) {
+                [got appendFormat:@" %@@%lu(type %ld)", b.name, (unsigned long)b.index, (long)b.type];
+                if (b.type == MTLBindingTypeBuffer && b.index == 2) {
+                    id<MTLBufferBinding> bb = (id<MTLBufferBinding>)b;
+                    NSArray *ms = bb.bufferStructType.members;
+                    for (MTLStructMember *m in ms) {
+                        [got appendFormat:@" {%@ +%lu}", m.name, (unsigned long)m.offset];
+                    }
+                    members = ms.count == 3 && [[ms[0] name] isEqual:@"color"] && [ms[1] offset] == 16 &&
+                              [[ms[2] name] isEqual:@"m"] && [ms[2] offset] == 32;
+                    buf = [b.name isEqual:@"u"];
+                }
+                tex |= b.type == MTLBindingTypeTexture && b.index == 1 && [b.name isEqual:@"t"];
+                smp |= b.type == MTLBindingTypeSampler && b.index == 0;
+            }
+            BOOL ok = rp2 && refl && buf && tex && smp && members;
+            printf("reflection: %s (%s )\n", ok ? "ok" : "FAIL", got.UTF8String);
+            failures += !ok;
         }
         printf("%s\n", failures ? "FAILED" : "PASS");
         return failures ? 1 : 0;

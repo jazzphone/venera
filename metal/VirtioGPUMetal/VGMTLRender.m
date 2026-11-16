@@ -576,6 +576,14 @@ static void vg_set_sampler(VGMTLCommandBuffer *cmd, vg_stage_bindings *t, id<MTL
     }
 }
 - (void)setStencilReferenceValue:(uint32_t)v { _stencilRef[0] = _stencilRef[1] = v; }
+// Store actions decided after the pass began (5d: Apple's GL renderer): every attachment is stored anyway.
+- (void)setColorStoreAction:(MTLStoreAction)a atIndex:(NSUInteger)i { }
+- (void)setLineWidth:(float)w { }   // wide lines aren't a dynamic state here; GL's are 1 wide
+- (void)setDepthStoreAction:(MTLStoreAction)a { }
+- (void)setStencilStoreAction:(MTLStoreAction)a { }
+- (void)setColorStoreActionOptions:(MTLStoreActionOptions)o atIndex:(NSUInteger)i { }
+- (void)setDepthStoreActionOptions:(MTLStoreActionOptions)o { }
+- (void)setStencilStoreActionOptions:(MTLStoreActionOptions)o { }
 - (void)setStencilFrontReferenceValue:(uint32_t)f backReferenceValue:(uint32_t)b { _stencilRef[0] = f, _stencilRef[1] = b; }
 - (void)setDepthBias:(float)b slopeScale:(float)s clamp:(float)c { }
 - (void)setDepthClipMode:(MTLDepthClipMode)m { }

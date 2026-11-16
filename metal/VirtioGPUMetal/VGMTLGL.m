@@ -31,7 +31,7 @@ static struct {
     vg_gl_gen_fn gen;
 } gGL;
 static NSString *gGLWhy;
-static char gGLRetKey, gGLReflV, gGLReflF;
+static char gGLRetKey;
 
 static BOOL vg_gl_ready(void) {
     static dispatch_once_t once;
@@ -202,39 +202,14 @@ MTLRenderPipelineDescriptor *vg_gl_rewrite_descriptor(id<MTLDevice> device, MTLR
     return c;
 }
 
-// What the renderer reads back from a GL pipeline's reflection.
-@interface VGMTLRenderPipelineReflection : NSObject
-@end
-@implementation VGMTLRenderPipelineReflection
-- (NSData *)vertexPluginReturnData { return objc_getAssociatedObject(self, &gGLReflV); }
-- (NSData *)fragmentPluginReturnData { return objc_getAssociatedObject(self, &gGLReflF); }
-- (uint64_t)usageFlags { return 0; }
-- (NSDictionary *)performanceStatistics { return @{}; }
-- (NSArray *)vertexArguments { return @[]; }
-- (NSArray *)fragmentArguments { return @[]; }
-- (NSArray *)tileArguments { return @[]; }
-- (NSArray *)vertexBindings { return @[]; }
-- (NSArray *)fragmentBindings { return @[]; }
-- (NSArray *)tileBindings { return @[]; }
-- (NSArray *)objectBindings { return @[]; }
-- (NSArray *)meshBindings { return @[]; }
-@end
-
-// A reflection for a pipeline whose functions came from GL (nil for any other: we don't reflect those yet).
-id vg_gl_reflection(MTLRenderPipelineDescriptor *d) {
-    id v = d.vertexFunction ? objc_getAssociatedObject(d.vertexFunction, &gGLRetKey) : nil;
-    id f = d.fragmentFunction ? objc_getAssociatedObject(d.fragmentFunction, &gGLRetKey) : nil;
-    if (!v && !f) {
-        return nil;
+// What the lowering returned, onto the pipeline's reflection (VGMTLReflection.m), where the renderer reads it.
+void vg_reflection_set_plugin_data(id r, NSData *v, NSData *f);
+void vg_gl_tag_reflection(id r, MTLRenderPipelineDescriptor *d) {
+    NSData *v = d.vertexFunction ? objc_getAssociatedObject(d.vertexFunction, &gGLRetKey) : nil;
+    NSData *f = d.fragmentFunction ? objc_getAssociatedObject(d.fragmentFunction, &gGLRetKey) : nil;
+    if (v || f) {
+        vg_reflection_set_plugin_data(r, v, f);
     }
-    VGMTLRenderPipelineReflection *r = [VGMTLRenderPipelineReflection new];
-    if (v) {
-        objc_setAssociatedObject(r, &gGLReflV, v, OBJC_ASSOCIATION_RETAIN);
-    }
-    if (f) {
-        objc_setAssociatedObject(r, &gGLReflF, f, OBJC_ASSOCIATION_RETAIN);
-    }
-    return r;
 }
 
 // The renderer's private calls.

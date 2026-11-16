@@ -54,6 +54,42 @@ static const vg_format kFormats[] = {
     {MTLPixelFormatX24_Stencil8, VK_FORMAT_D24_UNORM_S8_UINT, 4, VK_IMAGE_ASPECT_STENCIL_BIT},
 };
 
+// A view's component mapping (5d): Metal's swizzle picks from what the format reads as (A8: 0, 0, 0, r). Identity
+// (no swizzle, or a format of its own) stays VK_COMPONENT_SWIZZLE_IDENTITY: attachments and storage views need that.
+static BOOL vg_swz_identity(MTLTextureSwizzleChannels s) {
+    return (s.red == MTLTextureSwizzleRed || s.red == 0) && (s.green == MTLTextureSwizzleGreen || s.green == 0) &&
+           (s.blue == MTLTextureSwizzleBlue || s.blue == 0) && (s.alpha == MTLTextureSwizzleAlpha || s.alpha == 0);
+}
+static VkComponentMapping vg_components(MTLPixelFormat pf, MTLTextureSwizzleChannels s) {
+    const BOOL a8 = pf == MTLPixelFormatA8Unorm;
+    if (!a8 && vg_swz_identity(s)) {
+        return (VkComponentMapping){VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+                                    VK_COMPONENT_SWIZZLE_IDENTITY};
+    }
+    const VkComponentSwizzle base[4] = {a8 ? VK_COMPONENT_SWIZZLE_ZERO : VK_COMPONENT_SWIZZLE_R,
+                                        a8 ? VK_COMPONENT_SWIZZLE_ZERO : VK_COMPONENT_SWIZZLE_G,
+                                        a8 ? VK_COMPONENT_SWIZZLE_ZERO : VK_COMPONENT_SWIZZLE_B,
+                                        a8 ? VK_COMPONENT_SWIZZLE_R : VK_COMPONENT_SWIZZLE_A};
+    MTLTextureSwizzle ch[4] = {s.red ?: MTLTextureSwizzleRed, s.green ?: MTLTextureSwizzleGreen,
+                               s.blue ?: MTLTextureSwizzleBlue, s.alpha ?: MTLTextureSwizzleAlpha};
+    // all zero (never set) means identity; a real Zero swizzle on every channel isn't meaningful
+    if (!s.red && !s.green && !s.blue && !s.alpha) {
+        ch[0] = MTLTextureSwizzleRed, ch[1] = MTLTextureSwizzleGreen, ch[2] = MTLTextureSwizzleBlue, ch[3] = MTLTextureSwizzleAlpha;
+    }
+    VkComponentSwizzle out[4];
+    for (int i = 0; i < 4; i++) {
+        switch (ch[i]) {
+        case MTLTextureSwizzleZero: out[i] = VK_COMPONENT_SWIZZLE_ZERO; break;
+        case MTLTextureSwizzleOne: out[i] = VK_COMPONENT_SWIZZLE_ONE; break;
+        case MTLTextureSwizzleRed: out[i] = base[0]; break;
+        case MTLTextureSwizzleGreen: out[i] = base[1]; break;
+        case MTLTextureSwizzleBlue: out[i] = base[2]; break;
+        default: out[i] = base[3]; break;
+        }
+    }
+    return (VkComponentMapping){out[0], out[1], out[2], out[3]};
+}
+
 // What a sampling view (and a copy) of a format covers: depth of a depth-stencil format, stencil of a stencil-only one.
 static VkImageAspectFlags vg_view_aspect(VkImageAspectFlags a) {
     return (a & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT : a;
@@ -590,8 +626,20 @@ BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
 - (NSUInteger)heapOffset { return vg_heap_offset_of(self); }
 - (MTLResourceID)gpuResourceID { return (MTLResourceID){0}; }
 - (MTLTextureSwizzleChannels)swizzle {
-    return MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue,
-                                         MTLTextureSwizzleAlpha);
+    if (!_swz.red && !_swz.green && !_swz.blue && !_swz.alpha) {
+        return MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue,
+                                             MTLTextureSwizzleAlpha);
+    }
+    return _swz;
+}
+- (uint32_t)swizzleKey {   // 5d: Apple's GL renderer
+    MTLTextureSwizzleChannels c = [self swizzle];
+    return (uint32_t)c.red | (uint32_t)c.green << 8 | (uint32_t)c.blue << 16 | (uint32_t)c.alpha << 24;
+}
+- (BOOL)isWriteComplete { return YES; }   // reads wait for writes themselves (getBytes)
+- (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)pf textureType:(MTLTextureType)type levels:(NSRange)levels
+                                         slices:(NSRange)slices swizzle:(MTLTextureSwizzleChannels)swz {
+    return vg_texture_view_swz(self, pf, type, levels, slices, swz);
 }
 
 // Copies between the image and a staging buffer laid out with Metal's bytesPerRow / bytesPerImage.
@@ -732,6 +780,7 @@ id<MTLTexture> vg_new_texture(id<MTLDevice> device, MTLTextureDescriptor *d) {
     }
     VGMTLTexture *t = [VGMTLTexture new];
     t->_samples = samples;
+    t->_swz = d.swizzle;
     t->_dev = device;
     t->_pixelFormat = d.pixelFormat;
     t->_format = f->vk;
@@ -778,12 +827,8 @@ id<MTLTexture> vg_new_texture(id<MTLDevice> device, MTLTextureDescriptor *d) {
     if (r == VK_SUCCESS) {
         r = gVk.vkBindImageMemory(gVk.device, t->_image, t->_memory, 0);
     }
-    const BOOL alpha8 = f->mtl == MTLPixelFormatA8Unorm;
     VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, t->_image, vtype, f->vk,
-                                 {alpha8 ? VK_COMPONENT_SWIZZLE_ZERO : VK_COMPONENT_SWIZZLE_IDENTITY,
-                                  alpha8 ? VK_COMPONENT_SWIZZLE_ZERO : VK_COMPONENT_SWIZZLE_IDENTITY,
-                                  alpha8 ? VK_COMPONENT_SWIZZLE_ZERO : VK_COMPONENT_SWIZZLE_IDENTITY,
-                                  alpha8 ? VK_COMPONENT_SWIZZLE_R : VK_COMPONENT_SWIZZLE_IDENTITY},
+                                 vg_components(f->mtl, d.swizzle),
                                  {vg_view_aspect(f->aspect), 0, (uint32_t)t->_mips, 0, (uint32_t)t->_layers}};
     if (r == VK_SUCCESS) {
         vgtrace("texture: bound (%d), vkCreateImageView", r);
@@ -878,6 +923,10 @@ id<MTLSamplerState> vg_new_sampler(id<MTLDevice> device, MTLSamplerDescriptor *d
 @synthesize label = _label;
 - (id<MTLDevice>)device { return _dev; }
 - (MTLResourceID)gpuResourceID { return (MTLResourceID){0}; }
+- (BOOL)readsDepth { return _test; }       // 5d: Apple's GL renderer asks
+- (BOOL)writesDepth { return _write; }
+- (BOOL)readsStencil { return _stencil; }
+- (BOOL)writesStencil { return _stencil && (_sfront.writeMask || _sback.writeMask); }
 @end
 
 id<MTLDepthStencilState> vg_new_depth_stencil(id<MTLDevice> device, MTLDepthStencilDescriptor *d) {
@@ -913,6 +962,10 @@ id<MTLDepthStencilState> vg_new_depth_stencil(id<MTLDevice> device, MTLDepthSten
 // A view of another texture: same VkImage, its own VkImageView (format, type, levels, slices). Core Animation makes
 // them in its compute passes (calculate_average_luma) and blur chains.
 id<MTLTexture> vg_texture_view(VGMTLTexture *p, MTLPixelFormat pf, MTLTextureType type, NSRange levels, NSRange slices) {
+    return vg_texture_view_swz(p, pf, type, levels, slices, (MTLTextureSwizzleChannels){0, 0, 0, 0});
+}
+id<MTLTexture> vg_texture_view_swz(VGMTLTexture *p, MTLPixelFormat pf, MTLTextureType type, NSRange levels, NSRange slices,
+                                   MTLTextureSwizzleChannels swz) {
     while (p->_parent) {
         p = p->_parent;
     }
@@ -948,12 +1001,8 @@ id<MTLTexture> vg_texture_view(VGMTLTexture *p, MTLPixelFormat pf, MTLTextureTyp
         usage |= p->_imageUsage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT);
     }
     VkImageViewUsageCreateInfo uci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, NULL, usage};
-    const BOOL alpha8 = pf == MTLPixelFormatA8Unorm;
     VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &uci, 0, p->_image, vtype, f->vk,
-                                 {alpha8 ? VK_COMPONENT_SWIZZLE_ZERO : VK_COMPONENT_SWIZZLE_IDENTITY,
-                                  alpha8 ? VK_COMPONENT_SWIZZLE_ZERO : VK_COMPONENT_SWIZZLE_IDENTITY,
-                                  alpha8 ? VK_COMPONENT_SWIZZLE_ZERO : VK_COMPONENT_SWIZZLE_IDENTITY,
-                                  alpha8 ? VK_COMPONENT_SWIZZLE_R : VK_COMPONENT_SWIZZLE_IDENTITY},
+                                 vg_components(pf, swz),
                                  {vg_view_aspect(f->aspect), (uint32_t)levels.location, (uint32_t)levels.length,
                                   (uint32_t)slices.location, (uint32_t)slices.length}};
     VGMTLTexture *t = [VGMTLTexture new];
@@ -963,6 +1012,7 @@ id<MTLTexture> vg_texture_view(VGMTLTexture *p, MTLPixelFormat pf, MTLTextureTyp
     }
     VGCALL("texture view of %p: format %lu type %lu -> %p", p, (unsigned long)pf, (unsigned long)type, t);
     t->_parent = p;
+    t->_swz = swz;
     t->_dev = p->_dev;
     t->_image = p->_image;
     t->_imageUsage = p->_imageUsage;

@@ -43,6 +43,7 @@ id<MTLBuffer> vg_new_buffer_nocopy(id<MTLDevice> device, void *pointer, NSUInteg
     MTLTextureType _type;
     NSUInteger _width, _height, _depth, _mips, _layers;
     NSUInteger _samples;   // multisample images (5d); 0 or 1 = one sample
+    MTLTextureSwizzleChannels _swz;   // the descriptor's (or view's) channel swizzle (5d); all zero = identity
     MTLTextureUsage _usage;
     MTLStorageMode _storage;
     id<MTLDevice> _dev;
@@ -86,6 +87,9 @@ void vg_snap_write(VGMTLTexture *t, int number);
 void vg_twin_forget(VGMTLTexture *t);
 id<MTLTexture> vg_new_surface_texture(id<MTLDevice> device, MTLTextureDescriptor *d, IOSurfaceRef surface, NSUInteger plane);
 id<MTLTexture> vg_texture_view(VGMTLTexture *p, MTLPixelFormat pf, MTLTextureType type, NSRange levels, NSRange slices);
+// the same with a channel swizzle (5d)
+id<MTLTexture> vg_texture_view_swz(VGMTLTexture *p, MTLPixelFormat pf, MTLTextureType type, NSRange levels, NSRange slices,
+                                   MTLTextureSwizzleChannels swz);
 id<MTLTexture> vg_new_buffer_texture(id<MTLBuffer> buffer, MTLTextureDescriptor *d, NSUInteger offset, NSUInteger bpr);
 
 @interface VGMTLSamplerState : NSObject <MTLSamplerState> {

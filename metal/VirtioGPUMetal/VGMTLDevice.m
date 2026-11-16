@@ -202,6 +202,7 @@ static id vg_refuse_before_init(id obj) {
 
 // ---- the device ----------------------------------------------------------------------------------------------------
 
+id vg_compute_reflection(id<MTLFunction> fn);   // VGMTLReflection.m
 @implementation VGMTLDevice
 // Properties the base class implements (NV's list, NVMTLDevice.m): no ivars or accessors of ours.
 @dynamic depth24Stencil8PixelFormatSupported, headless, location, locationNumber, lowPower,
@@ -368,10 +369,11 @@ static id vg_refuse_before_init(id obj) {
                                                            options:(MTLPipelineOption)o
                                                         reflection:(MTLAutoreleasedComputePipelineReflection *)r
                                                              error:(NSError **)error {
+    id<MTLComputePipelineState> p = vg_new_compute_pipeline(self, f, error);
     if (r) {
-        *r = nil;
+        *r = p ? vg_compute_reflection(f) : nil;
     }
-    return vg_new_compute_pipeline(self, f, error);
+    return p;
 }
 // The two-argument form Core Animation's luma pass uses (5c: with transparency on, WindowServer aborted on
 // "function=compute_average_luma": MTLIOAccelDevice's own version returned nil without an error).
@@ -418,10 +420,11 @@ static id vg_refuse_before_init(id obj) {
                                                              options:(MTLPipelineOption)o
                                                           reflection:(MTLAutoreleasedComputePipelineReflection *)r
                                                                error:(NSError **)error {
+    id<MTLComputePipelineState> p = vg_new_compute_pipeline(self, d.computeFunction, error);
     if (r) {
-        *r = nil;
+        *r = p ? vg_compute_reflection(d.computeFunction) : nil;
     }
-    return vg_new_compute_pipeline(self, d.computeFunction, error);
+    return p;
 }
 
 // ---- stage 4c: textures and rendering (VGMTLTexture.m, VGMTLRender.m) ----
@@ -442,7 +445,9 @@ static id vg_refuse_before_init(id obj) {
 // OpenGL (5d, VGMTLGL.m): a pipeline of Apple GL functions is built from our lowering of them, and its reflection
 // carries what the lowering returned.
 MTLRenderPipelineDescriptor *vg_gl_rewrite_descriptor(id<MTLDevice> device, MTLRenderPipelineDescriptor *d, NSError **err);
-id vg_gl_reflection(MTLRenderPipelineDescriptor *d);
+void vg_gl_tag_reflection(id r, MTLRenderPipelineDescriptor *d);
+id vg_render_reflection(MTLRenderPipelineDescriptor *d);   // VGMTLReflection.m
+id vg_compute_reflection(id<MTLFunction> fn);
 - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)error {
     d = vg_gl_rewrite_descriptor(self, d, error);
     return d ? vg_new_render_pipeline(self, d, error) : nil;
@@ -459,8 +464,9 @@ id vg_gl_reflection(MTLRenderPipelineDescriptor *d);
         return nil;
     }
     id<MTLRenderPipelineState> p = vg_new_render_pipeline(self, d, error);
-    if (p && r) {
-        *r = vg_gl_reflection(d);
+    if (p && r) {   // 5d: reflection of our own (arguments, struct members), with OpenGL's plugin data when it has any
+        *r = vg_render_reflection(d);
+        vg_gl_tag_reflection(*r, d);
     }
     return p;
 }
