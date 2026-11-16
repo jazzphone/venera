@@ -1263,7 +1263,7 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
                 gVk.vkCmdCopyImageToBuffer(_cb, t->_image, VK_IMAGE_LAYOUT_GENERAL, t->_twin.buffer, 1, &tc);
                 // number this copy: submitted now, ready when the fence is (the kext flips only to a ready frame)
                 uint32_t pair[2] = {IOSurfaceGetID(t->_surface), ++t->_twinGen};
-                vg_twin_mark(pair[0], pair[1], NO);
+                BOOL shown = vg_twin_mark(pair[0], pair[1], NO);
                 if (!_twinFrames) {
                     _twinFrames = [NSMutableData data];
                 }
@@ -1271,7 +1271,12 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
                 if (_present && !_snapNumber) {
                     _snapNumber = vg_snap_wanted();   // served at completion, from what the screen shows then
                 }
-                if (!writeBackTwins) {
+                // Only a surface the display has shown skips its CPU write-back (5c round 6): Core Animation renders
+                // other screen-sized surfaces in display command buffers too (one GPU-only intermediate a frame, and
+                // a Cmd-Shift-3 screenshot, read on the CPU: it came out blank). Those keep it, landing before the
+                // completion handlers as Metal's results do, but commitAndWaitUntilSubmitted doesn't wait for it: only
+                // the display pipe's CPU copy needed that, and the pipe flips to the twin.
+                if (shown && !writeBackTwins) {
                     if (!noWriteBack) {
                         noWriteBack = [NSMutableSet set];
                     }

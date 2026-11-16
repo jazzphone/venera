@@ -1056,7 +1056,7 @@ IOReturn VirtioGPU::setTwin(task_t task, uint32_t surface, uint32_t resource, ui
             IOLockUnlock(twinLock_);
             return kIOReturnNoSpace;
         }
-        twins_[slot] = {surface, resource, width, height, stride, 0, 0, task};
+        twins_[slot] = {surface, resource, width, height, stride, 0, 0, task, false};
     }
     IOLockUnlock(twinLock_);
     if (old && old != resource && scanoutBlob_ == old) {
@@ -1065,7 +1065,11 @@ IOReturn VirtioGPU::setTwin(task_t task, uint32_t surface, uint32_t resource, ui
     return kIOReturnSuccess;
 }
 
-IOReturn VirtioGPU::markTwin(task_t task, uint32_t surface, uint32_t frame, bool ready) {
+// shown: whether a display transaction has asked for this surface yet (5c round 6). Only those surfaces may skip
+// their CPU write-back: Core Animation also renders screen-sized surfaces it reads on the CPU (a screenshot) in the
+// same display command buffers, and those came out blank.
+IOReturn VirtioGPU::markTwin(task_t task, uint32_t surface, uint32_t frame, bool ready, bool *shown) {
+    *shown = false;
     if (!twinLock_ || !surface) {
         return kIOReturnBadArgument;
     }
@@ -1077,6 +1081,7 @@ IOReturn VirtioGPU::markTwin(task_t task, uint32_t surface, uint32_t frame, bool
                 r = kIOReturnNotPermitted;
             } else {
                 (ready ? twins_[i].ready : twins_[i].submitted) = frame;
+                *shown = twins_[i].shown;
                 r = kIOReturnSuccess;
             }
             break;
@@ -1110,6 +1115,7 @@ bool VirtioGPU::twinFor(uint32_t surface, Twin *out) {
     IOLockLock(twinLock_);
     for (unsigned i = 0; i < kMaxTwins && !found; i++) {
         if (twins_[i].surface == surface) {
+            twins_[i].shown = true;   // only the accelerator's display path asks (transactions, the flip loop)
             *out = twins_[i];
             found = true;
         }

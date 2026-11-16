@@ -75,7 +75,7 @@ void vg_cmd_wrote(id cmd, VGMTLTexture *t);
 // Display-surface twins (5c): make and register one for a root surface texture that qualifies (WindowServer, BGRA,
 // screen-sized); forget it (the kext first) before the texture goes.
 BOOL vg_twin_ensure(VGMTLTexture *t);
-void vg_twin_mark(uint32_t surface, uint32_t frame, BOOL ready);
+BOOL vg_twin_mark(uint32_t surface, uint32_t frame, BOOL ready);   // YES: shown on the display already
 int vg_snap_wanted(void);
 VGMTLTexture *vg_twinned_shown(void);   // the twinned surface the kext flipped to last
 void vg_snap_write(VGMTLTexture *t, int number);

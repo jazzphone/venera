@@ -243,12 +243,18 @@ void vg_snap_write(VGMTLTexture *t, int number) {
     vglog("snapshot %d: surface %u -> %s", number, IOSurfaceGetID(t->_surface), path);
 }
 
-void vg_twin_mark(uint32_t surface, uint32_t frame, BOOL ready) {
+// Returns whether a display transaction has shown the surface yet (core 0.5.5; an older core says no, which keeps
+// the CPU write-back: slower, never wrong).
+BOOL vg_twin_mark(uint32_t surface, uint32_t frame, BOOL ready) {
     io_connect_t c = vg_twin_conn();
     if (c) {
-        uint64_t in[3] = {surface, frame, ready ? 1 : 0};
-        IOConnectCallScalarMethod(c, kVGUCTwinMark, in, 3, NULL, NULL);
+        uint64_t in[3] = {surface, frame, ready ? 1 : 0}, out[1] = {0};
+        uint32_t n = 1;
+        if (IOConnectCallScalarMethod(c, kVGUCTwinMark, in, 3, out, &n) == KERN_SUCCESS && n >= 1) {
+            return out[0] != 0;
+        }
     }
+    return NO;
 }
 
 void vg_twin_forget(VGMTLTexture *t) {

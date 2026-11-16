@@ -138,8 +138,15 @@ IOReturn VirtioGPUUserClient::externalMethod(uint32_t selector, IOExternalMethod
         if (args->scalarInputCount < 3) {
             return kIOReturnBadArgument;
         }
-        return core_->markTwin(task_, (uint32_t)args->scalarInput[0], (uint32_t)args->scalarInput[1],
-                               args->scalarInput[2] != 0);
+    {
+        bool shown = false;
+        IOReturn r = core_->markTwin(task_, (uint32_t)args->scalarInput[0], (uint32_t)args->scalarInput[1],
+                                     args->scalarInput[2] != 0, &shown);
+        if (args->scalarOutputCount >= 1) {   // since core 0.5.5: shown on a display yet
+            args->scalarOutput[0] = shown ? 1 : 0;
+        }
+        return r;
+    }
     case kVGUCScanoutBlob:
         if (args->scalarInputCount < 5) {
             return kIOReturnBadArgument;
