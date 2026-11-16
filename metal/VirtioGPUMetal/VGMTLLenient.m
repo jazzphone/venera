@@ -63,6 +63,11 @@ void vg_cahook_install(void);
 
 __attribute__((constructor)) static void vg_lenient_install(void) {
     if (!strcmp(getprogname(), "WindowServer")) {
+        BOOL vg_windowserver_refused(void);
+        void vg_coredisplay_off(const char *why);
+        if (vg_windowserver_refused()) {
+            vg_coredisplay_off("the accelerator doesn't give this WindowServer Metal");
+        }
         vg_cahook_install();   // only with /Library/GPUBundles/VirtioGPUMetal-cahook present
         void vg_coredisplay_report(void);
         vg_coredisplay_report();   // now, and again once the displays are up

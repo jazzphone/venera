@@ -18,6 +18,16 @@ void vg_callstack(const char *what);   // with the call trace on: the caller's f
         }                                                                                                          \
     } while (0)
 void vglog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+// 5c timing (VGMTLPerf.m): what each kind of work cost, summed and logged every 5 s in WindowServer (or with
+// VGMTL_PERF=1) while anything happened.
+enum { VG_PERF_PULL_COPY, VG_PERF_PULL_GPU, VG_PERF_WB_COPY, VG_PERF_CB, VG_PERF_ONESHOT, VG_PERF_UPLOAD, VG_PERF_DEFERRED, VG_PERF_FETCH, VG_PERF_CB_QUEUE, VG_PERF_CB_WAIT, VG_PERF_GPU, VG_PERF_POOL_HIT, VG_PERF_POOL_MISS, VG_PERF_SUBMIT_WAIT, VG_PERF_N };
+BOOL vg_perf_on(void);
+// GPU timestamps around a command buffer (5c, only while timing is on): begin returns a pair index or -1.
+int vg_gpu_time_begin(VkCommandBuffer cb);
+void vg_gpu_time_end(VkCommandBuffer cb, int pair);
+void vg_gpu_time_collect(int pair);
+void vg_perf(int kind, uint64_t bytes, uint64_t ns);
+static inline uint64_t vg_now(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 // VGMTL_TRACE=1: step-by-step lines for bisecting a host-side failure (the log is written before each step).
 BOOL vg_tracing(void);
 #define vgtrace(...)                                                                                                \
@@ -49,7 +59,8 @@ void vg_trace_sync(const char *after);
     X(vkCmdSetFrontFace) X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp)           \
     X(vkCmdSetBlendConstants) X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) X(vkCmdDraw) X(vkCmdDrawIndexed)   \
     X(vkCmdSetStencilTestEnable) X(vkCmdSetDepthBiasEnable) X(vkCmdSetRasterizerDiscardEnable)                     \
-    X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetDepthBoundsTestEnable) X(vkDeviceWaitIdle)
+    X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetDepthBoundsTestEnable) X(vkDeviceWaitIdle)                         \
+    X(vkCreateQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
 
 #define VG_DECLARE(name) PFN_##name name;
 struct vg_vulkan {
@@ -82,6 +93,23 @@ typedef struct {
 } vg_buffer;
 int vg_buffer_create(VkDeviceSize size, vg_buffer *out);
 void vg_buffer_destroy(vg_buffer *b);
+// Staging buffers recycled (5c): creating one through Venus is several round trips. get returns one at least size
+// bytes (out->size is its whole size); put takes it back, or destroys it when the pool is full.
+int vg_staging_get(VkDeviceSize size, vg_buffer *out);
+void vg_staging_put(vg_buffer *b);
+
+// Deferred GPU work (5c): new images' first layout transition, replaceRegion uploads and buffer-backed texture
+// refreshes used to be one-shot command buffers, each submitted and waited for (~5 ms each through Venus, hundreds a
+// second in WindowServer). Now they wait in a queue and are recorded ahead of the next submit: a commit submits them
+// in their own command buffer just before its own (same vkQueueSubmit), a one-shot records them first.
+void vg_pending_init_image(VkImage image, VkImageAspectFlags aspect, uint32_t mips, uint32_t layers);
+// staging (may be NULL) belongs to the queue from here on and is destroyed once the copy has run.
+void vg_pending_copy(VkBuffer src, VkImage dst, const VkBufferImageCopy *c, const vg_buffer *staging);
+void vg_pending_forget(VkImage image);   // an image going away: drop what waits for it
+// Records everything waiting into cb (barriers around it); the stagings to destroy after cb completes go to *owned
+// (an array of vg_buffer the caller frees with vg_pending_release). NO when nothing was waiting.
+BOOL vg_pending_record(VkCommandBuffer cb, NSMutableData **owned);
+void vg_pending_release(NSMutableData *owned);
 
 // The translator (NV's metal2vulkan wrapper, Contents/Resources/libnvmtl_translate.dylib) and Apple's LLVM.
 NSString *vg_air_to_text(NSData *air);   // AIR bitcode -> LLVM IR text, nil on failure

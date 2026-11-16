@@ -1,5 +1,5 @@
 #!/bin/zsh
-# User-space tools for the VM (x86_64): build/vgputest, build/vkprobe, build/vkexec, build/acceltest, build/llvmprobe, build/mtlprobe, build/mtlcompute, build/mtlrender (+ metallibs)
+# User-space tools for the VM (x86_64): build/vgputest, build/vkprobe, build/vkexec, build/acceltest, build/llvmprobe, build/mtlprobe, build/mtlcompute, build/mtlrender, build/mtllat (+ metallibs)
 set -euo pipefail
 cd "${0:A:h}/.."
 mkdir -p build
@@ -12,6 +12,7 @@ $CC tools/llvmprobe.c -o build/llvmprobe
 $CC -fobjc-arc -framework Foundation -framework Metal tools/mtlprobe.m -o build/mtlprobe
 $CC -fobjc-arc -framework Foundation -framework Metal tools/mtlcompute.m -o build/mtlcompute
 $CC -fobjc-arc -framework Foundation -framework Metal tools/mtlrender.m -o build/mtlrender
+$CC -fobjc-arc -framework Foundation -framework Metal tools/mtllat.m -o build/mtllat
 $CC -fobjc-arc -framework Foundation -framework Metal -framework IOSurface tools/mtlsurface.m -o build/mtlsurface
 $CC -fobjc-arc -framework Foundation -framework Metal tools/mtlcaps.m -o build/mtlcaps
 $CC -fobjc-arc -framework Foundation -framework Metal -framework QuartzCore -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers tools/carender.m -o build/carender

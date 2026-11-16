@@ -127,6 +127,18 @@ static BOOL vg_accel_allows_windowserver(mach_port_t port) {
     return yes;
 }
 
+// For the guard's fallback (VGMTLCAHook.m): would WindowServer be refused? Asked before any device exists, so it finds
+// the accelerator itself.
+BOOL vg_windowserver_refused(void) {
+    io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("VirtioGPUAccel"));
+    if (!s) {
+        return NO;   // no accelerator: Metal won't load us anyway
+    }
+    BOOL allowed = vg_accel_allows_windowserver(s) && !vg_allow_file_has("-WindowServer", NO);
+    IOObjectRelease(s);
+    return !allowed;
+}
+
 static BOOL vg_process_allowed(mach_port_t port) {
     const char *me = getprogname();
     if (!strcmp(me, "WindowServer")) {

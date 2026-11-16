@@ -856,3 +856,61 @@ counts and bytes per frame), then: present through a host-side blit instead of a
 image, or the virtio-gpu resource the IOSurface already is), and keep IOSurfaces resident on the Venus side so a frame
 isn't pulled from and written back to guest RAM. Fix the withdraw path before anything that could crash WindowServer
 in a loop.
+
+## Stage 5c, round 1 (2026-11-15): the Metal desktop, faster and clean
+
+Measured first (new: `VGMTLPerf.m` logs "perf 5 s: ..." from WindowServer, or any process with `VGMTL_PERF=1`;
+`VGMTL_PERF=2` / `/Library/GPUBundles/VirtioGPUMetal-gputime` add GPU timestamps; the kext publishes
+`VirtioGPUPipeTiming`; `tools/mtllat` times command-buffer round trips), then fixed in this order. Benchmark:
+`mtlwindow` (a spinning Metal triangle in a window) while WindowServer composites it at `vgpuaccel=4`.
+
+| Step | `mtlwindow` | What it was |
+|---|---|---|
+| 5b as committed | 15.7 fps | WindowServer spent 3.7-4.1 s of every 5 s in ~800 synchronous one-shot submits (~5 ms each) |
+| deferred work | 15 fps | one-shots ~0; the remaining waits are elsewhere |
+| PerfPowerServices off | ~10 fps (noisy) | a system daemon spun a whole vCPU on the emulated SMC |
+| staging pool for setBytes arenas | 27.2 fps | every command buffer created and destroyed Venus buffers |
+| one image per IOSurface | 42.5 fps | redundant pulls gone; also fixes most stale pieces |
+| wait for write-back in commitAndWaitUntilSubmitted | 29.6 fps | the display pipe no longer shows a surface before its frame is in it |
+
+The tester on VM 108 after the last step: dragging a Finder window is **clean** (before: old window pieces left behind and
+flicker), smoother than the first Metal desktop, still not smooth.
+
+What changed:
+- **Deferred GPU work** (`vg_pending_*` in `VGMTLTexture.m`): a new image's layout transition, `replaceRegion`
+  uploads, buffer-backed texture refreshes and IOSurface pulls no longer submit and wait. They queue and are recorded
+  in a command buffer submitted just ahead of the next commit (same `vkQueueSubmit`), or at the start of the next
+  one-shot (readbacks still wait, as `getBytes` must). An image going away drops its queued work.
+- **Staging pool** (`vg_staging_get/put`): uploads, pulls, readbacks and command buffers' `setBytes` arenas reuse
+  host-visible buffers (48 buffers / 192 MB at most). Creating one through Venus is several round trips plus a host
+  fault on each first-touched page; this was the biggest single cost.
+- **One GPU image per IOSurface plane** in a process: later wrappers of the same surface are views of the first.
+  With a private image per wrapper, synced only through the surface's CPU memory, WindowServer's copy-forward read
+  stale pixels once frames overlapped.
+- **`commitAndWaitUntilSubmitted` waits** for the write-back when the command buffer wrote IOSurfaces (Core Animation
+  commits its display frames this way, then hands the surface to the display pipe, which copies its CPU memory; the
+  family thinks our GPU work is already done). `VGMTL_NOWAIT_SUBMIT=1` turns it off (faster, with leftovers).
+- **Fence waits through the kernel** (`VN_PERF=no_fence_feedback`, set by the plugin unless the process set
+  `VN_PERF`): Venus' fence feedback polls with short sleeps that macOS stretches under load (median small submit
+  under load 8.3 -> 5.8 ms).
+- Framebuffer fetch copies only the scissor's pixels (Core Animation's scissors are mostly near-full-screen, so a
+  modest gain). Core Animation's `fixed_frag_*_cpf` shaders really read all three `[[color(n)]]` inputs (the plugin now
+  logs declared vs read per pipeline; declared-only inputs get no copies).
+- **Guard fallback fixed** (accel 0.5.9): a withdraw keeps `MetalPluginName`, so the plugin still loads into the next
+  WindowServer, turns CoreDisplay's IOPresentment switch off there (`vg_coredisplay_off`, the byte
+  `UseIOPresentment()` reads first, 25G342 layout checked) and refuses the device: software desktop (the tester saw the
+  login window). `mtl withdraw` + `killall -9 WindowServer` and `mtl wsarm` + `killall -9 WindowServer` switch both
+  ways without a reboot (the guard still counts WindowServers since the last arm).
+- VM 108: `launchctl disable system/com.apple.PerfPowerServices` (it spun on QEMU's SMC in
+  `PLSMCMetricsAgent getAllKeys`); `launchctl enable` + reboot undoes it.
+
+Where the time goes now (WindowServer, a busy desktop): ~60 command buffers/s, ~10 ms commit -> done, of which GPU
+time is a few ms; ~400 framebuffer-fetch pass splits/s (~22 per frame); every frame read back to the CPU (4 MB) for the
+pipe's copy; the pipe copy itself ~0.8 ms. The app's own tiny frames took ~15 ms commit -> done under load with 0.17
+ms of GPU time: latency between the host GPU finishing and the guest seeing it is the largest remaining cost.
+
+**Next (5c round 2)**: (1) present without the CPU: let the display pipe flip to (or the host blit from) the GPU image
+of the frame, so the write-back, the wait in `commitAndWaitUntilSubmitted` and the pipe's copy go away; (2) the
+framebuffer-fetch splits: native input attachments (dynamic rendering local read, if Venus can pass it) instead of
+end-copy-resume; (3) find the guest/host latency on fence completion (QEMU's fence handling, the kext's interrupt
+path, guest scheduling).

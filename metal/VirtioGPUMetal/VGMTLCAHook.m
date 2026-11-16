@@ -290,3 +290,29 @@ void vg_coredisplay_report(void) {
           *(const int64_t *)(base + 0x3e790c88) == -1 ? "done" : "not yet", base[0x3e78b94e], base[0x3e78c261],
           base[0x3e78c262], base[0x3e78c263]);
 }
+
+// The guard's fallback (5c). At vgpuaccel=4 the framebuffer's class name gives CoreDisplay a GPU vendor, so every
+// WindowServer takes the IOPresentment path, also one the accelerator has withdrawn from (no display pipes: the main
+// display goes offline, black screen). A withdrawn accelerator keeps MetalPluginName, so this plugin still loads into
+// WindowServer, early (CoreDisplay hasn't asked UseIOPresentment() yet at our constructor), and turns CoreDisplay's
+// switch (+0x3e78b94d, the first byte UseIOPresentment() reads) off: the display takes the legacy surface and the
+// software compositor, as before stage 5b. The device itself is then refused (vg_process_allowed).
+void vg_coredisplay_off(const char *why) {
+    const char *cd = "/System/Library/Frameworks/CoreDisplay.framework/Versions/A/CoreDisplay";
+    uint8_t *base = NULL;
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        if (!strcmp(_dyld_get_image_name(i), cd)) {
+            base = (uint8_t *)_dyld_get_image_header(i);
+        }
+    }
+    // cmpb $0x1, sw(%rip) at +0xb6f0, whose displacement must point at +0x3e78b94d
+    if (!base || base[0xb6f0] != 0x80 || base[0xb6f1] != 0x3d ||
+        0xb6f7 + *(const int32_t *)(base + 0xb6f2) != 0x3e78b94d) {
+        vglog("coredisplay: not the 25G342 layout: IOPresentment left as it is (%s)", why);
+        return;
+    }
+    volatile uint8_t *sw = base + 0x3e78b94d;
+    uint8_t was = *sw;
+    *sw = 0;
+    vglog("coredisplay: IOPresentment switch %u -> 0 (%s): this WindowServer composites in software", was, why);
+}

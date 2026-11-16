@@ -23,9 +23,9 @@
 // client is also served from here (type kVGUCAccelType, attached under IOAccelVirtioCarrier services), because
 // WindowServer's sandbox allows the accelerator's user clients and not the core's.
 // Guard: a third WindowServer process that opens the Venus client since the last arm (the first two died) withdraws
-// the display: MetalPluginName, VirtioGPUWindowServer and the pipe capabilities go (the AGDC can't be terminated and
-// needn't be), so the next WindowServer finds no display pipe and composites in software (a pipe without a Metal device is an abort loop, "Failed to create
-// MetalDevice"). A root process re-arms with {"VirtioGPUArmWindowServer": true} (acceltest wsarm) or withdraws with
+// the display: VirtioGPUWindowServer turns false and the pipe capabilities go (the AGDC can't be terminated and needn't
+// be). MetalPluginName stays, so the plugin loads into the next WindowServer, turns CoreDisplay's IOPresentment switch
+// off there and refuses it the device: it composites in software (5c). A root process re-arms with {"VirtioGPUArmWindowServer": true} (acceltest wsarm) or withdraws with
 // {"VirtioGPUWithdraw": true} (acceltest withdraw), without a reboot.
 //
 // IOLog doesn't reach the log on Tahoe: lines go to the core's ProbeLog (kVGPULog) and to "VirtioGPUAccelLog" on the
@@ -419,6 +419,7 @@ public:
         return gIop ? kIOReturnSuccess : kIOReturnUnsupported;
     }
     IOReturn performTransaction(IOAccelDisplayPipeTransaction2 *txn) APPLE_KEXT_OVERRIDE;
+    IOReturn performTransactionTimed(IOAccelDisplayPipeTransaction2 *txn);
     bool isTransactionComplete(IOAccelDisplayPipeTransaction2 *) APPLE_KEXT_OVERRIDE { return true; }   // copied synchronously
     // 5b probes: which of the family's pipe entry points WindowServer drives (first calls logged, then the base class).
     void gates(const char *why) {
@@ -531,7 +532,26 @@ const void *VGDisplayPipe::mapSurface(unsigned id, IOMemoryDescriptor *md, unsig
 }
 
 static SInt64 gIopCalls = 0;
+// 5c timing: how long each transaction's copy takes, and how often transactions come (VirtioGPUPipeTiming).
+static SInt64 gIopNs = 0, gIopMaxNs = 0, gIopFirstAbs = 0, gIopLastAbs = 0;
+
 IOReturn VGDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn) {
+    uint64_t t0 = mach_absolute_time();
+    IOReturn r = performTransactionTimed(txn);
+    uint64_t t1 = mach_absolute_time(), ns = 0;
+    absolutetime_to_nanoseconds(t1 - t0, &ns);
+    OSAddAtomic64((SInt64)ns, &gIopNs);
+    if ((SInt64)ns > gIopMaxNs) {
+        gIopMaxNs = (SInt64)ns;
+    }
+    if (!gIopFirstAbs) {
+        gIopFirstAbs = (SInt64)t0;
+    }
+    gIopLastAbs = (SInt64)t1;
+    return r;
+}
+
+IOReturn VGDisplayPipe::performTransactionTimed(IOAccelDisplayPipeTransaction2 *txn) {
     if (OSAddAtomic64(1, &gIopCalls) % 60 == 0) {
         iopPublishCounts();
     }
@@ -801,6 +821,13 @@ static void iopPublishCounts() {
     snprintf(line, sizeof(line), "calls %lld ok %lld fail %lld empty %lld refused %lld", (long long)gIopCalls,
              (long long)gIopOk, (long long)gIopFail, (long long)gIopEmpty, (long long)gIopRefused);
     gAccel->setProperty("VirtioGPUPipeFrames", line);
+    uint64_t span = 0;
+    absolutetime_to_nanoseconds((uint64_t)(gIopLastAbs - gIopFirstAbs), &span);
+    snprintf(line, sizeof(line), "copy avg %lld us max %lld us; %lld frames in %lld ms (%lld.%lld fps)",
+             gIopCalls ? (long long)(gIopNs / gIopCalls / 1000) : 0LL, (long long)(gIopMaxNs / 1000), (long long)gIopCalls,
+             (long long)(span / 1000000), span ? (long long)(gIopCalls * 1000000000LL / (SInt64)span) : 0LL,
+             span ? (long long)((gIopCalls * 10000000000LL / (SInt64)span) % 10) : 0LL);
+    gAccel->setProperty("VirtioGPUPipeTiming", line);
 }
 
 void VirtioGPUAccel::populateAccelConfig(IOAccelConfig *c) {
@@ -1123,8 +1150,9 @@ IOService *VirtioGPUAccel::findCore() {
 
 // From the arm work loop only (it terminates the AGDC synchronously).
 void VirtioGPUAccel::withdrawForWindowServer(const char *why) {
-    removeProperty("MetalPluginName");
-    removeProperty("MetalPluginClassName");
+    // MetalPluginName stays (5c): at vgpuaccel=4 the framebuffer's class name sends every WindowServer down the
+    // IOPresentment path, and only our plugin, loaded into WindowServer, can turn that off again (vg_coredisplay_off);
+    // VirtioGPUWindowServer = false makes it refuse WindowServer the device.
     setProperty("VirtioGPUWindowServer", kOSBooleanFalse);
     removeProperty("IOAccelDisplayPipeCapabilities");
     nameOnFramebuffer(false);
@@ -1134,7 +1162,7 @@ void VirtioGPUAccel::withdrawForWindowServer(const char *why) {
     armed_ = 1;
     setProperty("VirtioGPUGuard", why);
     setProperty("VirtioGPUArmState", "withdrawn: no pipe capabilities, no Metal for WindowServer (software compositor)");
-    vlog("WITHDRAWN (%s): MetalPluginName and pipe capabilities gone; the next WindowServer composites in software", why);
+    vlog("WITHDRAWN (%s): pipe capabilities gone, WindowServer refused; the next WindowServer composites in software", why);
 }
 
 // ---- 5b probe: the display pipe's user client (IOAccelDisplayPipeUserClient2, the family's) ----------------------

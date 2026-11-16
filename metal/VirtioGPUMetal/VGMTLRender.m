@@ -17,24 +17,50 @@
 #import "objects.h"
 #include "nvmtl_fetch_copy.h"
 
-// Which [[color(n)]] inputs a fragment module reads: OpDecorate Binding 192+n.
-static uint32_t vg_spirv_fetch_mask(NSData *spv) {
+// Which [[color(n)]] inputs a fragment module declares (OpDecorate Binding 192+n) and which it reads: a variable some
+// OpLoad, OpAccessChain, OpCopyObject or OpFunctionCall uses (5c). Core Animation's specialized shaders can keep the
+// declarations after their function constants removed the reads, and a declared-only input needs no copies.
+static uint32_t vg_spirv_fetch_mask(NSData *spv, uint32_t *declared) {
     const uint32_t *w = spv.bytes;
     size_t nw = spv.length / 4;
-    uint32_t m = 0;
+    uint32_t m = 0, d = 0;
+    *declared = 0;
     if (nw < 5 || w[0] != 0x07230203u) {
         return 0;
     }
+    uint32_t ids[8] = {0};
     for (size_t i = 5; i < nw;) {
         uint32_t wc = w[i] >> 16, op = w[i] & 0xffffu;
         if (!wc || i + wc > nw) {
             break;
         }
         if (op == 71 && wc == 4 && w[i + 2] == 33 && w[i + 3] >= 192 && w[i + 3] < 200) {
-            m |= 1u << (w[i + 3] - 192);
+            d |= 1u << (w[i + 3] - 192);
+            ids[w[i + 3] - 192] = w[i + 1];
         }
         i += wc;
     }
+    for (size_t i = 5; d && i < nw;) {
+        uint32_t wc = w[i] >> 16, op = w[i] & 0xffffu;
+        if (!wc || i + wc > nw) {
+            break;
+        }
+        size_t from = 0, to = 0;   // operand words that may name the variable
+        if (op == 61 || op == 65 || op == 66 || op == 83) {   // OpLoad, OpAccessChain, OpInBoundsAccessChain, OpCopyObject
+            from = to = 3;
+        } else if (op == 57) {   // OpFunctionCall: arguments
+            from = 4, to = wc - 1;
+        }
+        for (size_t k = from; from && k <= to && k < wc; k++) {
+            for (uint32_t n = 0; n < 8; n++) {
+                if (ids[n] && w[i + k] == ids[n]) {
+                    m |= 1u << n;
+                }
+            }
+        }
+        i += wc;
+    }
+    *declared = d;
     return m;
 }
 
@@ -129,6 +155,7 @@ enum { kVGMaxColor = 8 };
     VkShaderModule _vs, _fs;
     VkDescriptorSetLayout _dsl[4];   // 0 vertex, 1 fragment, 2 empty, 3 framebuffer fetch (only with _fetchMask)
     uint32_t _fetchMask;             // [[color(n)]] the fragment stage reads
+    uint32_t _fetchDeclared;         // ... and declares (set 3 in the layout; no copies for declared-only ones)
     VkPipelineLayout _layout;
     vg_binding _vb[64], _fb[64];
     int _nvb, _nfb;
@@ -250,13 +277,19 @@ id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRende
         uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         NSData *vs = vg_translate([vf vgLL], "vertex", [vf vgFC], NULL, 0, &why);
         NSData *fs = ff && vs ? vg_translate([ff vgLL], "fragment", [ff vgFC], NULL, 0, &why) : nil;
-        uint32_t fetch = fs ? vg_spirv_fetch_mask(fs) : 0;
-        if (fetch) {
+        uint32_t declared = 0, fetch = fs ? vg_spirv_fetch_mask(fs, &declared) : 0;
+        if (declared) {
+            vglog("render pipeline %s: framebuffer inputs declared 0x%x, read 0x%x%s", p->_name.UTF8String, declared, fetch,
+                  fetch ? "" : " (no copies)");
+        }
+        if (declared) {
             size_t nw = 0;
             uint32_t *rw = nvmtl_spirv_fetch_to_texture(fs.bytes, fs.length / 4, &nw);
             if (rw && vg_fetch_layouts()) {
+                // Rewritten either way (declared inputs become sampled images at set 3); copies only for the read ones.
                 fs = [NSData dataWithBytesNoCopy:rw length:nw * 4 freeWhenDone:YES];
                 p->_fetchMask = fetch;
+                p->_fetchDeclared = declared;
             } else {
                 free(rw);
                 why = @"framebuffer fetch: the fragment module couldn't be rewritten for copies";
@@ -281,7 +314,7 @@ id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRende
             p->_dsl[1] = vg_set_layout(p->_fb, p->_nfb, VK_SHADER_STAGE_FRAGMENT_BIT);
             p->_dsl[2] = gEmptyLayout;
             p->_dsl[3] = gFetchLayout;
-            VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, p->_fetchMask ? 4 : 2,
+            VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, p->_fetchDeclared ? 4 : 2,
                                                p->_dsl, 0, NULL};
             vg_trace_sync("shader modules + set layouts");
             gVk.vkCreatePipelineLayout(gVk.device, &plci, NULL, &p->_layout);
@@ -577,9 +610,20 @@ static void vg_set_sampler(VGMTLCommandBuffer *cmd, vg_stage_bindings *t, id<MTL
             [_owner->_keep addObject:dst];
         }
         if (src) {
-            VkImageCopy r = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
-                             {MIN((uint32_t)src->_width, _area.extent.width), MIN((uint32_t)src->_height, _area.extent.height), 1}};
-            gVk.vkCmdCopyImage(cb, src->_image, VK_IMAGE_LAYOUT_GENERAL, dst->_image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+            // Only the scissor's pixels (5c): a fetch reads the fragment's own position, and fragments stay inside the
+            // scissor, so the rest of the scratch image is never read by this draw. Core Animation scissors its fetch
+            // draws to the layer; a full-screen copy per draw was most of a WindowServer frame.
+            int32_t x0 = MAX(_scissor.offset.x, 0), y0 = MAX(_scissor.offset.y, 0);
+            int32_t x1 = MIN(_scissor.offset.x + (int32_t)_scissor.extent.width,
+                             MIN((int32_t)src->_width, (int32_t)_area.extent.width));
+            int32_t y1 = MIN(_scissor.offset.y + (int32_t)_scissor.extent.height,
+                             MIN((int32_t)src->_height, (int32_t)_area.extent.height));
+            if (x1 > x0 && y1 > y0) {
+                VkImageCopy r = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {x0, y0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                 {x0, y0, 0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0), 1}};
+                gVk.vkCmdCopyImage(cb, src->_image, VK_IMAGE_LAYOUT_GENERAL, dst->_image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+                vg_perf(VG_PERF_FETCH, (uint64_t)(x1 - x0) * (y1 - y0) * 4, 0);
+            }
         }
         ii[nw] = (VkDescriptorImageInfo){VK_NULL_HANDLE, dst->_view, VK_IMAGE_LAYOUT_GENERAL};
         wr[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, VK_NULL_HANDLE, 192 + i, 0, 1,

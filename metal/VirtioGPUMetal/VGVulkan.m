@@ -19,6 +19,10 @@ NSString *vg_resource_path(const char *name) {
 }
 
 static int vg_vulkan_init_locked(void) {
+    // Fence waits through the kernel's interrupt instead of Venus' shared-memory fence feedback (5c): feedback is polled
+    // with short usleeps that macOS stretches under load (median small submit under WindowServer load: 8.3 ms with
+    // feedback, 5.8 ms without, tools/mtllat). A VN_PERF the process set itself wins.
+    setenv("VN_PERF", "no_fence_feedback", 0);
     NSString *path = vg_resource_path("libvulkan_virtio.dylib");
     void *lib = path ? dlopen(path.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL) : NULL;
     if (!lib) {

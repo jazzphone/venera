@@ -101,6 +101,9 @@ BOOL vg_spirv_has_push_constants(NSData *spv);   // DescriptorSet 0 -> newSet (N
 @interface VGMTLCommandBuffer : NSObject <MTLCommandBuffer> {
 @public
     VkCommandBuffer _cb;
+    VkCommandBuffer _pendingCb;   // deferred work submitted just ahead of _cb (5c), freed at completion
+    NSMutableData *_pendingOwned;
+    int _timePair;   // GPU timestamps (5c), -1 when off
     VkDescriptorPool _pools[64];
     int _npools;
     uint32_t _setsInPool;

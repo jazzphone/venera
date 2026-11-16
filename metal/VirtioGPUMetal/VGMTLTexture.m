@@ -68,9 +68,168 @@ VkFormat vg_vk_format(MTLPixelFormat f) {
     return v ? v->vk : VK_FORMAT_UNDEFINED;
 }
 
+// ---- staging pool (5c) ---------------------------------------------------------------------------------------------
+
+enum { kPoolMax = 48 };
+static const VkDeviceSize kPoolBytesMax = 192ull << 20;
+static pthread_mutex_t gPoolLock = PTHREAD_MUTEX_INITIALIZER;
+static vg_buffer gPool[kPoolMax];
+static int gPoolN;
+static VkDeviceSize gPoolBytes;
+
+int vg_staging_get(VkDeviceSize size, vg_buffer *out) {
+    pthread_mutex_lock(&gPoolLock);
+    int best = -1;
+    for (int i = 0; i < gPoolN; i++) {   // the smallest that fits, and not more than twice the size
+        if (gPool[i].size >= size && gPool[i].size <= 2 * size + 65536 && (best < 0 || gPool[i].size < gPool[best].size)) {
+            best = i;
+        }
+    }
+    if (best >= 0) {
+        *out = gPool[best];
+        gPoolBytes -= out->size;
+        gPool[best] = gPool[--gPoolN];
+        pthread_mutex_unlock(&gPoolLock);
+        vg_perf(VG_PERF_POOL_HIT, size, 0);
+        return 0;
+    }
+    pthread_mutex_unlock(&gPoolLock);
+    VkDeviceSize rounded = (size + 65535) & ~(VkDeviceSize)65535;   // sizes repeat (surfaces, glyph uploads): round
+    uint64_t t0 = vg_now();
+    int r = vg_buffer_create(rounded, out);
+    vg_perf(VG_PERF_POOL_MISS, rounded, vg_now() - t0);
+    return r;
+}
+
+void vg_staging_put(vg_buffer *b) {
+    if (!b->buffer) {
+        return;
+    }
+    pthread_mutex_lock(&gPoolLock);
+    if (gPoolN < kPoolMax && gPoolBytes + b->size <= kPoolBytesMax) {
+        gPool[gPoolN++] = *b;
+        gPoolBytes += b->size;
+        pthread_mutex_unlock(&gPoolLock);
+        memset(b, 0, sizeof(*b));
+        return;
+    }
+    pthread_mutex_unlock(&gPoolLock);
+    vg_buffer_destroy(b);
+}
+
+// ---- deferred work (5c) --------------------------------------------------------------------------------------------
+
+typedef struct {
+    int kind;   // 0 init, 1 copy
+    VkImage image;
+    VkImageAspectFlags aspect;
+    uint32_t mips, layers;
+    VkBuffer src;
+    VkBufferImageCopy copy;
+    vg_buffer staging;   // owned when .buffer is set
+} vg_pending_op;
+
+static pthread_mutex_t gPendingLock = PTHREAD_MUTEX_INITIALIZER;
+static vg_pending_op *gPending;
+static size_t gPendingCount, gPendingCap;
+
+static void vg_pending_push(const vg_pending_op *op) {
+    pthread_mutex_lock(&gPendingLock);
+    if (gPendingCount == gPendingCap) {
+        gPendingCap = gPendingCap ? gPendingCap * 2 : 64;
+        gPending = realloc(gPending, gPendingCap * sizeof(*gPending));
+    }
+    gPending[gPendingCount++] = *op;
+    pthread_mutex_unlock(&gPendingLock);
+}
+
+void vg_pending_init_image(VkImage image, VkImageAspectFlags aspect, uint32_t mips, uint32_t layers) {
+    vg_pending_op op = {0, image, aspect, mips, layers};
+    vg_pending_push(&op);
+}
+
+void vg_pending_copy(VkBuffer src, VkImage dst, const VkBufferImageCopy *c, const vg_buffer *staging) {
+    vg_pending_op op = {1, dst};
+    op.src = src;
+    op.copy = *c;
+    if (staging) {
+        op.staging = *staging;
+    }
+    vg_pending_push(&op);
+}
+
+void vg_pending_forget(VkImage image) {
+    pthread_mutex_lock(&gPendingLock);
+    size_t w = 0;
+    for (size_t i = 0; i < gPendingCount; i++) {
+        if (gPending[i].image == image) {
+            vg_staging_put(&gPending[i].staging);
+        } else {
+            gPending[w++] = gPending[i];
+        }
+    }
+    gPendingCount = w;
+    pthread_mutex_unlock(&gPendingLock);
+}
+
+BOOL vg_pending_record(VkCommandBuffer cb, NSMutableData **owned) {
+    pthread_mutex_lock(&gPendingLock);
+    size_t n = gPendingCount;
+    vg_pending_op *ops = n ? malloc(n * sizeof(*ops)) : NULL;
+    if (n) {
+        memcpy(ops, gPending, n * sizeof(*ops));
+    }
+    gPendingCount = 0;
+    pthread_mutex_unlock(&gPendingLock);
+    if (!n) {
+        return NO;
+    }
+    // Inits first (UNDEFINED -> GENERAL for life), then whatever came before this point is visible to the copies.
+    for (size_t i = 0; i < n; i++) {
+        if (ops[i].kind != 0) {
+            continue;
+        }
+        VkImageMemoryBarrier ib = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0,
+                                   VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                                   VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, ops[i].image,
+                                   {ops[i].aspect, 0, ops[i].mips, 0, ops[i].layers}};
+        gVk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0,
+                                 NULL, 1, &ib);
+    }
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT,
+                          VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
+    gVk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    NSMutableData *keep = [NSMutableData data];
+    for (size_t i = 0; i < n; i++) {
+        if (ops[i].kind == 1) {
+            gVk.vkCmdCopyBufferToImage(cb, ops[i].src, ops[i].image, VK_IMAGE_LAYOUT_GENERAL, 1, &ops[i].copy);
+            if (ops[i].staging.buffer) {
+                [keep appendBytes:&ops[i].staging length:sizeof(vg_buffer)];
+            }
+        }
+    }
+    VkMemoryBarrier after = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT,
+                             VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
+    gVk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &after, 0,
+                             NULL, 0, NULL);
+    vg_perf(VG_PERF_DEFERRED, n, 0);
+    free(ops);
+    *owned = keep.length ? keep : nil;
+    return YES;
+}
+
+void vg_pending_release(NSMutableData *owned) {
+    vg_buffer *b = owned.mutableBytes;
+    for (NSUInteger i = 0; i < owned.length / sizeof(vg_buffer); i++) {
+        vg_staging_put(&b[i]);
+    }
+}
+
 // ---- one-shot command buffers ------------------------------------------------------------------------------------
 
 BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
+    uint64_t t0 = vg_now();
     VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, gVk.pool,
                                       VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
     VkCommandBuffer cb = VK_NULL_HANDLE;
@@ -88,6 +247,8 @@ BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
                           VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
     gVk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
                              NULL, 0, NULL);
+    NSMutableData *owned = nil;
+    vg_pending_record(cb, &owned);   // deferred work first: it came before this
     record(cb);
     VkMemoryBarrier hb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT,
                           VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_READ_BIT};
@@ -110,6 +271,8 @@ BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
     pthread_mutex_lock(&gVk.lock);
     gVk.vkFreeCommandBuffers(gVk.device, gVk.pool, 1, &cb);
     pthread_mutex_unlock(&gVk.lock);
+    vg_pending_release(owned);
+    vg_perf(VG_PERF_ONESHOT, 0, vg_now() - t0);
     return r == VK_SUCCESS;
 }
 
@@ -130,6 +293,7 @@ BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
         return;   // a view: the image and its memory are the parent's
     }
     if (_image) {
+        vg_pending_forget(_image);
         gVk.vkDestroyImage(gVk.device, _image, NULL);
     }
     if (_memory) {
@@ -200,7 +364,7 @@ BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
     }
     NSUInteger size = bpi * (depth - 1) + bpr * (rows - 1) + region.size.width * f->bytes;
     vg_buffer staging;
-    if (vg_buffer_create(size, &staging)) {
+    if (vg_staging_get(size, &staging)) {
         return NO;
     }
     if (toImage) {
@@ -213,6 +377,12 @@ BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
     VkImage image = _image;
     vgtrace("texture: %s %ux%u level %lu, row length %u, %lu staging bytes", toImage ? "upload" : "readback",
             c.imageExtent.width, c.imageExtent.height, (unsigned long)level, c.bufferRowLength, (unsigned long)size);
+    if (toImage) {
+        // An upload: the bytes are in staging now (replaceRegion's contract), the GPU copy waits for the next submit.
+        vg_pending_copy(staging.buffer, image, &c, &staging);
+        vg_perf(VG_PERF_UPLOAD, size, 0);
+        return YES;
+    }
     BOOL ok = vg_one_shot(^(VkCommandBuffer cb) {
         if (toImage) {
             gVk.vkCmdCopyBufferToImage(cb, staging.buffer, image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
@@ -223,7 +393,7 @@ BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
     if (ok && !toImage) {
         memcpy(bytes, staging.map, size);
     }
-    vg_buffer_destroy(&staging);
+    vg_staging_put(&staging);
     return ok;
 }
 - (void)replaceRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes
@@ -359,15 +529,8 @@ id<MTLTexture> vg_new_texture(id<MTLDevice> device, MTLTextureDescriptor *d) {
     VkImage image = t->_image;
     VkImageAspectFlags aspect = f->aspect;
     uint32_t mips = (uint32_t)t->_mips, layers = (uint32_t)t->_layers;
-    BOOL ok = vg_one_shot(^(VkCommandBuffer cb) {   // UNDEFINED -> GENERAL, for life
-        VkImageMemoryBarrier ib = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0,
-                                   VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
-                                   VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, image,
-                                   {aspect, 0, mips, 0, layers}};
-        gVk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0,
-                                 NULL, 1, &ib);
-    });
-    return ok ? t : nil;
+    vg_pending_init_image(image, aspect, mips, layers);   // UNDEFINED -> GENERAL for life, ahead of the next submit
+    return t;
 }
 
 // ---- MTLSamplerState ---------------------------------------------------------------------------------------------
@@ -546,10 +709,7 @@ void vg_surface_pull(VGMTLTexture *t) {
         VkBufferImageCopy c = {t->_srcOffset, (uint32_t)(t->_srcBpr / bf->bytes), (uint32_t)t->_height,
                                {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
                                {(uint32_t)t->_width, (uint32_t)t->_height, 1}};
-        VkImage image = t->_image;
-        vg_one_shot(^(VkCommandBuffer cb) {
-            gVk.vkCmdCopyBufferToImage(cb, buf, image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
-        });
+        vg_pending_copy(buf, t->_image, &c, NULL);   // ahead of the next submit (the one that reads it)
         return;
     }
     if (!t || !t->_surface) {
@@ -561,18 +721,22 @@ void vg_surface_pull(VGMTLTexture *t) {
     }
     const vg_format *f = vg_format_of(t->_pixelFormat);
     NSUInteger rows = t->_height;
+    // The surface's bytes go into a staging buffer of their own now; the GPU copy waits for the next submit (5c: it
+    // was a one-shot, ~9 ms of WindowServer's time per pulled frame). t->_staging stays the write-back's.
+    uint64_t t0 = vg_now();
+    vg_buffer up;
+    if (vg_staging_get(t->_surfaceBpr * rows, &up)) {
+        return;
+    }
     IOSurfaceLock(t->_surface, kIOSurfaceLockReadOnly, &seed);
-    memcpy(t->_staging.map, IOSurfaceGetBaseAddressOfPlane(t->_surface, t->_plane), t->_surfaceBpr * rows);
+    memcpy(up.map, IOSurfaceGetBaseAddressOfPlane(t->_surface, t->_plane), t->_surfaceBpr * rows);
     IOSurfaceUnlock(t->_surface, kIOSurfaceLockReadOnly, NULL);
+    vg_perf(VG_PERF_PULL_COPY, t->_surfaceBpr * rows, vg_now() - t0);
     VkBufferImageCopy c = {0, (uint32_t)(t->_surfaceBpr / f->bytes), (uint32_t)rows,
                            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
                            {(uint32_t)t->_width, (uint32_t)rows, 1}};
-    VkBuffer buf = t->_staging.buffer;
-    VkImage image = t->_image;
     vgtrace("surface %u: pull (seed %u, had %u)", IOSurfaceGetID(t->_surface), seed, t->_syncedSeed);
-    vg_one_shot(^(VkCommandBuffer cb) {
-        gVk.vkCmdCopyBufferToImage(cb, buf, image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
-    });
+    vg_pending_copy(up.buffer, t->_image, &c, &up);
     t->_syncedSeed = seed;
     t->_neverSynced = NO;
 }
@@ -611,10 +775,39 @@ id<MTLTexture> vg_new_surface_texture(id<MTLDevice> device, MTLTextureDescriptor
               IOSurfaceGetBytesPerElementOfPlane(surface, plane));
         return nil;
     }
-    VGMTLTexture *t = (VGMTLTexture *)vg_new_texture(device, d);
+    // One GPU image per IOSurface plane in this process (5c). Every wrapper Core Animation makes of the same surface
+    // is a view of the first one, so GPU reads see GPU writes in queue order. With a private image per wrapper, synced
+    // only through the surface's CPU memory, a second wrapper could be read before the first one's write-back landed:
+    // WindowServer copied stale pixels forward (old window pieces left behind, flicker) once frames overlapped.
+    static NSMapTable<NSString *, VGMTLTexture *> *roots;
+    static pthread_mutex_t rootsLock = PTHREAD_MUTEX_INITIALIZER;
+    NSString *key = [NSString stringWithFormat:@"%u/%lu/%lux%lu", IOSurfaceGetID(surface), (unsigned long)plane,
+                                               (unsigned long)d.width, (unsigned long)d.height];
+    pthread_mutex_lock(&rootsLock);
+    if (!roots) {
+        roots = [NSMapTable strongToWeakObjectsMapTable];
+    }
+    VGMTLTexture *root = [roots objectForKey:key];
+    if (root && root->_surface == surface) {
+        pthread_mutex_unlock(&rootsLock);
+        id<MTLTexture> v = vg_texture_view(root, d.pixelFormat, MTLTextureType2D, NSMakeRange(0, 1), NSMakeRange(0, 1));
+        if (v) {
+            ((VGMTLTexture *)v)->_usage = d.usage;
+            vg_surface_pull(root);   // what the surface holds now, if someone else changed it
+        }
+        return v;
+    }
+    // The first wrapper: its image can be anything a later wrapper needs (render target, storage, other formats).
+    MTLTextureDescriptor *rd = [d copy];
+    rd.usage = d.usage | MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+    VGMTLTexture *t = (VGMTLTexture *)vg_new_texture(device, rd);
     if (!t || vg_buffer_create(bpr * d.height, &t->_staging)) {
+        pthread_mutex_unlock(&rootsLock);
         return nil;
     }
+    t->_usage = d.usage;
+    [roots setObject:t forKey:key];
+    pthread_mutex_unlock(&rootsLock);
     t->_surface = (IOSurfaceRef)CFRetain(surface);
     t->_plane = plane;
     t->_surfaceBpr = bpr;

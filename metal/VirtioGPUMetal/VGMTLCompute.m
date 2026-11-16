@@ -920,6 +920,7 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL,
                                    VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
     gVk.vkBeginCommandBuffer(_cb, &bi);
+    _timePair = vg_gpu_time_begin(_cb);
     return YES;
 }
 
@@ -970,7 +971,7 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
     align = MAX(align, 16);
     VkDeviceSize at = (_arenaUsed + align - 1) & ~(align - 1);
     if (!_narena || at + len > _arena[_narena - 1].size) {
-        if (_narena == 64 || vg_buffer_create(MAX(65536, len), &_arena[_narena])) {
+        if (_narena == 64 || vg_staging_get(MAX(65536, len), &_arena[_narena])) {
             return NO;
         }
         _narena++;
@@ -1043,9 +1044,17 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
 
 - (void)finishWith:(MTLCommandBufferStatus)status fence:(VkFence)fence {
     VGCALL("cb %p completing, status %lu", self, (unsigned long)status);
+    uint64_t dequeued = vg_now();
+    if (_submitted) {
+        vg_perf(VG_PERF_CB_QUEUE, 0, dequeued - _submitted);
+    }
     if (fence) {
         gVk.vkWaitForFences(gVk.device, 1, &fence, VK_TRUE, UINT64_MAX);
         gVk.vkDestroyFence(gVk.device, fence, NULL);
+        vg_perf(VG_PERF_CB_WAIT, 0, vg_now() - dequeued);
+        if (_cb) {
+            vg_gpu_time_collect(_timePair);
+        }
     }
     _completed = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     if (_cb) {
@@ -1054,20 +1063,33 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
         pthread_mutex_unlock(&gVk.lock);
         _cb = VK_NULL_HANDLE;
     }
+    if (_pendingCb) {
+        pthread_mutex_lock(&gVk.lock);
+        gVk.vkFreeCommandBuffers(gVk.device, gVk.pool, 1, &_pendingCb);
+        pthread_mutex_unlock(&gVk.lock);
+        _pendingCb = VK_NULL_HANDLE;
+    }
+    vg_pending_release(_pendingOwned);
+    _pendingOwned = nil;
     for (int i = 0; i < _npools; i++) {
         gVk.vkDestroyDescriptorPool(gVk.device, _pools[i], NULL);
     }
     _npools = 0;
     for (int i = 0; i < _narena; i++) {
-        vg_buffer_destroy(&_arena[i]);
+        vg_staging_put(&_arena[i]);   // back to the pool (5c)
     }
     _narena = 0;
+    if (_submitted) {
+        vg_perf(VG_PERF_CB, 0, _completed - _submitted);
+    }
     if (status == MTLCommandBufferStatusCompleted) {
         for (VGMTLTexture *t in _surfacesWritten) {
+            uint64_t t0 = vg_now();
             IOSurfaceLock(t->_surface, 0, NULL);
             memcpy(IOSurfaceGetBaseAddressOfPlane(t->_surface, t->_plane), t->_staging.map, t->_surfaceBpr * t->_height);
             uint32_t seed = 0;
             IOSurfaceUnlock(t->_surface, 0, &seed);
+            vg_perf(VG_PERF_WB_COPY, t->_surfaceBpr * t->_height, vg_now() - t0);
             t->_syncedSeed = seed;   // our own write: no pull needed for it
             t->_neverSynced = NO;
         }
@@ -1122,10 +1144,39 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
         if (_surfacesWritten.count) {
             [self barrier];
         }
+        vg_gpu_time_end(_cb, _timePair);
         gVk.vkEndCommandBuffer(_cb);
+        // Deferred work (new images, uploads, buffer-texture refreshes) in its own command buffer, ahead of ours.
+        VkCommandBuffer cbs[2];
+        uint32_t ncb = 0;
+        VkCommandBufferAllocateInfo pai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, gVk.pool,
+                                           VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+        pthread_mutex_lock(&gVk.lock);
+        VkResult pr = gVk.vkAllocateCommandBuffers(gVk.device, &pai, &_pendingCb);
+        pthread_mutex_unlock(&gVk.lock);
+        if (pr == VK_SUCCESS) {
+            VkCommandBufferBeginInfo pbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL,
+                                            VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
+            gVk.vkBeginCommandBuffer(_pendingCb, &pbi);
+            NSMutableData *owned = nil;
+            BOOL any = vg_pending_record(_pendingCb, &owned);
+            _pendingOwned = owned;
+            gVk.vkEndCommandBuffer(_pendingCb);
+            if (any) {
+                cbs[ncb++] = _pendingCb;
+            } else {
+                pthread_mutex_lock(&gVk.lock);
+                gVk.vkFreeCommandBuffers(gVk.device, gVk.pool, 1, &_pendingCb);
+                pthread_mutex_unlock(&gVk.lock);
+                _pendingCb = VK_NULL_HANDLE;
+            }
+        } else {
+            _pendingCb = VK_NULL_HANDLE;
+        }
+        cbs[ncb++] = _cb;
         VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         gVk.vkCreateFence(gVk.device, &fci, NULL, &fence);
-        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &_cb, 0, NULL};
+        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, ncb, cbs, 0, NULL};
         pthread_mutex_lock(&gVk.lock);
         VkResult r = gVk.vkQueueSubmit(gVk.queue, 1, &si, fence);
         pthread_mutex_unlock(&gVk.lock);
@@ -1166,7 +1217,24 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
 
 - (void)waitUntilScheduled { }
 // Core Animation in WindowServer commits this way (5b: lenient mode swallowed it, and its frames were never submitted).
-- (void)commitAndWaitUntilSubmitted { [self commit]; }
+// ... and then hands the frame's IOSurface to the display pipe, which copies the surface's CPU memory: the write-back
+// must have landed by then (5c: when it returned at once, the pipe could show a surface before its last frame was in
+// it, and pieces of old frames stayed on screen). So a command buffer that wrote IOSurfaces returns only once they
+// are written back. VGMTL_NOWAIT_SUBMIT=1 returns at once again.
+- (void)commitAndWaitUntilSubmitted {
+    static int nowait = -1;
+    if (nowait < 0) {
+        const char *e = getenv("VGMTL_NOWAIT_SUBMIT");
+        nowait = e && e[0] == '1';
+    }
+    BOOL wroteSurfaces = _surfacesWritten.count > 0;
+    [self commit];
+    if (wroteSurfaces && !nowait) {
+        uint64_t t0 = vg_now();
+        dispatch_group_wait(_done, DISPATCH_TIME_FOREVER);
+        vg_perf(VG_PERF_SUBMIT_WAIT, 0, vg_now() - t0);
+    }
+}
 - (NSMutableDictionary *)userDictionary {
     @synchronized(self) {
         NSMutableDictionary *d = objc_getAssociatedObject(self, @selector(userDictionary));
