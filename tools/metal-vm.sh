@@ -10,10 +10,15 @@ install)
   set -e
   rm -rf /tmp/vgmetal && mkdir -p /tmp/vgmetal && tar -xzf $X/vgmetal.tgz -C /tmp/vgmetal
   mkdir -p /Library/GPUBundles $T
-  rm -rf /Library/GPUBundles/VirtioGPUMetal.bundle
-  mv /tmp/vgmetal/VirtioGPUMetal.bundle /Library/GPUBundles/
-  chown -R root:wheel /Library/GPUBundles/VirtioGPUMetal.bundle
-  chmod -R go-w,a+rX /Library/GPUBundles/VirtioGPUMetal.bundle
+  if [ -L /Library/GPUBundles/VirtioGPUMetal.bundle ]; then
+    # 5d: the driver lives on the system volume (packaging/sysvol.sh): a new copy there, a new snapshot, a reboot
+    sh $X/sysvol.sh install /tmp/vgmetal/VirtioGPUMetal.bundle && echo "on the system volume: reboot to load it"
+  else
+    rm -rf /Library/GPUBundles/VirtioGPUMetal.bundle
+    mv /tmp/vgmetal/VirtioGPUMetal.bundle /Library/GPUBundles/
+    chown -R root:wheel /Library/GPUBundles/VirtioGPUMetal.bundle
+    chmod -R go-w,a+rX /Library/GPUBundles/VirtioGPUMetal.bundle
+  fi
   for f in /tmp/vgmetal/*; do [ -d "$f" ] || cp "$f" $T/; done && chmod 755 $T $T/mtl* $T/acceltest && chmod 644 $T/*.metallib
   sudo -u _windowserver test -r /Library/GPUBundles/VirtioGPUMetal.bundle/Contents/MacOS/VirtioGPUMetal && echo "readable by _windowserver"
   ls -la /Library/GPUBundles /Library/GPUBundles/VirtioGPUMetal.bundle/Contents/*
