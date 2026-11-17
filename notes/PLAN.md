@@ -1366,3 +1366,22 @@ Checked without changing the host or installing anything in VM 108 (tools/vtprob
   process's sandbox lets it open the user client -- unverified) hardware decoding through Apple's own code. There is
   no route to the host GPU's decoder without a host change: the host's virglrenderer has no Vulkan video, its Intel
   Vulkan driver decodes only with ANV_DEBUG=video-decode, and QEMU leaves virgl's VA-API path off.
+
+### GPU video decode: the design (2026-11-17, owner's OK for the host part)
+
+The owner approved: `intel-media-va-driver` installed on the host (done: 25.2.3 + libigdgmm12, nothing else changed),
+our program under /root, VM 108's config. Proxmox's own packages stay as shipped.
+
+- **Guest kext** (new, injected like the others): provides the IOService class `AppleVideoToolboxParavirtualizationDriver`
+  that Intel macOS ships no code for, with the user client VideoToolboxParavirtualizationSupport expects -- scalar 0
+  (send-buffer size in; 3 values out), struct 1/2 (guest UUID), scalar 3 (send: length + up to 5 IOSurface IDs, one
+  value out), scalar 4 (host message consumed), host messages through an IODataQueue + notification port. IOSurface
+  IDs become surfaces with `IOSurfaceRoot::lookupSurface(id, task)` (exported by com.apple.iokit.IOSurface); decoded
+  frames are copied into them.
+- **Transport**: `ivshmem-doorbell` (in the host's QEMU 11.1): a shared memory region plus interrupts both ways,
+  served by our host program over a UNIX socket. VM 108's memory setup stays as it is; its config gains one chardev
+  and one device.
+- **Host program** (/root/vgpu): the ivshmem server, the host side of Apple's protocol (the Mac's VideoToolbox host
+  session is the reference: tools/pvhost.m), and decoding with FFmpeg over VA-API on the Iris Xe, frames written to
+  the shared region. Runtime needs only what the host has (libva2, libva-drm2, libdrm2, glibc 2.41). Built on the Mac
+  in a Debian amd64 container with its own minimal FFmpeg (H.264, HEVC, AV1, VP9 decoders + VA-API), shipped beside it.
