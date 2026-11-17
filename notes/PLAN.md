@@ -1345,3 +1345,24 @@ Measured on VM 108 (snapshots `pre-core057` and earlier):
 - **Intel's route**: GPU kexts advertise `IOGVACodec` (Gen95, Gen11), `IOVARendererID`, `IOGVAHEVCDecode`; AppleGVA
   then loads Apple's Intel decoder bundles, which drive Intel hardware directly: no way in without reverse engineering
   AppleGVA's private plugin interface.
+
+### GPU video decode: the guest side works (2026-11-16)
+
+Checked without changing the host or installing anything in VM 108 (tools/vtprobe.m, tools/pvshim.c, tools/pvhost.m):
+
+- Intel Tahoe's VideoToolbox has Apple's whole paravirtualized-video stack (decoder and encoder). It reaches its driver
+  only through VideoToolboxParavirtualizationSupport.framework, which opens `AppleVideoToolboxParavirtualizationDriver`
+  (user client: scalar 0 = buffer size in, 3 values out; struct 1/2 = register/deregister a 16-byte guest UUID; a send
+  of iovecs; scalar 4 after each host message; host-to-guest messages in an IODataQueue with a notification port,
+  handed to three blocks: alloc(capacity, &msg, &buf), deliver(msg, len), release(msg)).
+- pvshim interposes those four functions in one process. VideoToolbox then says it runs in a guest, registers a UUID
+  and asks the host for its decoders (`vtpv` `decs`, 68 bytes). Apple's own host side -- in this Mac's VideoToolbox
+  (VTParavirtualizationHostSessionCreate / DeliverMessageFromGuest; messages are CMBlockBuffers of boxes and binary
+  plists) -- answers it (1399 bytes); given that answer, the guest lists paravirtualized hardware decoders for H.264,
+  HEVC, AV1, VP9, ProRes and JPEG, and every session, the default one included, asks for the paravirtualized H.264
+  decoder first (`+dec`, codec avc1, decoder id avd.avc, guest build) and falls back to software only when nobody
+  answers. The Mac's host session accepts that request too (a real decoder session; `-dec` closes it).
+- So a kext of ours providing that service, plus something answering on the host, gives every app (Safari, if its GPU
+  process's sandbox lets it open the user client -- unverified) hardware decoding through Apple's own code. There is
+  no route to the host GPU's decoder without a host change: the host's virglrenderer has no Vulkan video, its Intel
+  Vulkan driver decodes only with ANV_DEBUG=video-decode, and QEMU leaves virgl's VA-API path off.
