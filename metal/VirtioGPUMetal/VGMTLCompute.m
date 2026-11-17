@@ -917,10 +917,13 @@ static VGMTLTexture *vg_blit_texture(VGMTLCommandBuffer *cmd, id<MTLTexture> t, 
     }
     VGMTLTexture *v = (VGMTLTexture *)t;
     [cmd->_keep addObject:v];
+    // A copy into a surface may cover only part of it, and the write-back at completion writes all of it: the image
+    // must hold what the surface does first, or what the CPU drew outside the copied region is overwritten with stale
+    // pixels (5d: Safari's page, grown from 466 to 608 rows by a GPU copy of the old rows, lost the CPU-painted strip
+    // below them for good -- a black band). A pull is nothing when the surface hasn't changed.
+    vg_surface_pull(v);
     if (writes) {
         vg_cmd_wrote(cmd, v);
-    } else {
-        vg_surface_pull(v);
     }
     return v;
 }
@@ -957,7 +960,11 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
        destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dorg
                 options:(MTLBlitOption)opt {
     VkBuffer s = vg_vkbuffer(src);
-    VGMTLTexture *d = vg_blit_texture(_owner, dst, YES);
+    VGMTLTexture *d = vg_blit_texture(_owner, dst, NO);   // pulled; written where it lands
+    if (d) {
+        vg_cmd_wrote_rect(_owner, d, (int32_t)dorg.x, (int32_t)dorg.y, (int32_t)(dorg.x + size.width),
+                          (int32_t)(dorg.y + size.height));
+    }
     NSUInteger bpp = d ? vg_bytes_per_pixel(d->_pixelFormat) : 0;
     if (!s || !d || !bpp || ![_owner begin]) {
         [_owner fail:@"copyFromBuffer:toTexture: not our objects or format"];
@@ -979,11 +986,13 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
 - (void)copyFromTexture:(id<MTLTexture>)src sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl
            sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)size toTexture:(id<MTLTexture>)dst
        destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dorg {
-    VGMTLTexture *s = vg_blit_texture(_owner, src, NO), *d = vg_blit_texture(_owner, dst, YES);
+    VGMTLTexture *s = vg_blit_texture(_owner, src, NO), *d = vg_blit_texture(_owner, dst, NO);
     if (!s || !d || ![_owner begin]) {
         [_owner fail:@"copyFromTexture:toTexture: not our textures"];
         return;
     }
+    vg_cmd_wrote_rect(_owner, d, (int32_t)dorg.x, (int32_t)dorg.y, (int32_t)(dorg.x + size.width),
+                      (int32_t)(dorg.y + size.height));
     VkImageCopy r = {vg_layers(s, ss, sl), {(int32_t)so.x, (int32_t)so.y, (int32_t)so.z}, vg_layers(d, ds, dl),
                      {(int32_t)dorg.x, (int32_t)dorg.y, (int32_t)dorg.z},
                      {(uint32_t)size.width, (uint32_t)size.height, (uint32_t)MAX(size.depth, 1u)}};
@@ -1001,6 +1010,8 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
          destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
 }
 @end
+
+static BOOL vg_dirty_rect(VGMTLCommandBuffer *c, VGMTLTexture *t, int32_t r[4]);
 
 @implementation VGMTLCommandBuffer
 @synthesize device = _device, commandQueue = _commandQueue, label = _label;
@@ -1339,18 +1350,42 @@ static void vg_surface_debug(VGMTLTexture *t) {
                 continue;   // its staging couldn't be had at commit
             }
             uint64_t t0 = vg_now();
+            int32_t dr[4];
+            vg_dirty_rect(self, t, dr);
+            NSUInteger px = IOSurfaceGetBytesPerElementOfPlane(t->_surface, t->_plane);
             IOSurfaceLock(t->_surface, 0, NULL);
-            memcpy(IOSurfaceGetBaseAddressOfPlane(t->_surface, t->_plane), t->_staging.map, t->_surfaceBpr * t->_height);
+            // Did anyone else write the surface since we last pulled it? Then the rest of it is newer than our image,
+            // and the next bind must pull it (5d): marking it synced kept Safari's page image without what WebKit had
+            // painted on the CPU meanwhile, and Core Animation drew that part black.
+            const BOOL othersWrote = !t->_neverSynced && IOSurfaceGetSeed(t->_surface) != t->_syncedSeed;
+            uint8_t *base = IOSurfaceGetBaseAddressOfPlane(t->_surface, t->_plane);
+            const uint8_t *from = t->_staging.map;
+            size_t bytes = 0;
+            if (dr[0] == 0 && dr[2] == (int32_t)t->_width) {   // whole rows: one copy
+                size_t off = (size_t)dr[1] * t->_surfaceBpr;
+                bytes = (size_t)(dr[3] - dr[1]) * t->_surfaceBpr;
+                memcpy(base + off, from + off, bytes);
+            } else {
+                size_t rowBytes = (size_t)(dr[2] - dr[0]) * px;
+                for (int32_t y = dr[1]; y < dr[3]; y++) {
+                    size_t off = (size_t)y * t->_surfaceBpr + (size_t)dr[0] * px;
+                    memcpy(base + off, from + off, rowBytes);
+                }
+                bytes = rowBytes * (size_t)(dr[3] - dr[1]);
+            }
             uint32_t seed = 0;
             IOSurfaceUnlock(t->_surface, 0, &seed);
-            vg_perf(VG_PERF_WB_COPY, t->_surfaceBpr * t->_height, vg_now() - t0);
-            t->_syncedSeed = seed;   // our own write: no pull needed for it
-            t->_neverSynced = NO;
+            vg_perf(VG_PERF_WB_COPY, bytes, vg_now() - t0);
+            if (!othersWrote) {
+                t->_syncedSeed = seed;   // our own write: no pull needed for it
+                t->_neverSynced = NO;
+            }
             vg_surface_wrote_back(t, seed);   // and none for a process sharing this image (5d)
             vg_surface_debug(t);
         }
     }
     [_surfacesWritten removeAllObjects];
+    _surfaceDirty = nil;
     for (id<MTLDrawable> d in _drawables) {
         [d present];
     }
@@ -1448,12 +1483,22 @@ static void vg_surface_debug(VGMTLTexture *t) {
             } else {
                 _allTwinned = NO;
             }
+            int32_t dr[4];
+            if (!vg_dirty_rect(self, t, dr)) {   // stored, but nothing drawn into it: nothing to copy out
+                if (!noWriteBack) {
+                    noWriteBack = [NSMutableSet set];
+                }
+                [noWriteBack addObject:t];
+                continue;
+            }
             if (!t->_staging.buffer && vg_staging_get(t->_surfaceBpr * t->_height, &t->_staging)) {
                 continue;   // no memory for its write-back (logged by the pool)
             }
             NSUInteger px = IOSurfaceGetBytesPerElementOfPlane(t->_surface, t->_plane);
-            VkBufferImageCopy c = {0, (uint32_t)(t->_surfaceBpr / px), (uint32_t)t->_height,
-                                   {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {(uint32_t)t->_width, (uint32_t)t->_height, 1}};
+            VkBufferImageCopy c = {(VkDeviceSize)dr[1] * t->_surfaceBpr + (VkDeviceSize)dr[0] * px,
+                                   (uint32_t)(t->_surfaceBpr / px), (uint32_t)t->_height,
+                                   {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {dr[0], dr[1], 0},
+                                   {(uint32_t)(dr[2] - dr[0]), (uint32_t)(dr[3] - dr[1]), 1}};
             gVk.vkCmdCopyImageToBuffer(_cb, t->_image, VK_IMAGE_LAYOUT_GENERAL, t->_staging.buffer, 1, &c);
         }
         if (noWriteBack) {
@@ -1645,11 +1690,49 @@ static void vg_present_throttle(VGMTLCommandBuffer *cb) {
 }
 @end
 
-void vg_cmd_wrote(id cmd, VGMTLTexture *t) {
+// What a command buffer wrote of a surface (5d): only that rectangle is copied out at completion. Copying all of it
+// put the image's stale copy over what the CPU had drawn elsewhere in the surface meanwhile -- a GPU pass drew Safari's
+// animated cells into its page surface while WebKit painted the rest on the CPU, and on a cold start, when the timing
+// fell that way, the rest of the page stayed black. On a Mac the GPU writes only the pixels it draws. An empty
+// rectangle (a pass that stored but drew nothing) copies nothing.
+void vg_cmd_wrote_rect(id cmd, VGMTLTexture *t, int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
     while (t && t->_parent) {
         t = t->_parent;   // a view writes its texture
     }
-    if (t && t->_surface) {
-        [((VGMTLCommandBuffer *)cmd)->_surfacesWritten addObject:t];
+    if (!t || !t->_surface) {
+        return;
     }
+    VGMTLCommandBuffer *c = cmd;
+    [c->_surfacesWritten addObject:t];
+    if (!c->_surfaceDirty) {
+        c->_surfaceDirty = [NSMutableDictionary dictionary];
+    }
+    int32_t w = (int32_t)t->_width, h = (int32_t)t->_height;
+    x0 = MAX(x0, 0), y0 = MAX(y0, 0), x1 = MIN(x1, w), y1 = MIN(y1, h);
+    NSValue *k = [NSValue valueWithPointer:(__bridge void *)t];
+    NSData *old = c->_surfaceDirty[k];
+    int32_t r[4] = {x0, y0, x1, y1};
+    if (old) {
+        const int32_t *o = old.bytes;
+        BOOL oldEmpty = o[2] <= o[0] || o[3] <= o[1], newEmpty = x1 <= x0 || y1 <= y0;
+        if (newEmpty) {
+            memcpy(r, o, sizeof(r));
+        } else if (!oldEmpty) {
+            r[0] = MIN(o[0], x0), r[1] = MIN(o[1], y0), r[2] = MAX(o[2], x1), r[3] = MAX(o[3], y1);
+        }
+    }
+    c->_surfaceDirty[k] = [NSData dataWithBytes:r length:sizeof(r)];
+}
+void vg_cmd_wrote(id cmd, VGMTLTexture *t) {
+    vg_cmd_wrote_rect(cmd, t, 0, 0, INT32_MAX, INT32_MAX);
+}
+// The written rectangle of t in this command buffer (all of it when nothing says otherwise); NO when it is empty.
+static BOOL vg_dirty_rect(VGMTLCommandBuffer *c, VGMTLTexture *t, int32_t r[4]) {
+    NSData *d = c->_surfaceDirty[[NSValue valueWithPointer:(__bridge void *)t]];
+    if (!d) {
+        r[0] = 0, r[1] = 0, r[2] = (int32_t)t->_width, r[3] = (int32_t)t->_height;
+        return YES;
+    }
+    memcpy(r, d.bytes, 4 * sizeof(int32_t));
+    return r[2] > r[0] && r[3] > r[1];
 }

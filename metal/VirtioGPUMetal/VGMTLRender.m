@@ -495,6 +495,7 @@ id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRende
     VGMTLDepthStencilState *_ds;
     uint32_t _stencilRef[2];   // front, back (5d)
     BOOL _depthClamp;          // setDepthClipMode: clamp (5d)
+    int32_t _drawn[4];         // what the draws could touch (their scissors' union, x0 y0 x1 y1): a surface's written part
     float _blend[4];
     BOOL _open;
     // the pass, kept so rendering can be ended and resumed around a framebuffer-fetch copy
@@ -722,6 +723,15 @@ static BOOL vg_passlog(void) {
     return on;
 }
 - (BOOL)prepareDraw:(MTLPrimitiveType)type {
+    {
+        int32_t x0 = MAX(_scissor.offset.x, 0), y0 = MAX(_scissor.offset.y, 0);
+        int32_t x1 = MIN(_scissor.offset.x + (int32_t)_scissor.extent.width, (int32_t)_area.extent.width);
+        int32_t y1 = MIN(_scissor.offset.y + (int32_t)_scissor.extent.height, (int32_t)_area.extent.height);
+        if (x1 > x0 && y1 > y0) {
+            _drawn[0] = MIN(_drawn[0], x0), _drawn[1] = MIN(_drawn[1], y0);
+            _drawn[2] = MAX(_drawn[2], x1), _drawn[3] = MAX(_drawn[3], y1);
+        }
+    }
     if (vg_passlog()) {
         if (!_dbgPipes) {
             _dbgPipes = [NSMutableOrderedSet orderedSet];
@@ -1308,6 +1318,13 @@ static int vg_dbg_next_read(void) { return gDbgReads + 1; }
     }
 }
 - (void)endEncoding {
+    if (_open && _drawn[2] > _drawn[0]) {
+        for (uint32_t i = 0; i < _ncolor; i++) {
+            if (_colorTex[i] && _colorInfo[i].storeOp != VK_ATTACHMENT_STORE_OP_DONT_CARE) {
+                vg_cmd_wrote_rect(_owner, _colorTex[i], _drawn[0], _drawn[1], _drawn[2], _drawn[3]);
+            }
+        }
+    }
     if (_open && vg_passlog()) {
         static int n;
         if (n++ < 400) {
@@ -1429,14 +1446,16 @@ static VkAttachmentStoreOp vg_store(MTLStoreAction a) {
             }
             [_keep addObject:target];
         }
-        if (c.loadAction == MTLLoadActionLoad) {
+        // A surface's attachment with "don't care" keeps what it holds (5d): the pass may draw only part of it, and
+        // the write-back copies the whole rectangle its draws could touch, so the rest of that must be what the
+        // surface holds, not leftovers.
+        // (An immediate-mode GPU's "don't care" keeps the pixels too, and apps written on one can count on it.)
+        const BOOL surfaceKeep = c.loadAction == MTLLoadActionDontCare && (t->_surface || (t->_parent && t->_parent->_surface));
+        if (c.loadAction == MTLLoadActionLoad || surfaceKeep) {
             vg_surface_pull(t);
         }
-        if (c.storeAction != MTLStoreActionDontCare) {
-            vg_cmd_wrote(self, t);
-        }
         color[i].imageView = target->_view;
-        color[i].loadOp = vg_load(c.loadAction);
+        color[i].loadOp = surfaceKeep ? VK_ATTACHMENT_LOAD_OP_LOAD : vg_load(c.loadAction);
         color[i].storeOp = vg_store(c.storeAction);
         // Multisample resolve (5d): into the resolve texture (its level and slice), averaged, or sample 0 for integers
         if (c.resolveTexture && (c.storeAction == MTLStoreActionMultisampleResolve ||
@@ -1521,6 +1540,16 @@ static VkAttachmentStoreOp vg_store(MTLStoreAction a) {
         e->_colorTex[i] = (VGMTLTexture *)d.colorAttachments[i].texture;
     }
     e->_ncolor = ncolor;
+    // A surface's written part (5d): a cleared one all of the pass's area, a loaded one what the draws touch (added at
+    // endEncoding). Writing back more put stale pixels over what the CPU drew there meanwhile.
+    e->_drawn[0] = e->_drawn[1] = INT32_MAX, e->_drawn[2] = e->_drawn[3] = INT32_MIN;
+    for (uint32_t i = 0; i < ncolor; i++) {
+        MTLRenderPassColorAttachmentDescriptor *c = d.colorAttachments[i];
+        if (c.texture && c.storeAction != MTLStoreActionDontCare) {
+            BOOL all = c.loadAction == MTLLoadActionClear;
+            vg_cmd_wrote_rect(self, (VGMTLTexture *)c.texture, 0, 0, all ? (int32_t)w : 0, all ? (int32_t)h : 0);
+        }
+    }
     e->_depthInfo = depth;
     e->_depthTex = dt;
     e->_stencilInfo = stencil;

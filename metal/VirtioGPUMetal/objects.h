@@ -88,6 +88,7 @@ void vg_texture_share_dealloc(VGMTLTexture *t);
 void vg_surface_pull(VGMTLTexture *t);
 // Records that `cmd` writes texture `t`: a surface texture is copied back to its IOSurface when `cmd` completes.
 void vg_cmd_wrote(id cmd, VGMTLTexture *t);
+void vg_cmd_wrote_rect(id cmd, VGMTLTexture *t, int32_t x0, int32_t y0, int32_t x1, int32_t y1);
 // Display-surface twins (5c): make and register one for a root surface texture that qualifies (WindowServer, BGRA,
 // screen-sized); forget it (the kext first) before the texture goes.
 BOOL vg_twin_ensure(VGMTLTexture *t);
@@ -166,6 +167,7 @@ BOOL vg_spirv_has_push_constants(NSData *spv);   // DescriptorSet 0 -> newSet (N
     NSError *_error;
     uint64_t _submitted, _completed;
     NSMutableSet *_surfacesWritten;   // VGMTLTexture with an IOSurface, copied out at completion
+    NSMutableDictionary *_surfaceDirty;   // each one's written rectangle (x0 y0 x1 y1, int32): only that is copied out
     NSMutableArray *_drawables;       // presented after the copy-out
     NSMutableArray *_signals;         // [event, value]: signaled at completion, after the write-back (5d)
     NSMutableArray *_waits;           // [event, value]: shared events waited for at commit (5d)

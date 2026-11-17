@@ -55,10 +55,10 @@ if [ -d /System/Library/Extensions/VirtioGPUMetal.bundle ]; then
 fi
 run rm -rf /Library/GPUBundles/VirtioGPUMetal.bundle /Library/GPUBundles/Venera
 for f in /Library/GPUBundles/VirtioGPUMetal-*; do [ -e "$f" ] && run rm -f "$f"; done
-# translated shaders and display snapshots WindowServer kept (its Darwin cache folder)
-for d in /private/var/folders/*/*/C/WindowServer/local.homelab.VirtioGPUMetal; do
-  [ -d "$d" ] && run rm -rf "$d"
-done
+# translated shaders (and WindowServer's display snapshots) every process kept, in its own cache folder
+while IFS= read -r d; do
+  [ -n "$d" ] && [ -d "$d" ] && run rm -rf "$d"
+done < <(find /private/var/folders /Users/*/Library/Containers -type d -name local.homelab.VirtioGPUMetal -prune 2>/dev/null)
 run rm -rf "/Library/Application Support/Venera"
 
 # ---- the Auxiliary KC ----------------------------------------------------------------------------------------------
@@ -118,7 +118,7 @@ if [ $NO_OC = 0 ]; then
     OCARGS=$(pl -extract "NVRAM.Add.$GUID.boot-args" raw -o - 2>/dev/null)
     NEW=
     for a in $OCARGS; do
-      case $a in vgpuaccel=* | vgpuflipms=* | -vgpu*) ;; *) NEW="$NEW $a" ;; esac
+      case $a in vgpuaccel=* | vgpuflipms=* | vgpugl=* | -vgpu*) ;; *) NEW="$NEW $a" ;; esac
     done
     run pl -replace "NVRAM.Add.$GUID.boot-args" -string "${NEW# }"
     [ $DRY = 1 ] || plutil -lint "$CONFIG" >/dev/null || {

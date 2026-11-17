@@ -4,6 +4,7 @@
 #   qmpinput.py VMID drag X0 Y0 SECONDS [RADIUS]     press at (X0, Y0), move in circles, release
 #   qmpinput.py VMID scroll X Y SECONDS [DIRECTION [DZ]]  wheel ticks every 16 ms over (X, Y) (down or up, DZ each)
 #   qmpinput.py VMID click X Y
+#   qmpinput.py VMID line X0 Y0 X1 Y1 SECONDS          press at (X0, Y0), move straight to (X1, Y1), release
 # Coordinates are screen points of a 1280x800 display, top-left origin.
 import json, math, socket, sys, time
 
@@ -57,6 +58,17 @@ def main():
             move(f, x0, y0); time.sleep(0.05)
             button(f, "left", False)
             print(f"drag: {n} moves in {time.time() - t0:.1f} s")
+        elif what == "line":
+            x0, y0, x1, y1, secs = (float(v) for v in sys.argv[3:8])
+            move(f, x0, y0); time.sleep(0.2)
+            button(f, "left", True); time.sleep(0.15)
+            steps = max(2, int(secs * 60))
+            for i in range(1, steps + 1):
+                move(f, x0 + (x1 - x0) * i / steps, y0 + (y1 - y0) * i / steps)
+                time.sleep(secs / steps)
+            time.sleep(0.1)
+            button(f, "left", False)
+            print(f"line: {steps} moves")
         elif what == "scroll":
             x, y, secs = float(sys.argv[3]), float(sys.argv[4]), float(sys.argv[5])
             d = sys.argv[6] if len(sys.argv) > 6 else "down"
