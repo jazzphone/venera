@@ -1326,3 +1326,22 @@ Measured on VM 108 (snapshots `pre-core057` and earlier):
   in use. Checked: not the driver -- with Venera off for Safari's GPU process it drops the same (~4 frames shown a second against ~6 with it on), and while it plays WindowServer's render thread, its main thread and Safari's four JVTlib decoder threads all sit waiting. The media pipeline skips frames before decoding them (about 30 decoded in 5 s, ~11% of a core), so it is macOS's own choice for 4K software H.264 on this machine; host decode is the only lever there. Host decode
   would save roughly half a core at 1080p. (The transfer disk's `com.apple.fskit.msdos` takes a core whenever the
   tools touch it: leave it out of CPU numbers.)
+
+### GPU video decode: what it would take (2026-11-16, read-only survey)
+
+- **Host today**: the Iris Xe's Vulkan driver (ANV, Mesa 25.0.7) decodes H.264/H.265/AV1 only with
+  `ANV_DEBUG=video-decode`; no VA-API driver is installed (`libva2` only, no `intel-media-va-driver`); virglrenderer
+  1.1.0's video is for virgl contexts only and QEMU doesn't hand it a DRM fd; Mesa's Venus has no video commands at
+  all. Only VM 108 uses virgl on this host. QEMU 11.1 has generic devices served by a separate process
+  (`vhost-user-test-device-pci`, `vhost-user-vsock-pci`), so a decoder could be a program of ours with no package
+  replaced.
+- **macOS's own paravirtual decoder**: `AppleVideoToolboxParavirtualization.kext` (virtio PCI 106b:1a03, over
+  AppleVirtIO) is on Intel Tahoe as a plist only -- its code is in neither kernel collection (Apple silicon only) --
+  but the user-space half, `VideoToolboxParavirtualizationSupport.framework` (project AppleParavirtGPU), IS in the
+  x86 dyld cache: it opens `AppleVideoToolboxParavirtualizationDriver` and has a host-to-guest queue. A kext of ours
+  providing that service (protocol learned from Apple silicon's driver and the framework) plus a host program speaking
+  the device side would let VideoToolbox, Safari and QuickTime decode on the host. Unverified: whether Intel
+  VideoToolbox picks that path for H.264/HEVC.
+- **Intel's route**: GPU kexts advertise `IOGVACodec` (Gen95, Gen11), `IOVARendererID`, `IOGVAHEVCDecode`; AppleGVA
+  then loads Apple's Intel decoder bundles, which drive Intel hardware directly: no way in without reverse engineering
+  AppleGVA's private plugin interface.
