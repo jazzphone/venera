@@ -1284,3 +1284,45 @@ Measured on VM 108 (snapshots `pre-gl`, `pre-share`, `pre-accel0612`):
   stayed black (twice in the first minutes, never with warm caches). Watch for it after an update.
 - tools/vm-remote.sh injecting the core now keeps csr-active-config 0xA03: 0x203 turned authenticated root back on and
   the next boot came up without the system-volume copy.
+
+### Round 8, part 5: Spotlight, the translation pool, small buffers, the cold-start band (2026-11-16)
+
+Measured on VM 108 (snapshots `pre-core057` and earlier):
+
+- **Spotlight's icons and the Dock's icon shadow** draw (9829b94). RenderBox's path coverage vertex shader
+  binary-searches its segment array by moving a device pointer around a loop; NV's translator, given typed-pointer IR
+  (what the guest's LLVM prints), turned that pointer into a null private variable, so every coverage read was 0.
+  `vg_opaque_ir.h` rewrites the module's text with opaque pointers first (what LLVM 23 prints for the same bitcode;
+  checked against it and `llvm-as` on the RenderBox corpus). `tools/mtlptr` (six pointer patterns; the loop phi is the
+  one that failed) and `tools/mtlpath` (RenderBox's own shader on recorded inputs) reproduce it. Spotlight is on the
+  driver by default. Also: FPFastMathMode NotNaN|NotInf cleared from translated SPIR-V (`VirtioGPUMetal-fastinf` keeps
+  them), `setDepthClipMode:` clamp is a real pipeline variant.
+- **One translation pool** (d5f8a43): the watcher gathers every process's translated shaders into
+  `/Library/GPUBundles/Venera/cache` (256 MB cap) and copies them back into each process's own cache; the driver falls
+  back to the pool on a miss. Safari's GPU process with its own cache deleted draws the test page at 58-59 fps from the
+  start (25 fps translating cold).
+- **Small buffers** (5743b8c): every MTLBuffer was its own mapped Venus allocation, each holding one of the core's
+  2048 host-memory ranges for the whole machine; with WindowServer, Safari and a few apps open they ran out (Grapher's
+  3D surface: 233 map failures). Buffers up to 256 KB are cut from 4 MB chunks; core 0.5.7 has 16384 ranges.
+- **Venus ring abort** (Mesa patch 0008): eight missed alive checks in a row (~30 s) before `vn_relax` aborts, each
+  logged; a host stall of a few seconds no longer takes down every waiting app (Chess aborted once).
+- **App and WindowServer CPU** (316111b): profiled on Safari's GPU test page, the driver's own share is ~5% (surface
+  copies, Venus encoding); the rest is Core Animation's own work. Two wastes fixed on the way (surface roots found by
+  IOSurface ID, kept roots evicted least recently used first); no measurable change.
+- **Safari's cold-start black band** (5405fb0; part 4's "seen once"): reproduced with caches cleared (2 of 2 boots).
+  A GPU pass drew the page's animated cells into WebKit's page surface while WebKit painted the rest on the CPU; the
+  write-back at completion copied the whole image back over the CPU's part and marked the surface in sync, so neither
+  side had it. Now each command buffer keeps a written rectangle per surface (cleared attachments: the pass's area;
+  loaded ones: their draws' scissors; blits: the destination; compute: all) and copies only that; a surface someone
+  else wrote since our pull stays out of sync. 3 of 3 cold boots clean.
+- **VM 108's snapshots**: 21 deleted with the owner's OK (thin pool 62.5% -> 53.7%); kept `clean-dev`,
+  `venera-010-r6` and `pre-pkgtest`.
+- **GPU video decode** is not started: it needs a video path in Venus (none in Mesa's guest driver; the host's
+  virglrenderer 1.1.0 decodes only for virgl contexts, over VA-API, and reports "Video disabled due to missing
+  get_drm_fd"), host package changes, and a decoder plugin for macOS's private AppleGVA/VideoToolbox interface.
+  What software decode costs today (Safari, one tab, synthetic 30 fps clips, 4 vCPUs): 1080p H.264 plays with 0 of
+  601 frames dropped, WebKit.GPU ~33% of a core and WindowServer ~16% over idle; 1080p HEVC 0 dropped,
+  VTDecoderXPCService 18% + WebKit.GPU 11% + WindowServer ~16%; 4K H.264 drops 552 of 601 frames with little CPU
+  in use, so its limit is not the decoder's CPU (unexplained; the surface path is the first suspect). Host decode
+  would save roughly half a core at 1080p. (The transfer disk's `com.apple.fskit.msdos` takes a core whenever the
+  tools touch it: leave it out of CPU numbers.)
