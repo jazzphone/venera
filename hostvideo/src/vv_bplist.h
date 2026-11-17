@@ -174,25 +174,26 @@ static uint8_t *bp_encode(bp *root, size_t *len) {
 }
 
 // The top-level object of a binary plist, if it is an ASCII string: copied into out (NUL-terminated). 0 on success.
+// Every offset the guest wrote is checked against the buffer before it is used.
 static int bp_read_string(const uint8_t *p, size_t n, char *out, size_t outsz) {
-    if (n < 40 || memcmp(p, "bplist00", 8)) {
+    if (n < 40 || outsz == 0 || memcmp(p, "bplist00", 8)) {
         return -1;
     }
     const uint8_t *t = p + n - 32;
-    int osz = t[6];
-    uint64_t top = 0, table = 0;
+    uint64_t osz = t[6], top = 0, table = 0;
     for (int i = 0; i < 8; i++) {
         top = top << 8 | t[16 + i];
         table = table << 8 | t[24 + i];
     }
-    if (table + (top + 1) * (uint64_t)osz > n - 32) {
+    uint64_t body = n - 32;   // the objects and the offset table lie before the trailer
+    if (osz < 1 || osz > 8 || table < 8 || table > body || top >= (body - table) / osz) {   // top + 1 entries fit
         return -1;
     }
     uint64_t off = 0;
-    for (int i = 0; i < osz; i++) {
-        off = off << 8 | p[table + top * (uint64_t)osz + (uint64_t)i];
+    for (uint64_t i = 0; i < osz; i++) {
+        off = off << 8 | p[table + top * osz + i];
     }
-    if (off >= n) {
+    if (off < 8 || off >= table) {
         return -1;
     }
     uint8_t m = p[off];
@@ -201,14 +202,20 @@ static int bp_read_string(const uint8_t *p, size_t n, char *out, size_t outsz) {
     }
     size_t len = m & 0x0F, at = off + 1;
     if (len == 15) {   // an int object follows
+        if (at >= table) {
+            return -1;
+        }
         uint8_t im = p[at++];
-        int sz = 1 << (im & 0x0F);
+        unsigned sz = 1u << (im & 0x0F);
+        if ((im & 0xF0) != 0x10 || sz > 8 || sz > table - at) {
+            return -1;
+        }
         len = 0;
-        for (int i = 0; i < sz; i++) {
+        for (unsigned i = 0; i < sz; i++) {
             len = len << 8 | p[at++];
         }
     }
-    if (at + len > n || len + 1 > outsz) {
+    if (len >= outsz || len > table - at) {
         return -1;
     }
     memcpy(out, p + at, len);

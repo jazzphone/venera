@@ -811,7 +811,8 @@ static BOOL vg_passlog(void) {
                 b >= 32 && b < 32 + kVGMaxTextureSlots) {
                 VGMTLTexture *tx = _ft.tex[b - 32];
                 for (uint32_t i = 0; tx && i < _ncolor; i++) {
-                    if (_colorTex[i] && _colorInfo[i].imageView && _colorTex[i]->_image == tx->_image) {
+                    if (_colorTex[i] && _colorInfo[i].imageView && _colorTex[i]->_image == tx->_image &&
+                        vg_can_feedback(_colorTex[i], "bound as a texture")) {
                         selfRead |= 1u << i;
                     }
                 }
@@ -968,21 +969,38 @@ static BOOL vg_passlog(void) {
 // the draw samples the attachment itself, in VK_EXT_attachment_feedback_loop_layout's layout, instead of a copy). Measured in WindowServer under mtlwindow: GPU time per
 // command buffer 2.55 / 1.85 / 1.77 / 2.52 ms, frame rate the same in all four (the copies are ~27 % of the GPU time,
 // the splits and barriers almost nothing, and GPU time doesn't limit the frame rate).
-// Default 4 since 5c round 6 (falls back to copies when Venus lacks the extension): visually the same as copies in
+// Default 4 in WindowServer since 5c round 6, 0 elsewhere since round 11 (falls back to copies when Venus lacks the extension): visually the same as copies in
 // pixel comparisons, deterministic, WindowServer's command buffers done ~8 ms sooner (12 vs 20 ms commit -> done
 // during a drag), ~70 MB less memory (no scratch copies); a 10-minute soak without a crash. A file holding 0 goes
 // back to copies.
 int vg_fetch_mode(void) {
     static int mode = -1;
     if (mode < 0) {
-        mode = 4;
+        // In place only in WindowServer (round 11): reading the attachment in place is right when each pixel is drawn
+        // once per draw; Vulkan on the Iris Xe has no raster-order guarantee (Metal on Apple's GPUs does), and Core
+        // Animation in Safari's GPU process, drawing software-decoded video, came out with wrong colors and stale
+        // blocks after a while. Copies there drew it right at the same frame rate. WindowServer's composition was
+        // compared pixel for pixel (5c round 6) and gains ~8 ms per frame from it.
+        mode = !strcmp(getprogname(), "WindowServer") ? 4 : 0;
+        // The file: a digit for every process, and/or lines "NAME DIGIT" for processes whose name starts with NAME
+        // (the last match wins), e.g. "com.apple.WebKit.GPU 0".
         FILE *f = fopen("/Library/GPUBundles/VirtioGPUMetal-fetchmode", "r");
-        if (f) {
-            int m = fgetc(f) - '0';
-            fclose(f);
-            if (m >= 0 && m <= 4) {
-                mode = m;
+        const char *me = getprogname();
+        char line[128];
+        while (f && fgets(line, sizeof(line), f)) {
+            line[strcspn(line, "\r\n")] = 0;
+            char *sp = strrchr(line, ' ');
+            if (!sp && line[0] >= '0' && line[0] <= '4' && !line[1]) {
+                mode = line[0] - '0';
+            } else if (sp && sp[1] >= '0' && sp[1] <= '4' && !sp[2]) {
+                *sp = 0;
+                if (line[0] && !strncmp(me, line, strlen(line))) {
+                    mode = sp[1] - '0';
+                }
             }
+        }
+        if (f) {
+            fclose(f);
         }
         vglog("framebuffer fetch: mode %d", mode);
     }
@@ -1007,6 +1025,21 @@ static void vg_fetch_barrier(VkCommandBuffer cb, BOOL beforeCopy) {
               VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
     }
     gVk.vkCmdPipelineBarrier(cb, src, dst, 0, 1, &mb, 0, NULL, 0, NULL);
+}
+
+// Whether an attachment can be in the feedback loop layout: its image was made for it (VK_IMAGE_USAGE_ATTACHMENT_
+// FEEDBACK_LOOP_BIT_EXT). One that wasn't keeps the Iris Xe's compression, and reads of it in that layout return
+// compressed blocks (Safari's software-decoded video came out with wrong colors and blocky smears): it gets copies.
+static BOOL vg_can_feedback(VGMTLTexture *t, const char *why) {
+    if (t && (t->_imageUsage & VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT)) {
+        return YES;
+    }
+    static int logged;
+    if (t && logged++ < 5) {
+        vglog("render: %s: an attachment (format %lu, %lux%lu, usage 0x%x) wasn't made for the feedback loop: copies",
+              why, (unsigned long)t->_pixelFormat, (unsigned long)t->_width, (unsigned long)t->_height, t->_imageUsage);
+    }
+    return NO;
 }
 
 // End the pass, move the attachments in `mask` into the feedback loop layout (their writes so far -> the fragment
@@ -1164,7 +1197,13 @@ static void vg_fetch_barrier(VkCommandBuffer cb, BOOL beforeCopy) {
 - (VkDescriptorSet)fetchCopy:(uint32_t)mask {
     VkCommandBuffer cb = _owner->_cb;
     const int mode = vg_fetch_mode();
-    if (mode == 4 && gVk.feedbackLoop) {
+    BOOL inPlace = mode == 4 && gVk.feedbackLoop;
+    for (uint32_t i = 0; inPlace && i < _ncolor; i++) {
+        if ((mask & (1u << i)) && _colorTex[i] && _colorInfo[i].imageView && !_feedback[i]) {
+            inPlace = vg_can_feedback(_colorTex[i], "framebuffer fetch");
+        }
+    }
+    if (inPlace) {
         return [self fetchInPlace:mask];
     }
     if (mode != 2) {

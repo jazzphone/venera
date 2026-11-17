@@ -785,7 +785,10 @@ id<MTLTexture> vg_new_texture(id<MTLDevice> device, MTLTextureDescriptor *d) {
         vglog("texture: pixel format %lu can't be a storage image here (shaderWrite will fail)", (unsigned long)d.pixelFormat);
     }
     const VkImageUsageFlags rw = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    if (gVk.feedbackLoop && (usage & rw) == rw && (d.usage & MTLTextureUsageRenderTarget)) {
+    // MTLTextureUsageUnknown (0) allows every use, a render target's included: such a texture drawn into and read in
+    // place without this bit stays compressed on the Iris Xe, and its reads come back as the compression's blocks.
+    if (gVk.feedbackLoop && (usage & rw) == rw &&
+        ((d.usage & MTLTextureUsageRenderTarget) || d.usage == MTLTextureUsageUnknown)) {
         usage |= VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;   // framebuffer fetch in place (mode 4)
     }
     VGMTLTexture *t = [VGMTLTexture new];
@@ -1267,11 +1270,13 @@ void vg_surface_pull(VGMTLTexture *t) {
 
 id<MTLTexture> vg_new_buffer_texture(id<MTLBuffer> buffer, MTLTextureDescriptor *d, NSUInteger offset, NSUInteger bpr) {
     const vg_format *f = vg_format_of(d.pixelFormat);
-    if (!f || (f->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT) || d.textureType != MTLTextureType2D || d.mipmapLevelCount > 1 ||
-        !bpr || bpr % f->bytes || offset + bpr * (d.height - 1) + d.width * f->bytes > buffer.length) {
-        vglog("buffer texture: %lux%lu format %lu at %lu, %lu bytes per row doesn't fit a %lu-byte buffer (2D color only)",
-              (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.pixelFormat, (unsigned long)offset,
-              (unsigned long)bpr, (unsigned long)buffer.length);
+    // Mip levels (round 11: WindowServer makes a 54x54 one with 6, and it was refused -- nothing drew): level 0 is the
+    // buffer's, the rest the image's own (filled by a blit's generateMipmaps, as Metal leaves them).
+    if (!f || (f->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT) || d.textureType != MTLTextureType2D || !bpr || bpr % f->bytes || offset + bpr * (d.height - 1) + d.width * f->bytes > buffer.length) {
+        vglog("buffer texture: %lux%lu format %lu type %lu, %lu levels, at %lu, %lu bytes per row doesn't fit a %lu-byte "
+              "buffer (2D color only)",
+              (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.pixelFormat, (unsigned long)d.textureType,
+              (unsigned long)d.mipmapLevelCount, (unsigned long)offset, (unsigned long)bpr, (unsigned long)buffer.length);
         return nil;
     }
     VGMTLTexture *t = (VGMTLTexture *)vg_new_texture(buffer.device, d);
@@ -1279,6 +1284,11 @@ id<MTLTexture> vg_new_buffer_texture(id<MTLBuffer> buffer, MTLTextureDescriptor 
         t->_srcBuffer = buffer;
         t->_srcOffset = offset;
         t->_srcBpr = bpr;
+        static int said;
+        if (d.mipmapLevelCount > 1 && said++ < 3) {
+            vglog("buffer texture: %lux%lu with %lu levels, level 0 from the buffer", (unsigned long)d.width,
+                  (unsigned long)d.height, (unsigned long)d.mipmapLevelCount);
+        }
     }
     return t;
 }

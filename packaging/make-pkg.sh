@@ -36,6 +36,8 @@ if [ ! -e "$C/webgl" ] && ! csrutil authenticated-root status 2>/dev/null | grep
   ARGS+=(--no-system-volume)
 fi
 rm -rf "$C"
+# what runs as root below is root's, whoever built the package
+chown -R root:wheel "$V/release" && chmod -R go-w "$V/release" || exit 1
 echo "Venera: install.sh ${ARGS[*]}"
 "$V/release/install.sh" "${ARGS[@]}" 2>&1 | tee "$V/install.log"
 exit "${PIPESTATUS[0]}"

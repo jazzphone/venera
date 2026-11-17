@@ -120,11 +120,11 @@ static int vg_vulkan_init_locked(void) {
     // Translated shaders declare what they use (descriptor indexing, formatless storage images, 8/16-bit types,
     // the memory model...), and Vulkan needs each feature enabled: turn on everything the device has, except
     // robustBufferAccess (bounds checks on every access, which Metal doesn't promise).
-    // Framebuffer fetch in place (5c round 6, mode 4): sampling a color attachment inside its own pass needs
-    // VK_EXT_attachment_feedback_loop_layout; asked for only in that mode.
+    // Sampling a color attachment inside its own pass needs VK_EXT_attachment_feedback_loop_layout: framebuffer fetch
+    // in place (5c round 6, mode 4), and an attachment the app binds as a texture (5d, RenderBox) in every mode.
     VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT ffl = {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT};
-    const BOOL wantFeedback = vg_fetch_mode() == 4;
+    const BOOL wantFeedback = YES;
     VkPhysicalDeviceVulkan13Features f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
                                             wantFeedback ? &ffl : NULL};
     VkPhysicalDeviceVulkan12Features f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13};

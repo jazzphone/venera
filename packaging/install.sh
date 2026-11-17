@@ -76,6 +76,14 @@ for d in OpenCore/VirtioGPU.kext Extensions/VirtioGPUFramebuffer.kext Extensions
   GPUBundles/VirtioGPUMetal.bundle Support/sysvol.sh Support/venera-watch.sh Support/local.venera.watch.plist; do
   [ -e "$PAYLOAD/$d" ] || die "payload/$d is missing: run this from the unpacked release folder"
 done
+# The host's video device in this VM (QEMU's ivshmem-doorbell, 1af4:1110) needs VeneraVideo.kext even when video
+# decoding wasn't asked for: left to Apple's VirtIO driver, which takes every 1af4 device and hangs on this one, the
+# boot never publishes the partitions of disks found after it (the OpenCore disk among them) -- round 11.
+if [ $VIDEO = 0 ] && ioreg -r -c IOPCIDevice -d1 -w0 2>/dev/null | grep -q '"pci1af4,1110"'; then
+  say "this VM has the host's video device: adding VeneraVideo.kext anyway (without it the boot loses disks;"
+  say "  to do without video decoding, take the device out on the host: install-host.sh --remove-vm VMID)"
+  VIDEO=1
+fi
 [ $VIDEO = 0 ] || [ -e "$PAYLOAD/OpenCore/VeneraVideo.kext" ] || die "payload/OpenCore/VeneraVideo.kext is missing"
 [ "$(uname -m)" = x86_64 ] || die "x86_64 macOS only (this is $(uname -m))"
 VER=$(sw_vers -productVersion)
@@ -211,14 +219,16 @@ done
 KC=/Library/KernelCollections/AuxiliaryKernelExtensions.kc
 say "Auxiliary KC: rebuilding (a minute or two)"
 if [ $DRY = 0 ]; then
+  # not a fixed /tmp name: anyone could have planted a symlink there for root to write through
+  KLOG=$(mktemp /private/var/run/venera-kmutil.XXXXXX) || die "can't make a log file in /private/var/run"
   kmutil create -n aux --volume-root / --allow-missing-kdk --kernel /System/Library/Kernels/kernel \
     -B /System/Library/KernelCollections/BootKernelExtensions.kc \
     -S /System/Library/KernelCollections/SystemKernelExtensions.kc \
-    --repository /Library/Extensions -A "$KC.venera-new" -z >/tmp/venera-kmutil.log 2>&1 ||
-    { tail -20 /tmp/venera-kmutil.log; die "kmutil failed (log: /tmp/venera-kmutil.log)"; }
+    --repository /Library/Extensions -A "$KC.venera-new" -z >"$KLOG" 2>&1 ||
+    { tail -20 "$KLOG"; die "kmutil failed (log: $KLOG)"; }
   for k in VirtioGPUFramebuffer VirtioGPUAccel; do
     kmutil inspect -a x86_64 -A "$KC.venera-new" 2>/dev/null | grep -q "homelab\.$k[^A-Za-z]" ||
-      { tail -20 /tmp/venera-kmutil.log; rm -f "$KC.venera-new"; die "kmutil left $k out (log: /tmp/venera-kmutil.log)"; }
+      { tail -20 "$KLOG"; rm -f "$KC.venera-new"; die "kmutil left $k out (log: $KLOG)"; }
   done
   mv -f "$KC.venera-new" "$KC" || die "couldn't replace $KC (SIP file system protection still on?)"
 fi
@@ -229,6 +239,9 @@ V="/Library/Application Support/Venera"
 # the kept copy lives under /Library/GPUBundles: WindowServer's sandbox maps code from there, not from $V
 K=/Library/GPUBundles/Venera
 run mkdir -p "$V" "$K"
+# the watcher (root) keeps its files here and the app's answer file inside it: root's, and nobody else's to change
+run chown root:wheel "$V" "$K"
+run chmod 755 "$V" "$K"
 run rm -rf "$K/VirtioGPUMetal.bundle"
 run cp -R "$PAYLOAD/GPUBundles/VirtioGPUMetal.bundle" "$K/"
 run chown -R root:wheel "$K/VirtioGPUMetal.bundle"
@@ -247,6 +260,11 @@ if [ $NO_SYSVOL = 0 ]; then
     run "$V/sysvol.sh" install "$K/VirtioGPUMetal.bundle" || die "the system-volume copy failed (sysvol.sh above)"
     run ln -sfn "$K/VirtioGPUMetal.bundle" /Library/GPUBundles/VirtioGPUMetal.bundle   # the system copy is there after the reboot; the watcher switches
     SYSVOL="on the system volume after the reboot"
+    # until then the booted system has the old copy (or none): the watcher must not take that for an update's doing
+    if [ $DRY = 0 ]; then
+      ST="$V/watch-state"
+      { grep -v '^pending=' "$ST" 2>/dev/null; echo "pending=$BUILD"; } >"$ST.new" && mv "$ST.new" "$ST"
+    fi
   else
     SYSVOL="kept copy until authenticated root is off (then the watcher offers the system-volume copy; Safari's WebGL needs it)"
   fi
@@ -269,6 +287,7 @@ if [ $NO_APP = 0 ] && [ -d "$PAYLOAD/Apps/Venera.app" ]; then
   run rm -rf /Applications/Venera.app
   run cp -R "$PAYLOAD/Apps/Venera.app" /Applications/
   run chown -R root:wheel /Applications/Venera.app
+  run chmod -R go-w,a+rX /Applications/Venera.app
   run cp "$PAYLOAD/Support/local.venera.helper.plist" /Library/LaunchAgents/
   run chown root:wheel /Library/LaunchAgents/local.venera.helper.plist
   run chmod 644 /Library/LaunchAgents/local.venera.helper.plist

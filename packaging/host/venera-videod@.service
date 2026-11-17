@@ -1,15 +1,67 @@
 # Venera video: the host side of hardware video decoding for macOS VM %i (Apple's paravirtualized VideoToolbox over
-# QEMU's ivshmem-doorbell). The VM's device connects to /run/venera-video-%i.sock when QEMU starts, so this runs
-# before the guests start (install-host.sh enables one instance per VM).
+# QEMU's ivshmem-doorbell device). Started by venera-videod@%i.socket.
+#
+# It decodes what the VM sends, so it runs with as little as it needs: a user of its own made for each run, the GPU's
+# render node and nothing else in /dev, no network, a read-only system, no privileges. Its shared memory, doorbells and
+# QEMU's connection live in systemd's file descriptor store, so a restart (an update, a crash) carries on with them
+# and the VM keeps its device.
 [Unit]
 Description=Venera video decoding for VM %i
-After=local-fs.target
-Before=pve-guests.service
+Requires=venera-videod@%i.socket
+After=venera-videod@%i.socket
+
+StartLimitIntervalSec=60
+StartLimitBurst=30
 
 [Service]
+Type=notify
+NotifyAccess=main
 ExecStart=/opt/venera/video/bin/venera-videod /run/venera-video-%i.sock
+# Back at once: macOS's VideoToolbox, finding its host gone for a second or more, slows to a frame a second until
+# the page is opened again; within ~100 ms it carries on from the next key frame (a crash, measured on VM 108).
 Restart=always
-RestartSec=2
+RestartSec=100ms
+FileDescriptorStoreMax=8
+FileDescriptorStorePreserve=yes
+StateDirectory=venera-video/%i
+StateDirectoryMode=0700
+
+DynamicUser=yes
+SupplementaryGroups=render
+DevicePolicy=closed
+DeviceAllow=char-drm rw
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateUsers=no
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @swap @reboot @module @raw-io @debug @cpu-emulation @obsolete
+SystemCallErrorNumber=EPERM
+UMask=0077
+MemoryMax=2G
+TasksMax=64
+LimitNOFILE=1024
 
 [Install]
 WantedBy=multi-user.target

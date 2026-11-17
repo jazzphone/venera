@@ -63,8 +63,16 @@ fi
 run rm -rf /Library/GPUBundles/VirtioGPUMetal.bundle /Library/GPUBundles/Venera
 for f in /Library/GPUBundles/VirtioGPUMetal-*; do [ -e "$f" ] && run rm -f "$f"; done
 # translated shaders (and WindowServer's display snapshots) every process kept, in its own cache folder
+# These folders are the users': root never walks one with rm (a user could swap a folder for a link mid-delete and
+# make it remove something else), the folder's owner does. Root's own, under /private/var/folders/zz, is root's to remove.
 while IFS= read -r d; do
-  [ -n "$d" ] && [ -d "$d" ] && run rm -rf "$d"
+  [ -n "$d" ] && [ -d "$d" ] && [ ! -L "$d" ] || continue
+  o=$(stat -f %u "$d" 2>/dev/null) || continue
+  if [ "$o" != 0 ]; then
+    run sudo -u "#$o" /bin/rm -rf "$d"
+  else
+    case "$d" in /private/var/folders/zz/*) run rm -rf "$d" ;; esac
+  fi
 done < <(find /private/var/folders /Users/*/Library/Containers -type d -name local.homelab.VirtioGPUMetal -prune 2>/dev/null)
 run rm -rf "/Library/Application Support/Venera"
 # the installer package's receipts (Install Venera.pkg), so a reinstall starts clean
@@ -78,12 +86,13 @@ done
 if [ $DRY = 0 ]; then
   if ls -d /Library/Extensions/*.kext >/dev/null 2>&1; then
     say "Auxiliary KC: rebuilding from what is left in /Library/Extensions"
+    KLOG=$(mktemp /private/var/run/venera-kmutil.XXXXXX) || KLOG=/dev/null   # not a fixed /tmp name (a planted symlink)
     kmutil create -n aux --volume-root / --allow-missing-kdk --kernel /System/Library/Kernels/kernel \
       -B /System/Library/KernelCollections/BootKernelExtensions.kc \
       -S /System/Library/KernelCollections/SystemKernelExtensions.kc \
-      --repository /Library/Extensions -A "$KC.venera-new" -z >/tmp/venera-kmutil.log 2>&1 &&
+      --repository /Library/Extensions -A "$KC.venera-new" -z >"$KLOG" 2>&1 &&
       mv -f "$KC.venera-new" "$KC" ||
-      say "warning: kmutil failed (/tmp/venera-kmutil.log); the old Auxiliary KC still lists the driver's kexts, which
+      say "warning: kmutil failed ($KLOG); the old Auxiliary KC still lists the driver's kexts, which
   then fail to load harmlessly. Rebuild it once the other kexts are sorted out."
   elif [ -f "$KC" ]; then
     say "Auxiliary KC: no third-party kexts left; removing it"
@@ -119,13 +128,23 @@ if [ $NO_OC = 0 ]; then
     run cp "$CONFIG" "$BACKUP"
     N=$(pl -extract Kernel.Add raw -o - 2>/dev/null || echo 0)
     i=$((N - 1))
+    # VeneraVideo stays while the host still gives this VM its video device (1af4:1110): without it, Apple's VirtIO
+    # driver takes the device and hangs on it, and the boot never publishes the OpenCore disk's partitions (round 11)
+    KEEP_VIDEO=0
+    if ioreg -r -c IOPCIDevice -d1 -w0 2>/dev/null | grep -q '"pci1af4,1110"'; then
+      KEEP_VIDEO=1
+      say "OpenCore: keeping VeneraVideo.kext: the host still gives this VM its video device. Take it out on the host"
+      say "  (install-host.sh --remove-vm VMID), start the VM again, then run this again to remove VeneraVideo too."
+    fi
     while [ $i -ge 0 ]; do   # from the end: removing shifts the ones after
       case "$(pl -extract Kernel.Add.$i.BundlePath raw -o - 2>/dev/null)" in
-      VirtioGPU.kext | VeneraVideo.kext) run pl -remove Kernel.Add.$i ;;
+      VirtioGPU.kext) run pl -remove Kernel.Add.$i ;;
+      VeneraVideo.kext) [ $KEEP_VIDEO = 1 ] || run pl -remove Kernel.Add.$i ;;
       esac
       i=$((i - 1))
     done
-    run rm -rf "$OC_ROOT/EFI/OC/Kexts/VirtioGPU.kext" "$OC_ROOT/EFI/OC/Kexts/VeneraVideo.kext"
+    run rm -rf "$OC_ROOT/EFI/OC/Kexts/VirtioGPU.kext"
+    [ $KEEP_VIDEO = 1 ] || run rm -rf "$OC_ROOT/EFI/OC/Kexts/VeneraVideo.kext"
     OCARGS=$(pl -extract "NVRAM.Add.$GUID.boot-args" raw -o - 2>/dev/null)
     NEW=
     for a in $OCARGS; do
@@ -136,7 +155,7 @@ if [ $NO_OC = 0 ]; then
       cp "$BACKUP" "$CONFIG"
       die "config.plist didn't validate after the edit; restored the backup"
     }
-    say "OpenCore: VirtioGPU.kext and VeneraVideo.kext removed, boot-args \"${NEW# }\" (backup: $BACKUP)"
+    say "OpenCore: VirtioGPU.kext$([ $KEEP_VIDEO = 1 ] || echo " and VeneraVideo.kext") removed, boot-args \"${NEW# }\" (backup: $BACKUP)"
     cleanup
   fi
 fi

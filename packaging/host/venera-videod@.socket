@@ -1,0 +1,14 @@
+# Venera video: VM %i's video device connects here when QEMU starts (QEMU's ivshmem-doorbell chardev). systemd holds
+# the socket from early boot, so the VM finds it even while venera-videod@%i is restarting; the first connection
+# starts the service.
+[Unit]
+Description=Venera video decoding socket for VM %i
+Before=pve-guests.service
+
+[Socket]
+ListenStream=/run/venera-video-%i.sock
+SocketMode=0600
+FileDescriptorName=listen
+
+[Install]
+WantedBy=sockets.target

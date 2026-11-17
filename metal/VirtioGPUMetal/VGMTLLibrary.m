@@ -79,7 +79,13 @@ NSString *vg_air_to_text(NSData *air) {
     if (!t || !ff) {
         return t;
     }
+    int phis = vg_frontface_unhandled;
     char *o = vg_frontface_ir(t.UTF8String);
+    static int told;
+    if (vg_frontface_unhandled != phis && told++ < 20) {   // a branch on front_facing the rewrite can't reach: say so
+        vglog("frontface: %d 16-bit phi(s) under a branch on a bool parameter, not rewritten (%s)",
+              vg_frontface_unhandled - phis, vg_frontface_where);
+    }
     if (!o) {
         return t;
     }

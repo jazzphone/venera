@@ -1461,3 +1461,52 @@ are untouched. hostvideo/README.md says how it fits together and deploys.
   macOS didn't publish the OpenCore disk's partition (AHCI QEMU HARDDISK, GPT with its backup header not at the end of
   the 152 MB volume), so a reinstall from inside the guest found no OpenCore and the package failed. After the
   rollback it shows again (disk3s1). Cause not found.
+
+## Round 11 (2026-11-17): checking it all -- the host service locked down, restarts survived, and the bugs that turned up
+
+- **venera-videod sandboxed** (packaging/host/venera-videod@.service + .socket): DynamicUser, only `char-drm` devices,
+  PrivateNetwork, ProtectSystem=strict, no capabilities, @system-service syscall filter, MemoryMax=2G. Socket
+  activation: systemd holds `/run/venera-video-VMID.sock` from boot. The daemon keeps its memfd, both eventfds, QEMU's
+  connection and a session store in systemd's fd store (FileDescriptorStorePreserve), so a restart or a crash carries
+  on with the same connection: sessions are reopened from their saved sample descriptions, frames the old process held
+  are reported dropped, numbers skipped while it died likewise, and decoding resumes at the next key frame. Request
+  numbers continue (reusing them wedged the guest: a Dbuf never answered). A Dbuf unanswered for 2 s drops its frame.
+  RestartSec=100ms: a gap of a second or more puts VideoToolbox's reply clerk into 1 s timeouts (below). No GPU: it
+  still serves, refusing +dec, and the guest decodes in software. install-host.sh installs both units, migrates the
+  hand-made dev layout (done on node 2 for VM 108: /opt/venera, venera-videod@108), restarts keeping connections;
+  tools/test-install-host.sh 21 checks.
+- **Guest input copied before parsing** (drain_g2h), host-owned ring counters private, outbox capped. Fuzzing
+  (hostvideo/fuzz, FINDINGS.md): 7 bugs, two High (bp_read_string length wrap -> stack overflow; avcodec_flush_buffers
+  on a freed decoder), all fixed; re-run clean.
+- **VeneraVideo: the process is told of every message** (VeneraVideoDataQueue: sendDataAvailableNotification on each
+  enqueue, again on method 4 "drained" when data is left). IODataQueue only notifies empty -> non-empty; the support
+  framework drains once per notification, so a message landing mid-drain waited for VTParavirtualizationReplyClerk's
+  1 s timeout -- after a burst, every frame did (a frame a second). Seen only after host outages, but latent always.
+- **Safari's software-decoded video drew wrong colors and stale blocks** (found by running the service with no GPU):
+  framebuffer fetch in place in com.apple.WebKit.GPU (Core Animation's fixed_frag_lph_cph). In place is only right when
+  each pixel is drawn once per draw; Vulkan on the Iris Xe has no raster-order guarantee. Fetch mode is now 4 in
+  WindowServer only, copies elsewhere (same frame rate); the fetchmode file takes "NAME DIGIT" lines. The feedback-loop
+  extension is enabled in every mode (RenderBox's attachment-as-texture needs it); images of unknown usage get the
+  feedback usage bit; in-place reads of an image without it fall back to copies.
+- **Front-facing rewrite widened**: the inverse (`xor i1 %ff, true`), every vector width, i16. 16-bit phis under a
+  branch on a bool parameter (in modules with air.front_facing) are logged: only RenderBox/CA helpers with ordinary
+  bool flags showed up, and the A/B sweep found nothing.
+- **A/B screenshot sweep** (16 apps, driver vs `-APP` in the allow-list, pngdiff): Contacts, Notes, Photos, Reminders,
+  Books identical; the rest differ only in the clock, the Dock, a window behind, Font Book's random preview style, and
+  Chess's edge rounding (max 50).
+- **WindowServer's 54x54 mipmapped buffer texture** (6 levels) was refused, so it never drew; now accepted (level 0
+  from the buffer).
+- **The OpenCore disk after an uninstall**: reproduced -- with the host's ivshmem device present and VeneraVideo
+  disabled, IOGUIDPartitionScheme on the OpenCore disk stays !registered (no disk3s1); with VeneraVideo, it publishes.
+  Apple's VirtIO driver takes 1af4:1110 when nothing else does. install.sh adds VeneraVideo whenever the device is
+  there; uninstall.sh keeps it until the device is gone. (The backup-GPT oddity is not the cause.)
+- **Package checks** on VM 108 (snapshot pre-pkg-r11): upgrade over the dev install worked; a simulated macOS update
+  (sysvol.sh remove, reboot) -> question in the app's window (notifications off) -> Reinstall -> Restart -> back on the
+  system volume. Fixed on the way: the watcher asked before the reboot of a fresh install (install.sh now sets
+  pending), gave up when nobody was logged in at boot (now waits up to 10 min), left a stale question behind (cleared
+  at start). Root scripts hardened (notes/root-scripts-review.md): pool copies as the cache folder's owner, no fixed
+  /tmp names. Not run: an install with nobody logged in (the agent dropped out on logout).
+- **Frame pacing**: drag 17.9 ms, scroll 18.1, resize 23.3, minimize 25.8 -- as round 7 -- with only the usual apps;
+  with the sweep's 16 apps open, 26-57 ms. Remote slowness is mostly the console: QEMU's VNC 30 ms floor, and noVNC's
+  tiles over the link; SPICE (already on for virtio-gl) streams changing areas.
+- Codecs: H.264, HEVC 8/10-bit and VP9 decode on the host (HEVC 10 colors right).

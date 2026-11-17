@@ -18,7 +18,7 @@ docker run --rm --platform linux/amd64 -e EXTRA="-lva-drm" -v ~/src:/src venera-
 rm -rf $D && mkdir -p $D/bin $D/lib $D/licenses
 cp hostvideo/out/bin/venera-videod hostvideo/out/bin/vaprofiles $D/bin/
 cp -P hostvideo/out/ffmpeg/lib/*.so* $D/lib/
-cp packaging/host/install-host.sh packaging/host/venera-videod@.service VERSION LICENSE NOTICE.md $D/
+cp packaging/host/install-host.sh packaging/host/venera-videod@.service packaging/host/venera-videod@.socket VERSION LICENSE NOTICE.md $D/
 chmod 755 $D/install-host.sh $D/bin/*
 FF=${FFSRC:-$HOME/src/vendor-src/ffmpeg/ffmpeg-7.1.1}
 cp $FF/COPYING.LGPLv2.1 $D/licenses/FFmpeg-LGPL-2.1.txt

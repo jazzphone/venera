@@ -14,8 +14,12 @@
 //      1  struct  in: a 16-byte UUID (a guest object of this process; host messages for it come here)
 //      2  struct  in: a UUID going away
 //      3  scalar  in: a message's length (in the send buffer), up to five IOSurface IDs   out: 0
-//      4  scalar  the process has drained its queue
+//      4  scalar  the process has drained its queue (if anything came meanwhile, it is told again)
 //      and the queue's notification port (IOConnectSetNotificationPort type 0).
+//
+// The process is told of every message, not only of the first into an empty queue as IODataQueue does: its reader
+// drains once per notification, so a message that lands while it drains would wait for the reply clerk's 1 s
+// timeout -- and after a burst (the host back from a restart) every reply did, a frame a second from then on.
 //
 // Messages go to the host as they are, with the IOSurfaces they name described (and kept: an output buffer comes
 // back in a "fill" order -- copy frame slot N into surface S -- before the message that hands it to VideoToolbox).
@@ -25,6 +29,7 @@
 // At boot, this one's probe score wins.
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IODataQueue.h>
+#include <IOKit/IODataQueueShared.h>
 #include <IOKit/IOFilterInterruptEventSource.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOLocks.h>
@@ -137,7 +142,7 @@ private:
     AppleVideoToolboxParavirtualizationDriver *drv_ = nullptr;
     task_t task_ = nullptr;
     IOLock *lock_ = nullptr;
-    IODataQueue *queue_ = nullptr;
+    class VeneraVideoDataQueue *queue_ = nullptr;
     IOMemoryMap *queueMap_ = nullptr;
     IOBufferMemoryDescriptor *send_ = nullptr;
     IOMemoryMap *sendMap_ = nullptr;
@@ -564,6 +569,25 @@ void AppleVideoToolboxParavirtualizationDriver::drain() {
 
 // ---- the user client -----------------------------------------------------------------------------------------------
 
+// IODataQueue with its notification and emptiness reachable.
+class VeneraVideoDataQueue : public IODataQueue {
+    OSDeclareDefaultStructors(VeneraVideoDataQueue)
+public:
+    static VeneraVideoDataQueue *make(UInt32 size) {
+        VeneraVideoDataQueue *q = OSTypeAlloc(VeneraVideoDataQueue);
+        if (q && !q->initWithCapacity(size)) {
+            q->release();
+            q = nullptr;
+        }
+        return q;
+    }
+    void notify() { sendDataAvailableNotification(); }
+    bool holdsData() const {
+        return dataQueue && __atomic_load_n(&dataQueue->head, __ATOMIC_ACQUIRE) != __atomic_load_n(&dataQueue->tail, __ATOMIC_ACQUIRE);
+    }
+};
+OSDefineMetaClassAndStructors(VeneraVideoDataQueue, IODataQueue)
+
 bool AppleVideoToolboxParavirtualizationUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type) {
     if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
         return false;
@@ -578,7 +602,7 @@ bool AppleVideoToolboxParavirtualizationUserClient::start(IOService *provider) {
     if (!drv_ || !IOUserClient::start(provider)) {
         return false;
     }
-    queue_ = IODataQueue::withCapacity(256 * 1024);
+    queue_ = VeneraVideoDataQueue::make(256 * 1024);
     if (!queue_) {
         return false;
     }
@@ -637,8 +661,11 @@ bool AppleVideoToolboxParavirtualizationUserClient::owns(const uint8_t *uuid) {
 
 void AppleVideoToolboxParavirtualizationUserClient::deliver(const uint8_t *msg, uint32_t len) {
     IOLockLock(lock_);
-    if (queue_ && !closed_ && !queue_->enqueue((void *)msg, len)) {
-        IOLog("VeneraVideo: a process's message queue is full; a host message was dropped\n");
+    if (queue_ && !closed_) {
+        if (!queue_->enqueue((void *)msg, len)) {
+            IOLog("VeneraVideo: a process's message queue is full; a host message was dropped\n");
+        }
+        queue_->notify();   // every time (the header says why)
     }
     IOLockUnlock(lock_);
 }
@@ -754,7 +781,12 @@ IOReturn AppleVideoToolboxParavirtualizationUserClient::externalMethod(uint32_t 
         }
         return kIOReturnSuccess;
     }
-    case 4:   // the process drained its queue
+    case 4:   // the process drained its queue: anything that came meanwhile, it is told of again
+        IOLockLock(lock_);
+        if (queue_ && !closed_ && queue_->holdsData()) {
+            queue_->notify();
+        }
+        IOLockUnlock(lock_);
         return kIOReturnSuccess;
     default:
         return kIOReturnUnsupported;

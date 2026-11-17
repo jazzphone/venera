@@ -34,12 +34,21 @@ dialog() {
   local text=$1; shift
   local uid user buttons="" b
   uid=$(stat -f %u /dev/console)
+  local waited=0
+  while [ "$uid" = 0 ] && [ $waited -lt 600 ]; do   # at boot, before the login: wait for someone (up to 10 minutes)
+    sleep 5
+    waited=$((waited + 5))
+    uid=$(stat -f %u /dev/console)
+  done
+  [ "$uid" = 0 ] && return 1   # still nobody: ask on the next run
+  [ $waited -gt 0 ] && sleep 20   # the login items (the Venera app) start after the console changes hands
   user=$(stat -f %Su /dev/console)
-  [ "$uid" = 0 ] && return 1   # nobody logged in: ask later
   if pgrep -u "$uid" -x Venera >/dev/null 2>&1; then
     ask_app "$uid" "$text" "$@"
     return
   fi
+  # backslashes first, then quotes: a text ending in a backslash (or carrying \" from a tool's output) must not close the string
+  text=${text//\\/\\\\}
   for b in "$@"; do buttons="$buttons${buttons:+, }\"$b\""; done
   launchctl asuser "$uid" sudo -u "$user" /usr/bin/osascript \
     -e "display dialog \"${text//\"/\\\"}\" buttons {$buttons} default button \"${*: -1}\" with title \"Venera\" with icon caution giving up after 3600" \
@@ -58,9 +67,11 @@ ask_app() {
   : >"$A/answer" && chown "$uid" "$A/answer" && chmod 644 "$A/answer"
   echo "$id" >"$A/id"   # last: the app reads the id first
   for i in $(seq 1 1800); do
-    if [ "$(sed -n 1p "$A/answer" 2>/dev/null)" = "$id" ]; then
-      r=$(sed -n 2p "$A/answer")
-      break
+    # the file is the console user's to write: read only its first two lines, and take the answer once it is whole
+    # (the app writes it in place, so a read can land between the truncate and the write)
+    if [ "$(head -n 1 "$A/answer" 2>/dev/null | head -c 64)" = "$id" ]; then
+      r=$(head -n 2 "$A/answer" 2>/dev/null | sed -n 2p | head -c 64)
+      [ -n "$r" ] && break
     fi
     sleep 2
   done
@@ -69,6 +80,9 @@ ask_app() {
 }
 
 mkdir -p "$V"
+# A question left from an earlier run (a restart came before the answer) has nobody waiting on it: launchd runs one
+# watcher at a time, so whatever is in ask/ now is stale. The app sees it go.
+rm -rf "$V/ask"
 
 # The translation pool (5d): every process keeps its own cache of translated shaders (in its own, often sandboxed,
 # cache folder), so WindowServer, Safari's GPU process and each app translated the same Core Animation and RenderBox
@@ -76,20 +90,37 @@ mkdir -p "$V"
 # into one pool every process reads on a miss, and back into each process's own folder (for sandboxes that can't read
 # the pool). Kept under 256 MB, oldest first.
 POOL=/Library/GPUBundles/Venera/cache
+# The cache folders are the processes' (a user's own, or a sandbox container's), so a user can plant one, put a
+# symlink in it, or swap a folder for a link while this runs. Root therefore never reads or writes inside one: every
+# read and write there is done as the folder's owner (sudo -u "#UID"), so a link can only reach what that user can.
+# Root-owned folders are used as root only under /private/var/folders/zz, root's own tree, which no user can touch.
 pool_caches() {
   [ -d /Library/GPUBundles/Venera ] || return 0
   mkdir -p "$POOL" && chmod 755 "$POOL"
-  local dirs d n=0
+  local dirs d n=0 o f name tmp as c
   dirs=$(find /private/var/folders /Users/*/Library/Containers -type d -path '*local.homelab.VirtioGPUMetal/spirv' 2>/dev/null)
   [ -n "$dirs" ] || return 0
   while IFS= read -r d; do
-    find -E "$d" -maxdepth 1 -type f -regex '.*/[0-9a-f]{64}' -exec cp -n {} "$POOL"/ \; 2>/dev/null
-  done <<<"$dirs"
-  chmod 644 "$POOL"/* 2>/dev/null
-  while IFS= read -r d; do
-    for f in "$POOL"/*; do
-      [ -e "$d/${f##*/}" ] || { cp "$f" "$d/" 2>/dev/null && n=$((n + 1)); }
-    done
+    o=$(stat -f %u "$d" 2>/dev/null) || continue
+    if [ "$o" = 0 ]; then
+      case "$d" in /private/var/folders/zz/*) as=() ;; *) continue ;; esac
+    else
+      as=(sudo -u "#$o")
+    fi
+    # into the pool: only plain files of a hash's name, owned by the folder's owner (not a hard link to someone
+    # else's file), a sane size; read as the owner into a root-made temp file, then moved into place
+    while IFS= read -r f; do
+      name=${f##*/}
+      [ -e "$POOL/$name" ] && continue
+      tmp=$(mktemp "$POOL/.new.XXXXXX") || break
+      if ${as[@]+"${as[@]}"} /bin/cat -- "$f" >"$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+        chmod 644 "$tmp" && mv -n "$tmp" "$POOL/$name"
+      fi
+      rm -f "$tmp"
+    done < <(find -E "$d" -maxdepth 1 -type f -user "$o" -links 1 -size -16385k -regex '.*/[0-9a-f]{64}' 2>/dev/null)
+    # and back out: the pool's entries the process doesn't have, copied in as the owner
+    c=$(${as[@]+"${as[@]}"} /bin/sh -c 'for f in "$1"/*; do n=${f##*/}; [ -e "$2/$n" ] || { /bin/cp -- "$f" "$2/" 2>/dev/null && echo x; }; done' sh "$POOL" "$d" | wc -l)
+    n=$((n + c))
   done <<<"$dirs"
   # the cap: oldest entries out first
   while [ "$(du -sk "$POOL" | cut -f1)" -gt 262144 ]; do

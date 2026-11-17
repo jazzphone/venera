@@ -2,3 +2,5 @@ build/
 .DS_Store
 dist/
 tools/local.env
+hostvideo/fuzz/out/
+hostvideo/fuzz/gen/

@@ -138,14 +138,29 @@ qm shutdown 108 && qm start 108     # the VM picks up its new device when QEMU s
 ```
 
 It installs `intel-media-va-driver` (and `libva-drm2`) from the host's apt sources when they're missing,
-`venera-videod` with the FFmpeg it was built with in `/opt/venera/video`, a service per VM
-(`venera-videod@VMID`, started before the guests), and adds the VM's video device to its `args:` line (the VM's config
-is backed up to `/opt/venera/backup` first). `--status` shows what runs, `--remove-vm VMID` takes one VM's device out,
-`--uninstall` takes everything out again (packages only if it installed them). Nothing else on the host changes.
+`venera-videod` with the FFmpeg it was built with in `/opt/venera/video`, a socket and a service per VM
+(`venera-videod@VMID.socket` and `.service`), and adds the VM's video device to its `args:` line (the VM's config is
+backed up to `/opt/venera/backup` first). `--status` shows what runs, `--remove-vm VMID` takes one VM's device out,
+`--uninstall` takes everything out again (packages only if it installed them). Nothing else on the host changes. An
+older hand-made setup (`venera-videod.service` and `/run/venera-video.sock` in the VM's args) is replaced.
 
-**A VM with the video device doesn't start while its `venera-videod@VMID` isn't running**: QEMU waits for the
-service's socket. The service starts at boot before the guests and restarts by itself; `--remove-vm` gives the VM back
-its old config. Restarting the service (an update) cuts a running VM's video until the VM is stopped and started.
+**The service decodes what the VM sends it, so it runs with as little as it can**: a user made for each run
+(systemd's `DynamicUser`), the GPU's render node and nothing else in `/dev`, no network, a read-only file system, no
+privileges or capabilities, a system-call filter, 2 GB of memory at most. Everything it reads from the VM is copied out
+of the shared memory before it is parsed, and the parsers were fuzzed (`hostvideo/fuzz`).
+
+**Restarts don't cost the VM its device.** systemd holds the socket from boot (the VM finds it even while the service
+is down) and keeps the service's shared memory and the VM's connection across a restart (its file descriptor store):
+an update or a crash carries on with them, back within ~100 ms, and the video in a player picks up at its next key
+frame (a second or two). A host with no usable GPU still serves the VM, answering that it decodes nothing, so the
+guest decodes in software. Debugging: `systemctl kill -s USR1 venera-videod@VMID` toggles verbose logging (and message
+dumps in `/var/lib/venera-video/VMID`), `-s USR2` logs its state.
+
+**A VM with the device needs `VeneraVideo.kext`.** Without it, Apple's VirtIO driver takes the device and hangs on
+it, and the boot doesn't publish the partitions of disks found after it -- the OpenCore disk among them, so an
+installer finds no OpenCore. So install the guest's half before the VM starts with the device; the installer adds
+the kext whenever the device is there (even with "Hardware video decoding" unticked), and the uninstaller keeps it
+until the device is gone (`--remove-vm` on the host, start the VM again, run the uninstaller again).
 
 ### Which processes use the driver
 
@@ -220,7 +235,9 @@ The accelerator flips at most once per 12 ms by default (`vgpuflipms=N` boot-arg
 - **Proxmox's noVNC console shows at most ~33 fps**: QEMU's VNC server sends an update at most every 30 ms
   (`VNC_REFRESH_INTERVAL_BASE`), however fast the guest draws. The guest runs 50-60 fps; to see that, view the VM
   through a display that isn't VNC (QEMU's `gtk,gl=on` or `sdl,gl=on` on the host, or local SPICE with `gl=on`) or
-  stream it from inside the guest.
+  stream it from inside the guest. Away from home, noVNC also has to fit every frame through the link as compressed
+  tiles: Proxmox's SPICE console (already on for `virtio-gl`; a client such as virt-viewer opens the `.vv` file the
+  console menu gives) sends changing areas as a video stream, which usually holds up better on a slow link.
 - Apps: tested on VM 108 with Safari (WebGL, canvas, CSS effects at 60 fps), Preview and QuickTime (Core Image,
   video), Maps, Photos, Freeform, Calendar, Contacts, Notes, Music, TV, System Settings and others. OpenGL apps
   (Chess) still draw with macOS's software OpenGL; Core Image's stitched kernels fall back to its source path.

@@ -9,6 +9,13 @@
 // guest's own IOSurface (the guest copies it out of a shared-memory slot).
 //
 //   venera-videod [-v] SOCKET            serve the VM (QEMU's chardev for ivshmem-doorbell connects to SOCKET)
+//
+// Under systemd (packaging/host/venera-videod@.service and .socket) it is socket-activated, runs as a dynamic user
+// with only the GPU's render node, and keeps its shared memory, doorbells and QEMU's connection in systemd's file
+// descriptor store: a crash or a restart picks up the same connection, so the VM keeps its device (the guest sees a
+// new host_gen and its sessions start over). Everything the guest writes is read from a private copy, never in place.
+// Environment: VENERA_VIDEO_DEVICE (the render node, default the first Intel one), STATE_DIRECTORY (where -v dumps
+// and unknown messages are saved; nothing is written without it).
 //   venera-videod [-v] -replay MSG...    play messages a guest sent (tools/pvshim.c saves them) against the engine,
 //                                        acting as the guest: output buffers are made up, frames' pixels printed
 #define _GNU_SOURCE
@@ -25,7 +32,9 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <stddef.h>
 #include <sys/un.h>
+#include <dirent.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -216,6 +225,7 @@ typedef struct frame_out {
     uint32_t surf;       // the guest's buffer, once it answered
     uint8_t uui[16];
     int answered;
+    struct timespec asked;   // when the Dbuf went out: an answer that never comes drops the frame (pump_stale)
     struct frame_out *next;
 } frame_out;
 
@@ -243,8 +253,16 @@ typedef struct {
     int64_t suppress[64];   // replayed frames whose output is not owed to VideoToolbox
     int nsuppress;
     uint64_t frames_in, frames_out;
+    uint8_t *fds;   // dsta's sample description, kept so a restarted program can open the decoder again
+    size_t fds_len;
+    int await_key;   // after a restart: frames are dropped until the next key frame (the references are gone)
+    int64_t max_frm;   // the highest frame number the guest sent; after a crash, numbers skipped since were lost
+    int gap_check;
+    int fds_kept;   // the sample description is in the restart store already (persist copies it once)
 } session;
 #define MAX_SESSIONS 32
+#define SAVED_MAX_BYTES (64u << 20)
+#define PS_FDS 8192   // the largest sample description kept across a restart
 static session sessions[MAX_SESSIONS];
 static AVBufferRef *hwdev;
 
@@ -274,6 +292,7 @@ static void free_session(session *s) {
         free(f);
     }
     avcodec_free_context(&s->c);
+    free(s->fds);
     if (s->used) {
         LOG("session %02x%02x%02x%02x closed: %llu frames in, %llu out", s->uuid[0], s->uuid[1], s->uuid[2], s->uuid[3],
             (unsigned long long)s->frames_in, (unsigned long long)s->frames_out);
@@ -351,6 +370,7 @@ static int open_decoder(session *s, const uint8_t *fds, size_t n) {
                 s->bits = 8;   // High 10 and up would need the SPS; 8 assumed
             }
             if (id != AV_CODEC_ID_VP9) {
+                av_freep(&s->c->extradata);   // a second box of the same kind replaces the first (it leaked)
                 s->c->extradata = av_mallocz(cn + AV_INPUT_BUFFER_PADDING_SIZE);
                 memcpy(s->c->extradata, c, cn);
                 s->c->extradata_size = (int)cn;
@@ -552,6 +572,7 @@ static void pump(session *s) {
         if (!f->dropped && !f->err && !f->dbuf_req) {
             buf m = {0};
             f->dbuf_req = ++host_req;
+            clock_gettime(CLOCK_MONOTONIC, &f->asked);
             msg_header(&m, "Dbuf", 2, s->uuid, f->dbuf_req);
             field_s64(&m, "frm", f->frm);
             out.msg(&m);
@@ -565,6 +586,15 @@ static void pump(session *s) {
         } else if (f->err) {
             send_demt(s, f, kVTDecodeInfo_Asynchronous);
         } else {
+            if (!f->answered && f->dbuf_req && f->asked.tv_sec) {
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                if (now.tv_sec - f->asked.tv_sec > 2) {   // the guest never gave a buffer (a lost request): dropped
+                    VLOG("frame %lld: no buffer from the guest in 2 s; dropped", (long long)f->frm);
+                    f->dropped = 1;
+                    continue;
+                }
+            }
             if (!f->answered || f->slot < 0) {
                 break;   // in output order: wait for this one's buffer (or a free slot; VV_G_SLOTDONE pumps again)
             }
@@ -597,6 +627,9 @@ static void pump(session *s) {
         out.msg(&r);
         free(r.p);
         s->finishing = 0;
+        if (!s->c) {   // a dsta since the dfin took the decoder away and did not get another
+            return;
+        }
         avcodec_flush_buffers(s->c);
         s->nsuppress = 0;
         for (int i = 0; i < s->nsaved; i++) {
@@ -658,6 +691,7 @@ static void collect(session *s) {
                 if (s->pending_fo[i]) {   // its buffer was asked for already: carry that over
                     frame_out *e = s->pending_fo[i];
                     f->dbuf_req = e->dbuf_req, f->answered = e->answered, f->surf = e->surf, f->err = e->err;
+                    f->asked = e->asked;
                     memcpy(f->uui, e->uui, 16);
                     free(e);
                 }
@@ -711,12 +745,149 @@ static const uint8_t *sample_data(const uint8_t *sbf, size_t n, size_t *len) {
     return NULL;
 }
 
+// Whether a sample starts a picture that needs no earlier ones: an H.264 IDR or HEVC IRAP NAL unit (length-prefixed,
+// as in MP4), or a VP9 key frame.
+static int is_key_frame(uint32_t codec, const uint8_t *d, size_t n) {
+    if (codec == FOURCC('v', 'p', '0', '9')) {
+        if (n < 1) {
+            return 0;
+        }
+        int bit = 3;   // after frame_marker (2 bits) and profile (2)
+        int marker = (d[0] >> 6) & 3, profile = ((d[0] >> 5) & 1) | (((d[0] >> 4) & 1) << 1);
+        if (marker != 2) {
+            return 0;
+        }
+        if (profile == 3) {
+            bit--;   // reserved_zero
+        }
+        if ((d[0] >> bit) & 1) {
+            return 0;   // show_existing_frame
+        }
+        bit--;
+        return bit >= 0 && !((d[0] >> bit) & 1);   // frame_type 0: key frame
+    }
+    for (size_t i = 0; i + 5 <= n;) {
+        size_t l = (size_t)get_be(d + i, 4);
+        if (l == 0 || l > n - i - 4) {
+            break;
+        }
+        uint8_t h = d[i + 4];
+        if (codec == FOURCC('h', 'v', 'c', '1') ? ((h >> 1) & 0x3f) >= 16 && ((h >> 1) & 0x3f) <= 23 : (h & 0x1f) == 5) {
+            return 1;
+        }
+        i += 4 + l;
+    }
+    return 0;
+}
+
+// ---- what survives a restart: each session's sample description and the frames the guest still waits for ---------
+// A memfd in systemd's file descriptor store (beside the shared memory), rewritten as sessions change.
+#define PS_OUT 512
+typedef struct {
+    uint32_t used, codec, fds_len, nout;
+    int64_t max_frm;
+    uint8_t uuid[16];
+    uint8_t fds[PS_FDS];
+    int64_t out[PS_OUT];
+} ps_session;
+typedef struct {
+    uint32_t magic, n;
+    uint64_t host_req;   // the guest matches answers by request number: a new run must not reuse one
+    ps_session s[MAX_SESSIONS];
+} ps_state;
+#define PS_MAGIC 0x56565055u   // changes with ps_state's layout
+static ps_state *ps;
+static int ps_fd = -1;
+static void persist(void) {
+    if (!ps) {
+        return;
+    }
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        session *s = &sessions[i];
+        ps_session *p = &ps->s[i];
+        if (!s->used) {
+            p->used = 0;
+            continue;
+        }
+        if (!s->fds_kept || !p->used || memcmp(p->uuid, s->uuid, 16)) {
+            memcpy(p->uuid, s->uuid, 16);
+            p->codec = s->codec;
+            p->fds_len = s->fds_len <= PS_FDS ? (uint32_t)s->fds_len : 0;
+            if (p->fds_len) {
+                memcpy(p->fds, s->fds, p->fds_len);
+            }
+            s->fds_kept = 1;
+        }
+        uint32_t k = 0;
+        for (int j = 0; j < s->npending && k < PS_OUT; j++) {
+            p->out[k++] = s->pending[j];
+        }
+        for (frame_out *f = s->head; f && k < PS_OUT; f = f->next) {
+            p->out[k++] = f->frm;
+        }
+        p->nout = k;
+        p->max_frm = s->max_frm;
+        p->used = 1;
+    }
+    ps->host_req = host_req;
+    ps->n = (uint32_t)sizeof(ps_state);
+    ps->magic = PS_MAGIC;
+}
+// After a restart: the sessions again, their decoders opened, every frame the old program held reported dropped.
+static void restore_sessions(void) {
+    if (!ps || ps->magic != PS_MAGIC || ps->n != sizeof(ps_state)) {
+        return;
+    }
+    host_req = ps->host_req + 100000;
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        ps_session *p = &ps->s[i];
+        if (!p->used) {
+            continue;
+        }
+        session *s = &sessions[i];
+        memset(s, 0, sizeof(*s));
+        s->used = 1;
+        memcpy(s->uuid, p->uuid, 16);
+        s->codec = p->codec;
+        if (p->fds_len && p->fds_len <= PS_FDS && hwdev && !open_decoder(s, p->fds, p->fds_len)) {
+            s->fds = malloc(p->fds_len);
+            memcpy(s->fds, p->fds, p->fds_len);
+            s->fds_len = p->fds_len;
+            s->await_key = 1;
+        }
+        s->max_frm = p->max_frm;
+        s->gap_check = 1;
+        uint32_t nout = p->nout <= PS_OUT ? p->nout : PS_OUT;
+        for (uint32_t j = 0; j < nout; j++) {
+            frame_out f = {.frm = p->out[j], .dropped = 1};
+            send_demt(s, &f, kVTDecodeInfo_Asynchronous | kVTDecodeInfo_FrameDropped);
+        }
+        LOG("session %02x%02x%02x%02x: back after the restart (%u frames reported dropped)%s", s->uuid[0], s->uuid[1],
+            s->uuid[2], s->uuid[3], nout, s->c ? "" : "; no decoder");
+    }
+}
+
 static void on_dfrm(session *s, const msg *m) {
     int64_t frm = field_int(m, "frm", "s64", -1);
     uint32_t dfl = (uint32_t)field_int(m, "dfl", "u32", 0);
     size_t sn = 0, dn = 0;
     const uint8_t *sbf = msg_field(m, "sbf", "sbf", &sn);
     const uint8_t *data = sbf ? sample_data(sbf, sn, &dn) : NULL;
+    if (s->gap_check) {   // frames the guest sent while the old program was dying: never answered, so dropped now
+        s->gap_check = 0;
+        int n = 0;
+        for (int64_t x = s->max_frm + 1; x < frm && n < 64; x++, n++) {
+            frame_out f = {.frm = x, .dropped = 1};
+            send_demt(s, &f, kVTDecodeInfo_Asynchronous | kVTDecodeInfo_FrameDropped);
+        }
+        if (n) {
+            LOG("session %02x%02x%02x%02x: %d frames lost in the restart reported dropped", s->uuid[0], s->uuid[1], s->uuid[2],
+                s->uuid[3], n);
+        }
+    }
+    if (frm > s->max_frm) {
+        s->max_frm = frm;
+    }
     buf r = {0};
     msg_header(&r, "dfrm", 4, m->uuid, m->req);
     if (!s->c || !data) {
@@ -724,6 +895,20 @@ static void on_dfrm(session *s, const msg *m) {
         out.msg(&r);
         free(r.p);
         return;
+    }
+    if (s->await_key) {
+        if (!is_key_frame(s->codec, data, dn)) {   // no references to decode it against: dropped
+            field_s32(&r, "err", 0);
+            field_u32(&r, "inf", kVTDecodeInfo_Asynchronous);
+            out.msg(&r);
+            free(r.p);
+            frame_out f = {.frm = frm, .dropped = 1};
+            send_demt(s, &f, kVTDecodeInfo_Asynchronous | kVTDecodeInfo_FrameDropped);
+            return;
+        }
+        LOG("session %02x%02x%02x%02x: decoding again from key frame %lld", s->uuid[0], s->uuid[1], s->uuid[2], s->uuid[3],
+            (long long)frm);
+        s->await_key = 0;
     }
     AVPacket *p = av_packet_alloc();
     av_new_packet(p, (int)dn);
@@ -733,6 +918,18 @@ static void on_dfrm(session *s, const msg *m) {
     if (s->nsaved == s->capsaved) {
         s->capsaved = s->capsaved ? s->capsaved * 2 : 64;
         s->saved = realloc(s->saved, sizeof(AVPacket *) * (size_t)s->capsaved);
+    }
+    {   // the packets kept for a replay since the last key frame: bounded, or a guest that never sends one grows this forever
+        size_t bytes = dn;
+        for (int i = 0; i < s->nsaved; i++) {
+            bytes += (size_t)s->saved[i]->size;
+        }
+        if (s->nsaved >= 1024 || bytes > SAVED_MAX_BYTES) {
+            for (int i = 0; i < s->nsaved; i++) {
+                av_packet_free(&s->saved[i]);
+            }
+            s->nsaved = 0;   // a replay from here has no references to start from anyway
+        }
     }
     s->saved[s->nsaved++] = av_packet_clone(p);
     // never drop a packet: when the decoder has frames to hand out first, take them and send it again
@@ -760,6 +957,7 @@ static void on_dfrm(session *s, const msg *m) {
             e = calloc(1, sizeof(*e));
             e->frm = frm, e->slot = -1;
             e->dbuf_req = ++host_req;
+            clock_gettime(CLOCK_MONOTONIC, &e->asked);
             buf m = {0};
             msg_header(&m, "Dbuf", 2, s->uuid, e->dbuf_req);
             field_s64(&m, "frm", frm);
@@ -778,6 +976,23 @@ static void on_dfrm(session *s, const msg *m) {
     pump(s);
 }
 
+// Where debugging files go: systemd's StateDirectory, or nowhere.
+static const char *dump_dir(void) {
+    const char *d = getenv("STATE_DIRECTORY");
+    return d && *d ? d : NULL;
+}
+// A message type as a file name and log text: the guest chooses it, so only letters and digits pass.
+static const char *safe_type(const char *t) {
+    static char s[5];
+    for (int i = 0; i < 4; i++) {
+        char c = t[i];
+        s[i] = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ? c : c == '+' ? '_' : c == '-' ? '=' : '.';
+    }
+    s[4] = 0;
+    return s;
+}
+static int open_hw(void);
+
 // One message from the guest, with the IOSurfaces it carries.
 static void engine_msg(const uint8_t *p, size_t n, const struct vv_surf *surfs, int nsurf) {
     msg m;
@@ -788,10 +1003,9 @@ static void engine_msg(const uint8_t *p, size_t n, const struct vv_surf *surfs, 
     session *s = find_session(m.uuid);
     VLOG("<- %s flags %u req %llu (%zu bytes, %d surfaces)", m.type, m.flags, (unsigned long long)m.req, n, nsurf);
     static int ndump;
-    if (verbose && ndump < 400) {   // debugging: the messages themselves, for tools/pvdump.py
-        char path[128];
-        snprintf(path, sizeof(path), "/root/vgpu/video/dump/%04d-%02x%02x-%s.bin", ndump++, m.uuid[0], m.uuid[1],
-                 m.type[0] == '+' ? "_dec" : m.type[0] == '-' ? "=dec" : m.type);
+    if (verbose && ndump < 400 && dump_dir()) {   // debugging: the messages themselves, for tools/pvdump.py
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%04d-%02x%02x-%s.bin", dump_dir(), ndump++, m.uuid[0], m.uuid[1], safe_type(m.type));
         FILE *f = fopen(path, "wb");
         if (f) {
             fwrite(p, 1, n, f);
@@ -834,7 +1048,9 @@ static void engine_msg(const uint8_t *p, size_t n, const struct vv_surf *surfs, 
         static const int hevc[] = {1, 2, 3}, avc[] = {66, 77, 100};
         const int *profiles = NULL;
         int np = 0, level = 0;
-        if (cod == FOURCC('h', 'v', 'c', '1')) {
+        if (!hwdev && open_hw()) {
+            // nothing: no GPU to decode on
+        } else if (cod == FOURCC('h', 'v', 'c', '1')) {
             profiles = hevc, np = 3, level = 186;   // level 6.2
         } else if (cod == FOURCC('a', 'v', 'c', '1')) {
             profiles = avc, np = 3, level = 52;     // level 5.2
@@ -876,8 +1092,9 @@ static void engine_msg(const uint8_t *p, size_t n, const struct vv_surf *surfs, 
         free(r.p);
     } else if (!strcmp(t, "+dec")) {
         uint32_t cod = (uint32_t)field_int(&m, "cod", "s32", 0);
-        int ok = cod == FOURCC('a', 'v', 'c', '1') || cod == FOURCC('h', 'v', 'c', '1') ||
-                 cod == FOURCC('v', 'p', '0', '9');
+        int ok = (cod == FOURCC('a', 'v', 'c', '1') || cod == FOURCC('h', 'v', 'c', '1') ||
+                  cod == FOURCC('v', 'p', '0', '9')) &&
+                 (hwdev || !open_hw());   // no GPU: the guest decodes in software
         buf r = {0};
         msg_header(&r, "+dec", 4, m.uuid, m.req);
         if (!s && ok) {
@@ -904,9 +1121,25 @@ static void engine_msg(const uint8_t *p, size_t n, const struct vv_surf *surfs, 
     } else if (!strcmp(t, "dsta")) {
         size_t fn = 0;
         const uint8_t *fds = msg_field(&m, "fds", "fds", &fn);
-        if (!fds || open_decoder(s, fds, fn)) {
+        if (s->c) {   // a second dsta for the session: start its decoder over
+            AVCodecContext *old = s->c;
+            avcodec_free_context(&old);
+            s->c = NULL;
+            for (int i = 0; i < s->nsaved; i++) {
+                av_packet_free(&s->saved[i]);
+            }
+            s->nsaved = 0;
+        }
+        if (!fds || !hwdev || open_decoder(s, fds, fn)) {
             reply_err(&m, kVTVideoDecoderMalfunctionErr);
         } else {
+            free(s->fds);
+            s->fds_kept = 0;
+            s->fds = fn <= PS_FDS ? malloc(fn) : NULL;
+            s->fds_len = s->fds ? fn : 0;
+            if (s->fds) {
+                memcpy(s->fds, fds, fn);
+            }
             send_pba(s);
             reply_err(&m, 0);
         }
@@ -971,15 +1204,15 @@ static void engine_msg(const uint8_t *p, size_t n, const struct vv_surf *surfs, 
         }
         if (!known && nseen < 64) {
             strcpy(seen[nseen++], t);
-            char path[96];
-            snprintf(path, sizeof(path), "/root/vgpu/video/unhandled-%s.bin", t);
-            FILE *f = fopen(path, "wb");
+            char path[512];
+            snprintf(path, sizeof(path), "%s/unhandled-%s.bin", dump_dir() ? dump_dir() : "/nonexistent", safe_type(t));
+            FILE *f = dump_dir() ? fopen(path, "wb") : NULL;
             if (f) {
                 fwrite(p, 1, n, f);
                 fclose(f);
             }
         }
-        LOG("%s (flags %u): not handled%s", t, m.flags, m.flags & 1 ? "; answered with no error" : "");
+        LOG("%s (flags %u): not handled%s", safe_type(t), m.flags, m.flags & 1 ? "; answered with no error" : "");
         if (m.flags & 1) {
             reply_err(&m, 0);
         }
@@ -995,6 +1228,14 @@ static void engine_slotdone(int slot, int err) {
     }
     for (int i = 0; i < MAX_SESSIONS; i++) {
         if (sessions[i].used) {
+            pump(&sessions[i]);
+        }
+    }
+}
+// Now and then: sessions waiting on a buffer the guest may never give (pump drops a frame after 2 s).
+static void engine_tick(void) {
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        if (sessions[i].used && sessions[i].head && !sessions[i].head->answered) {
             pump(&sessions[i]);
         }
     }
@@ -1015,10 +1256,16 @@ static void engine_reset(void) {
 // ---- the rings -----------------------------------------------------------------------------------------------------
 
 static struct vv_ctl *ctl;
+// The counters this side owns, kept here: the copies in shared memory are for the guest to read, and anything it
+// writes there is never trusted.
+static uint32_t h2g_head, g2h_tail;
 static int ring_put(struct vv_ring *r, uint8_t *base, uint32_t size, uint16_t kind, const uint32_t *args, const void *a,
                     uint32_t na) {
     uint32_t need = VV_ALIGN((uint32_t)sizeof(struct vv_rec) + na);
-    uint32_t head = r->head, tail = __atomic_load_n(&r->tail, __ATOMIC_ACQUIRE);
+    uint32_t head = h2g_head, tail = __atomic_load_n(&r->tail, __ATOMIC_ACQUIRE);
+    if (head - tail > size || need > size / 2) {   // a tail ahead of head, or behind by more than the ring: corrupt
+        return -1;
+    }
     uint32_t off = head % size, toend = size - off;
     if (toend < need) {
         if (size - (head - tail) < toend + need) {
@@ -1042,7 +1289,8 @@ static int ring_put(struct vv_ring *r, uint8_t *base, uint32_t size, uint16_t ki
     if (na) {
         memcpy(rec + 1, a, na);
     }
-    __atomic_store_n(&r->head, head + need, __ATOMIC_RELEASE);
+    h2g_head = head + need;
+    __atomic_store_n(&r->head, h2g_head, __ATOMIC_RELEASE);
     return 0;
 }
 
@@ -1056,6 +1304,8 @@ typedef struct ob {
     struct ob *next;
 } ob;
 static ob *outbox, *outbox_tail;   // records waiting for room in the host-to-guest ring
+static size_t outbox_bytes;
+#define OUTBOX_MAX (64u << 20)   // a guest that stops reading can't grow this program without end
 static int kicked;
 
 static void h2g(uint16_t kind, const uint32_t *args, const void *p, uint32_t n) {
@@ -1063,6 +1313,14 @@ static void h2g(uint16_t kind, const uint32_t *args, const void *p, uint32_t n) 
         kicked = 1;
         return;
     }
+    if (outbox_bytes + n > OUTBOX_MAX) {
+        static int warned;
+        if (!warned++) {
+            LOG("the guest isn't reading its ring: dropping messages for it");
+        }
+        return;
+    }
+    outbox_bytes += n;
     ob *o = calloc(1, sizeof(*o));
     o->kind = kind;
     if (args) {
@@ -1085,6 +1343,7 @@ static void flush_outbox(void) {
         if (!outbox) {
             outbox_tail = NULL;
         }
+        outbox_bytes -= o->n;
         free(o->p);
         free(o);
         kicked = 1;
@@ -1113,48 +1372,78 @@ static void srv_fill(uint32_t surf, int slot, int w, int h, int stride, int bps)
     h2g(VV_H_FILL, a, NULL, 0);
 }
 
+static void ring_corrupt(const char *why, uint32_t v) {
+    static unsigned n;
+    if (n++ < 20) {   // a misbehaving guest can't flood the journal
+        LOG("guest ring corrupt (%s %u); dropping what it holds", why, v);
+    }
+}
+// Each record is copied out of shared memory before anything reads it, so the guest can't change it between a check
+// and a use; the record's place is checked against the ring (a record never wraps).
 static void drain_g2h(void) {
+    static uint8_t *copy;
+    if (!copy && !(copy = malloc(VV_G2H_SIZE))) {
+        return;
+    }
     struct vv_ring *r = &ctl->g2h;
-    uint8_t *base = shm + VV_G2H_OFF;
+    const uint8_t *base = shm + VV_G2H_OFF;
     for (;;) {
-        uint32_t tail = r->tail, head = __atomic_load_n(&r->head, __ATOMIC_ACQUIRE);
+        uint32_t tail = g2h_tail, head = __atomic_load_n(&r->head, __ATOMIC_ACQUIRE);
         if (tail == head) {
             break;
         }
-        struct vv_rec *rec = (struct vv_rec *)(base + tail % VV_G2H_SIZE);
-        uint32_t step = VV_ALIGN((uint32_t)sizeof(struct vv_rec) + rec->len);
-        if (rec->len > VV_G2H_SIZE) {
-            LOG("guest ring corrupt (record of %u bytes); dropping everything", rec->len);
-            __atomic_store_n(&r->tail, head, __ATOMIC_RELEASE);
+        uint32_t used = head - tail, off = tail % VV_G2H_SIZE;
+        struct vv_rec rec;
+        if (used > VV_G2H_SIZE || used < sizeof(rec) || VV_G2H_SIZE - off < sizeof(rec)) {
+            ring_corrupt("head", head);
+            g2h_tail = head;
+            __atomic_store_n(&r->tail, g2h_tail, __ATOMIC_RELEASE);
             break;
         }
-        const uint8_t *pay = (const uint8_t *)(rec + 1);
-        switch (rec->kind) {
+        memcpy(&rec, base + off, sizeof(rec));
+        if (rec.len > VV_G2H_SIZE - off - sizeof(rec) || VV_ALIGN((uint32_t)sizeof(rec) + rec.len) > used) {
+            ring_corrupt("record length", rec.len);
+            g2h_tail = head;
+            __atomic_store_n(&r->tail, g2h_tail, __ATOMIC_RELEASE);
+            break;
+        }
+        uint32_t step = VV_ALIGN((uint32_t)sizeof(rec) + rec.len);
+        if (rec.kind != VV_PAD) {
+            memcpy(copy, base + off + sizeof(rec), rec.len);
+        }
+        const uint8_t *pay = copy;
+        switch (rec.kind) {
         case VV_PAD:
             break;
         case VV_G_HELLO:
-            LOG("guest driver started (run %u)", rec->arg[0]);
+            LOG("guest driver started (run %u)", rec.arg[0]);
             engine_reset();
             break;
         case VV_G_MSG: {
-            uint32_t ns = rec->arg[0], ml = rec->arg[1];
-            if (ns <= 5 && ns * sizeof(struct vv_surf) + ml <= rec->len) {
-                engine_msg(pay + ns * sizeof(struct vv_surf), ml, (const struct vv_surf *)pay, (int)ns);
+            uint32_t ns = rec.arg[0], ml = rec.arg[1];
+            if (ns <= 5 && ml <= rec.len && ns * sizeof(struct vv_surf) + ml <= rec.len) {
+                struct vv_surf sf[5];
+                memcpy(sf, pay, ns * sizeof(struct vv_surf));
+                engine_msg(pay + ns * sizeof(struct vv_surf), ml, sf, (int)ns);
             }
             break;
         }
         case VV_G_SLOTDONE:
-            engine_slotdone((int)rec->arg[0], (int)rec->arg[1]);
+            engine_slotdone((int)rec.arg[0], (int)rec.arg[1]);
             break;
         case VV_G_UUIDGONE:
-            if (rec->len >= 16) {
+            if (rec.len >= 16) {
                 engine_uuid_gone(pay);
             }
             break;
         default:
-            LOG("guest record kind %u?", rec->kind);
+            ring_corrupt("record kind", rec.kind);
         }
-        __atomic_store_n(&r->tail, tail + step, __ATOMIC_RELEASE);
+        g2h_tail = tail + step;
+        __atomic_store_n(&r->tail, g2h_tail, __ATOMIC_RELEASE);
+        if (rec.kind == VV_G_MSG || rec.kind == VV_G_HELLO || rec.kind == VV_G_UUIDGONE) {
+            persist();   // after each message, so a crash loses as little as it can (a session's few hundred bytes)
+        }
     }
 }
 
@@ -1214,35 +1503,170 @@ static void dump_state(void) {
     }
 }
 
-static int serve(const char *path) {
-    shm_fd = memfd_create("venera-video", MFD_CLOEXEC);
-    if (shm_fd < 0 || ftruncate(shm_fd, VV_SHM_SIZE) < 0) {
-        LOG("shared memory: %s", strerror(errno));
-        return 1;
-    }
-    shm = mmap(NULL, VV_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
-    if (shm == MAP_FAILED) {
-        LOG("mapping the shared memory: %s", strerror(errno));
-        return 1;
-    }
-    ctl = (struct vv_ctl *)shm;
-    memset(ctl, 0, sizeof(*ctl));
-    ctl->magic = VV_MAGIC;
-    ctl->version = VV_VERSION;
-    ctl->host_gen = (uint32_t)time(NULL);
-    host_ev = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    vm_ev = eventfd(0, EFD_CLOEXEC);
-    int ls = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+// ---- systemd: socket activation and the file descriptor store (sd_notify's protocol, without libsystemd) ----------
+
+static int sd_notify_fd(const char *state, int fd) {
+    const char *e = getenv("NOTIFY_SOCKET");
     struct sockaddr_un a = {.sun_family = AF_UNIX};
-    snprintf(a.sun_path, sizeof(a.sun_path), "%s", path);
-    unlink(path);
-    if (bind(ls, (struct sockaddr *)&a, sizeof(a)) < 0 || listen(ls, 2) < 0) {
-        LOG("listening on %s: %s", path, strerror(errno));
-        return 1;
+    size_t l = e ? strlen(e) : 0;
+    if (!l || l >= sizeof(a.sun_path)) {
+        return -1;
     }
-    chmod(path, 0600);
-    LOG("serving %s: %u MB shared, %d frame slots", path, VV_SHM_SIZE >> 20, VV_NSLOTS);
-    int client = -1;
+    memcpy(a.sun_path, e, l);
+    if (a.sun_path[0] == '@') {
+        a.sun_path[0] = 0;
+    }
+    int s = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (s < 0) {
+        return -1;
+    }
+    struct iovec iov = {(void *)state, strlen(state)};
+    char cbuf[CMSG_SPACE(sizeof(int))];
+    struct msghdr mh = {.msg_name = &a, .msg_namelen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + l),
+                        .msg_iov = &iov, .msg_iovlen = 1};
+    if (fd >= 0) {
+        memset(cbuf, 0, sizeof(cbuf));
+        mh.msg_control = cbuf;
+        mh.msg_controllen = sizeof(cbuf);
+        struct cmsghdr *c = CMSG_FIRSTHDR(&mh);
+        c->cmsg_level = SOL_SOCKET, c->cmsg_type = SCM_RIGHTS, c->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(c), &fd, sizeof(int));
+    }
+    int rc = sendmsg(s, &mh, MSG_NOSIGNAL) < 0 ? -1 : 0;
+    close(s);
+    return rc;
+}
+static void fd_store(const char *name, int fd) {
+    char st[96];
+    snprintf(st, sizeof(st), "FDSTOREREMOVE=1\nFDNAME=%s", name);
+    sd_notify_fd(st, -1);
+    if (fd >= 0) {
+        snprintf(st, sizeof(st), "FDSTORE=1\nFDNAME=%s", name);
+        sd_notify_fd(st, fd);
+    }
+}
+// The descriptors systemd passed: the listening socket (the .socket unit's) and whatever an earlier run stored.
+static void systemd_fds(int *ls, int *client) {
+    const char *pid = getenv("LISTEN_PID"), *nfds = getenv("LISTEN_FDS"), *names = getenv("LISTEN_FDNAMES");
+    if (!pid || !nfds || atol(pid) != (long)getpid()) {
+        return;
+    }
+    int n = atoi(nfds);
+    const char *nm = names ? names : "";
+    for (int i = 0; i < n && i < 16; i++) {
+        int fd = 3 + i;
+        const char *end = strchr(nm, ':');
+        size_t l = end ? (size_t)(end - nm) : strlen(nm);
+        char name[64] = "";
+        if (l < sizeof(name)) {
+            memcpy(name, nm, l);
+            name[l] = 0;
+        }
+        nm = end ? end + 1 : nm + l;
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
+        if (!strcmp(name, "shm")) {
+            shm_fd = fd;
+        } else if (!strcmp(name, "hostev")) {
+            host_ev = fd;
+        } else if (!strcmp(name, "vmev")) {
+            vm_ev = fd;
+        } else if (!strcmp(name, "client")) {
+            *client = fd;
+        } else if (!strcmp(name, "sessions")) {
+            ps_fd = fd;
+        } else {
+            *ls = fd;
+        }
+    }
+    unsetenv("LISTEN_PID"), unsetenv("LISTEN_FDS"), unsetenv("LISTEN_FDNAMES");
+}
+
+static int serve(const char *path) {
+    int ls = -1, client = -1;
+    systemd_fds(&ls, &client);
+    if (shm_fd >= 0 && host_ev >= 0 && vm_ev >= 0) {   // an earlier run's memory and doorbells: carry on with them
+        shm = mmap(NULL, VV_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+        if (shm != MAP_FAILED && ((struct vv_ctl *)shm)->magic == VV_MAGIC &&
+            ((struct vv_ctl *)shm)->version == VV_VERSION) {
+            ctl = (struct vv_ctl *)shm;
+            ctl->host_gen++;   // the guest learns its host started over (its sessions are gone)
+            g2h_tail = ctl->g2h.tail & ~31u;   // the guest can write these: records start on 32 bytes
+            h2g_head = ctl->h2g.head & ~31u;
+            LOG("carrying on after a restart: the same shared memory%s", client >= 0 ? " and QEMU's connection" : "");
+        } else {
+            LOG("the stored shared memory isn't ours; starting over");
+            if (shm != MAP_FAILED) {
+                munmap(shm, VV_SHM_SIZE);
+            }
+            shm = NULL;
+        }
+    }
+    struct stat st;
+    if (ctl && ps_fd >= 0 && fstat(ps_fd, &st) == 0 && st.st_size == (off_t)sizeof(ps_state)) {   // else another version's
+        ps = mmap(NULL, sizeof(ps_state), PROT_READ | PROT_WRITE, MAP_SHARED, ps_fd, 0);
+        if (ps == MAP_FAILED) {
+            ps = NULL;
+        }
+        restore_sessions();
+    }
+    if (!ctl) {
+        if (shm_fd >= 0) close(shm_fd);
+        if (host_ev >= 0) close(host_ev);
+        if (vm_ev >= 0) close(vm_ev);
+        if (client >= 0) close(client);
+        shm_fd = host_ev = vm_ev = client = -1;
+        shm_fd = memfd_create("venera-video", MFD_CLOEXEC);
+        if (shm_fd < 0 || ftruncate(shm_fd, VV_SHM_SIZE) < 0) {
+            LOG("shared memory: %s", strerror(errno));
+            return 1;
+        }
+        shm = mmap(NULL, VV_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+        if (shm == MAP_FAILED) {
+            LOG("mapping the shared memory: %s", strerror(errno));
+            return 1;
+        }
+        ctl = (struct vv_ctl *)shm;
+        memset(ctl, 0, sizeof(*ctl));
+        ctl->magic = VV_MAGIC;
+        ctl->version = VV_VERSION;
+        ctl->host_gen = (uint32_t)time(NULL);
+        host_ev = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        vm_ev = eventfd(0, EFD_CLOEXEC);
+        fd_store("shm", shm_fd);
+        fd_store("hostev", host_ev);
+        fd_store("vmev", vm_ev);
+        fd_store("client", -1);
+    }
+    if (!ps) {   // where sessions are kept for the next run
+        if (ps_fd >= 0) {
+            close(ps_fd);
+        }
+        ps_fd = memfd_create("venera-video-sessions", MFD_CLOEXEC);
+        if (ps_fd >= 0 && ftruncate(ps_fd, sizeof(ps_state)) == 0) {
+            ps = mmap(NULL, sizeof(ps_state), PROT_READ | PROT_WRITE, MAP_SHARED, ps_fd, 0);
+            if (ps == MAP_FAILED) {
+                ps = NULL;
+            } else {
+                fd_store("sessions", ps_fd);
+            }
+        }
+    }
+    int own_socket = ls < 0;
+    if (own_socket) {   // run by hand: our own socket
+        ls = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        struct sockaddr_un a = {.sun_family = AF_UNIX};
+        snprintf(a.sun_path, sizeof(a.sun_path), "%s", path);
+        unlink(path);
+        if (bind(ls, (struct sockaddr *)&a, sizeof(a)) < 0 || listen(ls, 2) < 0) {
+            LOG("listening on %s: %s", path, strerror(errno));
+            return 1;
+        }
+        chmod(path, 0600);
+    }
+    fcntl(host_ev, F_SETFL, fcntl(host_ev, F_GETFL) | O_NONBLOCK);
+    LOG("serving %s: %u MB shared, %d frame slots%s", own_socket ? path : "systemd's socket", VV_SHM_SIZE >> 20, VV_NSLOTS,
+        hwdev ? "" : "; no GPU, so the guest decodes in software");
+    sd_notify_fd("READY=1", -1);
     while (!stop) {
         struct pollfd fds[3] = {{ls, POLLIN, 0}, {host_ev, POLLIN, 0}, {client, POLLIN, 0}};
         int rc = poll(fds, client >= 0 ? 3 : 2, 50);
@@ -1261,14 +1685,21 @@ static int serve(const char *path) {
                 engine_reset();
                 memset(&ctl->g2h, 0, sizeof(ctl->g2h));
                 memset(&ctl->h2g, 0, sizeof(ctl->h2g));
+                g2h_tail = h2g_head = 0;
                 ctl->host_gen++;
-                LOG(handshake(c) ? "handshake with QEMU failed" : "QEMU connected");
+                if (handshake(c)) {
+                    LOG("handshake with QEMU failed");
+                } else {
+                    LOG("QEMU connected");
+                    fd_store("client", c);
+                }
             }
         }
         if (client >= 0 && (fds[2].revents & (POLLIN | POLLHUP | POLLERR))) {
             char x[64];
             if (read(client, x, sizeof(x)) <= 0) {
                 LOG("QEMU disconnected (the VM stopped)");
+                fd_store("client", -1);
                 close(client);
                 client = -1;
                 engine_reset();
@@ -1279,15 +1710,22 @@ static int serve(const char *path) {
             while (read(host_ev, &v, 8) == 8) {
             }
         }
-        drain_g2h();
-        flush_outbox();
-        kick_vm();
+        if (client >= 0) {
+            drain_g2h();
+            engine_tick();
+            flush_outbox();
+            kick_vm();
+            persist();
+        }
         if (dump_wanted) {
             dump_wanted = 0;
             dump_state();
         }
     }
-    unlink(path);
+    sd_notify_fd("STOPPING=1", -1);
+    if (own_socket) {
+        unlink(path);
+    }
     return 0;
 }
 
@@ -1376,6 +1814,57 @@ static int replay(int argc, char **argv) {
     return 0;
 }
 
+// The GPU: VENERA_VIDEO_DEVICE, else the first Intel render node, else renderD128. 0 when VA-API is up. A host with
+// no GPU (or a broken driver) still serves the VM, answering that it decodes nothing; each new session tries again.
+static int open_hw(void) {
+    static time_t last;
+    if (hwdev) {
+        return 0;
+    }
+    if (last && time(NULL) - last < 10) {
+        return -1;
+    }
+    last = time(NULL);
+    char dev[320] = "/dev/dri/renderD128";
+    const char *e = getenv("VENERA_VIDEO_DEVICE");
+    if (e && *e) {
+        snprintf(dev, sizeof(dev), "%s", e);
+    } else {
+        DIR *d = opendir("/sys/class/drm");
+        struct dirent *de;
+        while (d && (de = readdir(d))) {
+            if (strncmp(de->d_name, "renderD", 7)) {
+                continue;
+            }
+            char vp[320], v[16] = "";
+            snprintf(vp, sizeof(vp), "/sys/class/drm/%s/device/vendor", de->d_name);
+            FILE *f = fopen(vp, "r");
+            if (f) {
+                if (!fgets(v, sizeof(v), f)) {
+                    v[0] = 0;
+                }
+                fclose(f);
+            }
+            if (!strncmp(v, "0x8086", 6)) {
+                snprintf(dev, sizeof(dev), "/dev/dri/%s", de->d_name);
+                break;
+            }
+        }
+        if (d) {
+            closedir(d);
+        }
+    }
+    int rc = av_hwdevice_ctx_create(&hwdev, AV_HWDEVICE_TYPE_VAAPI, dev, NULL, 0);
+    if (rc < 0) {
+        LOG("VA-API on %s: %s (the guest decodes in software until it works)", dev, av_err2str(rc));
+        hwdev = NULL;
+        return -1;
+    }
+    dpy = ((AVVAAPIDeviceContext *)((AVHWDeviceContext *)hwdev->data)->hwctx)->display;
+    LOG("decoding on %s", dev);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     int a = 1;
     if (a < argc && !strcmp(argv[a], "-v")) {
@@ -1391,18 +1880,16 @@ int main(int argc, char **argv) {
     signal(SIGUSR1, on_usr1);
     signal(SIGUSR2, on_usr2);
     setvbuf(stdout, NULL, _IOLBF, 0);
-    int rc = av_hwdevice_ctx_create(&hwdev, AV_HWDEVICE_TYPE_VAAPI, "/dev/dri/renderD128", NULL, 0);
-    if (rc < 0) {
-        LOG("VA-API on /dev/dri/renderD128: %s", av_err2str(rc));
-        return 1;
-    }
-    dpy = ((AVVAAPIDeviceContext *)((AVHWDeviceContext *)hwdev->data)->hwctx)->display;
     for (int i = 0; i < VV_NSLOTS; i++) {
         slot_va[i].s = VA_INVALID_SURFACE;
     }
     if (!strcmp(argv[a], "-replay")) {
+        if (open_hw()) {
+            return 1;
+        }
         return replay(argc - a - 1, argv + a + 1);
     }
+    open_hw();
     out.msg = srv_msg, out.fill = srv_fill;
     return serve(argv[a]);
 }
