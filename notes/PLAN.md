@@ -1323,6 +1323,6 @@ Measured on VM 108 (snapshots `pre-core057` and earlier):
   What software decode costs today (Safari, one tab, synthetic 30 fps clips, 4 vCPUs): 1080p H.264 plays with 0 of
   601 frames dropped, WebKit.GPU ~33% of a core and WindowServer ~16% over idle; 1080p HEVC 0 dropped,
   VTDecoderXPCService 18% + WebKit.GPU 11% + WindowServer ~16%; 4K H.264 drops 552 of 601 frames with little CPU
-  in use, so its limit is not the decoder's CPU (unexplained; the surface path is the first suspect). Host decode
+  in use. Checked: not the driver -- with Venera off for Safari's GPU process it drops the same (~4 frames shown a second against ~6 with it on), and while it plays WindowServer's render thread, its main thread and Safari's four JVTlib decoder threads all sit waiting. The media pipeline skips frames before decoding them (about 30 decoded in 5 s, ~11% of a core), so it is macOS's own choice for 4K software H.264 on this machine; host decode is the only lever there. Host decode
   would save roughly half a core at 1080p. (The transfer disk's `com.apple.fskit.msdos` takes a core whenever the
   tools touch it: leave it out of CPU numbers.)
