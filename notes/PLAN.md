@@ -1408,6 +1408,16 @@ are untouched. hostvideo/README.md says how it fits together and deploys.
   203 fps, pixels matching the reference decodes. Safari: 1080p and 4K H.264 play with no drops after the start (4K
   dropped 92% in software); at 1080p the VM's CPU went from ~33% (Safari's GPU process) + ~25% (WindowServer) to
   ~0% + 8% (+4% kernel copies); 4K: WindowServer 21%, kernel 9%, Safari's GPU process 7%; the host program ~1.5%.
+- **Safari's codec checks** (later the same morning): with paravirtualized decoders listed, Safari validates HEVC
+  against VideoToolbox's HEVC capabilities, which a guest asks the host for (`dcap`, codec in `cod`; the reply's `dca`
+  is a dictionary: VTSupportedProfiles, VTPerProfileSupport per profile, VTIsHDRAllowedOnDevice). Answered now for
+  HEVC (Main, Main 10, Main Still Picture, level 6.2) and H.264 (Constrained Baseline, Main, High, level 5.2), as the
+  host decodes them; VP9 empty, as Apple's host answers. HEVC plays in Safari (8- and 10-bit). AV1 is no longer
+  listed: Debian's intel-media-va-driver 25.2 has no AV1 decoding on this Iris Xe (hostvideo/src/vaprofiles.c lists
+  what it has), and listing it made Safari report AV1 as hardware-decoded. Publishing IOGVAHEVCDecode* on the
+  accelerator did nothing for this (reverted).
+- **Measured in Safari at the end**: 1080p H.264, Core Media's own counts: 180 frames enqueued and 180 displayed per
+  6 s, none dropped or late.
 - **Limits**: restarting venera-videod needs VM 108 restarted (QEMU's ivshmem has no reconnect). With Venera's Metal
   off for Safari's GPU process the picture froze (not the default). A kernel panic seen at one shutdown (06:40, a
   shutdown-stall `heap` sample faulting in `mach_vm_page_range_query`) happened before the video device existed.

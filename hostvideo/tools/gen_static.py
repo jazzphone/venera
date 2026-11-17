@@ -12,7 +12,9 @@ def field(path, key):
     n = struct.unpack('>I', b[i - 4:i])[0]
     return plistlib.loads(b[i + len(tag):i - 4 + n])
 
-decs = [d for d in field('data/apple-decs-reply.bin', 'dec') if set(d['VTCodecType']) & {'avc1', 'hvc1', 'av01', 'vp09'}]
+# the codecs the host's VA-API driver decodes (Debian's intel-media-va-driver 25.2 on the Iris Xe has no AV1: listing it
+# made Safari report AV1 as hardware-decoded and pick it)
+decs = [d for d in field('data/apple-decs-reply.bin', 'dec') if set(d['VTCodecType']) & {'avc1', 'hvc1', 'vp09'}]
 sup = field('data/apple-dsup-reply.bin', 'sup')
 items = {
     'vv_decs_plist': decs,

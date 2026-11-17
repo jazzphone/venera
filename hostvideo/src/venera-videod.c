@@ -825,6 +825,48 @@ static void engine_msg(const uint8_t *p, size_t n, const struct vv_surf *surfs, 
         return;
     }
     const char *t = m.type;
+    if (!strcmp(t, "dcap")) {   // a codec's capabilities (VTCopyHEVCDecoderCapabilitiesDictionary; Safari checks it)
+        uint32_t cod = (uint32_t)field_int(&m, "cod", "s32", 0);
+        buf r = {0};
+        msg_header(&r, "dcap", 4, m.uuid, m.req);
+        // what the host decodes and the guest can be given (8- and 10-bit 4:2:0): HEVC Main, Main 10, Main Still
+        // Picture; H.264 Constrained Baseline, Main, High. Anything else, nothing (as Apple's host answers VP9).
+        static const int hevc[] = {1, 2, 3}, avc[] = {66, 77, 100};
+        const int *profiles = NULL;
+        int np = 0, level = 0;
+        if (cod == FOURCC('h', 'v', 'c', '1')) {
+            profiles = hevc, np = 3, level = 186;   // level 6.2
+        } else if (cod == FOURCC('a', 'v', 'c', '1')) {
+            profiles = avc, np = 3, level = 52;     // level 5.2
+        }
+        if (profiles) {
+            bp *d = bp_dict(), *per = bp_dict(), *list = bp_array();
+            bp_set(d, "VTIsHDRAllowedOnDevice", bp_bool(cod == FOURCC('h', 'v', 'c', '1')));
+            for (int i = 0; i < np; i++) {
+                char k[16];
+                snprintf(k, sizeof(k), "%d", profiles[i]);
+                bp *e = bp_dict();
+                bp_set(e, "VTIsHardwareAccelerated", bp_bool(1));
+                bp_set(e, "VTMaxDecodeLevel", bp_int(level));
+                bp_set(e, "VTMaxPlaybackLevel", bp_int(level));
+                bp_set(per, k, e);
+                bp_push(list, bp_int(profiles[i]));
+            }
+            bp_set(d, "VTPerProfileSupport", per);
+            bp_set(d, "VTSupportedProfiles", list);
+            size_t n2;
+            uint8_t *pl = bp_encode(d, &n2);
+            bp_free(d);
+            field(&r, "dca", "pls", pl, n2);
+            free(pl);
+        } else {
+            field(&r, "dca", "pls", "", 0);
+        }
+        field_u32(&r, "ver", 6);
+        out.msg(&r);
+        free(r.p);
+        return;
+    }
     if (!strcmp(t, "decs")) {
         buf r = {0};
         msg_header(&r, "decs", 4, m.uuid, m.req);
@@ -834,7 +876,7 @@ static void engine_msg(const uint8_t *p, size_t n, const struct vv_surf *surfs, 
         free(r.p);
     } else if (!strcmp(t, "+dec")) {
         uint32_t cod = (uint32_t)field_int(&m, "cod", "s32", 0);
-        int ok = cod == FOURCC('a', 'v', 'c', '1') || cod == FOURCC('h', 'v', 'c', '1') || cod == FOURCC('a', 'v', '0', '1') ||
+        int ok = cod == FOURCC('a', 'v', 'c', '1') || cod == FOURCC('h', 'v', 'c', '1') ||
                  cod == FOURCC('v', 'p', '0', '9');
         buf r = {0};
         msg_header(&r, "+dec", 4, m.uuid, m.req);
