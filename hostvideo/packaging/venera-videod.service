@@ -1,0 +1,14 @@
+# Venera video (VM 108's hardware video decoding): the host side of Apple's paravirtualized VideoToolbox, which QEMU's
+# ivshmem-doorbell device in VM 108 connects to at start. Started before the guests so the VM finds its socket.
+[Unit]
+Description=Venera video decoding for VM 108
+After=local-fs.target
+Before=pve-guests.service
+
+[Service]
+ExecStart=/root/vgpu/video/bin/venera-videod /run/venera-video.sock
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -1385,3 +1385,30 @@ our program under /root, VM 108's config. Proxmox's own packages stay as shipped
   session is the reference: tools/pvhost.m), and decoding with FFmpeg over VA-API on the Iris Xe, frames written to
   the shared region. Runtime needs only what the host has (libva2, libva-drm2, libdrm2, glibc 2.41). Built on the Mac
   in a Debian amd64 container with its own minimal FFmpeg (H.264, HEVC, AV1, VP9 decoders + VA-API), shipped beside it.
+
+## Round 9 (2026-11-17): hardware video decoding through the host
+
+The owner approved the host part: `intel-media-va-driver` installed (with libigdgmm12; nothing else changed), our
+program in /root/vgpu/video, VM 108's `args` (+ ivshmem-doorbell), a `venera-videod` service. Proxmox's own packages
+are untouched. hostvideo/README.md says how it fits together and deploys.
+
+- **The guest**: kext/VeneraVideo provides Apple's missing `AppleVideoToolboxParavirtualizationDriver` (Intel macOS has
+  the rest of paravirtualized VideoToolbox) on the ivshmem device. It loads from OpenCore, not the AuxKC: AppleVirtIO's
+  PCI transport matches every 1af4 device, ivshmem's too, and hangs on it, so a driver loaded later never gets it.
+  IOSurface IDs become surfaces with `IOSurfaceRoot::lookupSurface` (returns retained).
+- **The host**: venera-videod answers the protocol (decs, +dec, dsta -> Dpba, dsup, dcop, dset, dfrm -> Dbuf/Demt, dfin,
+  dinv, -dec; learned with tools/pvshim.c in the guest and Apple's host session on a Mac, tools/pvhost.m), decodes with
+  FFmpeg 7.1.1 over VA-API, and has the GPU copy each frame into a shared slot (VA-API video processing into
+  user-pointer surfaces: data_size must be whole pages): 4.9 ms a 4K frame against 21.5 ms reading it with the CPU.
+- **Fixed on the way**: packets were dropped on EAGAIN when GPU surfaces ran out (frames now leave them at once);
+  `dfin` lost references (AVPlayer prerolls "frame 1, finish, the rest": the packets since the last key frame are
+  replayed after the drain); `Demt` lost its buffer UUID once frames left the GPU early (VideoToolbox emitted empty
+  frames); 10-bit streams (HEVC Main10, AV1, VP9) get 'x420' buffers.
+- **Measured in VM 108** (tools/vtprobe.m): 1080p H.264 ~230 fps, 4K H.264 141 fps, 1080p HEVC 456 fps, 10-bit HEVC
+  203 fps, pixels matching the reference decodes. Safari: 1080p and 4K H.264 play with no drops after the start (4K
+  dropped 92% in software); at 1080p the VM's CPU went from ~33% (Safari's GPU process) + ~25% (WindowServer) to
+  ~0% + 8% (+4% kernel copies); 4K: WindowServer 21%, kernel 9%, Safari's GPU process 7%; the host program ~1.5%.
+- **Limits**: restarting venera-videod needs VM 108 restarted (QEMU's ivshmem has no reconnect). With Venera's Metal
+  off for Safari's GPU process the picture froze (not the default). A kernel panic seen at one shutdown (06:40, a
+  shutdown-stall `heap` sample faulting in `mach_vm_page_range_query`) happened before the video device existed.
+  H.264 High 10 is assumed 8-bit. Snapshot `pre-video` is the state before all this.

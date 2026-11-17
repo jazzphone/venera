@@ -77,6 +77,26 @@ devmetal) # 5d: build, then the bundle in a writable folder the /Library/GPUBund
   "${SCP[@]}" build/vgmetal.tgz tools/metal-vm.sh $HOST:/root/vgpu/xfer/
   "${SSH[@]}" $HOST "bash /root/vgpu/vm-remote.sh xfer /root/vgpu/xfer/* >/dev/null; bash /root/vgpu/vm-remote.sh run 'sh /Volumes/VGPU/metal-vm.sh devinstall' 120"
   ;;
+video-kext) # hardware video decoding, the guest half: VeneraVideo.kext through OpenCore (boot KC), VM 108 restarts
+  tools/build.sh >/dev/null
+  "${SSH[@]}" $HOST 'rm -rf /root/vgpu/VeneraVideo.kext'
+  "${SCP[@]}" -r build/VeneraVideo.kext $HOST:/root/vgpu/
+  "${SSH[@]}" $HOST 'bash /root/vgpu/vm-remote.sh deploy /root/vgpu/VeneraVideo.kext'
+  ;;
+video-host) # the host half: venera-videod and its FFmpeg into /root/vgpu/video, the service restarted. The VM loses its
+            # ivshmem connection then (QEMU has no reconnect): restart VM 108 after (tools/redeploy.sh --no-build).
+  docker image inspect venera-hostvideo-build >/dev/null 2>&1 ||
+    docker build --platform linux/amd64 -t venera-hostvideo-build hostvideo >/dev/null
+  [ -d hostvideo/out/ffmpeg/lib ] || docker run --rm --platform linux/amd64 -v ~/src:/src venera-hostvideo-build \
+    /src/macos-virtio-gpu/hostvideo/build-ffmpeg.sh
+  docker run --rm --platform linux/amd64 -v ~/src:/src venera-hostvideo-build /src/macos-virtio-gpu/hostvideo/build.sh \
+    venera-videod vatest | tail -1
+  tar -czf build/hostvideo.tgz -C hostvideo/out bin -C ffmpeg lib -C ../../packaging venera-videod.service
+  "${SCP[@]}" build/hostvideo.tgz $HOST:/root/vgpu/
+  "${SSH[@]}" $HOST 'mkdir -p /root/vgpu/video && cd /root/vgpu/video && tar -xzf /root/vgpu/hostvideo.tgz && chown -R root:root . &&
+    mv -f venera-videod.service /etc/systemd/system/ && systemctl daemon-reload && systemctl enable venera-videod >/dev/null 2>&1;
+    systemctl restart venera-videod && systemctl is-active venera-videod'
+  ;;
 mtl) # tools/deploy.sh mtl arm|disarm|probe: run tools/metal-vm.sh in the VM
   shift
   "${SSH[@]}" $HOST "bash /root/vgpu/vm-remote.sh run 'sh /Volumes/VGPU/metal-vm.sh $*' 240"

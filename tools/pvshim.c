@@ -106,11 +106,33 @@ static OSStatus my_send(const pv_iov *iov, size_t n, uint64_t a2, uint64_t a3) {
             uint8_t *rb = malloc((size_t)rl);
             fread(rb, 1, (size_t)rl, r);
             fclose(r);
-            memcpy(rb + 16, head + 16, 32);
+            // one message, or several packed as "PVRS" then (u32 length, message)...
+            uint8_t *req = malloc(48);
+            memcpy(req, head, 48);
             fprintf(stderr, "pvshim: answering %.4s with %s\n", (const char *)head + 8, rp);
             dispatch_async(dispatch_get_global_queue(0, 0), ^{
-              pv_to_guest(rb, (uint32_t)rl);
+              long at = 0, end = rl;
+              int packed = rl > 4 && !memcmp(rb, "PVRS", 4);
+              if (packed) {
+                  at = 4;
+              }
+              while (at < end) {
+                  uint32_t len = (uint32_t)(end - at);
+                  if (packed) {
+                      len = (uint32_t)rb[at] << 24 | (uint32_t)rb[at + 1] << 16 | (uint32_t)rb[at + 2] << 8 | rb[at + 3];
+                      at += 4;
+                  }
+                  uint8_t *m = rb + at;
+                  memcpy(m + 16, req + 16, 16);   // the guest's UUID
+                  uint32_t flags = (uint32_t)m[12] << 24 | (uint32_t)m[13] << 16 | (uint32_t)m[14] << 8 | m[15];
+                  if (flags & 4) {
+                      memcpy(m + 32, req + 32, 16);   // a reply: the request's number
+                  }
+                  pv_to_guest(m, len);
+                  at += len;
+              }
               free(rb);
+              free(req);
             });
         }
     }
