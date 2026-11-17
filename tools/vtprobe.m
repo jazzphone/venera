@@ -64,6 +64,18 @@ int main(int argc, char **argv) {
         if (inGuest) {
             printf("VTParavirtualizationIsRunningInGuest() = %d\n", inGuest());
         }
+        const char *codecs[] = {"avc1", "hvc1", "av01", "vp09"};
+        for (int i = 0; i < 4; i++) {
+            CMVideoCodecType c = (CMVideoCodecType)((uint32_t)codecs[i][0] << 24 | (uint32_t)codecs[i][1] << 16 |
+                                                    (uint32_t)codecs[i][2] << 8 | (uint32_t)codecs[i][3]);
+            printf("VTIsHardwareDecodeSupported(%s) = %d\n", codecs[i], VTIsHardwareDecodeSupported(c));
+        }
+        CFDictionaryRef (*hevcCaps)(void) = dlsym(RTLD_DEFAULT, "VTCopyHEVCDecoderCapabilitiesDictionary");
+        if (hevcCaps) {
+            CFDictionaryRef d = hevcCaps();
+            printf("VTCopyHEVCDecoderCapabilitiesDictionary: %s\n",
+                   d ? [[(__bridge NSDictionary *)d description] stringByReplacingOccurrencesOfString:@"\n" withString:@" "].UTF8String : "(null)");
+        }
         CFArrayRef list = NULL;
         OSStatus (*copyList)(CFDictionaryRef, CFArrayRef *) = dlsym(RTLD_DEFAULT, "VTCopyVideoDecoderList");   // private
         if (copyList) {
