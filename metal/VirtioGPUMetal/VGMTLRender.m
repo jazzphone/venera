@@ -167,7 +167,8 @@ enum { kVGMaxColor = 8 };
     uint32_t _ncolor;
     VkFormat _color[kVGMaxColor], _depthFormat, _stencilFormat;
     VkPipelineColorBlendAttachmentState _blend[kVGMaxColor];
-    VkPipeline _pipelines[6];   // points, lines, triangles; then the same with depth clamped (MTLDepthClipModeClamp)
+    VkPipeline _pipelines[12];   // points, lines, triangles; the same with depth clamped (MTLDepthClipModeClamp); then all
+                                 // six for attachments in the feedback loop layout (5d)
     id<MTLDevice> _dev;
 }
 @property(readonly) id<MTLDevice> device;
@@ -185,12 +186,17 @@ enum { kVGMaxColor = 8 };
 - (NSUInteger)meshThreadExecutionWidth { return 0; }
 
 - (VkPipeline)pipelineForClass:(int)cls error:(NSString **)error {
-    return [self pipelineForClass:cls clamp:NO error:error];
+    return [self pipelineForClass:cls clamp:NO feedback:NO error:error];
+}
+- (VkPipeline)pipelineForClass:(int)cls clamp:(BOOL)clamp error:(NSString **)error {
+    return [self pipelineForClass:cls clamp:clamp feedback:NO error:error];
 }
 // clamp (5d): depth clamped instead of clipped (setDepthClipMode:MTLDepthClipModeClamp). RenderBox draws its path
 // coverage at depth 2 with clamping on; clipped, nothing of it was drawn (the Dock's icon shadow, Spotlight's icons).
-- (VkPipeline)pipelineForClass:(int)cls clamp:(BOOL)clamp error:(NSString **)error {
-    const int slot = cls + (clamp ? 3 : 0);
+// feedback (5d): drawing while an attachment is in the feedback loop layout -- read in place by a framebuffer fetch, or
+// bound as an ordinary texture by the app itself (RenderBox's programmable blending reads its color target as texture(4)).
+- (VkPipeline)pipelineForClass:(int)cls clamp:(BOOL)clamp feedback:(BOOL)feedback error:(NSString **)error {
+    const int slot = cls + (clamp ? 3 : 0) + (feedback ? 6 : 0);
     @synchronized(self) {
         if (_pipelines[slot]) {
             return _pipelines[slot];
@@ -239,7 +245,7 @@ enum { kVGMaxColor = 8 };
         gci.pColorBlendState = &cb;
         gci.pDynamicState = &dyn;
         gci.layout = _layout;
-        if (_fetchMask && gVk.feedbackLoop) {
+        if ((_fetchMask || feedback) && gVk.feedbackLoop) {
             gci.flags |= VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;   // samples its attachment (mode 4)
         }
         VkResult r = gVk.vkCreateGraphicsPipelines(gVk.device, VK_NULL_HANDLE, 1, &gci, NULL, &_pipelines[slot]);
@@ -714,11 +720,21 @@ static void vg_set_sampler(VGMTLCommandBuffer *cmd, vg_stage_bindings *t, id<MTL
 }
 - (void)textureBarrier { [self vgSplitPass]; }
 
+// The pass log is rechecked every 2 s, so it can be switched on in a running WindowServer; each time it comes on, its
+// 400-pass budget starts over (vg_passlog_epoch).
+static int vg_passlog_epoch;
 static BOOL vg_passlog(void) {
     static int on = -1;
-    if (on < 0) {
+    static uint64_t last;
+    uint64_t now = vg_now();
+    if (on < 0 || now - last > 2000000000ull) {
         BOOL vg_debug_flag(const char *name);
+        int was = on;
+        last = now;
         on = vg_debug_flag("passlog");
+        if (on && was != 1) {
+            vg_passlog_epoch++;
+        }
     }
     return on;
 }
@@ -783,7 +799,45 @@ static BOOL vg_passlog(void) {
     }
     int cls = type == MTLPrimitiveTypePoint ? 0 : (type == MTLPrimitiveTypeLine || type == MTLPrimitiveTypeLineStrip) ? 1 : 2;
     NSString *why = nil;
-    VkPipeline pipe = [_pso pipelineForClass:cls clamp:_depthClamp error:&why];
+    // An attachment the fragment stage also has bound as a texture (5d): RenderBox, without framebuffer reads, blends
+    // by reading its own color target as texture(4) (and its coverage as texture(5)) right after a render-target
+    // barrier. Sampling an attachment of the open pass outside the feedback loop layout is undefined in Vulkan; on the
+    // Iris Xe it read the color target's compressed blocks, and the Dock's menus came out in vertical stripes.
+    if (gVk.feedbackLoop) {
+        uint32_t selfRead = 0;
+        for (int k = 0; k < _pso->_nfb; k++) {
+            uint32_t b = _pso->_fb[k].binding;
+            if ((_pso->_fb[k].type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || _pso->_fb[k].type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) &&
+                b >= 32 && b < 32 + kVGMaxTextureSlots) {
+                VGMTLTexture *tx = _ft.tex[b - 32];
+                for (uint32_t i = 0; tx && i < _ncolor; i++) {
+                    if (_colorTex[i] && _colorInfo[i].imageView && _colorTex[i]->_image == tx->_image) {
+                        selfRead |= 1u << i;
+                    }
+                }
+            }
+        }
+        uint32_t fresh = 0;
+        for (uint32_t i = 0; i < _ncolor; i++) {
+            if ((selfRead & (1u << i)) && !_feedback[i]) {
+                fresh |= 1u << i;
+            }
+        }
+        if (fresh) {
+            [self enterFeedback:fresh];
+        }
+    }
+    BOOL anyFeedback = NO;
+    _owner->_nfeedback = 0;
+    for (uint32_t i = 0; i < _ncolor; i++) {
+        if (_feedback[i] && _colorTex[i]) {
+            anyFeedback = YES;
+            if (_owner->_nfeedback < 8) {
+                _owner->_feedbackImages[_owner->_nfeedback++] = _colorTex[i]->_image;
+            }
+        }
+    }
+    VkPipeline pipe = [_pso pipelineForClass:cls clamp:_depthClamp feedback:anyFeedback error:&why];
     if (!pipe) {
         [_owner fail:why];
         return NO;
@@ -953,6 +1007,59 @@ static void vg_fetch_barrier(VkCommandBuffer cb, BOOL beforeCopy) {
               VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
     }
     gVk.vkCmdPipelineBarrier(cb, src, dst, 0, 1, &mb, 0, NULL, 0, NULL);
+}
+
+// End the pass, move the attachments in `mask` into the feedback loop layout (their writes so far -> the fragment
+// shader's reads) and resume the pass in that layout (5d: an attachment the app binds as a texture).
+- (void)enterFeedback:(uint32_t)mask {
+    VkCommandBuffer cb = _owner->_cb;
+    gVk.vkCmdEndRendering(cb);
+    VkImageMemoryBarrier ib[kVGMaxColor];
+    uint32_t nb = 0;
+    for (uint32_t i = 0; i < _ncolor; i++) {
+        VGMTLTexture *t = _colorTex[i];
+        if (!(mask & (1u << i)) || !t || !_colorInfo[i].imageView || _feedback[i]) {
+            continue;
+        }
+        ib[nb++] = (VkImageMemoryBarrier){VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+                                          VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                                          VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                                              VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                                          VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT,
+                                          VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, t->_image,
+                                          {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0,
+                                           VK_REMAINING_ARRAY_LAYERS}};
+        _feedback[i] = YES;
+        _colorInfo[i].imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
+    }
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL,
+                          VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                          VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                              VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                              VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT};
+    gVk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                 VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                             VK_DEPENDENCY_BY_REGION_BIT, 1, &mb, 0, NULL, nb, ib);
+    VkRenderingAttachmentInfo color[kVGMaxColor];
+    for (uint32_t i = 0; i < _ncolor; i++) {
+        color[i] = _colorInfo[i];
+        if (color[i].imageView) {
+            color[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        }
+    }
+    VkRenderingAttachmentInfo depth = _depthInfo, stencil = _stencilInfo;
+    depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    stencil.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, _area, 1, 0, _ncolor, color, _depthTex ? &depth : NULL,
+                          _stencilTex ? &stencil : NULL};
+    gVk.vkCmdBeginRendering(cb, &ri);
+    memset(&_last, 0, sizeof(_last));   // a new rendering scope: dynamic state is sent again
+    static int logged;
+    if (logged++ < 3) {
+        vglog("render: an attachment bound as a texture: feedback loop layout (mask 0x%x, %ux%u)", mask,
+              _area.extent.width, _area.extent.height);
+    }
 }
 
 // Mode 4: end the pass, move each read attachment into the feedback loop layout (its writes so far -> the fragment
@@ -1260,6 +1367,61 @@ static float vg_half(uint16_t h) {
 }
 static int gDbgReads;
 static int vg_dbg_next_read(void) { return gDbgReads + 1; }
+// Debugging (with the pass log on): the stored color attachments of a pass whose pipelines' names contain a line of
+// /Library/GPUBundles/VirtioGPUMetal-passdump, written raw (any format) into the process's cache folder as
+// dump-N-PIPELINE-pfF-WxH.raw, up to 80 files.
+- (void)dbgPassDump {
+    static int saved;
+    if (saved >= 80) {
+        return;
+    }
+    NSString *want = [NSString stringWithContentsOfFile:@"/Library/GPUBundles/VirtioGPUMetal-passdump" encoding:NSUTF8StringEncoding
+                                                  error:NULL];
+    NSString *hit = nil;
+    for (NSString *w in [want componentsSeparatedByString:@"\n"]) {
+        NSString *t = [w stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        for (NSString *name in _dbgPipes) {
+            if (t.length && [name containsString:t]) {
+                hit = name;
+            }
+        }
+    }
+    NSString *vg_disk_dir(void);
+    NSString *dir = vg_disk_dir();
+    if (!hit || !dir) {
+        return;
+    }
+    NSUInteger vg_bytes_per_pixel(MTLPixelFormat f);
+    for (uint32_t i = 0; i < _ncolor && saved < 80; i++) {
+        VGMTLTexture *t = _colorTex[i];
+        if (!t || _colorInfo[i].storeOp != VK_ATTACHMENT_STORE_OP_STORE) {
+            continue;
+        }
+        NSUInteger pf = t->_pixelFormat, bpp = vg_bytes_per_pixel(pf);
+        if (!bpp) {
+            continue;
+        }
+        vg_buffer *b = calloc(1, sizeof(*b));
+        if (vg_buffer_create(t->_width * t->_height * bpp, b)) {
+            free(b);
+            continue;
+        }
+        int k = ++saved;
+        [_owner barrier];
+        VkBufferImageCopy c = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {(uint32_t)t->_width, (uint32_t)t->_height, 1}};
+        gVk.vkCmdCopyImageToBuffer(_owner->_cb, t->_image, VK_IMAGE_LAYOUT_GENERAL, b->buffer, 1, &c);
+        [_owner barrier];
+        size_t w = t->_width, h = t->_height, n = w * h * bpp;
+        NSString *path = [dir stringByAppendingFormat:@"/dump-%d-%@-c%u-%p-pf%lu-%zux%zu.raw", k,
+                                                      [hit stringByReplacingOccurrencesOfString:@"+" withString:@"~"], i, t,
+                                                      (unsigned long)pf, w, h];
+        [_owner addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+          [[NSData dataWithBytes:b->map length:n] writeToFile:path atomically:NO];
+          vg_buffer_destroy(b);
+          free(b);
+        }];
+    }
+}
 - (void)dbgReadBack {
     for (uint32_t i = 0; i < _ncolor && gDbgReads < 400; i++) {
         VGMTLTexture *t = _colorTex[i];
@@ -1326,7 +1488,10 @@ static int vg_dbg_next_read(void) { return gDbgReads + 1; }
         }
     }
     if (_open && vg_passlog()) {
-        static int n;
+        static int n, epoch;
+        if (epoch != vg_passlog_epoch) {
+            epoch = vg_passlog_epoch, n = 0;
+        }
         if (n++ < 400) {
             NSMutableString *a = [NSMutableString string];
             for (uint32_t i = 0; i < _ncolor; i++) {
@@ -1372,7 +1537,9 @@ static int vg_dbg_next_read(void) { return gDbgReads + 1; }
         if (vg_passlog()) {
             [self dbgReadBack];
             [self dbgUniformsBack];
+            [self dbgPassDump];
         }
+        _owner->_nfeedback = 0;   // back in GENERAL: later descriptor sets say so
         _open = NO;
     }
 }

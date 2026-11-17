@@ -5,6 +5,7 @@
 #import "vg.h"
 #import <dlfcn.h>
 #import "vg_opaque_ir.h"
+#import "vg_frontface_ir.h"
 #import <objc/message.h>
 #import <objc/runtime.h>
 
@@ -66,7 +67,26 @@ static NSString *vg_air_to_text_typed(NSData *air);
 // The whole module with opaque pointers (vg_opaque_ir.h), unless VirtioGPUMetal-typedir asks for the typed text as
 // printed (then only constant-space accesses are respelled, the narrower first fix; VirtioGPUMetal-typedconst drops
 // that too).
+static NSString *vg_air_to_text_opaque(NSData *air);
+// Then a select on [[front_facing]] feeding 16-bit values is made a 32-bit one (vg_frontface_ir.h: the host's Intel
+// compiler striped RenderBox's path fills); VirtioGPUMetal-nofrontface turns that off.
 NSString *vg_air_to_text(NSData *air) {
+    NSString *t = vg_air_to_text_opaque(air);
+    static int ff = -1;
+    if (ff < 0) {
+        ff = access("/Library/GPUBundles/VirtioGPUMetal-nofrontface", F_OK) != 0;
+    }
+    if (!t || !ff) {
+        return t;
+    }
+    char *o = vg_frontface_ir(t.UTF8String);
+    if (!o) {
+        return t;
+    }
+    NSString *r = [[NSString alloc] initWithBytesNoCopy:o length:strlen(o) encoding:NSUTF8StringEncoding freeWhenDone:YES];
+    return r ?: t;
+}
+static NSString *vg_air_to_text_opaque(NSData *air) {
     NSString *t = vg_air_to_text_typed(air);
     static int mode = -1;
     if (mode < 0) {

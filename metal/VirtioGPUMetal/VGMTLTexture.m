@@ -1495,9 +1495,20 @@ id<MTLTexture> vg_new_surface_texture(id<MTLDevice> device, MTLTextureDescriptor
     vg_surface_pull(t);
     static int said;
     if (said++ < 60) {
-        vglog("surface texture: IOSurface %u plane %lu, %lux%lu, %zu bytes per row (key %s, kept %lu, roots %lu)",
+        OSType sf = IOSurfaceGetPixelFormat(surface);
+        char fc[5] = {(char)(sf >> 24), (char)(sf >> 16), (char)(sf >> 8), (char)sf, 0};
+        for (int i = 0; i < 4; i++) {
+            if (fc[i] < 32 || fc[i] > 126) {
+                fc[i] = '?';
+            }
+        }
+        vglog("surface texture: IOSurface %u plane %lu, %lux%lu, %zu bytes per row (key %s, kept %lu, roots %lu); surface "
+              "'%s' (0x%x) %zux%zu, %zu bytes an element of %zux%zu, %zu planes, alloc %zu; texture pf%lu",
               IOSurfaceGetID(surface), (unsigned long)plane, (unsigned long)d.width, (unsigned long)d.height, bpr,
-              key.UTF8String, (unsigned long)gKept.count, (unsigned long)roots.count);
+              key.UTF8String, (unsigned long)gKept.count, (unsigned long)roots.count, fc, (unsigned)sf,
+              IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface), IOSurfaceGetBytesPerElement(surface),
+              IOSurfaceGetElementWidth(surface), IOSurfaceGetElementHeight(surface), IOSurfaceGetPlaneCount(surface),
+              IOSurfaceGetAllocSize(surface), (unsigned long)d.pixelFormat);
     }
     return t;
 }

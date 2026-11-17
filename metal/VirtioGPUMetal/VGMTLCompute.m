@@ -374,7 +374,13 @@ VkDescriptorSet vg_write_set(VGMTLCommandBuffer *cmd, VkDescriptorSetLayout dsl,
                 [cmd fail:[NSString stringWithFormat:@"%@: nothing bound at texture(%d)", who, (int)b - (int)base]];
                 return VK_NULL_HANDLE;
             }
-            iinfo[i] = (VkDescriptorImageInfo){VK_NULL_HANDLE, tex->_view, VK_IMAGE_LAYOUT_GENERAL};
+            VkImageLayout layout = VK_IMAGE_LAYOUT_GENERAL;
+            for (uint32_t f = 0; f < cmd->_nfeedback; f++) {   // an attachment of the open pass, read in place (5d)
+                if (cmd->_feedbackImages[f] == tex->_image) {
+                    layout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
+                }
+            }
+            iinfo[i] = (VkDescriptorImageInfo){VK_NULL_HANDLE, tex->_view, layout};
             if (type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
                 [cmd fail:[NSString stringWithFormat:@"%@: combined image-samplers aren't supported yet", who]];
                 return VK_NULL_HANDLE;
@@ -390,7 +396,7 @@ VkDescriptorSet vg_write_set(VGMTLCommandBuffer *cmd, VkDescriptorSetLayout dsl,
             sig[3 * i] = (uint64_t)binfo[i].buffer, sig[3 * i + 1] = binfo[i].offset, sig[3 * i + 2] = binfo[i].range;
         } else {
             sig[3 * i] = (uint64_t)iinfo[i].sampler, sig[3 * i + 1] = (uint64_t)iinfo[i].imageView,
-                    sig[3 * i + 2] = writes[i].descriptorType;
+                    sig[3 * i + 2] = writes[i].descriptorType | (uint64_t)iinfo[i].imageLayout << 32;
         }
     }
     if (!cmd->_setMemo) {

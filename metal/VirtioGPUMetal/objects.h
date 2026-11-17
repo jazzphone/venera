@@ -153,6 +153,8 @@ BOOL vg_spirv_has_push_constants(NSData *spv);   // DescriptorSet 0 -> newSet (N
     int _snapNumber;
     VkDescriptorPool _pools[64];
     void *_setMemo;   // recent descriptor sets by binding contents (5c round 4), see vg_write_set
+    VkImage _feedbackImages[8];   // the open render pass's attachments in the feedback loop layout (vg_write_set)
+    uint32_t _nfeedback;
     unsigned _setMemoNext;
     int _npools;
     uint32_t _setsInPool;
