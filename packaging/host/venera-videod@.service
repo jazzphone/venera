@@ -1,0 +1,15 @@
+# Venera video: the host side of hardware video decoding for macOS VM %i (Apple's paravirtualized VideoToolbox over
+# QEMU's ivshmem-doorbell). The VM's device connects to /run/venera-video-%i.sock when QEMU starts, so this runs
+# before the guests start (install-host.sh enables one instance per VM).
+[Unit]
+Description=Venera video decoding for VM %i
+After=local-fs.target
+Before=pve-guests.service
+
+[Service]
+ExecStart=/opt/venera/video/bin/venera-videod /run/venera-video-%i.sock
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

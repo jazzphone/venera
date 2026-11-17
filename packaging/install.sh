@@ -1,17 +1,21 @@
 #!/bin/bash
 # Venera installer: run inside the macOS guest, as root, from the unpacked release folder.
 #
-#   sudo ./install.sh [--level 4|2] [--oc /Volumes/EFI] [--no-opencore] [--set-security] [--no-system-volume] [--dry-run]
+#   sudo ./install.sh [--level 4|2] [--video] [--no-app] [--oc /Volumes/EFI] [--no-opencore] [--set-security]
+#                     [--no-system-volume] [--dry-run]
 #
 # What it does (each step says what it changed; nothing is downloaded):
 #   1. checks the guest: x86_64 macOS 26, a virtio-gpu device, SIP and AMFI as the driver needs them
 #   2. OpenCore: copies VirtioGPU.kext (the core, which must load from the Boot KC) into EFI/OC/Kexts, adds or enables
-#      its Kernel > Add entry and sets vgpuaccel=LEVEL in OpenCore's boot-args (config.plist is backed up first)
+#      its Kernel > Add entry and sets vgpuaccel=LEVEL in OpenCore's boot-args (config.plist is backed up first); with
+#      --video, VeneraVideo.kext too (hardware video decoding through the host: the host half is install-host.sh)
 #   3. /Library/Extensions: VirtioGPUFramebuffer.kext and VirtioGPUAccel.kext, then rebuilds the Auxiliary KC
 #   4. the Metal driver (over Venus): kept in /Library/GPUBundles/Venera, copied onto the system volume
 #      (/System/Library/Extensions, a new blessed snapshot: sysvol.sh) where Safari's sandboxed graphics process can
 #      load it, and /Library/GPUBundles/VirtioGPUMetal.bundle pointing at it; and the watcher (local.venera.watch),
 #      which keeps it there across macOS updates, asking before it reinstalls
+#   5. the Venera app (/Applications/Venera.app, started at login by local.venera.helper): it asks the watcher's
+#      questions as notifications and shows what runs; --no-app leaves it out (the watcher then asks in dialogs)
 # Then reboot. ./uninstall.sh undoes all of it; ./status.sh shows what runs.
 #
 # The system-volume copy needs SIP's authenticated root off (csr bit 0x800): --set-security sets it with the rest
@@ -30,6 +34,8 @@ SET_SECURITY=0
 NO_SYSVOL=0
 DRY=0
 FORCE=0
+VIDEO=0
+NO_APP=0
 GUID=7C436110-AB2A-4BBB-A880-FE41995C9F82
 MOUNTED=
 
@@ -55,7 +61,9 @@ while [ $# -gt 0 ]; do
   --no-system-volume) NO_SYSVOL=1 ;;
   --dry-run) DRY=1 ;;
   --force) FORCE=1 ;;
-  -h | --help) sed -n '2,27p' "$0"; exit 0 ;;
+  --video) VIDEO=1 ;;
+  --no-app) NO_APP=1 ;;
+  -h | --help) sed -n '2,31p' "$0"; exit 0 ;;
   *) die "unknown option $1 (--help)" ;;
   esac
   shift
@@ -68,6 +76,7 @@ for d in OpenCore/VirtioGPU.kext Extensions/VirtioGPUFramebuffer.kext Extensions
   GPUBundles/VirtioGPUMetal.bundle Support/sysvol.sh Support/venera-watch.sh Support/local.venera.watch.plist; do
   [ -e "$PAYLOAD/$d" ] || die "payload/$d is missing: run this from the unpacked release folder"
 done
+[ $VIDEO = 0 ] || [ -e "$PAYLOAD/OpenCore/VeneraVideo.kext" ] || die "payload/OpenCore/VeneraVideo.kext is missing"
 [ "$(uname -m)" = x86_64 ] || die "x86_64 macOS only (this is $(uname -m))"
 VER=$(sw_vers -productVersion)
 BUILD=$(sw_vers -buildVersion)
@@ -137,20 +146,25 @@ if [ $NO_OC = 0 ]; then
   say "OpenCore: $CONFIG"
   BACKUP=$CONFIG.venera-$(date +%Y%m%d-%H%M%S)
   run cp "$CONFIG" "$BACKUP"
-  run rm -rf "$OC_ROOT/EFI/OC/Kexts/VirtioGPU.kext"
-  run cp -R "$PAYLOAD/OpenCore/VirtioGPU.kext" "$OC_ROOT/EFI/OC/Kexts/"
-  N=$(pl -extract Kernel.Add raw -o -) || die "config.plist has no Kernel > Add"
-  IDX=
-  i=0
-  while [ $i -lt "$N" ]; do
-    [ "$(pl -extract Kernel.Add.$i.BundlePath raw -o - 2>/dev/null)" = VirtioGPU.kext ] && IDX=$i
-    i=$((i + 1))
-  done
-  if [ -n "$IDX" ]; then
-    run pl -replace Kernel.Add.$IDX.Enabled -bool YES
-  else
-    run pl -insert Kernel.Add.$N -json '{"Arch":"x86_64","BundlePath":"VirtioGPU.kext","Comment":"Venera core (virtio-gpu)","Enabled":true,"ExecutablePath":"Contents/MacOS/VirtioGPU","MaxKernel":"","MinKernel":"","PlistPath":"Contents/Info.plist"}'
-  fi
+  # oc_kext NAME COMMENT: NAME.kext copied into EFI/OC/Kexts, its Kernel > Add entry added or enabled
+  oc_kext() {
+    run rm -rf "$OC_ROOT/EFI/OC/Kexts/$1.kext"
+    run cp -R "$PAYLOAD/OpenCore/$1.kext" "$OC_ROOT/EFI/OC/Kexts/"
+    N=$(pl -extract Kernel.Add raw -o -) || die "config.plist has no Kernel > Add"
+    IDX=
+    i=0
+    while [ $i -lt "$N" ]; do
+      [ "$(pl -extract Kernel.Add.$i.BundlePath raw -o - 2>/dev/null)" = "$1.kext" ] && IDX=$i
+      i=$((i + 1))
+    done
+    if [ -n "$IDX" ]; then
+      run pl -replace Kernel.Add.$IDX.Enabled -bool YES
+    else
+      run pl -insert Kernel.Add.$N -json "{\"Arch\":\"x86_64\",\"BundlePath\":\"$1.kext\",\"Comment\":\"$2\",\"Enabled\":true,\"ExecutablePath\":\"Contents/MacOS/$1\",\"MaxKernel\":\"\",\"MinKernel\":\"\",\"PlistPath\":\"Contents/Info.plist\"}"
+    fi
+  }
+  oc_kext VirtioGPU "Venera core (virtio-gpu)"
+  [ $VIDEO = 1 ] && oc_kext VeneraVideo "Venera video decoding (through the host)"
   OCARGS=$(pl -extract "NVRAM.Add.$GUID.boot-args" raw -o - 2>/dev/null)
   NEW=
   for a in $OCARGS; do
@@ -179,11 +193,12 @@ if [ $NO_OC = 0 ]; then
     cp "$BACKUP" "$CONFIG"
     die "config.plist didn't validate after the edit; restored the backup"
   }
-  say "OpenCore: VirtioGPU.kext enabled, boot-args \"${NEW# }\" (backup: $BACKUP)"
+  say "OpenCore: VirtioGPU.kext$([ $VIDEO = 1 ] && echo " and VeneraVideo.kext") enabled, boot-args \"${NEW# }\" (backup: $BACKUP)"
   cleanup
 else
   say "OpenCore: skipped (--no-opencore). Add payload/OpenCore/VirtioGPU.kext to Kernel > Add and vgpuaccel=$LEVEL"
   say "  to boot-args yourself (INSTALL.md)."
+  [ $VIDEO = 1 ] && say "  And payload/OpenCore/VeneraVideo.kext, for video decoding."
 fi
 
 # ---- 3. the Auxiliary KC -------------------------------------------------------------------------------------------
@@ -219,7 +234,9 @@ run cp -R "$PAYLOAD/GPUBundles/VirtioGPUMetal.bundle" "$K/"
 run chown -R root:wheel "$K/VirtioGPUMetal.bundle"
 run chmod -R go-w,a+rX "$K/VirtioGPUMetal.bundle"
 for f in sysvol.sh venera-watch.sh; do run cp "$PAYLOAD/Support/$f" "$V/" && run chmod 755 "$V/$f"; done
+for f in uninstall.sh status.sh; do [ "$HERE/$f" -ef "$V/$f" ] || { run cp "$HERE/$f" "$V/" && run chmod 755 "$V/$f"; }; done
 [ $DRY = 1 ] || { cp "$HERE/VERSION" "$V/VERSION" 2>/dev/null; echo 25G342 >"$V/TESTED_BUILD"; }
+if [ $VIDEO = 1 ]; then run touch "$V/VIDEO"; else run rm -f "$V/VIDEO"; fi   # what the app checks video against
 # /Library/GPUBundles' bundle is a symlink from now on: to the kept copy until the system-volume copy is in
 [ -L /Library/GPUBundles/VirtioGPUMetal.bundle ] || run rm -rf /Library/GPUBundles/VirtioGPUMetal.bundle
 run ln -sfn "$K/VirtioGPUMetal.bundle" /Library/GPUBundles/VirtioGPUMetal.bundle
@@ -242,7 +259,27 @@ run chmod 644 /Library/LaunchDaemons/local.venera.watch.plist
 run launchctl bootstrap system /Library/LaunchDaemons/local.venera.watch.plist
 say "Metal driver: kept in $K; $SYSVOL; watcher local.venera.watch running"
 
+# ---- 5. the Venera app ---------------------------------------------------------------------------------------------
+CUID=$(stat -f %u /dev/console)
+if [ -f /Library/LaunchAgents/local.venera.helper.plist ] && [ "$CUID" != 0 ] && [ $DRY = 0 ]; then
+  launchctl bootout "gui/$CUID/local.venera.helper" 2>/dev/null
+fi
+[ $DRY = 1 ] || pkill -x Venera 2>/dev/null
+if [ $NO_APP = 0 ] && [ -d "$PAYLOAD/Apps/Venera.app" ]; then
+  run rm -rf /Applications/Venera.app
+  run cp -R "$PAYLOAD/Apps/Venera.app" /Applications/
+  run chown -R root:wheel /Applications/Venera.app
+  run cp "$PAYLOAD/Support/local.venera.helper.plist" /Library/LaunchAgents/
+  run chown root:wheel /Library/LaunchAgents/local.venera.helper.plist
+  run chmod 644 /Library/LaunchAgents/local.venera.helper.plist
+  [ "$CUID" != 0 ] && run launchctl bootstrap "gui/$CUID" /Library/LaunchAgents/local.venera.helper.plist
+  say "Venera app: /Applications/Venera.app, started at login (local.venera.helper)"
+else
+  run rm -rf /Applications/Venera.app /Library/LaunchAgents/local.venera.helper.plist
+  say "Venera app: not installed$([ $NO_APP = 1 ] && echo " (--no-app)")"
+fi
+
 say ""
-say "Installed Venera $(cat "$HERE/VERSION" 2>/dev/null) (level $LEVEL). Reboot to start it: sudo shutdown -r now"
+say "Installed Venera $(cat "$HERE/VERSION" 2>/dev/null) (level $LEVEL$([ $VIDEO = 1 ] && echo ", video decoding")). Reboot to start it: sudo shutdown -r now"
 say "If the desktop doesn't come back, the driver falls back to the software desktop by itself after two WindowServer"
 say "failures; INSTALL.md, \"Recovery\", has the rest. ./status.sh shows what runs."

@@ -3,7 +3,7 @@
 #
 #   sudo ./uninstall.sh [--oc /Volumes/EFI] [--no-opencore] [--dry-run]
 #
-# Removes the Metal driver, the two Auxiliary KC kexts (and rebuilds the Auxiliary KC from what is left in
+# Removes the Metal driver, the Venera app, the two Auxiliary KC kexts (and rebuilds the Auxiliary KC from what is left in
 # /Library/Extensions), and in OpenCore the VirtioGPU.kext entry and folder and vgpuaccel from boot-args (config.plist
 # backed up first). SIP and amfi_get_out_of_my_way are left as they are: put them back from a config.plist backup
 # (EFI/OC/config.plist.venera-*) or by hand. Then reboot: the VM is back on the firmware's framebuffer.
@@ -38,7 +38,14 @@ while [ $# -gt 0 ]; do
 done
 [ "$(id -u)" = 0 ] || die "run as root: sudo $0"
 
-# ---- the watcher, the Metal driver and its files ---------------------------------------------------------------------
+# ---- the app, the watcher, the Metal driver and its files ------------------------------------------------------------
+CUID=$(stat -f %u /dev/console)
+if [ -f /Library/LaunchAgents/local.venera.helper.plist ]; then
+  [ $DRY = 1 ] || { [ "$CUID" != 0 ] && launchctl bootout "gui/$CUID/local.venera.helper" 2>/dev/null; }
+  run rm -f /Library/LaunchAgents/local.venera.helper.plist
+fi
+[ $DRY = 1 ] || pkill -x Venera 2>/dev/null
+[ -d /Applications/Venera.app ] && run rm -rf /Applications/Venera.app
 if [ -f /Library/LaunchDaemons/local.venera.watch.plist ]; then
   [ $DRY = 1 ] || launchctl bootout system/local.venera.watch 2>/dev/null
   run rm -f /Library/LaunchDaemons/local.venera.watch.plist
@@ -60,6 +67,8 @@ while IFS= read -r d; do
   [ -n "$d" ] && [ -d "$d" ] && run rm -rf "$d"
 done < <(find /private/var/folders /Users/*/Library/Containers -type d -name local.homelab.VirtioGPUMetal -prune 2>/dev/null)
 run rm -rf "/Library/Application Support/Venera"
+# the installer package's receipts (Install Venera.pkg), so a reinstall starts clean
+for r in $(pkgutil --pkgs 2>/dev/null | grep '^local\.homelab\.venera\.'); do run pkgutil --forget "$r" >/dev/null; done
 
 # ---- the Auxiliary KC ----------------------------------------------------------------------------------------------
 KC=/Library/KernelCollections/AuxiliaryKernelExtensions.kc
@@ -111,10 +120,12 @@ if [ $NO_OC = 0 ]; then
     N=$(pl -extract Kernel.Add raw -o - 2>/dev/null || echo 0)
     i=$((N - 1))
     while [ $i -ge 0 ]; do   # from the end: removing shifts the ones after
-      [ "$(pl -extract Kernel.Add.$i.BundlePath raw -o - 2>/dev/null)" = VirtioGPU.kext ] && run pl -remove Kernel.Add.$i
+      case "$(pl -extract Kernel.Add.$i.BundlePath raw -o - 2>/dev/null)" in
+      VirtioGPU.kext | VeneraVideo.kext) run pl -remove Kernel.Add.$i ;;
+      esac
       i=$((i - 1))
     done
-    run rm -rf "$OC_ROOT/EFI/OC/Kexts/VirtioGPU.kext"
+    run rm -rf "$OC_ROOT/EFI/OC/Kexts/VirtioGPU.kext" "$OC_ROOT/EFI/OC/Kexts/VeneraVideo.kext"
     OCARGS=$(pl -extract "NVRAM.Add.$GUID.boot-args" raw -o - 2>/dev/null)
     NEW=
     for a in $OCARGS; do
@@ -125,7 +136,7 @@ if [ $NO_OC = 0 ]; then
       cp "$BACKUP" "$CONFIG"
       die "config.plist didn't validate after the edit; restored the backup"
     }
-    say "OpenCore: VirtioGPU.kext removed, boot-args \"${NEW# }\" (backup: $BACKUP)"
+    say "OpenCore: VirtioGPU.kext and VeneraVideo.kext removed, boot-args \"${NEW# }\" (backup: $BACKUP)"
     cleanup
   fi
 fi

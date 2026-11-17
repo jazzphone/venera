@@ -1422,3 +1422,42 @@ are untouched. hostvideo/README.md says how it fits together and deploys.
   off for Safari's GPU process the picture froze (not the default). A kernel panic seen at one shutdown (06:40, a
   shutdown-stall `heap` sample faulting in `mach_vm_page_range_query`) happened before the video device existed.
   H.264 High 10 is assumed 8-bit. Snapshot `pre-video` is the state before all this.
+
+## Round 10 (2026-11-17): the Dock's menus, slow icons, and an installer for both halves
+
+- **Dock right-click menus were striped** (2273950): DockHelper's RenderBox fills paths by adding +1 or -1 by
+  `[[front_facing]]` into an RG16Float target; the host's Mesa 25.0.7 Intel compiler gets a select on that boolean
+  between 16-bit values wrong (alternate columns 0x0000 / 0xBF80, the halves of a float -1.0). The translator's SPIR-V
+  is right. `vg_frontface_ir.h` makes each such select a 32-bit integer select of the bits (VirtioGPUMetal-nofrontface
+  turns it off); tools/mtlmrt.m fd/fg pass, the menu draws clean. Kept with it: attachments bound as fragment textures
+  go to the feedback loop layout (Dock, DockHelper and Spotlight do it; undefined in GENERAL).
+- **Slow icons are not storage**: VM 108's disk is local-lvm. iconservicesagent draws icons on the CPU the first time
+  (a background daemon: not allow-listed for the device), ~7 s of CPU for one Finder folder, then 0.05 s from its
+  cache. Giving it the device was slower (10+ s and climbing), so it stays on the CPU. Many reboots and system-volume
+  snapshots this week kept the cache cold; it warms as folders are opened.
+- **Install Venera VERSION.pkg** (packaging/make-pkg.sh; make-dist.sh builds it): productbuild with Customize choices
+  (Graphics, required; Hardware video decoding, on; Venera app, on; Safari WebGL, off -- turns off authenticated root;
+  kept automatically when already off). Hidden prep/core packages around empty choice packages that leave markers;
+  core's postinstall runs the release's install.sh with them as flags, logs to Support/Venera/install.log, asks for the
+  restart. Bundles non-relocatable. Unsigned: SIGN_ID signs it. Files copied in over the transfer disk carry no
+  quarantine, so Gatekeeper doesn't ask.
+- **install.sh / uninstall.sh**: `--video` (VeneraVideo.kext through OpenCore), `--no-app`; uninstall removes both
+  OpenCore entries, the app and its login item, the package receipts.
+- **Venera.app** (helper/Venera, tools/build-helper.sh; LaunchAgent local.venera.helper, `--background` at login):
+  the watcher's questions as notifications with buttons, or in its window while notifications are off (protocol:
+  Support/Venera/ask/{id,text,buttons,answer}); once-a-boot notices for the software desktop and a missing host video
+  service; a status window; menu bar item off by default. Reads only.
+- **install-host.sh** (Venera-host-VERSION.tar.gz, packaging/make-host.sh): intel-media-va-driver and libva-drm2 when
+  missing (removed on uninstall only if it installed them), /opt/venera/video, `venera-videod@VMID` per VM (one VM per
+  socket: the daemon serves one client), each VM's args line gains its device (config backed up), every VM checked
+  before anything changes; `--status`, `--remove-vm`, `--uninstall`, `--dry-run`. tools/test-install-host.sh runs it in
+  a Debian container against stand-in qm/systemctl/apt: 18 checks pass. **Not run on node 2**: VM 108 still uses the
+  dev layout (/root/vgpu/video, venera-videod.service, /run/venera-video.sock); moving it is a host change for the owner
+  to OK.
+- **Tested on VM 108** (snapshot pre-pkg, rolled back after): the package with defaults installed everything (Metal
+  desktop, VeneraVideo attached, app at login, watcher moved the link to the system copy); the app's window answered a
+  watcher question (answer file `test-1 / Not now`); the menu bar item; uninstall.sh removed everything and the next
+  boot was the software framebuffer. **Open**: in the two boots after that uninstall (230 s each, against 30-40 s),
+  macOS didn't publish the OpenCore disk's partition (AHCI QEMU HARDDISK, GPT with its backup header not at the end of
+  the 152 MB volume), so a reinstall from inside the guest found no OpenCore and the package failed. After the
+  rollback it shows again (disk3s1). Cause not found.

@@ -28,17 +28,44 @@ point() {
 }
 state() { grep "^$1=" "$STATE" 2>/dev/null | tail -1 | cut -d= -f2-; }
 set_state() { { grep -v "^$1=" "$STATE" 2>/dev/null; echo "$1=$2"; } >"$STATE.new" && mv "$STATE.new" "$STATE"; }
-# dialog TEXT BUTTON... : shown to the console user; prints the button pressed ("" if nobody answered in an hour)
+# dialog TEXT BUTTON... : shown to the console user; prints the button pressed ("" if nobody answered in an hour).
+# Through the Venera app when it runs (a notification with the buttons, or its window), else an AppleScript dialog.
 dialog() {
   local text=$1; shift
   local uid user buttons="" b
   uid=$(stat -f %u /dev/console)
   user=$(stat -f %Su /dev/console)
   [ "$uid" = 0 ] && return 1   # nobody logged in: ask later
+  if pgrep -u "$uid" -x Venera >/dev/null 2>&1; then
+    ask_app "$uid" "$text" "$@"
+    return
+  fi
   for b in "$@"; do buttons="$buttons${buttons:+, }\"$b\""; done
   launchctl asuser "$uid" sudo -u "$user" /usr/bin/osascript \
     -e "display dialog \"${text//\"/\\\"}\" buttons {$buttons} default button \"${*: -1}\" with title \"Venera\" with icon caution giving up after 3600" \
     2>/dev/null | sed -n 's/.*button returned:\([^,]*\).*/\1/p'
+}
+
+# ask_app UID TEXT BUTTON...: the question goes into $V/ask for the Venera app (helper/Venera/main.m), the answer comes
+# back as "ID\nBUTTON" in ask/answer, the one file there the console user may write. Waits up to an hour.
+ask_app() {
+  local uid=$1 text=$2 A="$V/ask" id r="" i
+  shift 2
+  id="$(date +%s)-$$"
+  rm -rf "$A" && mkdir -p "$A" && chmod 755 "$A"
+  printf '%s' "$text" >"$A/text"
+  printf '%s\n' "$@" >"$A/buttons"
+  : >"$A/answer" && chown "$uid" "$A/answer" && chmod 644 "$A/answer"
+  echo "$id" >"$A/id"   # last: the app reads the id first
+  for i in $(seq 1 1800); do
+    if [ "$(sed -n 1p "$A/answer" 2>/dev/null)" = "$id" ]; then
+      r=$(sed -n 2p "$A/answer")
+      break
+    fi
+    sleep 2
+  done
+  rm -rf "$A"
+  for b in "$@"; do [ "$r" = "$b" ] && { printf '%s' "$r"; return 0; }; done   # only a button we offered
 }
 
 mkdir -p "$V"

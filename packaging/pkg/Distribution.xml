@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Install Venera's Distribution (packaging/make-pkg.sh fills in the version). The packages install in the outline's
+     order: prep, the chosen extras (each leaves a marker), then core, whose postinstall runs install.sh. -->
+<installer-gui-script minSpecVersion="2">
+    <title>Venera @VERSION@</title>
+    <welcome file="welcome.html" mime-type="text/html"/>
+    <license file="LICENSE.html" mime-type="text/html"/>
+    <conclusion file="conclusion.html" mime-type="text/html"/>
+    <background file="background.png" alignment="bottomleft" scaling="none"/>
+    <background-darkAqua file="background.png" alignment="bottomleft" scaling="none"/>
+    <options customize="allow" require-scripts="true" rootVolumeOnly="true" hostArchitectures="x86_64"/>
+    <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
+    <volume-check>
+        <allowed-os-versions>
+            <os-version min="26.0"/>
+        </allowed-os-versions>
+    </volume-check>
+    <choices-outline>
+        <line choice="prep"/>
+        <line choice="graphics"/>
+        <line choice="video"/>
+        <line choice="app"/>
+        <line choice="webgl"/>
+        <line choice="core"/>
+    </choices-outline>
+    <choice id="prep" visible="false">
+        <pkg-ref id="local.homelab.venera.prep"/>
+    </choice>
+    <choice id="graphics" title="Graphics driver" enabled="false" start_selected="true"
+        description="Metal on the host's GPU, through virtio-gpu and Venus: the kexts (one through OpenCore, two in the Auxiliary Kernel Collection), the Metal driver and the watcher that keeps it in place across macOS updates. Required. If OpenCore doesn't yet allow unsigned kexts (SIP 0x203) and AMFI's ad-hoc code (amfi_get_out_of_my_way=1), the installer sets them in OpenCore's config.plist, after backing it up."/>
+    <choice id="video" title="Hardware video decoding" start_selected="true"
+        description="Safari, QuickTime and every app that uses VideoToolbox decode H.264, HEVC and VP9 on the host's GPU. Adds VeneraVideo.kext through OpenCore. The host needs its half too: install-host.sh on the Proxmox host (Venera-host-@VERSION@.tar.gz). Without it, video decodes in software as before.">
+        <pkg-ref id="local.homelab.venera.video"/>
+    </choice>
+    <choice id="app" title="Venera app" start_selected="true"
+        description="A small app that runs at login: it tells you when something needs you (a macOS update took the driver off the system volume, the desktop fell back to software, the host's video service isn't running) and shows what runs. No menu bar icon unless you turn it on.">
+        <pkg-ref id="local.homelab.venera.app"/>
+    </choice>
+    <choice id="webgl" title="Safari WebGL (changes a security setting)" start_selected="false"
+        description="Safari's graphics process only loads drivers from the system volume. This turns off SIP's authenticated root (csr 0x800, in OpenCore) and puts the Metal driver on the system volume, so WebGL in Safari uses the host's GPU. Every other app uses the GPU without it. If authenticated root is already off, the driver goes on the system volume whether or not this is chosen.">
+        <pkg-ref id="local.homelab.venera.webgl"/>
+    </choice>
+    <choice id="core" visible="false">
+        <pkg-ref id="local.homelab.venera.core"/>
+    </choice>
+    <pkg-ref id="local.homelab.venera.prep" version="@VERSION@">prep.pkg</pkg-ref>
+    <pkg-ref id="local.homelab.venera.video" version="@VERSION@">video.pkg</pkg-ref>
+    <pkg-ref id="local.homelab.venera.app" version="@VERSION@">app.pkg</pkg-ref>
+    <pkg-ref id="local.homelab.venera.webgl" version="@VERSION@">webgl.pkg</pkg-ref>
+    <pkg-ref id="local.homelab.venera.core" version="@VERSION@" onConclusion="RequireRestart">core.pkg</pkg-ref>
+</installer-gui-script>

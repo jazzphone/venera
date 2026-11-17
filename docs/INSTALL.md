@@ -58,6 +58,28 @@ VMs you use for testing and development, not for a VM that holds anything you ne
 
 ## Install
 
+### With the installer package
+
+Copy `Install Venera VERSION.pkg` into the guest and open it. Under **Customize**:
+
+| Choice | Default | What it does |
+|---|---|---|
+| Graphics driver | always | everything below ("From the command line", steps 1-5) |
+| Hardware video decoding | on | `VeneraVideo.kext` through OpenCore; needs the host's half ("Hardware video decoding", below) |
+| Venera app | on | `/Applications/Venera.app`, started at login (below, "The Venera app") |
+| Safari WebGL | off | turns off SIP's authenticated root in OpenCore and puts the Metal driver on the system volume; when authenticated root is already off, the driver goes there anyway |
+
+The package runs `install.sh --set-security` with those choices as flags, keeps the release folder in
+`/Library/Application Support/Venera/release`, writes what it did to `/Library/Application Support/Venera/install.log`,
+and ends with **Restart**.
+
+The package isn't signed with a Developer ID yet, so macOS says it can't check it the first time you open it: in
+**System Settings > Privacy & Security**, choose **Open Anyway** (once). A package copied into the VM without a web
+browser or AirDrop (a shared disk, `scp`) carries no quarantine and opens without asking. `packaging/make-pkg.sh` signs
+it when `SIGN_ID="Developer ID Installer: NAME (TEAM)"` names a certificate in the build Mac's keychain.
+
+### From the command line
+
 In the guest, as an administrator:
 
 ```bash
@@ -78,13 +100,52 @@ next to it (`config.plist.venera-DATE`), and then:
 4. installs the Metal driver: a copy kept in `/Library/GPUBundles/Venera`, a copy on the system volume
    (`/System/Library/Extensions`, with a new blessed system snapshot) when authenticated root is off, and
    `/Library/GPUBundles/VirtioGPUMetal.bundle` pointing at it;
-5. starts the watcher (`local.venera.watch`, below).
+5. starts the watcher (`local.venera.watch`, below);
+6. installs the Venera app and its login item (`local.venera.helper`).
 
 Options: `--level 2` installs everything with the software desktop (the framebuffer and the accelerator, Metal only
 for allow-listed test tools); `--no-opencore` skips step 1 and 2 for people who manage `config.plist` themselves (add
 `VirtioGPU.kext` with `ExecutablePath` `Contents/MacOS/VirtioGPU`, and `vgpuaccel=4` to boot-args);
-`--no-system-volume` leaves the system volume (and authenticated root) alone; `--dry-run` prints every change without
+`--no-system-volume` leaves the system volume (and authenticated root) alone; `--video` adds `VeneraVideo.kext` to
+OpenCore (hardware video decoding); `--no-app` leaves out the Venera app; `--dry-run` prints every change without
 making it.
+
+### The Venera app
+
+A small app that starts at login, with no Dock icon and no menu bar icon unless you turn one on. It says when
+something needs you, as a notification (macOS asks once whether Venera may send them):
+
+- after a macOS update took the Metal driver off the system volume, "Reinstall?" with the buttons, in place of the
+  watcher's dialog;
+- the desktop fell back to the software compositor this boot (and why);
+- video decoding is installed but the host's video service wasn't running when the VM started.
+
+Open it from Applications to see what runs: the desktop (Metal on the host's GPU, or the software desktop), where the
+Metal driver loads from, video decoding, the version, and a button for the watcher's log. With notifications off, a
+question waits in its window. "Show Venera in the menu bar" puts the same in a menu bar item.
+
+## Hardware video decoding
+
+Apps that decode with VideoToolbox (Safari, QuickTime, Photos, every AVFoundation player) decode H.264, HEVC (8 and
+10-bit) and VP9 on the host's GPU, up to 4K. The guest's half is the package's "Hardware video decoding" choice
+(`install.sh --video`). The host's half is `Venera-host-VERSION.tar.gz`, for a Proxmox host with an Intel GPU:
+
+```bash
+tar -xzf Venera-host-0.1.0.tar.gz
+cd Venera-host-0.1.0
+./install-host.sh --vm 108          # as root on the Proxmox host; --dry-run first to see each step
+qm shutdown 108 && qm start 108     # the VM picks up its new device when QEMU starts again
+```
+
+It installs `intel-media-va-driver` (and `libva-drm2`) from the host's apt sources when they're missing,
+`venera-videod` with the FFmpeg it was built with in `/opt/venera/video`, a service per VM
+(`venera-videod@VMID`, started before the guests), and adds the VM's video device to its `args:` line (the VM's config
+is backed up to `/opt/venera/backup` first). `--status` shows what runs, `--remove-vm VMID` takes one VM's device out,
+`--uninstall` takes everything out again (packages only if it installed them). Nothing else on the host changes.
+
+**A VM with the video device doesn't start while its `venera-videod@VMID` isn't running**: QEMU waits for the
+service's socket. The service starts at boot before the guests and restarts by itself; `--remove-vm` gives the VM back
+its old config. Restarting the service (an update) cuts a running VM's video until the VM is stopped and started.
 
 ### Which processes use the driver
 
@@ -120,14 +181,14 @@ WindowServer and the Dock already translated.
 ## Uninstall
 
 ```bash
-sudo ./uninstall.sh
+sudo "/Library/Application Support/Venera/uninstall.sh"
 sudo shutdown -r now
 ```
 
-It removes the Metal driver, its shader cache, both kexts (rebuilding the Auxiliary KC from whatever else is in
+It removes the Venera app, the Metal driver, its shader cache, the kexts (rebuilding the Auxiliary KC from whatever else is in
 `/Library/Extensions`), and the OpenCore entry, kext and `vgpuaccel` boot-arg (`config.plist` backed up first). SIP
 and AMFI stay as they are; restore them from a `config.plist.venera-*` backup, or set `csr-active-config` back to
-`00000000` and drop `amfi_get_out_of_my_way=1`.
+`00000000` and drop `amfi_get_out_of_my_way=1`. On the host, `./install-host.sh --uninstall`.
 
 ## Recovery
 
