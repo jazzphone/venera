@@ -1134,6 +1134,26 @@ static void engine_msg(const uint8_t *p, size_t n, const struct vv_surf *surfs, 
         VLOG("esta %dx%d: answered", w, h);
         return;
     }
+    if (!strcmp(t, "efrm") && getenv("VENERA_VIDEO_ENCODE")) {   // research: ask the guest for the frame's buffer
+        size_t un = 0;
+        const uint8_t *u = msg_field(&m, "uui", "uui", &un);
+        int64_t frm = field_int(&m, "frm", "s64", 0);
+        buf e = {0};
+        msg_header(&e, "Efdr", 2, m.uuid, ++host_req);
+        field_s64(&e, "frm", frm);
+        if (u && un == 16) {
+            field(&e, "uui", "uui", u, 16);
+        }
+        out.msg(&e);
+        free(e.p);
+        buf r = {0};
+        msg_header(&r, "efrm", 4, m.uuid, m.req);
+        field_s32(&r, "err", 0);
+        out.msg(&r);
+        free(r.p);
+        VLOG("efrm %lld: asked the guest for its buffer (Efdr)", (long long)frm);
+        return;
+    }
     if (!strcmp(t, "decs")) {
         buf r = {0};
         msg_header(&r, "decs", 4, m.uuid, m.req);

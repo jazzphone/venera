@@ -1608,7 +1608,14 @@ hardware video encoding, a way to fix what apps ask for that the driver lacks, a
   "paravirtualized:...ave.avc", picks it, and goes `+enc` (codec, encoder id, guest build) -> `esta` (vdi=wxh; Apple
   answers Epba first: the pixel formats) -> `esup` (Apple: a 4.5 KB supported-properties dictionary) -> `epfr` ->
   `efrm` per frame (frm, pts, dur, uui = a 16-byte UUID, pat) -> `ecfr` -> `einv` -> `-enc`, from VideoToolbox's
-  encoder service process (com.apple.coremedia.videoencoder). `efrm` names the frame's buffer by UUID and carries no
-  IOSurface (the send method's surface list is empty, the UUID isn't an IOSurface value): how a host reaches the
-  frame is the open question. Baseline (software): H.264 720p 91 fps of simple frames, HEVC 720p 6.9 fps.
-  tools/vtenc.m measures it.
+  encoder service process (com.apple.coremedia.videoencoder). `efrm` carries the frame's IOSurface (the kext's surface list: 1
+  surface) besides its UUID. The host-to-guest codes the guest's encoder handles, found as cmp immediates next to
+  'Epba' in VideoToolbox's x86 code (the shared cache): Eemt, Efdr, Efds, Epba, Espr, Esps. When the guest got an empty
+  efrm answer it tried to read a serialized sample buffer (FigSampleBufferSerialization err -19640, "Unrecognised
+  VTVideoEncoderFrame token"): encoded frames go back as Apple's serialized CMSampleBuffers.
+  What's left: (1) the kext copies a kept IOSurface into a frame slot on the host's order (decode's fill, reversed);
+  (2) venera-videod encodes the slot with VA-API (FFmpeg h264_vaapi / hevc_vaapi), answers esup with the properties it
+  honors (bit rate, key frame interval, real time, profile) and Esps/Efds as the guest needs them; (3) the encoded
+  sample back as the guest's serialized sample buffer (Eemt): its format is the work, best learned from Apple's own
+  host producing one (pvhost's esta still fails, err -17691: find what its session needs). Baseline (software): H.264
+  720p 91 fps of simple frames, HEVC 720p 6.9 fps; tools/vtenc.m measures it (VTENC_SHOW=1 prints the buffer).
