@@ -28,7 +28,8 @@
 #define VV_H2G_OFF (VV_G2H_OFF + VV_G2H_SIZE)
 #define VV_H2G_SIZE (4u << 20)
 #define VV_SLOT_OFF (40u << 20)
-#define VV_SLOT_SIZE (16u << 20)   // a 4096x2160 frame at 16 bits per sample, 4:2:0
+#define VV_SLOT_SIZE (16u << 20)   // a 4096x2160 frame at 8 bits, 4:2:0 (13.3 MB); NOT one at 10 bits (P010:
+                                   // 26.5 MB), so 4K 10-bit doesn't decode through the host (notes/PLAN.md, 0.1.2)
 #define VV_NSLOTS 13               // 40 MB + 13 x 16 MB = 248 MB
 #define VV_HOST_PEER 0
 #define VV_VM_PEER 1

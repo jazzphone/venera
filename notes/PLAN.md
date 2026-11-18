@@ -1652,3 +1652,21 @@ softened-frame fixes. The package's "Hardware video decoding" choice is now "Har
 archives: install-host.sh on node 2 (reports "encodes H.264 HEVC"), the package over VM 108's dev install (snapshot
 pre-012; the seed added 0, VM 108 already held them), then H.264 and HEVC 1080p at 100-110 fps with all 300 frames
 decoding back (sync and async), and two avconvert re-encodes of 300 frames each. VM 107 and node 1 stay on 0.1.1.
+
+After the release, the same day:
+- **VM 107 on 0.1.2**, through the VM script's new **Upgrade Venera** (choice 4): this release's host half on every node
+  the VM may run on (others first), then the guest package from a USB disk hot-plugged on the EHCI bus, installed
+  through the guest agent with the choices macOS has (Installer's -applyChoiceChangesXML: video, app, webgl read from
+  VIDEO, /Applications/Venera.app, authenticated root and NO_SYSVOL), the disk unplugged, macOS restarted. Its plan
+  names who is logged in. VM 107 came back on Metal with VeneraVideo 0.2.0, and an export encoded on the host.
+- **Found: the host decoder dropped the second frame of H.264 with B-frames and no bitstream_restriction** (the
+  Notification Center's mac_widgets movie: 554 of 555 frames in VM 108's exports to ProRes and to HEVC, 555 on a
+  Mac). FFmpeg guesses the reorder depth for such a stream, starts at none and grows it at the first B-frame, handing
+  out one frame out of order, which AVFoundation drops. Since 0.1.0. **Fixed** (strict compliance for H.264: the depth
+  from the level). Both exports 555 now; encoding checks unchanged. On node 2 as a dev build (release copy
+  /root/vgpu/venera-videod.0.1.2); node 1 runs 0.1.2's.
+- **Found, not fixed: 4K 10-bit doesn't decode through the host.** A frame slot is 16 MB; a 3840x2160 P010 frame is
+  25 MB (the comment said 16 MB held one). Tahoe's and Sonoma's wallpaper movies (HEVC 10-bit 4K) fail to export
+  ("Cannot Decode", -11821/-16977) and Safari's 4K HDR would fail the same way. 10-bit 1080p and 8-bit 4K work. The fix
+  needs bigger slots (fewer, or a bigger shared region), which the kext and the host must agree on: a VeneraVideo and
+  host change together, with the hello saying which layout.

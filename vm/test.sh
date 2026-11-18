@@ -24,6 +24,9 @@ check "-cpu host at the end of the line" '[ "$(venera_args "-smbios type=2 -cpu 
 O=$(venera_args "-cpu Skylake-Client" 0 2>&1 >/dev/null)
 check "another -cpu is reported, not changed" '[[ $O == *"add host-phys-bits-limit=40 to it by hand"* ]] && [[ $(venera_args "-cpu Skylake-Client" 0 2>/dev/null) == "-cpu Skylake-Client -global"* ]]'
 
+X=$(choices_xml 1 0 1)
+check "the upgrade's choices are a property list Installer reads" 'python3 -c "import plistlib,sys; a=plistlib.loads(sys.argv[1].encode()); assert [(d[\"choiceIdentifier\"], d[\"attributeSetting\"], d[\"choiceAttribute\"]) for d in a] == [(\"video\",1,\"selected\"),(\"app\",0,\"selected\"),(\"webgl\",1,\"selected\")]" "$X"'
+
 cat >"$W/corosync.conf" <<'C'
 nodelist {
   node {

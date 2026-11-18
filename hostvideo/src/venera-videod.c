@@ -384,6 +384,13 @@ static int open_decoder(session *s, const uint8_t *fds, size_t n) {
     s->c->get_format = pick_vaapi;
     s->c->extra_hw_frames = 16;   // headroom; decoded frames leave their GPU surfaces as soon as a slot is free
     s->c->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
+    // H.264 whose SPS doesn't say how far frames are reordered (no bitstream_restriction): FFmpeg otherwise guesses,
+    // starts at no reordering and grows it when a B-frame comes, handing out one frame out of order on the way, and
+    // VideoToolbox's readers drop a frame that comes before its predecessor (AVFoundation's exports were a frame
+    // short: the second one). Strict takes the depth from the level, as the spec's DPB does, from the first frame.
+    if (id == AV_CODEC_ID_H264) {
+        s->c->strict_std_compliance = FF_COMPLIANCE_STRICT;
+    }
     int rc = avcodec_open2(s->c, codec, NULL);
     if (rc < 0) {
         LOG("dsta: opening %s: %s", codec->name, av_err2str(rc));

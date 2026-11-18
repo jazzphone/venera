@@ -16,7 +16,7 @@ a dry run.
 ## What it checks
 
 - an Intel CPU (the VM runs as an Intel Mac on `-cpu host`) and KVM;
-- the GPU: an Intel GPU gives Venera Metal, OpenGL and hardware video decoding; an AMD GPU, Metal and OpenGL; with no GPU
+- the GPU: an Intel GPU gives Venera Metal, OpenGL and hardware video (decoding and encoding); an AMD GPU, Metal and OpenGL; with no GPU
   the host can render on (or one passed through to another VM), the VM gets a plain VMware display instead;
 - QEMU 9.2 or later and virglrenderer 1.0 or later (Proxmox VE 9);
 - in a cluster, each other node over the cluster's own SSH: its GPU and its packages. Only when the VM's disk is on
@@ -24,7 +24,7 @@ a dry run.
 
 ## A new VM
 
-It asks for the name, Venera's choices (graphics, video decoding, Safari WebGL, a sound device), storage, network,
+It asks for the name, Venera's choices (graphics, hardware video, Safari WebGL, a sound device), storage, network,
 cores, memory, disk, the screen size at boot, and optionally your Mac's identity for iCloud. Then it:
 
 - installs what the host is missing, on this node and each node you choose: `mesa-vulkan-drivers` and
@@ -51,7 +51,7 @@ must not be signed into iCloud until you add yours (the script's third choice fo
 Run it again with the VM's name:
 
 1. **Finish**, once macOS and Venera are installed. It reads Venera's status in macOS through the guest agent, then:
-   - turns on hardware video decoding: `install-host.sh --vm VMID` on each node the VM may run on, the others first,
+   - turns on hardware video (decoding and encoding): `install-host.sh --vm VMID` on each node the VM may run on, the others first,
      so the VM finds its socket wherever HA starts it;
    - takes out and deletes the recovery and Venera disks;
    - sets the clock once and turns off Apple's power logging, which held a core at ~90% in the VM;
@@ -63,6 +63,12 @@ Run it again with the VM's name:
    VM's config is backed up first. Venera's installer then sets SIP and AMFI itself and finishes after a restart.
 3. **Its Mac identity**: writes your Mac's model, serial, board serial and ROM into OpenCore. The old OpenCore disk is
    saved first.
+4. **Upgrade Venera**, to the release the script came with, on a running VM that has Venera and the guest agent:
+   - this release's host half: `install-host.sh --vm VMID` on each node the VM may run on, the others first (running
+     VMs keep their video connections);
+   - the guest package from a USB disk it plugs into the running VM, installed through the guest agent with the
+     choices macOS has now (hardware video, the Venera app, the system-volume copy for Safari WebGL);
+   - the disk unplugged, then macOS restarted. Whoever is logged in loses unsaved work: the plan says who that is.
 
 ## Where it came from
 
