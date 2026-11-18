@@ -240,7 +240,7 @@ The accelerator flips at most once per 12 ms by default (`vgpuflipms=N` boot-arg
   console menu gives) sends changing areas as a video stream, which usually holds up better on a slow link.
 - Apps: tested on VM 108 with Safari (WebGL, canvas, CSS effects at 60 fps), Preview and QuickTime (Core Image,
   video), Maps, Photos, Freeform, Calendar, Contacts, Notes, Music, TV, System Settings and others. OpenGL apps
-  (Chess) still draw with macOS's software OpenGL; Core Image's stitched kernels fall back to its source path.
+  (Chess) draw through the driver too; Core Image's stitched kernels fall back to its source path (slower the first time).
 - WindowServer draws window drags, scrolling, resizing and minimizing at 45-60 fps on the tested host (mean frame
   gap 17-20 ms); each flip costs QEMU ~2-4 ms (egl-headless reads the frame back for VNC).
 - `screencapture` from a shell needs Screen Recording permission for the app that runs it (Terminal), as usual.

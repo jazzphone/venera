@@ -9,7 +9,8 @@ Named after the Soviet Venera probes, the first to reach Venus, the protocol it 
 **Status: experimental, home-lab.** Tested on macOS Tahoe 26.7.3 (25G342) in a Proxmox VE 9.2 VM (pve-qemu 11.1.3,
 virglrenderer 1.1.0) on an Intel Iris Xe host. Window drags, scrolling, live resize and minimizing run at 40-60 fps;
 screenshots, display sleep and the Dock's window previews work; when anything goes wrong the desktop falls back to
-software compositing by itself. Apps other than WindowServer get Metal only when allow-listed (the next stage).
+software compositing by itself. Every app gets Metal and OpenGL from the host GPU (Safari's WebGL included), and
+VideoToolbox decodes H.264, HEVC and VP9 on the host's GPU with the host half installed.
 
 ## Install
 
@@ -25,6 +26,7 @@ the rest. `uninstall.sh` removes everything again.
 | `VirtioGPUFramebuffer.kext` | Auxiliary KC | the IOFramebuffer macOS's display stack drives: modes, EDID, cursor |
 | `VirtioGPUAccel.kext` | Auxiliary KC | an IOAcceleratorFamily2 accelerator: Metal's device, the display pipe WindowServer presents through, VBL, paced flips to the host GPU's frames |
 | `VirtioGPUMetal.bundle` | /Library/GPUBundles | the Metal driver: Metal's API over Vulkan (Mesa's Venus, patched for macOS), Metal shaders translated to SPIR-V, IOSurfaces as host GPU images |
+| `VeneraVideo.kext` | Boot KC (OpenCore) | hardware video decoding: VideoToolbox's paravirtual decoder, over a shared-memory device to `venera-videod` on the host |
 
 A display frame never touches the guest's CPU: Core Animation renders it on the host GPU, the driver copies it into a
 host-visible "twin" buffer in the same command buffer, and the accelerator points the scanout at that buffer
