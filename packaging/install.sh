@@ -346,6 +346,24 @@ for f in sysvol.sh venera-watch.sh; do run cp "$PAYLOAD/Support/$f" "$V/" && run
 for f in uninstall.sh status.sh; do [ "$HERE/$f" -ef "$V/$f" ] || { run cp "$HERE/$f" "$V/" && run chmod 755 "$V/$f"; }; done
 [ $DRY = 1 ] || { cp "$HERE/VERSION" "$V/VERSION" 2>/dev/null; echo 25G342 >"$V/TESTED_BUILD"; }
 if [ $VIDEO = 1 ]; then run touch "$V/VIDEO"; else run rm -f "$V/VIDEO"; fi   # what the app checks video against
+# the translation pool's seed: Core Animation's shaders translated already, for the macOS build they were made on (a
+# fresh install's first boot otherwise spends minutes of WindowServer's CPU translating them). Entries already there
+# stay; only files named by a translation's hash are taken.
+if [ -f "$PAYLOAD/Support/pool.tar.gz" ] && [ "$(cat "$PAYLOAD/Support/pool.build" 2>/dev/null)" = "$BUILD" ]; then
+  if [ $DRY = 1 ]; then
+    say "  + seed the translation pool $K/cache from the package"
+  else
+    T=$(mktemp -d /private/var/tmp/venera-seed.XXXXXX) && tar -xzf "$PAYLOAD/Support/pool.tar.gz" -C "$T" &&
+      mkdir -p "$K/cache" && chmod 755 "$K/cache" && n=0 &&
+      for f in "$T"/*; do
+        b=${f##*/}
+        [[ $b =~ ^[0-9a-f]{64}$ ]] && [ -f "$f" ] && [ ! -L "$f" ] && [ ! -e "$K/cache/$b" ] || continue
+        chown root:wheel "$f" && chmod 644 "$f" && mv "$f" "$K/cache/$b" && n=$((n + 1))
+      done
+    rm -rf "$T"
+    say "translation pool: $n translations from the package (macOS $BUILD)"
+  fi
+fi
 # without the system-volume copy by choice (the package's "Safari WebGL" unticked): the watcher doesn't offer it
 if [ $NO_SYSVOL = 1 ]; then run touch "$V/NO_SYSVOL"; else run rm -f "$V/NO_SYSVOL"; fi
 # /Library/GPUBundles' bundle is a symlink from now on: to the kept copy until the system-volume copy is in

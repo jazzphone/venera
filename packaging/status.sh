@@ -31,6 +31,13 @@ P=$(pgrep -x WindowServer)
 echo "  pid $P, started $(ps -o lstart= -p "$P" 2>/dev/null)"
 ls -t /Library/Logs/DiagnosticReports/ 2>/dev/null | grep -m3 WindowServer | sed 's/^/  crash report: /'
 echo
+# Metal calls the driver doesn't have yet: answered with nil/0 (lenient mode) and logged once a process. What an app
+# asked for that drew wrong or not at all is here; a report of these lines is what the driver needs next.
+echo "== Metal calls the driver lacks (last day; app: call)"
+L=$(log show --last 1d --style compact --predicate 'subsystem == "local.homelab.VirtioGPUMetal" AND eventMessage CONTAINS "LENIENT"' 2>/dev/null |
+  sed -nE 's/^.* ([^ []+)\[[0-9]+:[0-9a-f]+\] .*LENIENT: (.*) not implemented.*/\1: \2/p' | sort | uniq -c | sort -rn | head -15)
+[ -n "$L" ] && echo "$L" | sed 's/^ */  /' || echo "  none"
+echo
 echo "== the Metal driver's log (last 2 minutes)"
 log show --last 2m --predicate 'subsystem == "local.homelab.VirtioGPUMetal"' 2>/dev/null | grep -v 'perf 5 s' |
   cut -c1-220 | tail -12

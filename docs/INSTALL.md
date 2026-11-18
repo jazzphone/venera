@@ -192,11 +192,17 @@ until the device is gone (`--remove-vm` on the host, start the VM again, run the
 
 ### Which processes use the driver
 
-WindowServer (the desktop) and every app: a process running from an `.app` bundle, and the graphics process WebKit
-starts for Safari and other web views. Background daemons (Spotlight's indexers, photo and media analysis...) don't,
-and neither do `loginwindow` and `SecurityAgent`, the processes that let you log in. `/Library/GPUBundles/VirtioGPUMetal-allow.txt`
-changes that, one line each: a process name adds it, `-name` excludes it, `*` adds every process, `apps-off` turns
-the apps default off.
+WindowServer (the desktop), every app (a process running from an `.app` bundle, and the graphics process WebKit
+starts for Safari and other web views), and the background services that draw for the screen: `iconservicesagent`
+(every icon Finder, the Dock and open panels show), `CursorUIViewService`, `avconferenced` (video calls) and
+`mediaanalysisd` (the photo library's analysis). Other daemons don't, and neither do `loginwindow` and
+`SecurityAgent`, the processes that let you log in. Each process on the driver costs the host about 58 MB.
+`/Library/GPUBundles/VirtioGPUMetal-allow.txt` changes that, one line each: a process name adds it, `-name` excludes
+it, `*` adds every process, `apps-off` turns the apps (and services) default off, `services-off` the services alone.
+
+A Metal call the driver doesn't have yet is answered with nothing (an empty object or zero) rather than crashing the
+app, and logged: `status.sh` lists the ones of the last day by app, under "Metal calls the driver lacks". An app that
+draws wrong usually shows up there, and that list is the report that helps.
 
 ### Why the system volume, and the watcher
 
@@ -253,7 +259,9 @@ Files in `/Library/GPUBundles` the Metal driver reads (root only; delete them to
 - `VirtioGPUMetal-fetchmode`: `0` emulates Metal's framebuffer fetch with copies instead of sampling the
   attachment in place (the default since 0.1.0's last round; in place needs Venus' `VK_EXT_attachment_feedback_loop_layout`
   and falls back to copies without it). Read when WindowServer starts: reboot after changing it.
-- `VirtioGPUMetal-gputime`: log GPU timings every 5 s (costs a little).
+- `VirtioGPUMetal-perf`: log where WindowServer's frames spend their time every 5 s (to
+  `/var/tmp/VirtioGPUMetal.log` and the system log; WindowServer notices the file within 5 s).
+- `VirtioGPUMetal-gputime`: with it, GPU timings too (costs a little). Read when a process starts.
 
 The accelerator flips at most once per 12 ms by default (`vgpuflipms=N` boot-arg, 0 = no limit).
 

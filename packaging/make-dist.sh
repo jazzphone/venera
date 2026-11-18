@@ -20,6 +20,15 @@ cp -R build/VirtioGPUMetal.bundle $D/payload/GPUBundles/
 cp packaging/install.sh packaging/uninstall.sh packaging/status.sh $D/
 cp packaging/sysvol.sh packaging/venera-watch.sh packaging/local.venera.watch.plist helper/local.venera.helper.plist $D/payload/Support/
 cp -R build/Venera.app $D/payload/Apps/
+# the translation pool's seed (tools/seed-pool.sh): only one made with this translator
+TR=$(shasum -a 256 build/translator/libnvmtl_translate.dylib | cut -c1-12)
+SEED=$(ls packaging/seed/pool-*-$TR.tar.gz 2>/dev/null | head -1 || true)
+if [[ -n $SEED ]]; then
+  cp $SEED $D/payload/Support/pool.tar.gz
+  echo ${${SEED:t}#pool-} | cut -d- -f1 >$D/payload/Support/pool.build
+else
+  echo "make-dist: no translation seed for translator $TR (tools/seed-pool.sh): the first boot translates everything" >&2
+fi
 chmod 755 $D/*.sh
 cp docs/INSTALL.md VERSION LICENSE NOTICE.md $D/
 cp vendor/nullmoth/LICENSE $D/licenses/NullMoth-PolyForm-Noncommercial-1.0.0.txt

@@ -1,6 +1,8 @@
 // Timing counters (stage 5c): where a WindowServer frame's time goes. Each kind sums its count, bytes and time; a
-// timer logs the last 5 s whenever anything happened. On in WindowServer and with VGMTL_PERF=1; VGMTL_PERF=2 (or the
-// flag file /Library/GPUBundles/VirtioGPUMetal-gputime) adds GPU timestamps around every command buffer.
+// timer logs the last 5 s whenever anything happened. Off unless asked for (0.1.2: on by default in WindowServer it
+// wrote 12 lines every 5 s, ~20 MB a day): VGMTL_PERF=1, or the flag file /Library/GPUBundles/VirtioGPUMetal-perf,
+// which WindowServer checks at each tick, so it turns on and off without a restart. VGMTL_PERF=2 (or the flag file
+// /Library/GPUBundles/VirtioGPUMetal-gputime) adds GPU timestamps around every command buffer.
 #import "objects.h"
 #include <stdatomic.h>
 
@@ -25,6 +27,12 @@ void vg_perf(int kind, uint64_t bytes, uint64_t ns) {
 }
 
 static void vg_perf_report(void) {
+    if (!vg_perf_on()) {   // WindowServer's timer runs while the flag file is away: drop what was counted
+        for (int k = 0; k < VG_PERF_N; k++) {
+            atomic_store(&gCount[k], 0), atomic_store(&gBytes[k], 0), atomic_store(&gNs[k], 0);
+        }
+        return;
+    }
     // one line per kind: the unified log cuts long messages
     for (int k = 0; k < VG_PERF_N; k++) {
         uint64_t c = atomic_exchange(&gCount[k], 0), b = atomic_exchange(&gBytes[k], 0), t = atomic_exchange(&gNs[k], 0);
@@ -35,8 +43,10 @@ static void vg_perf_report(void) {
     }
 }
 
-static BOOL gPerfOn;
-BOOL vg_perf_on(void) { return gPerfOn; }
+static BOOL gPerfOn;        // VGMTL_PERF, or the flag file when the process started
+static BOOL gPerfWatch;     // WindowServer: the flag file is read again at every tick
+static _Atomic BOOL gPerfFlag;
+BOOL vg_perf_on(void) { return gPerfOn || atomic_load_explicit(&gPerfFlag, memory_order_relaxed); }
 
 // ---- GPU timestamps ----
 static VkQueryPool gQueries;
@@ -124,15 +134,20 @@ __attribute__((constructor)) static void vg_perf_start(void) {
     const char *e = getenv("VGMTL_PERF");
     // 5d: /Library/GPUBundles/VirtioGPUMetal-perf turns it on in every process (an app's XPC service has no environment
     // of ours)
-    if (!((e && (e[0] == '1' || e[0] == '2')) || !strcmp(getprogname(), "WindowServer") ||
-          access("/Library/GPUBundles/VirtioGPUMetal-perf", F_OK) == 0)) {
+    gPerfOn = (e && (e[0] == '1' || e[0] == '2')) || access("/Library/GPUBundles/VirtioGPUMetal-perf", F_OK) == 0;
+    gPerfWatch = !strcmp(getprogname(), "WindowServer");
+    if (!gPerfOn && !gPerfWatch) {
         return;
     }
-    gPerfOn = YES;
     gGpuTimeOn = (e && e[0] == '2') || access("/Library/GPUBundles/VirtioGPUMetal-gputime", F_OK) == 0;
     dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(0, 0));
     dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), 5 * NSEC_PER_SEC, NSEC_PER_SEC / 10);
-    dispatch_source_set_event_handler(timer, ^{ vg_perf_report(); });
+    dispatch_source_set_event_handler(timer, ^{
+        if (gPerfWatch) {
+            atomic_store(&gPerfFlag, access("/Library/GPUBundles/VirtioGPUMetal-perf", F_OK) == 0);
+        }
+        vg_perf_report();
+    });
     dispatch_resume(timer);
     gTimer = timer;
 }

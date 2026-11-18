@@ -1562,3 +1562,53 @@ Proxmox cluster with HA) found what VM 108 never could:
 - Tested: `vm/test.sh` (args, corosync, OpenCore edits on KVM-Opencore v21's config.plist), the questions and plans on
   node 2 (create with node 1, create with WebGL, Finish on VM 108, Ready refused while running), the Venera disk's
   contents. Not tested: a whole run, from the Tahoe download through macOS's install to Finish.
+
+## Round 14 (2026-11-18): first boot, background services, missing calls, and hardware encoding
+
+The owner's list after 0.1.1: clean up (done: old branches, VM 108 snapshots pruned to clean-dev / video-decode /
+r12-installed / pre-r14, VM 107's detached Sequoia disk, the NAS's Sequoia image, stale host files), the slow first boot,
+hardware video encoding, a way to fix what apps ask for that the driver lacks, and background services on the driver.
+
+- **The log.** WindowServer wrote 12 "perf 5 s" lines every 5 s to /var/tmp/VirtioGPUMetal.log (6.9 MB in VM 107's
+  first 7 hours, never rotated). The counters are now off unless `/Library/GPUBundles/VirtioGPUMetal-perf` exists
+  (WindowServer checks it every tick) or VGMTL_PERF is set; the file rolls over at 4 MB (.log.1).
+- **OpenCore can't inject the framebuffer or the accelerator** (the owner asked): Kernel > Add links into the Boot
+  KC, and IOGraphicsFamily, IOAcceleratorFamily2 and AppleGraphicsDeviceControl are System KC (checked on VM 108 with
+  kmutil inspect; IOSurface and IOPCIFamily are Boot KC, which is why the core and VeneraVideo can be). And the Metal
+  driver is a user-space bundle on macOS's disk. So a new VM gets SIP/AMFI in OpenCore and the package on a disk.
+- **First boot.** With every cache empty (a fresh install), VM 108's first minutes translated 167 shaders, 125 s of
+  CPU (WindowServer 104 s: Core Animation's ogl_metal_uber fragment shader, 700 KB of LLVM text, ~46 sets of
+  function constants a boot, ~2 s each in the VM, 0.44 s natively on an M-series Mac).
+  - The one-module path (translate once, fix values per set) is wrong as it stands, measured with a check mode
+    (`VirtioGPUMetal-fccheck`: every per-set translation also built the one-module way and the interfaces compared):
+    besides harmless dead declarations, sets read bindings the one-module SPIR-V lacks (UberComposite: texture 162
+    and buffer 1 per set, binding 36 one-module), and the uber shader is 706 KB one-module against ~25 KB a set. That
+    is the "WebKit drew wrong" of round 8.
+  - Where a translation's time goes (tools: the fcdump flag writes each function's text and sets; a Rust bench over
+    the translator crate): AIR specialization 24 ms, translation 390 ms. The specialized text is still 693 of 699 KB:
+    the translator works through the whole uber shader and drops most of it after. Folding the constants' branches
+    in the IR before translation is the real speed-up (not done).
+  - Done instead: **the package ships a seed of the pool** (tools/seed-pool.sh -> packaging/seed/
+    pool-BUILD-TRANSLATOR.tar.gz, 796 translations, 2.8 MB, made on VM 108 from a cleared cache through restarts,
+    19 system apps, window gestures and the desktop's own windows; never VM 107's, whose pool holds the owner's own and
+    third-party apps' shaders). make-dist ships it only with the translator it was made with; install.sh unpacks it
+    into the pool only on that macOS build. Measured on VM 108, every cache cleared and the seed put in as install.sh
+    does: WindowServer's first boot 104 s of translation -> 1.3 s at the lock screen, 55 s (21 shaders) with the
+    desktop and restored windows up against the 720-translation seed; the 796 one adds those.
+- **Background services.** In a day of VM 107 only six processes asked for Metal and were turned away:
+  iconservicesagent, CursorUIViewService, avconferenced, mediaanalysisd, loginwindow (kept off), SafeEjectGPUService.
+  The first four are on by default now (kServices; `services-off` in the allow-list turns them off). Icons draw
+  right on the driver (Finder's Applications folder, the sidebar, the Dock: screenshot checked); iconservicesagent's
+  first run translated ~700 small shaders (52 s), which the seed now carries.
+- **Missing calls.** Lenient mode answers an unimplemented call with nil/0 and logs it once a process; VM 107 logged
+  none in 6 h of use. status.sh now lists the last day's by app ("Metal calls the driver lacks").
+- **Hardware encoding** (in progress). Tahoe's VideoToolbox has the paravirtualized encoder too. The guest asks
+  `encs` (68 bytes); Apple's host answers a list (ProRes, H.264, HEVC, JPEG: hostvideo/data/apple-encs-reply.bin).
+  With venera-videod answering H.264/HEVC (VENERA_VIDEO_ENCODE=1, VM 108's unit only), VideoToolbox lists
+  "paravirtualized:...ave.avc", picks it, and goes `+enc` (codec, encoder id, guest build) -> `esta` (vdi=wxh; Apple
+  answers Epba first: the pixel formats) -> `esup` (Apple: a 4.5 KB supported-properties dictionary) -> `epfr` ->
+  `efrm` per frame (frm, pts, dur, uui = a 16-byte UUID, pat) -> `ecfr` -> `einv` -> `-enc`, from VideoToolbox's
+  encoder service process (com.apple.coremedia.videoencoder). `efrm` names the frame's buffer by UUID and carries no
+  IOSurface (the send method's surface list is empty, the UUID isn't an IOSurface value): how a host reaches the
+  frame is the open question. Baseline (software): H.264 720p 91 fps of simple frames, HEVC 720p 6.9 fps.
+  tools/vtenc.m measures it.

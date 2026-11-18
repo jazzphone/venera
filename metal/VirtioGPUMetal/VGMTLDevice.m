@@ -7,9 +7,11 @@
 //
 // Who gets a device: WindowServer only when the accelerator says so (VirtioGPUWindowServer = true, published by the
 // kext's own arm at vgpuaccel=4, never by the late arm) and the list has no "-WindowServer" line; every app (a process
-// running from an .app bundle, and WebKit's GPU process) by default since 5d; daemons only when listed.
+// running from an .app bundle, and WebKit's GPU process) by default since 5d; the background services that draw for the
+// screen (kServices) since 0.1.2; other daemons only when listed.
 // /Library/GPUBundles/VirtioGPUMetal-allow.txt: one process name per line, `*` = all, `-name` = never, `apps-off` = no
-// apps by default; mtlprobe is always allowed; VGMTL_ENABLE=1 in the environment allows the process.
+// apps by default, `services-off` = none of kServices; mtlprobe is always allowed; VGMTL_ENABLE=1 in the environment
+// allows the process.
 //
 // Shape after nullmoth/nvidia-macos-driver's NVMTLDevice (plugin/NVMTLDevice.m): the refusal before super's init and
 // the initLimits call are theirs.
@@ -33,7 +35,7 @@
 @end
 
 // ---- log: os_log (subsystem local.homelab.VirtioGPUMetal), stderr when VGMTL_LOG=1, /var/tmp/VirtioGPUMetal.log
-// when the process can write it -------------------------------------------------------------------------------------
+// when the process can write it (4 MB, then .log.1) -------------------------------------------------------------------
 
 static os_log_t vglog_handle(void) {
     static os_log_t h;
@@ -62,7 +64,11 @@ void vglog(const char *fmt, ...) {
     FILE *f = fopen("/var/tmp/VirtioGPUMetal.log", "a");
     if (f) {
         fprintf(f, "[%d %s] %s\n", getpid(), getprogname(), line);
+        long size = ftell(f);
         fclose(f);
+        if (size > 4 << 20) {   // 4 MB, then one older file (0.1.2: it grew without end)
+            rename("/var/tmp/VirtioGPUMetal.log", "/var/tmp/VirtioGPUMetal.log.1");
+        }
     } else {
         noFile = 1;
     }
@@ -159,6 +165,12 @@ BOOL vg_windowserver_refused(void) {
     return !allowed;
 }
 
+// The background services that draw what's on screen, on the driver by default (0.1.2). Each one asked for Metal and
+// was turned away on VM 107 in a day's use, and drew on the CPU instead: icons for Finder, the Dock and every open
+// panel (iconservicesagent: ~7 s of CPU for one new folder), the cursor's own views, video calls' effects and the
+// photo library's analysis. Each costs one Venus context on the host (~58 MB).
+static const char *const kServices[] = {"iconservicesagent", "CursorUIViewService", "avconferenced", "mediaanalysisd"};
+
 static BOOL vg_process_allowed(mach_port_t port) {
     const char *me = getprogname();
     if (!strcmp(me, "WindowServer")) {
@@ -194,6 +206,11 @@ static BOOL vg_process_allowed(mach_port_t port) {
     // Never by default: the processes that let you log in and unlock (a driver fault there would lock the user out).
     if (!strcmp(me, "loginwindow") || !strcmp(me, "SecurityAgent")) {
         return NO;
+    }
+    for (size_t i = 0; i < sizeof(kServices) / sizeof(kServices[0]); i++) {
+        if (!strcmp(me, kServices[i])) {
+            return !vg_allow_file_has("services-off", NO);
+        }
     }
     NSString *bp = [[NSBundle mainBundle] bundlePath];
     return [bp hasSuffix:@".app"] || [bp containsString:@".app/"];

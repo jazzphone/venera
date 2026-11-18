@@ -1083,6 +1083,57 @@ static void engine_msg(const uint8_t *p, size_t n, const struct vv_surf *surfs, 
         free(r.p);
         return;
     }
+    if (!strcmp(t, "encs") && getenv("VENERA_VIDEO_ENCODE")) {   // encoding (0.1.2, in progress): opt-in until it works
+        buf r = {0};
+        msg_header(&r, "encs", 4, m.uuid, m.req);
+        field(&r, "enc", "pls", vv_encs_plist, sizeof(vv_encs_plist));
+        field_u32(&r, "ver", 6);
+        out.msg(&r);
+        free(r.p);
+        return;
+    }
+    if (!strcmp(t, "+enc") && getenv("VENERA_VIDEO_ENCODE")) {   // research: accept, then see what the guest sends
+        buf r = {0};
+        msg_header(&r, "+enc", 4, m.uuid, m.req);
+        field_s32(&r, "err", 0);
+        field_u32(&r, "ver", 6);
+        field(&r, "hin", "pls", vv_hin_plist, sizeof(vv_hin_plist));
+        out.msg(&r);
+        free(r.p);
+        return;
+    }
+    if (!strcmp(t, "esta") && getenv("VENERA_VIDEO_ENCODE")) {   // research: the encoder's pixel buffers, then OK
+        size_t n = 0;
+        const uint8_t *v = msg_field(&m, "vdi", "wxh", &n);
+        int w = n == 8 ? (int)((v[0] << 24) | (v[1] << 16) | (v[2] << 8) | v[3]) : 0;
+        int h = n == 8 ? (int)((v[4] << 24) | (v[5] << 16) | (v[6] << 8) | v[7]) : 0;
+        bp *d = bp_dict();
+        bp_set(d, "Width", bp_int(w));
+        bp_set(d, "Height", bp_int(h));
+        bp *pf = bp_array();
+        bp_push(pf, bp_int(FOURCC('4', '2', '0', 'v')));
+        bp_push(pf, bp_int(FOURCC('4', '2', '0', 'f')));
+        bp_set(d, "PixelFormatType", pf);
+        bp_set(d, "IOSurfaceProperties", bp_dict());
+        bp_set(d, "BytesPerRowAlignment", bp_int(64));
+        bp_set(d, "PlaneAlignment", bp_int(64));
+        size_t pn;
+        uint8_t *pl = bp_encode(d, &pn);
+        bp_free(d);
+        buf e = {0};
+        msg_header(&e, "Epba", 2, m.uuid, ++host_req);
+        field(&e, "pba", "pls", pl, pn);
+        out.msg(&e);
+        free(e.p);
+        free(pl);
+        buf r = {0};
+        msg_header(&r, "esta", 4, m.uuid, m.req);
+        field_s32(&r, "err", 0);
+        out.msg(&r);
+        free(r.p);
+        VLOG("esta %dx%d: answered", w, h);
+        return;
+    }
     if (!strcmp(t, "decs")) {
         buf r = {0};
         msg_header(&r, "decs", 4, m.uuid, m.req);

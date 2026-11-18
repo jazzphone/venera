@@ -16,9 +16,13 @@ def field(path, key):
 # made Safari report AV1 as hardware-decoded and pick it)
 decs = [d for d in field('data/apple-decs-reply.bin', 'dec') if set(d['VTCodecType']) & {'avc1', 'hvc1', 'vp09'}]
 sup = field('data/apple-dsup-reply.bin', 'sup')
+# the encoders the host's VA-API driver has (H.264 and HEVC on the Iris Xe's low-power encode entry point); Apple's list
+# also has ProRes and JPEG, which the host doesn't encode
+encs = [e for e in field('data/apple-encs-reply.bin', 'enc') if e['VTCodecType'] in (0x61766331, 0x68766331)]
 items = {
     'vv_decs_plist': decs,
     'vv_sup_plist': sup,
+    'vv_encs_plist': encs,
     'vv_hin_plist': {'VTHostBuildVersion': 'Venera'},
     'vv_true_plist': True,
     # SuggestedQualityOfServiceTiers, as Apple's host answers it (the player degrades through these under load)
@@ -33,4 +37,5 @@ for name, v in items.items():
         out.append('    ' + ', '.join(f'0x{x:02x}' for x in b[i:i + 20]) + ',')
     out.append('};')
 open(f'{here}/src/vv_static.h', 'w').write('\n'.join(out) + '\n')
-print('decoders:', [d['VTCodecType'] for d in decs], '; properties:', len(sup))
+print('decoders:', [d['VTCodecType'] for d in decs], '; encoders:', [e['CMClassImplementationID'] for e in encs],
+      '; properties:', len(sup))

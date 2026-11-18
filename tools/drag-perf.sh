@@ -6,7 +6,7 @@ T=${1:-8}
 G=${2:-drag}
 case $G in scroll|minimize) MODE=$G ;; *) MODE= ;; esac
 . "$(dirname "$0")/host.sh"
-"${SSH[@]}" $H "bash /root/vgpu/vm-remote.sh run 'pkill -x dragtest; U=\$(id -u dev); cd /var/tmp/vgpu; (launchctl asuser \$U sudo -u dev ./dragtest 60 $MODE >/dev/null 2>&1 &); sleep 4; /var/tmp/vgpu/acceltest pacereset >/dev/null; date \"+%Y-%m-%d %H:%M:%S\" > /var/tmp/t0' 30" >/dev/null
+"${SSH[@]}" $H "bash /root/vgpu/vm-remote.sh run 'touch /Library/GPUBundles/VirtioGPUMetal-perf; pkill -x dragtest; U=\$(id -u dev); cd /var/tmp/vgpu; (launchctl asuser \$U sudo -u dev ./dragtest 60 $MODE >/dev/null 2>&1 &); sleep 4; /var/tmp/vgpu/acceltest pacereset >/dev/null; date \"+%Y-%m-%d %H:%M:%S\" > /var/tmp/t0' 30" >/dev/null
 case $G in
 drag) "${SSH[@]}" $H "python3 /root/vgpu/qmpinput.py 108 drag 520 216 $T 140" >/dev/null ;;
 resize) "${SSH[@]}" $H "python3 /root/vgpu/qmpinput.py 108 drag 838 648 $T 100" >/dev/null ;;

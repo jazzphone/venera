@@ -398,9 +398,14 @@ static NSData *vg_spirv_ieee(NSData *spv) {
 }
 static NSData *vg_translate_flagged(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc,
                                     const uint32_t *tgLengths, uint32_t tgCount, NSString **error);
+static void vg_fc_check(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc, const uint32_t *tgLengths,
+                        uint32_t tgCount, NSData *spv);
 NSData *vg_translate(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc, const uint32_t *tgLengths,
                      uint32_t tgCount, NSString **error) {
     NSData *spv = vg_translate_flagged(ll, stage, fc, tgLengths, tgCount, error);
+    if (spv && fc.count) {
+        vg_fc_check(ll, stage, fc, tgLengths, tgCount, spv);
+    }
     return spv ? vg_spirv_ieee(spv) : nil;
 }
 static NSData *vg_translate_flagged(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc,
@@ -502,6 +507,202 @@ static NSData *vg_spec_entry(NSString *ll, const char *stage, const uint32_t *tg
     return entry;
 }
 
+// One set of values through the one-module path: the function's module (vg_spec_entry), its values fixed. The
+// threadgroup lengths must be set on this thread already. nil and why when it can't.
+static NSData *vg_spec_translate(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc,
+                                 const uint32_t *tgLengths, uint32_t tgCount, NSString **why) {
+    NSData *entry = vg_spec_entry(ll, stage, tgLengths, tgCount, why);
+    const uint32_t *hdr = entry.bytes;
+    if (!entry || entry.length < 8 || hdr[0] != 0x31435053u || entry.length < 8 + (size_t)hdr[1]) {
+        if (!*why) {
+            *why = @"no module";
+        }
+        return nil;
+    }
+    vg_fc_args a;
+    vg_fc_unpack(fc, &a);
+    const uint8_t *tab = (const uint8_t *)entry.bytes + 8, *mod = tab + hdr[1];
+    uint8_t *out = NULL;
+    size_t len = 0;
+    char err[1024] = "";
+    if (pSpecApply(mod, entry.length - 8 - hdr[1], tab, hdr[1], a.idx, a.sz, a.pay, a.n, &out, &len, err, sizeof(err)) ||
+        !out) {
+        *why = [NSString stringWithFormat:@"applying the values failed: %s", err];
+        return nil;
+    }
+    NSData *spv = [NSData dataWithBytes:out length:len];
+    pTranslateFree(out, len);
+    return spv;
+}
+
+// ---- the one-module path against a translation per set (0.1.2, /Library/GPUBundles/VirtioGPUMetal-fccheck) --------
+// What a pipeline is built from, for one module: each global variable (its storage class, set/binding, location or
+// built-in, whether any instruction names it), the execution modes, the capabilities, and how many discards. Two
+// translations of the same function and values should agree here, but for declarations the one-module path keeps
+// (it prunes nothing) that nothing reads once its constants are fixed.
+static NSArray<NSString *> *vg_spirv_iface(NSData *spv) {
+    const uint32_t *w = spv.bytes;
+    size_t n = spv.length / 4;
+    if (n < 5 || w[0] != 0x07230203u) {
+        return @[ @"not SPIR-V" ];
+    }
+    size_t bound = w[3];
+    int32_t *set = malloc(bound * 4), *bind = malloc(bound * 4), *loc = malloc(bound * 4), *bi = malloc(bound * 4);
+    memset(set, 0xff, bound * 4), memset(bind, 0xff, bound * 4), memset(loc, 0xff, bound * 4), memset(bi, 0xff, bound * 4);
+    uint32_t *refs = calloc(bound, 4);
+    uint8_t *isVar = calloc(bound, 1);
+    NSMutableArray *vars = [NSMutableArray array], *out = [NSMutableArray array];
+    NSMutableDictionary<NSNumber *, NSString *> *names = [NSMutableDictionary dictionary];
+    int kills = 0;
+    BOOL inFunctions = NO;
+    for (size_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) {
+            break;
+        }
+        if (op == 54) {   // OpFunction: the globals are behind us
+            inFunctions = YES;
+        }
+        if (op == 5 && len >= 3 && w[i + 1] < bound) {   // OpName
+            names[@(w[i + 1])] = @((const char *)&w[i + 2]);
+        } else if (op == 71 && len >= 4 && w[i + 1] < bound) {
+            uint32_t id = w[i + 1], d = w[i + 2], v = w[i + 3];
+            if (d == 34) set[id] = (int32_t)v;
+            else if (d == 33) bind[id] = (int32_t)v;
+            else if (d == 30) loc[id] = (int32_t)v;
+            else if (d == 11) bi[id] = (int32_t)v;
+        } else if (op == 59 && len >= 4 && w[i + 2] < bound && !inFunctions) {
+            isVar[w[i + 2]] = 1;
+            [vars addObject:@[ @(w[i + 2]), @(w[i + 3]) ]];
+        } else if (op == 16 && len >= 3) {   // OpExecutionMode entry mode ...
+            [out addObject:[NSString stringWithFormat:@"mode %u", w[i + 2]]];
+        } else if (op == 17 && len >= 2) {
+            [out addObject:[NSString stringWithFormat:@"capability %u", w[i + 1]]];
+        } else if (op == 252 || op == 4416 || op == 5380) {   // OpKill, OpTerminateInvocation, OpDemoteToHelperInvocation
+            kills++;
+        }
+        if (inFunctions) {
+            for (uint32_t k = 1; k < len; k++) {
+                if (w[i + k] < bound && isVar[w[i + k]]) {
+                    refs[w[i + k]]++;
+                }
+            }
+        }
+        i += len;
+    }
+    for (NSArray *v in vars) {
+        uint32_t id = [v[0] unsignedIntValue], cls = [v[1] unsignedIntValue];
+        if (cls == 7 || cls == 6) {   // Function, Private
+            continue;
+        }
+        NSMutableString *e = [NSMutableString stringWithFormat:@"class %u", cls];
+        if (bind[id] >= 0) [e appendFormat:@" set %d binding %d", set[id], bind[id]];
+        if (loc[id] >= 0) [e appendFormat:@" location %d", loc[id]];
+        if (bi[id] >= 0) [e appendFormat:@" builtin %d", bi[id]];
+        [e appendString:refs[id] ? @" used" : @" unused"];
+        if (names[@(id)].length && bind[id] < 0 && loc[id] < 0 && bi[id] < 0) [e appendFormat:@" %@", names[@(id)]];
+        [out addObject:e];
+    }
+    [out addObject:[NSString stringWithFormat:@"discards %d", kills ? 1 : 0]];
+    free(set), free(bind), free(loc), free(bi), free(refs), free(isVar);
+    return [[NSSet setWithArray:out].allObjects sortedArrayUsingSelector:@selector(compare:)];
+}
+
+static void vg_fc_check(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc, const uint32_t *tgLengths,
+                        uint32_t tgCount, NSData *spv) {
+    static int on = -1;
+    static NSMutableSet *done;
+    static _Atomic int same, differ, declined;
+    if (on < 0) {
+        BOOL vg_debug_flag(const char *name);
+        on = vg_debug_flag("fccheck") && vg_translator_ready() && pTranslateSpec && pSpecApply;   // disk-cache hits
+                                                                                                 // don't load it
+        done = [NSMutableSet set];
+    }
+    if (!on) {
+        return;
+    }
+    NSString *key = vg_translate_key(ll, stage, fc, tgLengths, tgCount);
+    @synchronized(done) {
+        if ([done containsObject:key]) {
+            return;
+        }
+        [done addObject:key];
+    }
+    NSString *name = @"?";
+    NSRange d = [ll rangeOfString:@"define "];
+    if (d.location != NSNotFound) {
+        NSRange at = [ll rangeOfString:@"@" options:0 range:NSMakeRange(d.location, MIN(ll.length - d.location, 4096))];
+        NSRange par = at.location == NSNotFound ? at
+                                                : [ll rangeOfString:@"(" options:0
+                                                              range:NSMakeRange(at.location, MIN(ll.length - at.location, 512))];
+        if (par.location != NSNotFound) {
+            name = [ll substringWithRange:NSMakeRange(at.location + 1, par.location - at.location - 1)];
+        }
+    }
+    static int dump = -1;
+    if (dump < 0) {
+        BOOL vg_debug_flag(const char *name);
+        dump = vg_debug_flag("fcdump") && vg_disk_dir();
+    }
+    if (dump) {   // the function's text and this set, for tools/fcbench (the process's cache folder, beside spirv/)
+        NSString *dir = [[vg_disk_dir() stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"fcdump"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        NSString *base = [NSString stringWithFormat:@"%@/%@-%s-%08lx", dir, name, stage, (unsigned long)ll.hash];
+        NSString *llPath = [base stringByAppendingString:@".ll"];
+        if (![[NSFileManager defaultManager] fileExistsAtPath:llPath]) {
+            [ll writeToFile:llPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        }
+        NSMutableString *line = [NSMutableString string];
+        for (NSNumber *i in [fc.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+            const uint8_t *b = fc[i].bytes;
+            [line appendFormat:@"%@:", i];
+            for (NSUInteger k = 0; k < fc[i].length; k++) [line appendFormat:@"%02x", b[k]];
+            [line appendString:@" "];
+        }
+        [line appendString:@"\n"];
+        NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:[base stringByAppendingString:@".fc"]];
+        if (!h) {
+            [[NSFileManager defaultManager] createFileAtPath:[base stringByAppendingString:@".fc"] contents:nil attributes:nil];
+            h = [NSFileHandle fileHandleForWritingAtPath:[base stringByAppendingString:@".fc"]];
+        }
+        [h seekToEndOfFile];
+        [h writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        [h closeFile];
+    }
+    NSString *why = nil;
+    pSetTgLengths(tgLengths, tgCount);
+    if (pSetSamples) {
+        pSetSamples(gSamples ? gSamples : 1);
+    }
+    NSData *one = vg_spec_translate(ll, stage, fc, tgLengths, tgCount, &why);
+    pSetTgLengths(NULL, 0);
+    if (!one) {
+        vglog("fccheck %s %s: the one-module path declined (%s) [%d declined]", name.UTF8String, stage, why.UTF8String,
+              ++declined);
+        return;
+    }
+    NSArray *a = vg_spirv_iface(vg_spirv_ieee(spv)), *b = vg_spirv_iface(vg_spirv_ieee(one));
+    NSMutableArray *onlyA = [NSMutableArray array], *onlyB = [NSMutableArray array];
+    for (NSString *x in a) if (![b containsObject:x]) [onlyA addObject:x];
+    for (NSString *x in b) if (![a containsObject:x]) [onlyB addObject:x];
+    if (!onlyA.count && !onlyB.count) {
+        if (++same % 50 == 1) {
+            vglog("fccheck: %d sets agree so far (%d differ)", same, differ);
+        }
+        return;
+    }
+    differ++;
+    NSMutableString *vals = [NSMutableString string];
+    for (NSNumber *i in [fc.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+        [vals appendFormat:@" %@=%@", i, [fc[i].description stringByReplacingOccurrencesOfString:@" " withString:@""]];
+    }
+    vglog("fccheck %s %s (%lu + %lu B):%s", name.UTF8String, stage, (unsigned long)spv.length, (unsigned long)one.length,
+          vals.length > 300 ? [[vals substringToIndex:300] stringByAppendingString:@"..."].UTF8String : vals.UTF8String);
+    vglog("fccheck   per set only: %s", [onlyA componentsJoinedByString:@"; "].UTF8String);
+    vglog("fccheck   one module only: %s", [onlyB componentsJoinedByString:@"; "].UTF8String);
+}
+
 static NSData *vg_translate_uncached(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc,
                                      const uint32_t *tgLengths, uint32_t tgCount, NSString **error) {
     if (!vg_translator_ready()) {
@@ -520,27 +721,16 @@ static NSData *vg_translate_uncached(NSString *ll, const char *stage, NSDictiona
     int r;
     if (fc.count && pTranslateSpec && pSpecApply && vg_fc_spec_on()) {
         NSString *why = nil;
-        NSData *entry = vg_spec_entry(ll, stage, tgLengths, tgCount, &why);
-        const uint32_t *hdr = entry.bytes;
-        if (entry && entry.length >= 8 && hdr[0] == 0x31435053u && entry.length >= 8 + (size_t)hdr[1]) {
-            vg_fc_args a;
-            vg_fc_unpack(fc, &a);
-            const uint8_t *tab = (const uint8_t *)entry.bytes + 8, *mod = tab + hdr[1];
-            if (!pSpecApply(mod, entry.length - 8 - hdr[1], tab, hdr[1], a.idx, a.sz, a.pay, a.n, &out, &len, err,
-                            sizeof(err)) &&
-                out) {
-                pSetTgLengths(NULL, 0);
-                NSData *spv = [NSData dataWithBytes:out length:len];
-                pTranslateFree(out, len);
-                return spv;
-            }
-            why = [NSString stringWithFormat:@"applying the values failed: %s", err];
+        NSData *spv = vg_spec_translate(ll, stage, fc, tgLengths, tgCount, &why);
+        if (spv) {
+            pSetTgLengths(NULL, 0);
+            return spv;
         }
         static int logged;
         if (logged++ < 10) {
             vglog("function constants: the one-module path declined (%s): translating this set", why.UTF8String);
         }
-        out = NULL, len = 0, err[0] = 0;
+        pSetTgLengths(tgLengths, tgCount);
     }
     if (fc.count) {
         vg_fc_args a;
