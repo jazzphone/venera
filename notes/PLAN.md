@@ -1644,6 +1644,14 @@ hardware video encoding, a way to fix what apps ask for that the driver lacks, a
     yet); 10-bit encoding (Main10); encoder messages in the fuzz seeds (the session harness only has decode's);
     `kVTCompressionPropertyKey_Quality` is taken as constant quality without a level.
 
+## Venera 0.1.4 (2026-11-18)
+
+Round 15 packaged: 4K 10-bit decoding through the host (VeneraVideo 0.2.1, frames spanning two slots) and the host
+encoder's leak fixed (Eemt names the frame's uui; long exports no longer run macOS out of memory, and encoding is
+~1.7-2x faster). The leak fix is host-only; 4K 10-bit needs both halves. Tested by upgrading VM 108 from 0.1.3 with
+the release's script: 15 s of Tahoe Day decoded on the host (3,601 frames, IOSurfaces flat at ~150), vtenc 1080p 300
+of 300 out in every run; in 1 of 12 the last frame came just after CompleteFrames returned (seen with 0.1.3 too).
+
 ## Venera 0.1.3 (2026-11-18)
 
 The VM script's **Upgrade Venera** (choice 4) and the host decoder's H.264 fix (the second frame no longer dropped),
