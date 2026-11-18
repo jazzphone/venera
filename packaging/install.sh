@@ -8,7 +8,7 @@
 #   1. checks the guest: x86_64 macOS 26, a virtio-gpu device, SIP and AMFI as the driver needs them
 #   2. OpenCore: copies VirtioGPU.kext (the core, which must load from the Boot KC) into EFI/OC/Kexts, adds or enables
 #      its Kernel > Add entry and sets vgpuaccel=LEVEL in OpenCore's boot-args (config.plist is backed up first); with
-#      --video, VeneraVideo.kext too (hardware video decoding through the host: the host half is install-host.sh)
+#      --video, VeneraVideo.kext too (hardware video decoding and encoding through the host: the host half is install-host.sh)
 #   3. /Library/Extensions: VirtioGPUFramebuffer.kext and VirtioGPUAccel.kext, then rebuilds the Auxiliary KC
 #   4. the Metal driver (over Venus): kept in /Library/GPUBundles/Venera, copied onto the system volume
 #      (/System/Library/Extensions, a new blessed snapshot: sysvol.sh) where Safari's sandboxed graphics process can
@@ -104,7 +104,7 @@ done
 # boot never publishes the partitions of disks found after it (the OpenCore disk among them) -- round 11.
 if [ $VIDEO = 0 ] && ioreg -r -c IOPCIDevice -d1 -w0 2>/dev/null | grep -q '"pci1af4,1110"'; then
   say "this VM has the host's video device: adding VeneraVideo.kext anyway (without it the boot loses disks;"
-  say "  to do without video decoding, take the device out on the host: install-host.sh --remove-vm VMID)"
+  say "  to do without hardware video, take the device out on the host: install-host.sh --remove-vm VMID)"
   VIDEO=1
 fi
 [ $VIDEO = 0 ] || [ -e "$PAYLOAD/OpenCore/VeneraVideo.kext" ] || die "payload/OpenCore/VeneraVideo.kext is missing"
@@ -253,7 +253,7 @@ if [ $NO_OC = 0 ]; then
 else
   say "OpenCore: skipped (--no-opencore). Add payload/OpenCore/VirtioGPU.kext to Kernel > Add and vgpuaccel=$LEVEL"
   say "  to boot-args yourself (INSTALL.md)."
-  [ $VIDEO = 1 ] && say "  And payload/OpenCore/VeneraVideo.kext, for video decoding."
+  [ $VIDEO = 1 ] && say "  And payload/OpenCore/VeneraVideo.kext, for hardware video."
 fi
 
 # ---- the first of two passes ends here: the next boot runs the rest ------------------------------------------------
@@ -415,7 +415,7 @@ else
 fi
 
 say ""
-say "Installed Venera $(cat "$HERE/VERSION" 2>/dev/null) (level $LEVEL$([ $VIDEO = 1 ] && echo ", video decoding")). Reboot to start it: sudo shutdown -r now"
+say "Installed Venera $(cat "$HERE/VERSION" 2>/dev/null) (level $LEVEL$([ $VIDEO = 1 ] && echo ", hardware video")). Reboot to start it: sudo shutdown -r now"
 say "If the desktop doesn't come back, the driver falls back to the software desktop by itself after two WindowServer"
 say "failures; INSTALL.md, \"Recovery\", has the rest. ./status.sh shows what runs."
 # the second pass restarts by itself: at the login window right away, else after asking whoever is logged in

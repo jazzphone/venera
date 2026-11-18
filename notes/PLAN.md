@@ -1643,3 +1643,12 @@ hardware video encoding, a way to fix what apps ask for that the driver lacks, a
   - Left: the efrm wait could overlap again (answer early unless the frame might be the last: no signal for that
     yet); 10-bit encoding (Main10); encoder messages in the fuzz seeds (the session harness only has decode's);
     `kVTCompressionPropertyKey_Quality` is taken as constant quality without a level.
+
+## Venera 0.1.2 (2026-11-18)
+
+Round 14 packaged: hardware encoding (VeneraVideo 0.2.0, venera-videod with FFmpeg's VA-API encoders), the
+translation pool's seed, background services and the quieter log (Metal driver 0.4.2), and the synchronous-decode and
+softened-frame fixes. The package's "Hardware video decoding" choice is now "Hardware video". Tested from the release
+archives: install-host.sh on node 2 (reports "encodes H.264 HEVC"), the package over VM 108's dev install (snapshot
+pre-012; the seed added 0, VM 108 already held them), then H.264 and HEVC 1080p at 100-110 fps with all 300 frames
+decoding back (sync and async), and two avconvert re-encodes of 300 frames each. VM 107 and node 1 stay on 0.1.1.

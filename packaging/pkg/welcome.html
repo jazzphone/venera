@@ -8,20 +8,20 @@ li { margin: 3px 0; }
 </style></head><body>
 <h2>Venera @VERSION@</h2>
 <p>Graphics and video for macOS virtual machines on Proxmox: the desktop and apps draw with Metal on the host's GPU
-(virtio-gpu with Venus), and video can decode on the host's GPU too.</p>
+(virtio-gpu with Venus), and video can decode and encode on the host's GPU too.</p>
 <p>This installer:</p>
 <ul>
 <li>adds Venera's core kext to <b>OpenCore</b> and sets <code>vgpuaccel=4</code> in its boot arguments (config.plist is
 backed up first, next to it);</li>
 <li>puts two kexts in <code>/Library/Extensions</code> and rebuilds the Auxiliary Kernel Collection;</li>
 <li>installs the Metal driver and a watcher that keeps it in place across macOS updates;</li>
-<li>with the choices under <b>Customize</b>: hardware video decoding, the Venera app, and Safari WebGL.</li>
+<li>with the choices under <b>Customize</b>: hardware video, the Venera app, and Safari WebGL.</li>
 </ul>
 <p><b>Before you start:</b> the VM uses <code>vga: virtio-gl</code> on the host, and OpenCore allows unsigned kexts
 (SIP <code>0x203</code>) and <code>amfi_get_out_of_my_way=1</code>. If it doesn't, the installer sets them in OpenCore,
 and they take effect at the restart.</p>
 <p><b>A restart finishes it.</b> If the desktop doesn't come back on Metal, Venera falls back to the software desktop by
 itself.</p>
-<p class="note">Video decoding also needs the host's half: run <code>install-host.sh</code> on the Proxmox host
+<p class="note">Hardware video also needs the host's half: run <code>install-host.sh</code> on the Proxmox host
 (Venera-host-@VERSION@.tar.gz). To remove Venera: <code>sudo "/Library/Application Support/Venera/uninstall.sh"</code>.</p>
 </body></html>

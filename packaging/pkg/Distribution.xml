@@ -28,8 +28,8 @@
     </choice>
     <choice id="graphics" title="Graphics driver" enabled="false" start_selected="true"
         description="Metal on the host's GPU, through virtio-gpu and Venus: the kexts (one through OpenCore, two in the Auxiliary Kernel Collection), the Metal driver and the watcher that keeps it in place across macOS updates. Required. If OpenCore doesn't yet allow unsigned kexts (SIP 0x203) and AMFI's ad-hoc code (amfi_get_out_of_my_way=1), the installer sets them in OpenCore's config.plist, after backing it up."/>
-    <choice id="video" title="Hardware video decoding" start_selected="true"
-        description="Safari, QuickTime and every app that uses VideoToolbox decode H.264, HEVC and VP9 on the host's GPU. Adds VeneraVideo.kext through OpenCore. The host needs its half too: install-host.sh on the Proxmox host (Venera-host-@VERSION@.tar.gz). Without it, video decodes in software as before.">
+    <choice id="video" title="Hardware video" start_selected="true"
+        description="Safari, QuickTime and every app that uses VideoToolbox decode H.264, HEVC and VP9 and encode H.264 and HEVC on the host's GPU. Adds VeneraVideo.kext through OpenCore. The host needs its half too: install-host.sh on the Proxmox host (Venera-host-@VERSION@.tar.gz). Without it, video decodes and encodes in software as before.">
         <pkg-ref id="local.homelab.venera.video"/>
     </choice>
     <choice id="app" title="Venera app" start_selected="true"

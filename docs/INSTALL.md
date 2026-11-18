@@ -105,8 +105,8 @@ it when `SIGN_ID="Developer ID Installer: NAME (TEAM)"` names a certificate in t
 In the guest, as an administrator:
 
 ```bash
-tar -xzf Venera-0.1.1.tar.gz
-cd Venera-0.1.1
+tar -xzf Venera-0.1.2.tar.gz
+cd Venera-0.1.2
 sudo ./install.sh --set-security      # or without --set-security when SIP and AMFI are already relaxed
 sudo shutdown -r now
 ```
@@ -155,12 +155,12 @@ the host's GPU can (the host's installer says what it encodes). Measured on an I
 H.264 720p ~175 fps, 1080p ~100 fps, HEVC 1080p ~105 fps, 4K ~30 fps for either, against Apple's software encoder in
 the VM at ~90 fps for H.264 720p and ~7 fps for HEVC 720p. Encoding needs VeneraVideo 0.2 or later in the guest; with
 an older one the host offers no encoders and the guest encodes in software as before. The guest's half is the
-package's "Hardware video decoding" choice (`install.sh --video`). The host's half is `Venera-host-VERSION.tar.gz`,
+package's "Hardware video" choice (`install.sh --video`). The host's half is `Venera-host-VERSION.tar.gz`,
 for a Proxmox host with an Intel GPU:
 
 ```bash
-tar -xzf Venera-host-0.1.1.tar.gz
-cd Venera-host-0.1.1
+tar -xzf Venera-host-0.1.2.tar.gz
+cd Venera-host-0.1.2
 ./install-host.sh --vm 108          # as root on the Proxmox host; --dry-run first to see each step
 qm shutdown 108 && qm start 108     # the VM picks up its new device when QEMU starts again
 ```
@@ -193,7 +193,7 @@ with Venus or the video device can't live-migrate: HA moves it by shutting it do
 **A VM with the device needs `VeneraVideo.kext`.** Without it, Apple's VirtIO driver takes the device and hangs on
 it, and the boot doesn't publish the partitions of disks found after it -- the OpenCore disk among them, so an
 installer finds no OpenCore. So install the guest's half before the VM starts with the device; the installer adds
-the kext whenever the device is there (even with "Hardware video decoding" unticked), and the uninstaller keeps it
+the kext whenever the device is there (even with "Hardware video" unticked), and the uninstaller keeps it
 until the device is gone (`--remove-vm` on the host, start the VM again, run the uninstaller again).
 
 ### Which processes use the driver

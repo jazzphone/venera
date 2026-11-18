@@ -1,5 +1,5 @@
 #!/bin/bash
-# Venera's host half: hardware video decoding for macOS VMs on a Proxmox host with an Intel GPU. Run as root on the
+# Venera's host half: hardware video decoding and encoding for macOS VMs on a Proxmox host with an Intel GPU. Run as root on the
 # host, from the unpacked Venera-host-VERSION folder.
 #
 #   ./install-host.sh --vm VMID [--vm VMID...]   install (or update), and give each VM its video device
@@ -19,7 +19,7 @@
 #       -chardev socket,path=/run/venera-video-VMID.sock,id=vvideo -device ivshmem-doorbell,chardev=vvideo,vectors=1
 #     (the VM's config is backed up to /opt/venera/backup first). Nothing else in the VM's config changes.
 # A VM picks up a new device when QEMU starts again: shut it down and start it (or `qm reboot VMID`); a restart from
-# inside the guest keeps the old QEMU. The guest's half is the Install Venera package's "Hardware video decoding".
+# inside the guest keeps the old QEMU. The guest's half is the Install Venera package's "Hardware video".
 #
 # Important: a VM with the device needs its socket (venera-videod@VMID.socket, enabled at boot) to start; QEMU waits
 # for the service to answer. --remove-vm or --uninstall take the device out first.
@@ -296,6 +296,6 @@ for id in "${VMS[@]}"; do add_vm "$id"; done
 
 say ""
 say "Venera host $(cat "$HERE/VERSION") installed for VM(s) ${VMS[*]}."
-say "In each VM: install Venera with Hardware video decoding chosen, then shut the VM down and start it again."
-[ $legacy = 1 ] && say "A VM that ran on the older setup has no video decoding until it is shut down and started again."
+say "In each VM: install Venera with Hardware video chosen, then shut the VM down and start it again."
+[ $legacy = 1 ] && say "A VM that ran on the older setup has no hardware video until it is shut down and started again."
 say "Updating later keeps running VMs' connections: systemd holds them while the service restarts."
