@@ -1544,3 +1544,21 @@ Proxmox cluster with HA) found what VM 108 never could:
   107 starts on either node with graphics, video and sound. Venus and ivshmem block live migration: HA moves it by
   restarting it.
 - The guide also lacked `host-phys-bits-limit=40` (both VMs needed it).
+
+## Round 13 (2026-11-18): a new VM, ready for Venera before macOS is in
+
+- VM 107 upgraded to 0.1.1 (one pass: SIP was already relaxed). The guest agent's ISA serial port timed out on even 20
+  KB of stdin, and VM 107's VLAN can't reach the Mac, so the release went in on a USB drive hot-added through QEMU's
+  monitor (an ISO, `usb-storage` on `ehci.0`: macOS ignored it on the xhci's hub), ejected and detached after.
+- `vm/proxmox-macos-vm.sh` (an earlier project's VM script, MIT) is now Venera's VM maker, shipped in the host package with the
+  guest package. It checks the host (Intel CPU, the GPU through sysfs: Intel for everything, AMD without video; QEMU
+  9.2+, virglrenderer 1.0+), installs the Venus packages on each node the VM may run on (only when its storage is
+  shared), and makes a macOS Tahoe VM (macrecovery's Mac-CFF7D910A743CAAF, `-os latest`). OpenCore gets SIP 0x203 (0xA03
+  for WebGL) and AMFI off before macOS is installed, so the guest package installs in one pass. A Venera disk (an ISO
+  imported as ide1) carries the package. Finish adds the video device on every node (others first), drops the
+  installer disks and restarts the VM. The device waits for Finish because it hangs a macOS without VeneraVideo.kext.
+  Without an identity the sample serial runs as an iMac20,1, which Tahoe supports; VM 107's iMac19,2 isn't on Tahoe's
+  list, so it may have relied on the installer letting VMs through.
+- Tested: `vm/test.sh` (args, corosync, OpenCore edits on KVM-Opencore v21's config.plist), the questions and plans on
+  node 2 (create with node 1, create with WebGL, Finish on VM 108, Ready refused while running), the Venera disk's
+  contents. Not tested: a whole run, from the Tahoe download through macOS's install to Finish.

@@ -18,6 +18,10 @@ Download a release (or build one, below), then follow [docs/INSTALL.md](docs/INS
 `virtio-vga-gl` with Venus and blob resources, the guest OpenCore with SIP and AMFI relaxed, and `install.sh` does
 the rest. `uninstall.sh` removes everything again.
 
+For a new VM on Proxmox, `proxmox-macos-vm.sh` in the host package does all of that before macOS is installed: it
+checks the host's GPU, installs what the host needs (on each cluster node), creates a macOS Tahoe VM with OpenCore,
+SIP and AMFI already set, and attaches a disk with the installer package ([vm/README.md](vm/README.md)).
+
 ## How it works
 
 | Piece | Where it runs | What it does |
@@ -56,6 +60,7 @@ For development against a test VM, `tools/deploy.sh` builds and installs pieces 
 - `vendor/nullmoth/` — nvidia-macos-driver's reconstructed IOAccel headers.
 - `packaging/` — the release builder, installer, uninstaller and status script; `docs/` — the install guide.
 - `tools/` — build, deploy and measurement scripts; `notes/` — plan, findings, device dumps.
+- `vm/` — the script that makes a macOS VM on Proxmox ready for Venera (MIT).
 
 ## License
 

@@ -5,6 +5,13 @@ the host's GPU through virtio-gpu's Venus (Vulkan) protocol, and the desktop's f
 from the host GPU. It is experimental: read "Security" and "Recovery" before installing, and take a snapshot of the
 VM first.
 
+**A new VM on Proxmox:** `proxmox-macos-vm.sh`, in the host package, sets up everything below for you before macOS is
+installed: the host's packages (on each cluster node the VM may run on), OpenCore with SIP and AMFI already relaxed, a
+macOS Tahoe VM with the `virtio-gl` display, Venus, the address width and a sound device, and a disk with the guest
+package. After macOS is installed, open the package from that disk, restart, and run the script again to Finish (video
+decoding on every node, the installer disks out). [vm/README.md](../vm/README.md) has the details. The rest of this
+page is for an existing VM, or a host other than Proxmox.
+
 ## What you need
 
 ### Host
