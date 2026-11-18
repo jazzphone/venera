@@ -45,3 +45,7 @@ restart-store code (tested on the host by restarting and crashing the service mi
 
 Run again: `docker run --rm --platform linux/amd64 -e RESNAP=1 -v ~/src:/src venera-hostvideo-build
 /src/macos-virtio-gpu/hostvideo/fuzz/run.sh all 300`
+
+Re-run on the fixed daemon (2026-11-17, all six, 240 s each, about 0.1 to 106 million inputs): no crashes, leaks or
+timeouts. One `msg` job then froze in the leak check at the end (its tracer and the job stopped each other, which
+happens under x86 emulation on a Mac), so `run.sh` now stops each fuzzer 5 minutes after its time is up.

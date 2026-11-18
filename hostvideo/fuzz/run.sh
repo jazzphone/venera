@@ -55,7 +55,8 @@ for n in $NAMES; do
   mkdir -p $FZ/out/$V/$n/corpus $FZ/out/$V/$n/findings
   seeds=""
   [ -n "${SEED[$n]}" ] && seeds=$FZ/seeds/${SEED[$n]}
-  ( cd $FZ/out/$V/$n/findings && $BIN/$n -fork=${FORK:-2} -max_total_time=$SECS -max_len=${MAXLEN[$n]} -timeout=20 -rss_limit_mb=3072 \
+  # a hard stop: the leak check can deadlock under x86 emulation on a Mac (its tracer and the job stop each other)
+  ( cd $FZ/out/$V/$n/findings && timeout -k 30 $((SECS + 300)) $BIN/$n -fork=${FORK:-2} -max_total_time=$SECS -max_len=${MAXLEN[$n]} -timeout=20 -rss_limit_mb=3072 \
       -artifact_prefix=$FZ/out/$V/$n/findings/ -print_final_stats=1 -ignore_crashes=1 -ignore_timeouts=1 -ignore_ooms=1 \
       $FZ/out/$V/$n/corpus $seeds > $FZ/out/$V/$n/log.txt 2>&1 ) &
   pids+=($!)
