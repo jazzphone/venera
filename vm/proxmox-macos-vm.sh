@@ -373,8 +373,22 @@ usb_disk() {   # usb_disk add IMAGE | del: the image as a USB drive in the runni
   qm monitor "$VMID" <<<"device_del venera-upgdev" >/dev/null 2>&1 || true
 }
 
+screen_state() {   # open, locked or nobody: macOS mounts a new USB disk only while someone is logged in, unlocked
+  guest 'ioreg -n Root -d1 -a | plutil -extract IOConsoleUsers json -o - - 2>/dev/null' | screen_says
+}
+screen_says() {   # IOConsoleUsers (JSON) -> open, locked or nobody; open when it can't tell (the mount's wait says)
+  python3 -c '
+import json, sys
+try:
+    us = json.load(sys.stdin)
+except Exception:
+    print("open"); sys.exit()
+on = [u for u in us if u.get("kCGSSessionOnConsoleKey")]
+print("nobody" if not on else "locked" if on[0].get("CGSSessionScreenIsLocked") else "open")'
+}
+
 upgrade_vm() {   # a VM with Venera: this release's host half on every node, then its guest package in macOS, a restart
-  local st cur="" video=0 app=0 webgl=0 user="" HASDEV=0 nodes=() n img mnt out
+  local st cur="" video=0 app=0 webgl=0 user="" HASDEV=0 nodes=() n img mnt out k
   [ -n "$GPKG" ] || die "no guest package beside this script: run it from the unpacked Venera-host folder"
   echo; echo "== Upgrade VM $VMID to Venera ${VER:-?}"
   qm status "$VMID" | grep -q running || die "VM $VMID isn't running: start it (the upgrade goes in through the guest agent), then run this again"
@@ -396,6 +410,7 @@ upgrade_vm() {   # a VM with Venera: this release's host half on every node, the
   [ $HASDEV = 1 ] && echo "  - the host half: install-host.sh --vm $VMID here${nodes[*]:+ and on ${nodes[*]}} (running VMs keep their video connections)"
   echo "  - in macOS: $(basename "$GPKG") from a USB disk, with the same choices, then a restart"
   [ -z "$user" ] || echo "    ($user is logged in: the restart closes their apps, and anything unsaved is lost)"
+  echo "    (macOS takes the disk only while someone is logged in with the screen unlocked: this waits for that)"
   yes_no "Go ahead?" || die "nothing changed"
   for n in "${nodes[@]}"; do   # the other nodes first: the VM needs its socket wherever it starts
     echo "== the host half on $n"
@@ -406,11 +421,18 @@ upgrade_vm() {   # a VM with Venera: this release's host half on every node, the
   echo "== the guest package"
   mkdir -p /root/venera; img=/root/venera/venera-upgrade-$VMID.iso
   venera_disk "$img"
+  while :; do   # loginwindow turns the disk away (and ejects it) while the screen is locked or nobody is logged in
+    case $(screen_state) in
+      locked) ask k "macOS's screen is locked, and it won't take a USB disk then: unlock it (the VM's console or Screen Sharing), then press Enter" ;;
+      nobody) ask k "nobody is logged in to macOS, and it won't take a USB disk then: log in (the VM's console or Screen Sharing), then press Enter" ;;
+      *) break ;;
+    esac
+  done
   usb_disk add "$img" || { rm -f "$img"; die "the USB disk didn't attach (qm monitor $VMID)"; }
   mnt=""; for n in $(seq 1 24); do
     mnt=$(guest "ls -d /Volumes/*/'$(basename "$GPKG")' 2>/dev/null | head -1"); [ -n "$mnt" ] && break; sleep 5
   done
-  if [ -z "$mnt" ]; then usb_disk del; rm -f "$img"; die "macOS didn't mount the USB disk in 2 minutes: nothing installed"; fi
+  if [ -z "$mnt" ]; then usb_disk del; rm -f "$img"; die "macOS didn't mount the USB disk in 2 minutes (did its screen lock?): nothing installed"; fi
   guest "printf '%s' '$(choices_xml $video $app $webgl)' > /private/var/tmp/venera-choices.xml" >/dev/null
   out=$(guest_rc 900 "/usr/sbin/installer -pkg '$mnt' -target / -applyChoiceChangesXML /private/var/tmp/venera-choices.xml 2>&1; rm -f /private/var/tmp/venera-choices.xml")
   sed 's/^/   /' <<<"$out" | grep -v '^   rc='

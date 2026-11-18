@@ -1,7 +1,7 @@
 #!/bin/bash
 # The VM script's own pieces, without a Proxmox host: the args Venera adds, a cluster node's address, and OpenCore's
 # config.plist edits (against KVM-Opencore v21's own config.plist, $1). Runs anywhere with bash 4+ and python3, e.g.
-#   docker run --rm --platform linux/amd64 -v ~/src:/src venera-hostvideo-build /src/macos-virtio-gpu/vm/test.sh CONFIG
+#   bash vm/test.sh CONFIG   (on a Proxmox host, say: the build container has no python3)
 set -u
 CFG=${1:?the stock config.plist from OpenCore-v21.iso (EFI/OC/config.plist)}
 MACOS_VM_TEST=1 . "$(dirname "$0")/proxmox-macos-vm.sh"
@@ -26,6 +26,8 @@ check "another -cpu is reported, not changed" '[[ $O == *"add host-phys-bits-lim
 
 X=$(choices_xml 1 0 1)
 check "the upgrade's choices are a property list Installer reads" 'python3 -c "import plistlib,sys; a=plistlib.loads(sys.argv[1].encode()); assert [(d[\"choiceIdentifier\"], d[\"attributeSetting\"], d[\"choiceAttribute\"]) for d in a] == [(\"video\",1,\"selected\"),(\"app\",0,\"selected\"),(\"webgl\",1,\"selected\")]" "$X"'
+LK='[{"kCGSSessionOnConsoleKey":true,"CGSSessionScreenIsLocked":true}]' NB='[{"kCGSSessionOnConsoleKey":false}]' OP='[{"kCGSSessionOnConsoleKey":true}]'
+check "a locked screen, nobody, and an open one" '[ "$(screen_says <<<"$LK")" = locked ] && [ "$(screen_says <<<"$NB")" = nobody ] && [ "$(screen_says <<<"$OP")" = open ] && [ "$(screen_says <<<"")" = open ]'
 
 cat >"$W/corosync.conf" <<'C'
 nodelist {

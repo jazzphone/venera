@@ -1644,6 +1644,15 @@ hardware video encoding, a way to fix what apps ask for that the driver lacks, a
     yet); 10-bit encoding (Main10); encoder messages in the fuzz seeds (the session harness only has decode's);
     `kVTCompressionPropertyKey_Quality` is taken as constant quality without a level.
 
+## Venera 0.1.3 (2026-11-18)
+
+The VM script's **Upgrade Venera** (choice 4) and the host decoder's H.264 fix (the second frame no longer dropped),
+both from after 0.1.2. No guest code changed: the package is 0.1.2's with the new version (Metal driver 0.4.2,
+VeneraVideo 0.2.0). 4K 10-bit decoding is still the next step. Tested by upgrading VM 108 with the script from the
+release's host archive, which found that macOS turns a USB disk away (loginwindow dissents and ejects it) while its
+screen is locked or nobody is logged in: VM 107 was unlocked when it was upgraded. The upgrade now waits for an unlocked
+session before plugging the disk in (it asks), and vm/test.sh checks how it reads the console's state.
+
 ## Venera 0.1.2 (2026-11-18)
 
 Round 14 packaged: hardware encoding (VeneraVideo 0.2.0, venera-videod with FFmpeg's VA-API encoders), the
