@@ -81,7 +81,7 @@ Copy `Install Venera VERSION.pkg` into the guest and open it. Under **Customize*
 | Choice | Default | What it does |
 |---|---|---|
 | Graphics driver | always | everything below ("From the command line", steps 1-5) |
-| Hardware video decoding | on | `VeneraVideo.kext` through OpenCore; needs the host's half ("Hardware video decoding", below) |
+| Hardware video decoding | on | `VeneraVideo.kext` through OpenCore, for decoding and encoding; needs the host's half ("Hardware video decoding and encoding", below) |
 | Venera app | on | `/Applications/Venera.app`, started at login (below, "The Venera app") |
 | Safari WebGL | off | turns off SIP's authenticated root in OpenCore and puts the Metal driver on the system volume; when authenticated root is already off, the driver goes there anyway |
 
@@ -146,11 +146,17 @@ Open it from Applications to see what runs: the desktop (Metal on the host's GPU
 Metal driver loads from, video decoding, the version, and a button for the watcher's log. With notifications off, a
 question waits in its window. "Show Venera in the menu bar" puts the same in a menu bar item.
 
-## Hardware video decoding
+## Hardware video decoding and encoding
 
 Apps that decode with VideoToolbox (Safari, QuickTime, Photos, every AVFoundation player) decode H.264, HEVC (8 and
-10-bit) and VP9 on the host's GPU, up to 4K. The guest's half is the package's "Hardware video decoding" choice
-(`install.sh --video`). The host's half is `Venera-host-VERSION.tar.gz`, for a Proxmox host with an Intel GPU:
+10-bit) and VP9 on the host's GPU, up to 4K. Apps that encode with it (QuickTime and AVFoundation exports,
+`avconvert`, screen recordings, anything with a `VTCompressionSession`) encode H.264 and HEVC (8-bit) there too, when
+the host's GPU can (the host's installer says what it encodes). Measured on an Iris Xe host (VM 108):
+H.264 720p ~175 fps, 1080p ~100 fps, HEVC 1080p ~105 fps, 4K ~30 fps for either, against Apple's software encoder in
+the VM at ~90 fps for H.264 720p and ~7 fps for HEVC 720p. Encoding needs VeneraVideo 0.2 or later in the guest; with
+an older one the host offers no encoders and the guest encodes in software as before. The guest's half is the
+package's "Hardware video decoding" choice (`install.sh --video`). The host's half is `Venera-host-VERSION.tar.gz`,
+for a Proxmox host with an Intel GPU:
 
 ```bash
 tar -xzf Venera-host-0.1.1.tar.gz

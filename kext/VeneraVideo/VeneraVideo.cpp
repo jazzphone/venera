@@ -97,7 +97,7 @@ private:
     void interruptOccurred(IOInterruptEventSource *, int);
     void timerFired(IOTimerEventSource *);
     void drain();
-    void fill(const vv_rec *r);
+    void fill(const vv_rec *r, bool pull);
     int putG2H(uint16_t kind, const uint32_t *args, const void *a, uint32_t na, const void *b, uint32_t nb);
     void doorbell();
     Surface *keepSurface(uint32_t id, task_t task, AppleVideoToolboxParavirtualizationUserClient *owner);
@@ -149,7 +149,71 @@ private:
     uint8_t uuids_[kMaxUUIDs][16] = {};
     unsigned nuuids_ = 0;
     bool closed_ = false;
+    // A request whose answer this process must have in hand before its send returns (see waitsForReply): its number,
+    // and 0 waiting, 1 the answer queued, 2 the process has drained its queue since (VideoToolbox has it)
+    bool waiting_ = false;
+    uint64_t waitReq_ = 0;
+    int waitState_ = 0;
+    // Host requests that came for this process while it was held, queued after the awaited answer. The process's
+    // drain answers a request before it takes the next message, and every send in the process takes one lock
+    // (VTParavirtualizationGuestSupportSendRawMessageToHost holds it across method 3): the held thread has it, so the
+    // drain would wait for that thread, which waits for the answer behind the request. Messages that need no answer
+    // (answers, an encoded frame: venera-videod sends those as plain messages) keep their place, so an encoded frame
+    // reaches the app before the answer to the CompleteFrames that waits for it.
+    struct Deferred {
+        Deferred *next;
+        uint32_t len;
+        uint8_t msg[];
+    };
+    Deferred *deferred_ = nullptr, **deferredTail_ = &deferred_;
+    void flushDeferred();   // with lock_ held
 };
+
+// Intel VideoToolbox's reply wait turns its timeout into nanoseconds in a 32-bit int (cvttsd2si, 26.7.3), so a timeout
+// over ~2.1 s overflows to a deadline in the past, and the wait succeeds only if the answer was already delivered. The
+// encoder's efrm and ecfr wait 10 s, and so does a synchronous decode's dfrm: without help every such frame fails at
+// once (-19092). For those, the send holds the process until the host's answer is in its queue and the process has
+// drained it (its drain calls method 4 after handing each message to VideoToolbox), at most 2 s. Apple's own hosts
+// never met this: Intel Macs encode on their own hardware.
+// held sends: done, ran out with no answer queued, ran out with the answer queued but not drained
+static volatile SInt64 gHolds[3], gHoldsBusy[3];   // gHoldsBusy: the same, for holds begun with the queue not empty
+static bool waitsForReply(const uint8_t *msg, uint32_t len) {
+    if (len < 48) {
+        return false;
+    }
+    uint32_t flags = (uint32_t)msg[12] << 24 | (uint32_t)msg[13] << 16 | (uint32_t)msg[14] << 8 | msg[15];
+    if (!(flags & 1)) {
+        return false;
+    }
+    if (!memcmp(msg + 8, "efrm", 4) || !memcmp(msg + 8, "ecfr", 4)) {
+        return true;
+    }
+    if (memcmp(msg + 8, "dfrm", 4)) {
+        return false;
+    }
+    // a frame to decode: held only when decoded synchronously (its dfl lacks EnableAsynchronousDecompression), where
+    // VideoToolbox waits for the answer; an asynchronous decode doesn't, and holding it would cost every frame a trip
+    static const char key[] = "para,dfl=u32";
+    const uint32_t kl = sizeof(key) - 1;
+    for (uint32_t i = 48; i + 8 <= len;) {
+        uint32_t size = (uint32_t)msg[i] << 24 | (uint32_t)msg[i + 1] << 16 | (uint32_t)msg[i + 2] << 8 | msg[i + 3];
+        if (size < 8 || size > len - i) {
+            break;
+        }
+        if (size == 4 + kl + 4 && !memcmp(msg + i + 4, key, kl)) {
+            return !(msg[i + 4 + kl + 3] & 1);
+        }
+        i += size;
+    }
+    return false;
+}
+static uint64_t msgReq(const uint8_t *msg) {
+    uint64_t r = 0;
+    for (int i = 0; i < 8; i++) {
+        r = r << 8 | msg[40 + i];
+    }
+    return r;
+}
 
 OSDefineMetaClassAndStructors(AppleVideoToolboxParavirtualizationDriver, IOService)
 OSDefineMetaClassAndStructors(AppleVideoToolboxParavirtualizationUserClient, IOUserClient)
@@ -219,7 +283,8 @@ bool AppleVideoToolboxParavirtualizationDriver::start(IOService *provider) {
     __sync_synchronize();
     ctl_->h2g.tail = ctl_->h2g.head;
     ctl_->g2h.head = ctl_->g2h.tail;
-    uint32_t a[6] = {ctl_->guest_gen, 0, 0, 0, 0, 0};
+    ctl_->guest_features = VV_GF_ENCODE;   // here too, for a host that starts (or restarts) after the hello
+    uint32_t a[6] = {ctl_->guest_gen, VV_GF_ENCODE, 0, 0, 0, 0};
     putG2H(VV_G_HELLO, a, nullptr, 0, nullptr, 0);
     doorbell();
     timer_->setTimeoutMS(100);
@@ -277,9 +342,10 @@ void AppleVideoToolboxParavirtualizationDriver::timerFired(IOTimerEventSource *t
     }
     static unsigned n;
     if (++n % 50 == 0) {   // every 5 s
-        char s[160];
-        snprintf(s, sizeof(s), "out %llu, in %llu, fills %llu (failed %llu), undeliverable %llu, ring full %llu",
-                 stats_[0], stats_[1], stats_[2], stats_[3], stats_[4], stats_[5]);
+        char s[300];
+        snprintf(s, sizeof(s), "out %llu, in %llu, fills %llu (failed %llu), undeliverable %llu, ring full %llu, holds %lld "
+                 "(no answer %lld, not drained %lld); begun busy %lld (%lld, %lld)", stats_[0], stats_[1], stats_[2], stats_[3],
+                 stats_[4], stats_[5], gHolds[0], gHolds[1], gHolds[2], gHoldsBusy[0], gHoldsBusy[1], gHoldsBusy[2]);
         setProperty("VeneraVideoStats", s);
     }
     t->setTimeoutMS(100);
@@ -464,7 +530,8 @@ void AppleVideoToolboxParavirtualizationDriver::removeClient(AppleVideoToolboxPa
 }
 
 // Copy slot r->arg[1] into the IOSurface r->arg[0], then tell the host the slot is free.
-void AppleVideoToolboxParavirtualizationDriver::fill(const vv_rec *r) {
+// A fill order (slot -> IOSurface: a decoded frame) or a pull order (IOSurface -> slot: a frame to encode).
+void AppleVideoToolboxParavirtualizationDriver::fill(const vv_rec *r, bool pull) {
     uint32_t id = r->arg[0], slot = r->arg[1], w = r->arg[2], h = r->arg[3], stride = r->arg[4], bps = r->arg[5];
     uint32_t err = 1;
     IOLockLock(lock_);
@@ -485,9 +552,9 @@ void AppleVideoToolboxParavirtualizationDriver::fill(const vv_rec *r) {
         if (s->map && surf->getPlaneCount() >= 2) {
             uint8_t *base = (uint8_t *)s->map->getVirtualAddress();
             uint64_t size = s->map->getLength();
-            const uint8_t *src = (const uint8_t *)(shm_ + VV_SLOT_OFF + (uint64_t)slot * VV_SLOT_SIZE);
+            uint8_t *slotp = (uint8_t *)(shm_ + VV_SLOT_OFF + (uint64_t)slot * VV_SLOT_SIZE);
             unsigned int seed = 0;
-            surf->lockSurface(0, &seed);
+            surf->lockSurface(pull ? 1 : 0, &seed);   // 1: read-only
             bool ok = true;
             for (unsigned p = 0; p < 2 && ok; p++) {
                 uint64_t off = surf->getPlaneOffset(p), bpr = surf->getPlaneBytesPerRow(p);
@@ -503,21 +570,25 @@ void AppleVideoToolboxParavirtualizationDriver::fill(const vv_rec *r) {
                     ok = false;
                     break;
                 }
-                const uint8_t *from = src + (p ? (uint64_t)stride * h : 0);
+                uint8_t *packed = slotp + (p ? (uint64_t)stride * h : 0);
                 for (uint64_t y = 0; y < rh; y++) {
-                    memcpy(base + off + y * bpr, from + y * stride, rowBytes);
+                    if (pull) {
+                        memcpy(packed + y * stride, base + off + y * bpr, rowBytes);
+                    } else {
+                        memcpy(base + off + y * bpr, packed + y * stride, rowBytes);
+                    }
                 }
             }
-            surf->unlockSurface(0, &seed);
+            surf->unlockSurface(pull ? 1 : 0, &seed);
             err = ok ? 0 : 2;
         }
         s->used = ++useClock_;
     }
     IOLockUnlock(lock_);
     OSIncrementAtomic64((volatile SInt64 *)&stats_[err ? 3 : 2]);
-    uint32_t a[6] = {slot, err, 0, 0, 0, 0};
+    uint32_t a[6] = {slot, err, id, 0, 0, 0};
     IOLockLock(g2hLock_);
-    putG2H(VV_G_SLOTDONE, a, nullptr, 0, nullptr, 0);
+    putG2H(pull ? VV_G_PULLDONE : VV_G_SLOTDONE, a, nullptr, 0, nullptr, 0);
     IOLockUnlock(g2hLock_);
 }
 
@@ -556,8 +627,8 @@ void AppleVideoToolboxParavirtualizationDriver::drain() {
             } else {
                 OSIncrementAtomic64((volatile SInt64 *)&stats_[4]);
             }
-        } else if (rec->kind == VV_H_FILL) {
-            fill(rec);
+        } else if (rec->kind == VV_H_FILL || rec->kind == VV_H_PULL) {
+            fill(rec, rec->kind == VV_H_PULL);
             any = true;
         }
         __atomic_store_n(&r->tail, tail + step, __ATOMIC_RELEASE);
@@ -614,6 +685,7 @@ void AppleVideoToolboxParavirtualizationUserClient::closeDown() {
     IOLockLock(lock_);
     bool was = closed_;
     closed_ = true;
+    IOLockWakeup(lock_, &waitState_, false);   // a held sender goes
     unsigned n = nuuids_;
     uint8_t uu[kMaxUUIDs][16];
     memcpy(uu, uuids_, sizeof(uu));
@@ -639,6 +711,8 @@ IOReturn AppleVideoToolboxParavirtualizationUserClient::clientDied() {
 }
 
 void AppleVideoToolboxParavirtualizationUserClient::free() {
+    closed_ = true;
+    flushDeferred();   // closed: frees them
     OSSafeReleaseNULL(queueMap_);
     OSSafeReleaseNULL(queue_);
     OSSafeReleaseNULL(sendMap_);
@@ -659,11 +733,42 @@ bool AppleVideoToolboxParavirtualizationUserClient::owns(const uint8_t *uuid) {
     return yes;
 }
 
+void AppleVideoToolboxParavirtualizationUserClient::flushDeferred() {
+    bool any = deferred_ != nullptr;
+    while (deferred_) {
+        Deferred *d = deferred_;
+        deferred_ = d->next;
+        if (queue_ && !closed_ && !queue_->enqueue(d->msg, d->len)) {
+            IOLog("VeneraVideo: a process's message queue is full; a host message was dropped\n");
+        }
+        IOFreeData(d, sizeof(Deferred) + d->len);
+    }
+    deferredTail_ = &deferred_;
+    if (any && queue_ && !closed_) {
+        queue_->notify();
+    }
+}
+
 void AppleVideoToolboxParavirtualizationUserClient::deliver(const uint8_t *msg, uint32_t len) {
     IOLockLock(lock_);
     if (queue_ && !closed_) {
+        bool awaited = waiting_ && waitState_ == 0 && len >= 48 && (msg[15] & 4) && msgReq(msg) == waitReq_;
+        if (waiting_ && !awaited && len >= 48 && (msg[15] & 2)) {   // after the awaited answer (Deferred says why)
+            Deferred *d = (Deferred *)IOMallocData(sizeof(Deferred) + len);
+            if (d) {
+                d->next = nullptr;
+                d->len = len;
+                memcpy(d->msg, msg, len);
+                *deferredTail_ = d;
+                deferredTail_ = &d->next;
+                IOLockUnlock(lock_);
+                return;
+            }
+        }
         if (!queue_->enqueue((void *)msg, len)) {
             IOLog("VeneraVideo: a process's message queue is full; a host message was dropped\n");
+        } else if (awaited) {
+            waitState_ = 1;
         }
         queue_->notify();   // every time (the header says why)
     }
@@ -773,8 +878,29 @@ IOReturn AppleVideoToolboxParavirtualizationUserClient::externalMethod(uint32_t 
         if (!copy) {
             return kIOReturnNoMemory;
         }
+        bool hold = waitsForReply(copy, (uint32_t)len), busy = false;
+        if (hold) {
+            IOLockLock(lock_);
+            waiting_ = true, waitReq_ = msgReq(copy), waitState_ = 0;
+            busy = queue_ && queue_->holdsData();
+            IOLockUnlock(lock_);
+        }
         IOReturn rc = drv_->sendMessage(this, copy, (uint32_t)len, ids, n, task_);
         IOFreeData(copy, len);
+        if (hold) {   // until the answer is in VideoToolbox's hands (waitsForReply says why), 2 s at most
+            uint64_t deadline;
+            clock_interval_to_deadline(2000, kMillisecondScale, &deadline);
+            IOLockLock(lock_);
+            while (rc == kIOReturnSuccess && waitState_ < 2 && !closed_) {
+                if (IOLockSleepDeadline(lock_, &waitState_, *(AbsoluteTime *)&deadline, THREAD_UNINT) == THREAD_TIMED_OUT) {
+                    break;
+                }
+            }
+            OSIncrementAtomic64(&(busy ? gHoldsBusy : gHolds)[waitState_ >= 2 ? 0 : waitState_ == 0 ? 1 : 2]);
+            waiting_ = false;
+            flushDeferred();
+            IOLockUnlock(lock_);
+        }
         if (a->scalarOutputCount >= 1) {
             a->scalarOutput[0] = rc == kIOReturnSuccess ? 0 : (uint64_t)(int64_t)-12911;
             a->scalarOutputCount = 1;
@@ -783,6 +909,12 @@ IOReturn AppleVideoToolboxParavirtualizationUserClient::externalMethod(uint32_t 
     }
     case 4:   // the process drained its queue: anything that came meanwhile, it is told of again
         IOLockLock(lock_);
+        // the awaited answer went to VideoToolbox, its sender may go on: only when the queue is empty, since a drain
+        // that found it empty just before the answer came calls this too, with the answer still in the queue
+        if (waiting_ && waitState_ == 1 && queue_ && !queue_->holdsData()) {
+            waitState_ = 2;
+            IOLockWakeup(lock_, &waitState_, false);
+        }
         if (queue_ && !closed_ && queue_->holdsData()) {
             queue_->notify();
         }

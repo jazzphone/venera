@@ -10,6 +10,7 @@
 #include <libavutil/pixdesc.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 static enum AVPixelFormat pick(AVCodecContext *c, const enum AVPixelFormat *f) {
@@ -57,8 +58,18 @@ static int vpp_copy(VASurfaceID from, VASurfaceID to, int w, int h) {
             return -1;
         }
     }
+    if (getenv("VATEST_VACOPY")) {   // vaCopy: a plain copy (the copy engine), no scaler
+        VACopyObject d = {.obj_type = VACopyObjectSurface, .object = {.surface_id = to}};
+        VACopyObject sobj = {.obj_type = VACopyObjectSurface, .object = {.surface_id = from}};
+        VACopyOption o = {.bits = {.va_copy_sync = VA_EXEC_SYNC, .va_copy_mode = (uint32_t)atoi(getenv("VATEST_VACOPY"))}};
+        VAStatus cs = vaCopy(dpy, &d, &sobj, o);
+        if (cs == VA_STATUS_SUCCESS) cs = vaSyncSurface(dpy, to);
+        if (cs != VA_STATUS_SUCCESS) fprintf(stderr, "vaCopy: %s\n", vaErrorStr(cs));
+        return cs == VA_STATUS_SUCCESS ? 0 : -1;
+    }
     VAProcPipelineParameterBuffer pp = {0};
     pp.surface = from;
+    pp.filter_flags = getenv("VATEST_VPPFLAGS") ? (unsigned)strtoul(getenv("VATEST_VPPFLAGS"), NULL, 0) : 0;
     VABufferID b;
     if (vaCreateBuffer(dpy, vpp, VAProcPipelineParameterBufferType, sizeof(pp), 1, &pp, &b) != VA_STATUS_SUCCESS) {
         return -1;
@@ -126,6 +137,13 @@ int main(int argc, char **argv) {
         if (p->stream_index == si && avcodec_send_packet(c, p) >= 0) {
             while (avcodec_receive_frame(c, f) >= 0) {
                 n++;
+                if (getenv("VATEST_LUMA")) {   // "X,Y": that pixel's luma in every frame, to compare with a software decode
+                    int x = atoi(getenv("VATEST_LUMA")), yy = atoi(strchr(getenv("VATEST_LUMA"), ',') + 1);
+                    av_frame_unref(sw);
+                    if (av_hwframe_transfer_data(sw, f, 0) >= 0) {
+                        printf("luma %d %u\n", n - 1, sw->data[0][yy * sw->linesize[0] + x]);
+                    }
+                }
                 if (!shown && n == 10) {
                     shown = 1;
                     if (av_hwframe_transfer_data(sw, f, 0) >= 0) {
@@ -140,6 +158,10 @@ int main(int argc, char **argv) {
                     double d0 = now();
                     int rc = vpp_copy((VASurfaceID)(uintptr_t)f->data[3], us, c->width, c->height);
                     dl += now() - d0, ndl++;
+                    if (getenv("VATEST_LUMA")) {
+                        int x = atoi(getenv("VATEST_LUMA")), yy = atoi(strchr(getenv("VATEST_LUMA"), ',') + 1);
+                        printf("vpp luma %d %u\n", n - 1, mem[(size_t)yy * stride + x]);
+                    }
                     if (n == 10) {
                         printf("frame 10 by the GPU into memory: %s, luma %u %u %u %u\n", rc ? "FAILED" : "ok", mem[0],
                                mem[c->width / 2], mem[(size_t)(c->height / 2) * stride + c->width / 2],

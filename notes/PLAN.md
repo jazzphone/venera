@@ -1602,20 +1602,44 @@ hardware video encoding, a way to fix what apps ask for that the driver lacks, a
   first run translated ~700 small shaders (52 s), which the seed now carries.
 - **Missing calls.** Lenient mode answers an unimplemented call with nil/0 and logs it once a process; VM 107 logged
   none in 6 h of use. status.sh now lists the last day's by app ("Metal calls the driver lacks").
-- **Hardware encoding** (in progress). Tahoe's VideoToolbox has the paravirtualized encoder too. The guest asks
-  `encs` (68 bytes); Apple's host answers a list (ProRes, H.264, HEVC, JPEG: hostvideo/data/apple-encs-reply.bin).
-  With venera-videod answering H.264/HEVC (VENERA_VIDEO_ENCODE=1, VM 108's unit only), VideoToolbox lists
-  "paravirtualized:...ave.avc", picks it, and goes `+enc` (codec, encoder id, guest build) -> `esta` (vdi=wxh; Apple
-  answers Epba first: the pixel formats) -> `esup` (Apple: a 4.5 KB supported-properties dictionary) -> `epfr` ->
-  `efrm` per frame (frm, pts, dur, uui = a 16-byte UUID, pat) -> `ecfr` -> `einv` -> `-enc`, from VideoToolbox's
-  encoder service process (com.apple.coremedia.videoencoder). `efrm` carries the frame's IOSurface (the kext's surface list: 1
-  surface) besides its UUID. The host-to-guest codes the guest's encoder handles, found as cmp immediates next to
-  'Epba' in VideoToolbox's x86 code (the shared cache): Eemt, Efdr, Efds, Epba, Espr, Esps. When the guest got an empty
-  efrm answer it tried to read a serialized sample buffer (FigSampleBufferSerialization err -19640, "Unrecognised
-  VTVideoEncoderFrame token"): encoded frames go back as Apple's serialized CMSampleBuffers.
-  What's left: (1) the kext copies a kept IOSurface into a frame slot on the host's order (decode's fill, reversed);
-  (2) venera-videod encodes the slot with VA-API (FFmpeg h264_vaapi / hevc_vaapi), answers esup with the properties it
-  honors (bit rate, key frame interval, real time, profile) and Esps/Efds as the guest needs them; (3) the encoded
-  sample back as the guest's serialized sample buffer (Eemt): its format is the work, best learned from Apple's own
-  host producing one (pvhost's esta still fails, err -17691: find what its session needs). Baseline (software): H.264
-  720p 91 fps of simple frames, HEVC 720p 6.9 fps; tools/vtenc.m measures it (VTENC_SHOW=1 prints the buffer).
+- **Hardware encoding: done.** Tahoe's VideoToolbox has a paravirtualized encoder beside the decoder; venera-videod
+  now answers it with VA-API (FFmpeg's h264_vaapi / hevc_vaapi, no B-frames, one frame in flight). The protocol, as
+  this host speaks it, is at the top of hostvideo/src/vv_encode.h; how it was learned: Apple's own host session run on
+  the Mac (an XPC LaunchAgent wrapping it, its messages replayed), and VideoToolbox's code read where it builds and
+  checks each message.
+  - The frame: `efrm` carries the frame's IOSurface; the host orders a **pull** (VV_H_PULL: the kext copies the
+    surface into a slot, VV_G_PULLDONE), uploads it and encodes. The sample goes back as `Eemt`: CoreMedia's
+    serialized sample buffer (sbuf: opts, stia, sdat with 4-byte lengths, nsmp, ssiz, sary attachments; fdsc, the
+    format description with avcC / hvcC, on the first sample), checked against VideoToolbox's own serializer and
+    reader run on the Mac. `Efds` before the first sample gives the guest the format description.
+  - **Intel VideoToolbox's reply wait is broken** (26.7.3): it turns the timeout into nanoseconds in a 32-bit int
+    (`cvttsd2si`), so efrm's and ecfr's 10 s become a deadline in the past, and the wait succeeds only if the answer
+    is already in. Every frame failed at once (-19092). VeneraVideo 0.2 holds such a send in the kernel until the
+    answer is queued and the process has drained it (2 s at most). A synchronous decode's `dfrm` waits the same way:
+    synchronous decoding through the host failed every frame since 0.1.0 (Safari decodes asynchronously, so nothing
+    showed) and works now.
+  - The guest's receive buffer is 16384 bytes: a bigger message never leaves the queue. Eemt is split as Apple's host
+    splits it (0x10, "more", on all but the last).
+  - **The last frame.** AVFoundation's exports came out one frame short (299 of 300). The guest sends one message at
+    a time (VideoToolboxParavirtualizationSupport holds a lock across the kext call), and the encoder runs in
+    VideoToolbox's encoder service (VTEncoderXPCService), whose paravirtualization queue hands each Eemt's frame to the
+    app and then answers it. While a send is held, that answer waits for the lock, and the queue with it. So the
+    host now sends each frame's Eemt before it answers that frame's efrm, and sends Eemt as a plain message (Apple's
+    host makes it a request; the kext holds requests back until a held send's answer is in, so a request would
+    arrive after the answer). Every frame is out when CompleteFrames returns (vtenc counts them; 8 of 8 exports have
+    every frame). The cost: the guest waits for each frame's encode, so 1080p went from ~160 fps to ~100 fps and 4K
+    from ~47 to ~30. A 100 ms wait before answering ecfr fixed 5 of 6 and was dropped.
+  - **Decoding was softening every frame** (since 0.1.0): the slot copy used VA-API video processing, which runs the
+    scaler even at 1:1 (a row's 255 beside 0 came out 56; small changes everywhere). Found by decoding the
+    encoder's output back (vtenc VTENC_VERIFY: 2 frames of 300 wrong at a sharp edge) and comparing with vatest's
+    VATEST_LUMA. vaCopy copies exactly and is a little faster (1.05 ms a 1080p frame against 1.28); video processing
+    stays as the fallback.
+  - **Old guests.** VeneraVideo 0.2 says VV_GF_ENCODE in its hello and writes it into the control block; a host
+    offers encoders only to a guest that says so (0.1.1's driver says 0: it would fail every frame).
+  - Measured on VM 108 (Iris Xe): H.264 720p ~175 fps, 1080p ~100, HEVC 1080p ~105, 4K ~30 either; Apple's software
+    encoder in the VM: H.264 720p 91 fps, HEVC 720p 6.9. Decoded back (sync and async, through the host and in
+    software), every frame matches to the encoder's loss. avconvert 1080p exports (H.264, HEVC) and a 10-bit HEVC
+    source decoded by the host and re-encoded: PSNR 44-50 dB against the source.
+  - Left: the efrm wait could overlap again (answer early unless the frame might be the last: no signal for that
+    yet); 10-bit encoding (Main10); encoder messages in the fuzz seeds (the session harness only has decode's);
+    `kVTCompressionPropertyKey_Quality` is taken as constant quality without a level.

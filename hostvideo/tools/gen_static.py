@@ -19,10 +19,19 @@ sup = field('data/apple-dsup-reply.bin', 'sup')
 # the encoders the host's VA-API driver has (H.264 and HEVC on the Iris Xe's low-power encode entry point); Apple's list
 # also has ProRes and JPEG, which the host doesn't encode
 encs = [e for e in field('data/apple-encs-reply.bin', 'enc') if e['VTCodecType'] in (0x61766331, 0x68766331)]
+# the properties an encoder session takes, as Apple's host answers them for its H.264 encoder (data/apple-esup-reply.bin,
+# captured with the software encoder: its hardware encoder's host session wouldn't start there)
+esup = field('data/apple-esup-reply.bin', 'sup')
 items = {
     'vv_decs_plist': decs,
     'vv_sup_plist': sup,
     'vv_encs_plist': encs,
+    'vv_encs_avc_plist': [e for e in encs if e['VTCodecType'] == 0x61766331],
+    'vv_encs_hevc_plist': [e for e in encs if e['VTCodecType'] == 0x68766331],
+    'vv_empty_array_plist': [],
+    'vv_esup_plist': esup,
+    # HEVC: the same without H.264's own (its profile values, its entropy mode)
+    'vv_esup_hevc_plist': {k: v for k, v in esup.items() if k not in ('ProfileLevel', 'H264EntropyMode')},
     'vv_hin_plist': {'VTHostBuildVersion': 'Venera'},
     'vv_true_plist': True,
     # SuggestedQualityOfServiceTiers, as Apple's host answers it (the player degrades through these under load)

@@ -17,7 +17,7 @@ fi
 mkdir -p $BIN $FZ/gen
 # fuzz a snapshot of the daemon (the source is being edited by others; FINDINGS.md cites this snapshot's sha256 and lines)
 if [ ! -f $FZ/gen/venera-videod.c ] || [ -n "$RESNAP" ]; then   # RESNAP=1 takes a fresh snapshot
-  cp $H/src/venera-videod.c $H/src/vv_bplist.h $H/src/vv_shm.h $H/src/vv_static.h $FZ/gen/
+  cp $H/src/venera-videod.c $H/src/vv_bplist.h $H/src/vv_shm.h $H/src/vv_static.h $H/src/vv_encode.h $FZ/gen/
   sha256sum $FZ/gen/venera-videod.c | cut -c1-16 > $FZ/gen/SNAPSHOT.sha256
 fi
 SRC=$FZ/gen/venera-videod.c

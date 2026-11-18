@@ -261,7 +261,9 @@ run chown -R root:root "$PREFIX/video"
 if [ $DRY = 0 ]; then
   prof=$("$PREFIX/video/bin/vaprofiles" 2>&1)
   if echo "$prof" | grep -q "decode: VAProfileH264"; then
-    say "VA-API: $(echo "$prof" | head -1); decodes $(echo "$prof" | grep -c 'decode:') profiles"
+    enc=$(echo "$prof" | grep -E 'encode.*(VAProfileH264High|VAProfileHEVCMain)$' | sed -E 's/.*VAProfile(H264High|HEVCMain)$/\1/' |
+      sed 's/H264High/H.264/; s/HEVCMain/HEVC/' | sort -u | tr '\n' ' ' | sed 's/ $//')
+    say "VA-API: $(echo "$prof" | grep -m1 '^VA-API' | sed 's/^VA-API //'); decodes $(echo "$prof" | grep -c 'decode:') profiles; encodes ${enc:-nothing (the guest encodes in software)}"
   else
     warn "VA-API can't decode H.264 on this GPU (vaprofiles: $(echo "$prof" | head -2 | tr '\n' ' '))"
   fi

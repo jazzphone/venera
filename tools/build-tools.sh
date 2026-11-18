@@ -30,4 +30,4 @@ for s in compute render; do
   xcrun metal -target air64-apple-macos26.0 -c tools/shaders/$s.metal -o build/$s.air && xcrun metallib build/$s.air -o build/$s.metallib
 done
 file build/vgputest build/vkprobe build/vkexec build/acceltest build/llvmprobe build/mtlprobe build/mtlcompute
-$CC -fobjc-arc -framework Foundation -framework VideoToolbox -framework CoreMedia -framework CoreVideo tools/vtenc.m -framework IOSurface -o build/vtenc
+$CC -fobjc-arc -framework Foundation -framework VideoToolbox -framework CoreMedia -framework CoreVideo tools/vtenc.m -framework IOSurface -framework AVFoundation -o build/vtenc

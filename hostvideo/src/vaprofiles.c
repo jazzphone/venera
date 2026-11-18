@@ -22,6 +22,9 @@ int main(void) {
         VAEntrypoint *e = calloc((size_t)ne, sizeof(*e));
         vaQueryConfigEntrypoints(d, p[i], e, &ne);
         for (int k = 0; k < ne; k++) {
+            if (e[k] == VAEntrypointEncSlice || e[k] == VAEntrypointEncSliceLP) {   // 0.1.2: hardware encoding
+                printf("  encode%s: %s\n", e[k] == VAEntrypointEncSliceLP ? " (low power)" : "", vaProfileStr(p[i]));
+            }
             if (e[k] == VAEntrypointVLD) {
                 printf("  decode: %s\n", vaProfileStr(p[i]));
             }

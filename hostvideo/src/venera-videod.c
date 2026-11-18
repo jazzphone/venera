@@ -206,6 +206,8 @@ typedef struct {
     void (*msg)(const buf *m);
     // copy slot `slot` (packed rows: luma `stride` x h, chroma after it) into the guest's IOSurface `surf`
     void (*fill)(uint32_t surf, int slot, int w, int h, int stride, int bps);
+    // copy the guest's IOSurface `surf` into slot `slot`, packed the same way (a frame to encode)
+    void (*pull)(uint32_t surf, int slot, int w, int h, int stride, int bps);
 } sink;
 static sink out;
 static uint8_t *shm;   // the shared memory (or the replay's copy of it)
@@ -493,7 +495,25 @@ static VASurfaceID slot_surface(int slot, int w, int h, int stride, int fourcc) 
     slot_va[slot].s = sid, slot_va[slot].w = w, slot_va[slot].h = h, slot_va[slot].stride = stride, slot_va[slot].fourcc = fourcc;
     return sid;
 }
+// A decoded picture into a slot's surface. vaCopy (the copy engine) copies it as it is; video processing, the
+// fallback for a driver without vaCopy, runs the scaler even at 1:1 and softens it (a row's 255 next to 0 came out 56;
+// every frame a little), as every frame did before 0.1.2.
+static int copy_broken;
 static int vpp_copy(VASurfaceID from, VASurfaceID to) {
+    if (!copy_broken) {
+        VACopyObject d = {.obj_type = VACopyObjectSurface, .object = {.surface_id = to}};
+        VACopyObject f = {.obj_type = VACopyObjectSurface, .object = {.surface_id = from}};
+        VACopyOption o = {.bits = {.va_copy_sync = VA_EXEC_SYNC, .va_copy_mode = VA_EXEC_MODE_DEFAULT}};
+        VAStatus st = vaCopy(dpy, &d, &f, o);
+        if (st == VA_STATUS_SUCCESS) {
+            st = vaSyncSurface(dpy, to);
+        }
+        if (st == VA_STATUS_SUCCESS) {
+            return 0;
+        }
+        LOG("vaCopy: %s; copying frames with video processing", vaErrorStr(st));
+        copy_broken = 1;
+    }
     if (vpp == VA_INVALID_ID) {
         VAConfigID cfg;
         if (vaCreateConfig(dpy, VAProfileNone, VAEntrypointVideoProc, NULL, 0, &cfg) != VA_STATUS_SUCCESS ||
@@ -992,6 +1012,8 @@ static const char *safe_type(const char *t) {
     return s;
 }
 static int open_hw(void);
+static int guest_encodes(void);
+#include "vv_encode.h"
 
 // One message from the guest, with the IOSurfaces it carries.
 static void engine_msg(const uint8_t *p, size_t n, const struct vv_surf *surfs, int nsurf) {
@@ -1039,6 +1061,9 @@ static void engine_msg(const uint8_t *p, size_t n, const struct vv_surf *surfs, 
         return;
     }
     const char *t = m.type;
+    if (enc_msg(&m, t, surfs, nsurf)) {   // an encoder's (vv_encode.h)
+        return;
+    }
     if (!strcmp(t, "dcap")) {   // a codec's capabilities (VTCopyHEVCDecoderCapabilitiesDictionary; Safari checks it)
         uint32_t cod = (uint32_t)field_int(&m, "cod", "s32", 0);
         buf r = {0};
@@ -1081,77 +1106,6 @@ static void engine_msg(const uint8_t *p, size_t n, const struct vv_surf *surfs, 
         field_u32(&r, "ver", 6);
         out.msg(&r);
         free(r.p);
-        return;
-    }
-    if (!strcmp(t, "encs") && getenv("VENERA_VIDEO_ENCODE")) {   // encoding (0.1.2, in progress): opt-in until it works
-        buf r = {0};
-        msg_header(&r, "encs", 4, m.uuid, m.req);
-        field(&r, "enc", "pls", vv_encs_plist, sizeof(vv_encs_plist));
-        field_u32(&r, "ver", 6);
-        out.msg(&r);
-        free(r.p);
-        return;
-    }
-    if (!strcmp(t, "+enc") && getenv("VENERA_VIDEO_ENCODE")) {   // research: accept, then see what the guest sends
-        buf r = {0};
-        msg_header(&r, "+enc", 4, m.uuid, m.req);
-        field_s32(&r, "err", 0);
-        field_u32(&r, "ver", 6);
-        field(&r, "hin", "pls", vv_hin_plist, sizeof(vv_hin_plist));
-        out.msg(&r);
-        free(r.p);
-        return;
-    }
-    if (!strcmp(t, "esta") && getenv("VENERA_VIDEO_ENCODE")) {   // research: the encoder's pixel buffers, then OK
-        size_t n = 0;
-        const uint8_t *v = msg_field(&m, "vdi", "wxh", &n);
-        int w = n == 8 ? (int)((v[0] << 24) | (v[1] << 16) | (v[2] << 8) | v[3]) : 0;
-        int h = n == 8 ? (int)((v[4] << 24) | (v[5] << 16) | (v[6] << 8) | v[7]) : 0;
-        bp *d = bp_dict();
-        bp_set(d, "Width", bp_int(w));
-        bp_set(d, "Height", bp_int(h));
-        bp *pf = bp_array();
-        bp_push(pf, bp_int(FOURCC('4', '2', '0', 'v')));
-        bp_push(pf, bp_int(FOURCC('4', '2', '0', 'f')));
-        bp_set(d, "PixelFormatType", pf);
-        bp_set(d, "IOSurfaceProperties", bp_dict());
-        bp_set(d, "BytesPerRowAlignment", bp_int(64));
-        bp_set(d, "PlaneAlignment", bp_int(64));
-        size_t pn;
-        uint8_t *pl = bp_encode(d, &pn);
-        bp_free(d);
-        buf e = {0};
-        msg_header(&e, "Epba", 2, m.uuid, ++host_req);
-        field(&e, "pba", "pls", pl, pn);
-        out.msg(&e);
-        free(e.p);
-        free(pl);
-        buf r = {0};
-        msg_header(&r, "esta", 4, m.uuid, m.req);
-        field_s32(&r, "err", 0);
-        out.msg(&r);
-        free(r.p);
-        VLOG("esta %dx%d: answered", w, h);
-        return;
-    }
-    if (!strcmp(t, "efrm") && getenv("VENERA_VIDEO_ENCODE")) {   // research: ask the guest for the frame's buffer
-        size_t un = 0;
-        const uint8_t *u = msg_field(&m, "uui", "uui", &un);
-        int64_t frm = field_int(&m, "frm", "s64", 0);
-        buf e = {0};
-        msg_header(&e, "Efdr", 2, m.uuid, ++host_req);
-        field_s64(&e, "frm", frm);
-        if (u && un == 16) {
-            field(&e, "uui", "uui", u, 16);
-        }
-        out.msg(&e);
-        free(e.p);
-        buf r = {0};
-        msg_header(&r, "efrm", 4, m.uuid, m.req);
-        field_s32(&r, "err", 0);
-        out.msg(&r);
-        free(r.p);
-        VLOG("efrm %lld: asked the guest for its buffer (Efdr)", (long long)frm);
         return;
     }
     if (!strcmp(t, "decs")) {
@@ -1316,10 +1270,17 @@ static void engine_uuid_gone(const uint8_t *uuid) {
     if (s) {
         free_session(s);
     }
+    encsession *e = find_enc(uuid);
+    if (e) {
+        enc_free(e);
+    }
 }
 static void engine_reset(void) {
     for (int i = 0; i < MAX_SESSIONS; i++) {
         free_session(&sessions[i]);
+    }
+    for (int i = 0; i < MAX_ENC; i++) {
+        enc_free(&encs[i]);
     }
     memset(slot_busy, 0, sizeof(slot_busy));
 }
@@ -1327,6 +1288,7 @@ static void engine_reset(void) {
 // ---- the rings -----------------------------------------------------------------------------------------------------
 
 static struct vv_ctl *ctl;
+static int guest_encodes(void) { return !ctl || (ctl->guest_features & VV_GF_ENCODE); }   // no ctl: the replay
 // The counters this side owns, kept here: the copies in shared memory are for the guest to read, and anything it
 // writes there is never trusted.
 static uint32_t h2g_head, g2h_tail;
@@ -1442,6 +1404,10 @@ static void srv_fill(uint32_t surf, int slot, int w, int h, int stride, int bps)
     uint32_t a[6] = {surf, (uint32_t)slot, (uint32_t)w, (uint32_t)h, (uint32_t)stride, (uint32_t)bps};
     h2g(VV_H_FILL, a, NULL, 0);
 }
+static void srv_pull(uint32_t surf, int slot, int w, int h, int stride, int bps) {
+    uint32_t a[6] = {surf, (uint32_t)slot, (uint32_t)w, (uint32_t)h, (uint32_t)stride, (uint32_t)bps};
+    h2g(VV_H_PULL, a, NULL, 0);
+}
 
 static void ring_corrupt(const char *why, uint32_t v) {
     static unsigned n;
@@ -1487,7 +1453,9 @@ static void drain_g2h(void) {
         case VV_PAD:
             break;
         case VV_G_HELLO:
-            LOG("guest driver started (run %u)", rec.arg[0]);
+            ctl->guest_features = rec.arg[1];
+            LOG("guest driver started (run %u)%s", rec.arg[0],
+                rec.arg[1] & VV_GF_ENCODE ? "" : "; it can't encode through the host (VeneraVideo before 0.2)");
             engine_reset();
             break;
         case VV_G_MSG: {
@@ -1501,6 +1469,9 @@ static void drain_g2h(void) {
         }
         case VV_G_SLOTDONE:
             engine_slotdone((int)rec.arg[0], (int)rec.arg[1]);
+            break;
+        case VV_G_PULLDONE:
+            engine_pulldone((int)rec.arg[0], (int)rec.arg[1]);
             break;
         case VV_G_UUIDGONE:
             if (rec.len >= 16) {
@@ -1820,6 +1791,25 @@ static void rp_msg(const buf *m) {
     if (!strcmp(mm.type, "Demt") || !strcmp(mm.type, "Dbuf")) {
         printf(", frame %lld, inf %lld", (long long)field_int(&mm, "frm", "s64", -1), (long long)field_int(&mm, "inf", "u32", -1));
     }
+    if (!strcmp(mm.type, "Eemt") || !strcmp(mm.type, "Efds")) {   // encoding: what it says, and the sample to a file
+        size_t sn = 0, en = 0;
+        const uint8_t *sbf = msg_field(&mm, "sbf", "sbf", &sn);
+        msg_field(&mm, "ext", "pls", &en);
+        printf(", frame %lld, efl %lld, sbf %zu bytes, ext %zu bytes, %dx%d", (long long)field_int(&mm, "frm", "s64", -1),
+               (long long)field_int(&mm, "efl", "u32", -1), sn, en, (int)field_int(&mm, "wdt", "s32", 0), (int)field_int(&mm, "hgt", "s32", 0));
+        const char *dir = getenv("VV_REPLAY_SAVE");
+        if (dir) {
+            static int k;
+            char path[512];
+            snprintf(path, sizeof(path), "%s/%03d-%s.bin", dir, k++, mm.type);
+            FILE *f = fopen(path, "wb");
+            if (f) {
+                fwrite(m->p, 1, m->n, f);
+                fclose(f);
+            }
+        }
+        (void)sbf;
+    }
     printf("\n");
     if (!strcmp(mm.type, "Dbuf") && (mm.flags & 2)) {   // answer as the guest: a made-up surface
         rq *q = calloc(1, sizeof(*q));
@@ -1839,6 +1829,17 @@ static void rp_msg(const buf *m) {
         }
         rq_tail = q;
     }
+    if ((!strcmp(mm.type, "Eemt") || !strcmp(mm.type, "Efds")) && (mm.flags & 2)) {   // answered as the guest would
+        rq *q = calloc(1, sizeof(*q));
+        msg_header(&q->m, mm.type, 8, mm.uuid, mm.req);
+        field_s32(&q->m, "err", 0);
+        if (rq_tail) {
+            rq_tail->next = q;
+        } else {
+            rq_head = q;
+        }
+        rq_tail = q;
+    }
 }
 static void rp_fill(uint32_t surf, int slot, int w, int h, int stride, int bps) {
     const uint8_t *y = shm + VV_SLOT_OFF + (size_t)slot * VV_SLOT_SIZE;
@@ -1846,7 +1847,24 @@ static void rp_fill(uint32_t surf, int slot, int w, int h, int stride, int bps) 
            y[w / 2 * bps], y[(size_t)(h / 2) * stride + (size_t)w / 2 * bps], y[(size_t)(h - 1) * stride + (size_t)(w - 1) * bps]);
     slot_busy[slot] = 0;   // copied at once
 }
+static int rp_pulls[VV_NSLOTS], rp_npull, rp_frame;
+static void rp_pull(uint32_t surf, int slot, int w, int h, int stride, int bps) {
+    uint8_t *y = shm + VV_SLOT_OFF + (size_t)slot * VV_SLOT_SIZE;
+    for (int r = 0; r < h; r++) {   // luma: a diagonal that moves a pixel a frame; chroma: flat
+        for (int x = 0; x < w; x++) {
+            y[(size_t)r * stride + x] = (uint8_t)((x + r + rp_frame * 4) & 0xff);
+        }
+    }
+    memset(y + (size_t)stride * h, 128, (size_t)stride * (h / 2));
+    rp_frame++;
+    printf("  host pulls surface %u into slot %d (%dx%d)\n", surf, slot, w, h);
+    rp_pulls[rp_npull++] = slot;
+}
 static void run_queue(void) {
+    while (rp_npull) {   // the guest's answers to pull orders: done at once
+        int slot = rp_pulls[--rp_npull];
+        engine_pulldone(slot, 0);
+    }
     while (rq_head) {
         rq *q = rq_head;
         rq_head = q->next;
@@ -1860,7 +1878,7 @@ static void run_queue(void) {
 }
 static int replay(int argc, char **argv) {
     shm = mmap(NULL, VV_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);   // page-aligned, as the real one
-    out.msg = rp_msg, out.fill = rp_fill;
+    out.msg = rp_msg, out.fill = rp_fill, out.pull = rp_pull;
     for (int i = 0; i < argc; i++) {
         FILE *f = fopen(argv[i], "rb");
         if (!f) {
@@ -1877,7 +1895,9 @@ static int replay(int argc, char **argv) {
         msg m;
         if (!msg_parse(p, (size_t)n, &m)) {
             printf("guest -> %s (%s, %ld bytes)\n", m.type, argv[i], n);
-            engine_msg(p, (size_t)n, NULL, 0);
+            struct vv_surf frame = {.id = 900u + (uint32_t)i, .format = FOURCC('4', '2', '0', 'v')};   // efrm's surface
+            int is_frame = !strcmp(m.type, "efrm");
+            engine_msg(p, (size_t)n, is_frame ? &frame : NULL, is_frame);
             run_queue();
         }
         free(p);
@@ -1932,6 +1952,7 @@ static int open_hw(void) {
         return -1;
     }
     dpy = ((AVVAAPIDeviceContext *)((AVHWDeviceContext *)hwdev->data)->hwctx)->display;
+    enc_probe(dpy);
     LOG("decoding on %s", dev);
     return 0;
 }
@@ -1961,6 +1982,6 @@ int main(int argc, char **argv) {
         return replay(argc - a - 1, argv + a + 1);
     }
     open_hw();
-    out.msg = srv_msg, out.fill = srv_fill;
+    out.msg = srv_msg, out.fill = srv_fill, out.pull = srv_pull;
     return serve(argv[a]);
 }

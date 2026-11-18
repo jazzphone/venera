@@ -6,10 +6,10 @@
 //   0          struct vv_ctl: magic, versions, and the two rings' head/tail counters
 //   VV_G2H_OFF the guest-to-host ring: Apple's paravirtualized-VideoToolbox messages (with the IOSurfaces they name),
 //              slots the guest has finished copying, a hello at driver start, guest UUIDs going away
-//   VV_H2G_OFF the host-to-guest ring: messages for the guest's processes, and "fill" orders (copy slot N into
-//              IOSurface S)
-//   VV_SLOT_OFF VV_NSLOTS frame slots of VV_SLOT_SIZE: decoded frames, NV12 (or P010) rows packed at a stride the
-//              fill order gives
+//   VV_H2G_OFF the host-to-guest ring: messages for the guest's processes, "fill" orders (copy slot N into
+//              IOSurface S: a decoded frame) and "pull" orders (copy IOSurface S into slot N: a frame to encode)
+//   VV_SLOT_OFF VV_NSLOTS frame slots of VV_SLOT_SIZE: decoded frames and frames to encode, NV12 (or P010) rows
+//              packed at a stride the order gives
 // Rings hold records: a 32-byte struct vv_rec, then len bytes, the whole padded to 32. head and tail are free-running
 // byte counters (offset = counter % ring size); the producer writes a record, then a barrier, then moves head; the
 // consumer reads at tail, then moves it. A record never wraps: when the space left before the end is too small, the
@@ -45,7 +45,9 @@ struct vv_ctl {
     uint32_t version;          // VV_VERSION
     volatile uint32_t host_gen;    // the host's run; the guest drops state when it changes
     volatile uint32_t guest_gen;   // the guest driver's run; the host drops sessions when it changes
-    uint32_t pad[12];
+    uint32_t guest_features;       // VV_GF_*: written by the guest driver as it starts and set again from its hello by
+                                   // the host (0.1.1's driver writes nothing here and says 0), so it outlives restarts
+    uint32_t pad[11];
     struct vv_ring g2h, h2g;
 };
 
@@ -59,15 +61,22 @@ struct vv_rec {
 enum {
     VV_PAD = 0,   // filler to the ring's end
     // guest -> host
-    VV_G_HELLO = 1,      // the guest driver started (arg0: guest_gen)
+    VV_G_HELLO = 1,      // the guest driver started (arg0: guest_gen, arg1: VV_GF_*; 0.1.1's driver sends 0)
     VV_G_MSG = 2,        // payload: arg0 vv_surf, then the message (arg1 bytes)
     VV_G_SLOTDONE = 3,   // arg0: the slot, arg1: 0 or an error (the surface was gone)
     VV_G_UUIDGONE = 4,   // payload: a 16-byte UUID whose process went away
+    VV_G_PULLDONE = 5,   // arg0: the slot, arg1: 0 or an error, arg2: the IOSurface (a pull order done)
     // host -> guest
     VV_H_MSG = 16,    // payload: a message, for the process that registered its UUID (bytes 16-31)
     VV_H_FILL = 17,   // copy slot arg1 into IOSurface arg0: arg2 width, arg3 height, arg4 the slot's luma stride
                       // (chroma follows at stride x height), arg5 bytes per sample (1: NV12, 2: P010)
+    VV_H_PULL = 18,   // copy IOSurface arg0 into slot arg1, packed as a fill order's (the same args): a frame to encode
 };
+
+// What the guest driver can do, in its hello. VV_GF_ENCODE: pull orders, and it holds a send whose answer VideoToolbox
+// can't wait for itself (kext/VeneraVideo, waitsForReply); without it the host offers no encoders (every frame would
+// fail on the guest's broken reply wait).
+#define VV_GF_ENCODE 1u
 
 // An IOSurface a guest message carries (an output buffer), as the guest driver found it.
 struct vv_surf {

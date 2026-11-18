@@ -1,13 +1,13 @@
 // vv_bplist.h (Venera video): just enough binary property list for the host side of Apple's paravirtualized
 // VideoToolbox protocol, which passes CoreFoundation objects as "bplist00": a writer for dictionaries, arrays, ASCII
-// strings, integers and booleans, and a reader for a top-level string. Header-only C.
+// strings, integers, booleans and data, and a reader for a top-level string. Header-only C.
 #ifndef VV_BPLIST_H
 #define VV_BPLIST_H
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
-enum { BP_DICT, BP_ARRAY, BP_STR, BP_INT, BP_BOOL };
+enum { BP_DICT, BP_ARRAY, BP_STR, BP_INT, BP_BOOL, BP_DATA };
 typedef struct bp {
     int type;
     int64_t i;
@@ -37,6 +37,13 @@ static bp *bp_bool(int v) {
 static bp *bp_str(const char *s) {
     bp *b = bp_new(BP_STR);
     b->s = strdup(s);
+    return b;
+}
+static bp *bp_data(const void *d, size_t n) {   // bytes (b->s holds them, b->i their count)
+    bp *b = bp_new(BP_DATA);
+    b->s = malloc(n ? n : 1);
+    memcpy(b->s, d, n);
+    b->i = (int64_t)n;
     return b;
 }
 static void bp_add(bp *c, bp *v) {
@@ -135,6 +142,9 @@ static uint8_t *bp_encode(bp *root, size_t *len) {
             bp_put(&o, &m, 1);
         } else if (b->type == BP_INT) {
             bp_intobj(&o, b->i);
+        } else if (b->type == BP_DATA) {
+            bp_marker(&o, 0x40, (size_t)b->i);
+            bp_put(&o, b->s, (size_t)b->i);
         } else if (b->type == BP_STR) {
             size_t sl = strlen(b->s);
             bp_marker(&o, 0x50, sl);
@@ -171,6 +181,44 @@ static uint8_t *bp_encode(bp *root, size_t *len) {
     free(l.objs);
     *len = o.n;
     return o.p;
+}
+
+// The top-level object of a one-object binary plist, if it is a number or a boolean (an integer of 1-8 bytes, a real of 4
+// or 8): into *v. 0 on success. Only the object right after the header is read, so every offset is the header's.
+static int bp_read_number(const uint8_t *p, size_t n, double *v) {
+    if (n < 8 + 1 + 32 || memcmp(p, "bplist00", 8)) {
+        return -1;
+    }
+    uint8_t m = p[8];
+    if (m == 0x08 || m == 0x09) {
+        *v = m == 0x09;
+        return 0;
+    }
+    int size = 1 << (m & 0x0f);
+    if ((m & 0xf0) == 0x10 && size <= 8 && 9 + (size_t)size <= n) {
+        uint64_t u = 0;
+        for (int i = 0; i < size; i++) {
+            u = u << 8 | p[9 + i];
+        }
+        *v = size == 8 ? (double)(int64_t)u : (double)u;
+        return 0;
+    }
+    if ((m & 0xf0) == 0x20 && (size == 4 || size == 8) && 9 + (size_t)size <= n) {
+        uint64_t u = 0;
+        for (int i = 0; i < size; i++) {
+            u = u << 8 | p[9 + i];
+        }
+        if (size == 4) {
+            uint32_t w = (uint32_t)u;
+            float f;
+            memcpy(&f, &w, 4);
+            *v = f;
+        } else {
+            memcpy(v, &u, 8);
+        }
+        return 0;
+    }
+    return -1;
 }
 
 // The top-level object of a binary plist, if it is an ASCII string: copied into out (NUL-terminated). 0 on success.
