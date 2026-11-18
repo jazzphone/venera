@@ -149,12 +149,15 @@ question waits in its window. "Show Venera in the menu bar" puts the same in a m
 ## Hardware video decoding and encoding
 
 Apps that decode with VideoToolbox (Safari, QuickTime, Photos, every AVFoundation player) decode H.264, HEVC (8 and
-10-bit) and VP9 on the host's GPU, up to 4K. Apps that encode with it (QuickTime and AVFoundation exports,
-`avconvert`, screen recordings, anything with a `VTCompressionSession`) encode H.264 and HEVC (8-bit) there too, when
-the host's GPU can (the host's installer says what it encodes). Measured on an Iris Xe host (VM 108):
-H.264 720p ~175 fps, 1080p ~100 fps, HEVC 1080p ~105 fps, 4K ~30 fps for either, against Apple's software encoder in
-the VM at ~90 fps for H.264 720p and ~7 fps for HEVC 720p. Encoding needs VeneraVideo 0.2 or later in the guest; with
-an older one the host offers no encoders and the guest encodes in software as before. The guest's half is the
+10-bit) and VP9 on the host's GPU, up to 4K. 4K 10-bit (HDR video, macOS's own wallpaper movies) needs VeneraVideo
+0.2.1 in the guest and a host from after Venera 0.1.3; with either half older, those frames fail. Apps that encode
+with it (QuickTime and AVFoundation exports, `avconvert`, screen recordings, anything with a `VTCompressionSession`)
+encode H.264 and HEVC (8-bit) there too, when the host's GPU can (the host's installer says what it encodes). Measured
+on an Iris Xe host (VM 108): H.264 720p ~295 fps, 1080p ~175 fps, 4K ~55 fps; HEVC 720p ~370 fps, 1080p ~200 fps, 4K
+~60 fps, against Apple's software encoder in the VM at ~90 fps for H.264 720p and ~7 fps for HEVC 720p. Encoding needs
+VeneraVideo 0.2 or later in the guest; with an older one the host offers no encoders and the guest encodes in software
+as before. With Venera 0.1.2's and 0.1.3's host, a long export through the host ran macOS out of memory (each frame
+was kept until the export ended: ~16,000 frames on an 8 GB VM); a newer host fixes it. The guest's half is the
 package's "Hardware video" choice (`install.sh --video`). The host's half is `Venera-host-VERSION.tar.gz`,
 for a Proxmox host with an Intel GPU:
 

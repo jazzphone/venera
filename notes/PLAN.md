@@ -1679,3 +1679,31 @@ After the release, the same day:
   ("Cannot Decode", -11821/-16977) and Safari's 4K HDR would fail the same way. 10-bit 1080p and 8-bit 4K work. The fix
   needs bigger slots (fewer, or a bigger shared region), which the kext and the host must agree on: a VeneraVideo and
   host change together, with the hello saying which layout.
+
+## Round 15 (2026-11-18): 4K 10-bit decoding, and the encoder's leak
+
+- **4K 10-bit decodes through the host.** A frame bigger than a slot (P010 3840x2160: 25 MB; slots are 16 MB) now
+  fills the next slot too: the host takes n free slots side by side, starting at a multiple of n so a stream keeps to
+  the same spans (and VA surfaces, which never overlap: a span's surface replaces those of the slots it covers), and
+  orders a fill naming the first; the guest's copy may run past its slot up to the last. Same shared memory, same
+  layout: VeneraVideo 0.2.1 says VV_GF_SPAN in its hello, and a host sends spans only to a guest that does (an older
+  guest's 4K 10-bit frames fail, as before). Tahoe Day (HEVC 10-bit 4K, 240 fps, 120 s): every one of 28,801 frames
+  decoded on the host; against the Mac's own decode at full size (a ProRes export), 62 dB luma, 57 dB chroma, SSIM
+  0.9992, so the chroma that starts in the second slot is right. Sonoma's Graphic Dark: all 21,600 to ProRes.
+- **The encoder leaked a frame's IOSurface per frame** (since 0.1.2's hardware encoding). The guest's encoder keeps
+  each frame's pixel buffer until both its efrm is answered and an Eemt names its uui
+  (paravirtualizedVideoEncoder_forgetPendingFramePixelBufferByUUID sets one flag each; VideoToolbox's own host side,
+  VTParavirtualizationHostEncoderSession, is in the same binary, which is how it was read). Our Eemt didn't carry the
+  frame's uui, so nothing was let go until the session ended: IOSurfaces grew one a frame (16,332 at 16,000 frames),
+  macOS compressed and swapped, and avconvert failed (-11801 / kCVReturnAllocationFailed -6662) at ~16,000 frames on
+  VM 108's 8 GB. The Eemt now says the frame's uui: IOSurfaces stay at ~150 through the whole Tahoe Day export
+  (28,801 frames to HEVC 1080p on the host, every one out). And encoding is faster, since the app's pool no longer
+  makes a new buffer each frame: 1080p H.264 101-105 -> 175-181 fps, HEVC 104 -> 203-205 (A/B against 0.1.3's
+  daemon); 720p 295 / 372, 4K 55 / 60. vtenc: 300 of 300 when CompleteFrames returned, every run (0.1.3's missed one
+  in four).
+- Found on the way: a full Tahoe Day export to ProRes at 4K is ~75 GB (5 GB for 8 s): VM 108's first attempt filled its
+  disk. Apple's host also sends a top-level "rels" box of 64-bit surface mapping ids
+  (VTParavirtualizationRelinquishMappedGuestSurfacesNoLongerInUse), most likely for Apple's guest driver, which
+  VeneraVideo replaces; nothing in VideoToolbox reads it, and VeneraVideo's own table (96 surfaces) needs none.
+- Checks: the session and ring fuzzers on the new slot code (1.4 M and 212 k runs, nothing found); the widget movie's
+  555 frames to ProRes and HEVC; vtenc's small exports, 8 of 8 complete.

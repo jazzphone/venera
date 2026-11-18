@@ -283,8 +283,8 @@ bool AppleVideoToolboxParavirtualizationDriver::start(IOService *provider) {
     __sync_synchronize();
     ctl_->h2g.tail = ctl_->h2g.head;
     ctl_->g2h.head = ctl_->g2h.tail;
-    ctl_->guest_features = VV_GF_ENCODE;   // here too, for a host that starts (or restarts) after the hello
-    uint32_t a[6] = {ctl_->guest_gen, VV_GF_ENCODE, 0, 0, 0, 0};
+    ctl_->guest_features = VV_GF_ENCODE | VV_GF_SPAN;   // here too, for a host that (re)starts after the hello
+    uint32_t a[6] = {ctl_->guest_gen, VV_GF_ENCODE | VV_GF_SPAN, 0, 0, 0, 0};
     putG2H(VV_G_HELLO, a, nullptr, 0, nullptr, 0);
     doorbell();
     timer_->setTimeoutMS(100);
@@ -529,7 +529,8 @@ void AppleVideoToolboxParavirtualizationDriver::removeClient(AppleVideoToolboxPa
     IOLockUnlock(lock_);
 }
 
-// Copy slot r->arg[1] into the IOSurface r->arg[0], then tell the host the slot is free.
+// Copy slot r->arg[1] into the IOSurface r->arg[0], then tell the host the slot is free. A frame bigger than a slot
+// runs on into the next ones (VV_GF_SPAN), up to the last.
 // A fill order (slot -> IOSurface: a decoded frame) or a pull order (IOSurface -> slot: a frame to encode).
 void AppleVideoToolboxParavirtualizationDriver::fill(const vv_rec *r, bool pull) {
     uint32_t id = r->arg[0], slot = r->arg[1], w = r->arg[2], h = r->arg[3], stride = r->arg[4], bps = r->arg[5];
@@ -541,7 +542,8 @@ void AppleVideoToolboxParavirtualizationDriver::fill(const vv_rec *r, bool pull)
             s = &surfaces_[i];
         }
     }
-    if (s && slot < VV_NSLOTS && bps >= 1 && bps <= 2 && (uint64_t)stride * h * 3 / 2 <= VV_SLOT_SIZE) {
+    if (s && slot < VV_NSLOTS && bps >= 1 && bps <= 2 &&
+        (uint64_t)stride * h * 3 / 2 <= (uint64_t)(VV_NSLOTS - slot) * VV_SLOT_SIZE) {
         IOSurface *surf = s->surface;
         if (!s->map) {
             IOMemoryDescriptor *md = surf->getMemoryDescriptor();

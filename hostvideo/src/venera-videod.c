@@ -212,6 +212,23 @@ typedef struct {
 static sink out;
 static uint8_t *shm;   // the shared memory (or the replay's copy of it)
 static int slot_busy[VV_NSLOTS];
+static int slot_span[VV_NSLOTS];   // at a busy frame's first slot: how many slots it fills (0 or 1: one; 4K 10-bit: 2)
+static void slot_release(int slot) {
+    if (slot < 0 || slot >= VV_NSLOTS) {
+        return;
+    }
+    int n = slot_span[slot] > 1 ? slot_span[slot] : 1;
+    for (int i = slot; i < slot + n && i < VV_NSLOTS; i++) {
+        slot_busy[i] = 0;
+    }
+    slot_span[slot] = 0;
+}
+static void slot_take(int slot, int n) {
+    for (int i = slot; i < slot + n; i++) {
+        slot_busy[i] = 1;
+    }
+    slot_span[slot] = n;
+}
 static uint64_t host_req = 100;
 
 // ---- sessions ------------------------------------------------------------------------------------------------------
@@ -288,7 +305,7 @@ static void free_session(session *s) {
         frame_out *f = s->head;
         s->head = f->next;
         if (f->slot >= 0) {
-            slot_busy[f->slot] = 0;
+            slot_release(f->slot);
         }
         av_frame_free(&f->f);
         free(f);
@@ -443,13 +460,26 @@ static void send_demt(session *s, frame_out *f, uint32_t inf) {
     s->frames_out++;
 }
 
-static int free_slot(void) {
-    for (int i = 0; i < VV_NSLOTS; i++) {
-        if (!slot_busy[i]) {
+// n free slots side by side (a frame bigger than one slot), starting at a multiple of n, so that a stream's frames
+// keep to the same spans and their VA surfaces stay; -1 when there are none.
+static int free_slot(int n) {
+    for (int i = 0; i + n <= VV_NSLOTS; i += n) {
+        int k = 0;
+        while (k < n && !slot_busy[i + k]) {
+            k++;
+        }
+        if (k == n) {
             return i;
         }
     }
     return -1;
+}
+// The slots a frame of these rows needs (whole pages: VA-API maps them), or 0 when the guest can't take that many.
+static int guest_spans(void);
+static int slots_for(int stride, int h) {
+    size_t bytes = ((size_t)stride * h * 3 / 2 + 4095) & ~(size_t)4095;
+    int n = (int)((bytes + VV_SLOT_SIZE - 1) / VV_SLOT_SIZE);
+    return n > VV_NSLOTS || (n > 1 && !guest_spans()) ? 0 : n;
 }
 
 // Copy a decoded frame off the GPU into a free slot (packed rows: luma at `stride`, chroma after it), which frees
@@ -465,17 +495,26 @@ static VAContextID vpp = VA_INVALID_ID;
 static int vpp_broken;
 static struct {
     VASurfaceID s;
-    int w, h, stride, fourcc;
+    int w, h, stride, fourcc, n;   // n: the slots its memory covers
 } slot_va[VV_NSLOTS];
-static VASurfaceID slot_surface(int slot, int w, int h, int stride, int fourcc) {
+static void slot_va_drop(int i) {
+    if (slot_va[i].s != VA_INVALID_SURFACE && slot_va[i].s != 0) {
+        vaDestroySurfaces(dpy, &slot_va[i].s, 1);
+    }
+    slot_va[i].s = VA_INVALID_SURFACE;
+}
+static VASurfaceID slot_surface(int slot, int n, int w, int h, int stride, int fourcc) {
     if (slot_va[slot].s != VA_INVALID_SURFACE && slot_va[slot].s != 0 && slot_va[slot].w == w && slot_va[slot].h == h &&
-        slot_va[slot].stride == stride && slot_va[slot].fourcc == fourcc) {
+        slot_va[slot].stride == stride && slot_va[slot].fourcc == fourcc && slot_va[slot].n == n) {
         return slot_va[slot].s;
     }
-    if (slot_va[slot].s != VA_INVALID_SURFACE && slot_va[slot].s != 0) {
-        vaDestroySurfaces(dpy, &slot_va[slot].s, 1);
+    // no two surfaces over the same memory: a span's surface replaces those of the slots it covers, and theirs it
+    for (int i = 0; i < VV_NSLOTS; i++) {
+        int in = slot_va[i].n > 1 ? slot_va[i].n : 1;
+        if (i < slot + n && slot < i + in) {
+            slot_va_drop(i);
+        }
     }
-    slot_va[slot].s = VA_INVALID_SURFACE;
     uintptr_t ptr = (uintptr_t)(shm + VV_SLOT_OFF + (size_t)slot * VV_SLOT_SIZE);
     int bps = fourcc == VA_FOURCC_P010 ? 2 : 1;
     (void)bps;
@@ -500,6 +539,7 @@ static VASurfaceID slot_surface(int slot, int w, int h, int stride, int fourcc) 
         return VA_INVALID_SURFACE;
     }
     slot_va[slot].s = sid, slot_va[slot].w = w, slot_va[slot].h = h, slot_va[slot].stride = stride, slot_va[slot].fourcc = fourcc;
+    slot_va[slot].n = n;
     return sid;
 }
 // A decoded picture into a slot's surface. vaCopy (the copy engine) copies it as it is; video processing, the
@@ -550,21 +590,22 @@ static int vpp_copy(VASurfaceID from, VASurfaceID to) {
     return st == VA_STATUS_SUCCESS ? 0 : -1;
 }   // the slot's memory is the shared region's
 static int download(frame_out *f) {
-    int slot = free_slot();
-    if (slot < 0) {
-        return 1;
-    }
     AVHWFramesContext *fc = (AVHWFramesContext *)f->f->hw_frames_ctx->data;
     int bps = fc->sw_format == AV_PIX_FMT_P010 ? 2 : 1;
     int w = f->f->width, h = f->f->height, stride = (w * bps + 127) & ~127;
-    if ((((size_t)stride * h * 3 / 2 + 4095) & ~(size_t)4095) > VV_SLOT_SIZE) {
+    int n = slots_for(stride, h);
+    if (!n) {
         return -1;
+    }
+    int slot = free_slot(n);
+    if (slot < 0) {
+        return 1;
     }
     uint8_t *dst = shm + VV_SLOT_OFF + (size_t)slot * VV_SLOT_SIZE;
     if (!vpp_broken && dpy) {
-        VASurfaceID to = slot_surface(slot, w, h, stride, bps == 2 ? VA_FOURCC_P010 : VA_FOURCC_NV12);
+        VASurfaceID to = slot_surface(slot, n, w, h, stride, bps == 2 ? VA_FOURCC_P010 : VA_FOURCC_NV12);
         if (to != VA_INVALID_SURFACE && !vpp_copy((VASurfaceID)(uintptr_t)f->f->data[3], to)) {
-            slot_busy[slot] = 1;
+            slot_take(slot, n);
             f->slot = slot, f->w = w, f->h = h, f->stride = stride, f->bps = bps;
             av_frame_free(&f->f);
             return 0;
@@ -582,7 +623,7 @@ static int download(frame_out *f) {
         LOG("frame %lld: copying it off the GPU: %s", (long long)f->frm, av_err2str(rc));
         return -1;
     }
-    slot_busy[slot] = 1;
+    slot_take(slot, n);
     f->slot = slot, f->w = w, f->h = h, f->stride = stride, f->bps = bps;
     av_frame_free(&f->f);
     return 0;
@@ -634,7 +675,7 @@ static void pump(session *s) {
             s->tail = NULL;
         }
         if (f->slot >= 0) {
-            slot_busy[f->slot] = 0;
+            slot_release(f->slot);
         }
         av_frame_free(&f->f);
         free(f);
@@ -1252,9 +1293,7 @@ static void engine_msg(const uint8_t *p, size_t n, const struct vv_surf *surfs, 
 }
 
 static void engine_slotdone(int slot, int err) {
-    if (slot >= 0 && slot < VV_NSLOTS) {
-        slot_busy[slot] = 0;
-    }
+    slot_release(slot);
     if (err) {
         VLOG("slot %d: the guest couldn't copy it (%d)", slot, err);
     }
@@ -1290,12 +1329,14 @@ static void engine_reset(void) {
         enc_free(&encs[i]);
     }
     memset(slot_busy, 0, sizeof(slot_busy));
+    memset(slot_span, 0, sizeof(slot_span));
 }
 
 // ---- the rings -----------------------------------------------------------------------------------------------------
 
 static struct vv_ctl *ctl;
 static int guest_encodes(void) { return !ctl || (ctl->guest_features & VV_GF_ENCODE); }   // no ctl: the replay
+static int guest_spans(void) { return !ctl || (ctl->guest_features & VV_GF_SPAN); }
 // The counters this side owns, kept here: the copies in shared memory are for the guest to read, and anything it
 // writes there is never trusted.
 static uint32_t h2g_head, g2h_tail;
@@ -1461,8 +1502,9 @@ static void drain_g2h(void) {
             break;
         case VV_G_HELLO:
             ctl->guest_features = rec.arg[1];
-            LOG("guest driver started (run %u)%s", rec.arg[0],
-                rec.arg[1] & VV_GF_ENCODE ? "" : "; it can't encode through the host (VeneraVideo before 0.2)");
+            LOG("guest driver started (run %u)%s%s", rec.arg[0],
+                rec.arg[1] & VV_GF_ENCODE ? "" : "; it can't encode through the host (VeneraVideo before 0.2)",
+                rec.arg[1] & VV_GF_SPAN ? "" : "; 4K 10-bit frames don't fit a slot (VeneraVideo before 0.2.1)");
             engine_reset();
             break;
         case VV_G_MSG: {
@@ -1852,7 +1894,7 @@ static void rp_fill(uint32_t surf, int slot, int w, int h, int stride, int bps) 
     const uint8_t *y = shm + VV_SLOT_OFF + (size_t)slot * VV_SLOT_SIZE;
     printf("  host fills surface %u from slot %d: %dx%d stride %d, luma %u %u %u %u\n", surf, slot, w, h, stride, y[0],
            y[w / 2 * bps], y[(size_t)(h / 2) * stride + (size_t)w / 2 * bps], y[(size_t)(h - 1) * stride + (size_t)(w - 1) * bps]);
-    slot_busy[slot] = 0;   // copied at once
+    slot_release(slot);   // copied at once
 }
 static int rp_pulls[VV_NSLOTS], rp_npull, rp_frame;
 static void rp_pull(uint32_t surf, int slot, int w, int h, int stride, int bps) {

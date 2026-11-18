@@ -11,9 +11,10 @@
 //   efrm frm pts dur uui (+ the frame's IOSurface): the frame is pulled from the guest's IOSurface into a slot
 //                     (VV_H_PULL / VV_G_PULLDONE), uploaded and encoded; its sample goes back as
 //   Efds           (a request, before the first sample) cod wdt hgt ext: the guest makes the format description
-//   Eemt           frm err efl sbf: the sample, serialized as CoreMedia's paravirtualized sample-buffer
-//                     atoms (sbuf: opts stia sdat nsmp ssiz sary), in messages of at most 16384 bytes (the
-//                     guest's receive buffer): flags 0x10 (more) on all but the last, which is a plain
+//   Eemt           frm err efl uui sbf: the sample (uui: the frame's id from its efrm; the guest lets go of the frame
+//                     once its efrm is answered and an Eemt names it), serialized as CoreMedia's paravirtualized
+//                     sample-buffer atoms (sbuf: opts stia sdat nsmp ssiz sary), in messages of at most 16384
+//                     bytes (the guest's receive buffer): flags 0x10 (more) on all but the last, which is a plain
 //                     message (0: Apple's host makes it a request, but the kext holds a request back until the
 //                     held send's answer is in, and this one has to come before it)
 //                  -> and then efrm's answer, err 0, inf 0 (inf 1, Asynchronous, when the encoder keeps the frame:
@@ -39,6 +40,8 @@ typedef struct {
     int key;                    // the guest asked for a key frame
     uint64_t req;               // its efrm
     int answered;
+    uint8_t uui[16];            // efrm's uui: the frame's id, said back in its Eemt
+    int has_uui;
 } enc_frame;
 
 typedef struct {
@@ -82,7 +85,7 @@ static void enc_close(encsession *s) {
     av_buffer_unref(&s->frames);
     for (int i = 0; i < s->nq; i++) {
         if (s->q[i].slot >= 0) {
-            slot_busy[s->q[i].slot] = 0;
+            slot_release(s->q[i].slot);
         }
         enc_answer_frame(s, &s->q[i], 2);   // a frame the guest still waits on: dropped (once: answered says)
     }
@@ -475,9 +478,9 @@ static void send_eemt(encsession *s, enc_frame *f, int32_t err, const uint8_t *d
     int first = 1;
     do {
         // a whole message fits the guest's 16384-byte receive buffer (VideoToolboxParavirtualizationSupport dequeues
-        // into one; a bigger message never leaves the queue): 48 bytes of header, the first part's frm/err/efl boxes
-        // (64), the sbf box's own 16
-        size_t room = 16384 - 48 - 16 - (first ? 64 : 0);
+        // into one; a bigger message never leaves the queue): 48 bytes of header, the first part's frm/err/efl/uui
+        // boxes (96), the sbf box's own 16
+        size_t room = 16384 - 48 - 16 - (first ? 96 : 0);
         size_t k = sb.n - at > room ? room : sb.n - at;
         buf m = {0};
         // every message but the last says "more follows" (0x10), as Apple's host does
@@ -495,6 +498,13 @@ static void send_eemt(encsession *s, enc_frame *f, int32_t err, const uint8_t *d
             field_s64(&m, "frm", f->frm);
             field_s32(&m, "err", err);
             field_u32(&m, "efl", err ? 2 : 0);   // kVTEncodeInfo_FrameDropped when it failed
+            // The frame's id from its efrm. The guest keeps each frame's pixel buffer (its IOSurface) until both
+            // its efrm is answered and an Eemt names it (VideoToolbox's
+            // paravirtualizedVideoEncoder_forgetPendingFramePixelBufferByUUID). Without it every frame stayed, and a
+            // long export ran macOS out of memory (~16,000 frames on an 8 GB VM), since 0.1.2.
+            if (f->has_uui) {
+                field(&m, "uui", "uui", f->uui, 16);
+            }
         }
         if (k) {
             field(&m, "sbf", "sbf", sb.p + at, k);
@@ -670,9 +680,7 @@ static void engine_pulldone(int slot, int err) {
             }
         }
     }
-    if (slot >= 0 && slot < VV_NSLOTS) {
-        slot_busy[slot] = 0;
-    }
+    slot_release(slot);
     if (!f) {
         return;
     }
@@ -820,11 +828,15 @@ static int enc_msg(const msg *m, const char *t, const struct vv_surf *surfs, int
     } else if (!strcmp(t, "efrm")) {
         size_t un = 0, pn = 0, dn = 0;
         const uint8_t *pts = msg_field(m, "pts", "tim", &pn), *dur = msg_field(m, "dur", "tim", &dn);
-        msg_field(m, "uui", "uui", &un);
-        int slot = s->nq < ENC_Q && nsurf >= 1 && !s->failed ? free_slot() : -1;
+        const uint8_t *uui = msg_field(m, "uui", "uui", &un);
+        int slot = s->nq < ENC_Q && nsurf >= 1 && !s->failed ? free_slot(1) : -1;
         enc_frame f = {.frm = field_int(m, "frm", "s64", 0), .slot = slot, .state = 0, .req = m->req};
         if (pn == 24) {
             memcpy(f.pts, pts, 24);
+        }
+        if (uui && un == 16) {
+            memcpy(f.uui, uui, 16);
+            f.has_uui = 1;
         }
         if (dn == 24) {
             memcpy(f.dur, dur, 24);
@@ -833,7 +845,7 @@ static int enc_msg(const msg *m, const char *t, const struct vv_surf *surfs, int
             send_eemt(s, &f, kVTVideoEncoderMalfunctionErr, NULL, 0, 0);
             return 1;
         }
-        slot_busy[slot] = 1;
+        slot_take(slot, 1);
         // not answered yet: send_eemt answers it once its sample is out (it says why), or the pull's end does if the
         // encoder holds the frame back
         s->q[s->nq++] = f;

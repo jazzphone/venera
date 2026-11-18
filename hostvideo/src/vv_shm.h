@@ -9,7 +9,8 @@
 //   VV_H2G_OFF the host-to-guest ring: messages for the guest's processes, "fill" orders (copy slot N into
 //              IOSurface S: a decoded frame) and "pull" orders (copy IOSurface S into slot N: a frame to encode)
 //   VV_SLOT_OFF VV_NSLOTS frame slots of VV_SLOT_SIZE: decoded frames and frames to encode, NV12 (or P010) rows
-//              packed at a stride the order gives
+//              packed at a stride the order gives. A frame bigger than a slot (4K 10-bit) fills the next slots too,
+//              when the guest says it can (VV_GF_SPAN): an order names the first, its size says how many
 // Rings hold records: a 32-byte struct vv_rec, then len bytes, the whole padded to 32. head and tail are free-running
 // byte counters (offset = counter % ring size); the producer writes a record, then a barrier, then moves head; the
 // consumer reads at tail, then moves it. A record never wraps: when the space left before the end is too small, the
@@ -28,8 +29,8 @@
 #define VV_H2G_OFF (VV_G2H_OFF + VV_G2H_SIZE)
 #define VV_H2G_SIZE (4u << 20)
 #define VV_SLOT_OFF (40u << 20)
-#define VV_SLOT_SIZE (16u << 20)   // a 4096x2160 frame at 8 bits, 4:2:0 (13.3 MB); NOT one at 10 bits (P010:
-                                   // 26.5 MB), so 4K 10-bit doesn't decode through the host (notes/PLAN.md, 0.1.2)
+#define VV_SLOT_SIZE (16u << 20)   // a 4096x2160 frame at 8 bits, 4:2:0 (13.3 MB); one at 10 bits (P010, 26.5 MB)
+                                   // takes two slots (VV_GF_SPAN)
 #define VV_NSLOTS 13               // 40 MB + 13 x 16 MB = 248 MB
 #define VV_HOST_PEER 0
 #define VV_VM_PEER 1
@@ -78,6 +79,9 @@ enum {
 // can't wait for itself (kext/VeneraVideo, waitsForReply); without it the host offers no encoders (every frame would
 // fail on the guest's broken reply wait).
 #define VV_GF_ENCODE 1u
+// VV_GF_SPAN: a fill or pull order may run past its slot into the next ones (up to the last), for frames bigger than a
+// slot; without it (VeneraVideo before 0.2.1) the host fails such frames, as before.
+#define VV_GF_SPAN 2u
 
 // An IOSurface a guest message carries (an output buffer), as the guest driver found it.
 struct vv_surf {
