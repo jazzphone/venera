@@ -149,6 +149,8 @@ fi
 
 # The system copy is gone or isn't this version: every app keeps Metal from the kept copy.
 point "$KEEP"
+# installed without it on purpose (--no-system-volume): nothing to offer
+[ -e "$V/NO_SYSVOL" ] && [ ! -d "$SYS" ] && exit 0
 WHY="the Metal driver is no longer on the system volume"
 [ -d "$SYS" ] && WHY="the Metal driver on the system volume is a different version from the one installed"
 [ "$ASK" = 0 ] && [ "$(state declined)" = "$BUILD" ] && exit 0

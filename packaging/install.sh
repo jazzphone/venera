@@ -18,6 +18,11 @@
 #      questions as notifications and shows what runs; --no-app leaves it out (the watcher then asks in dialogs)
 # Then reboot. ./uninstall.sh undoes all of it; ./status.sh shows what runs.
 #
+# When --set-security has to change SIP, steps 3-5 can't run until the restart (rebuilding the Auxiliary KC needs SIP's
+# new settings): this pass writes only the security settings (and VeneraVideo.kext) into OpenCore and leaves a
+# one-time job (local.venera.finish) that runs the install again at the next boot, as `install.sh --finish` with the
+# same options, then restarts once more (by itself at the login window, or after asking whoever is logged in).
+#
 # The system-volume copy needs SIP's authenticated root off (csr bit 0x800): --set-security sets it with the rest
 # (0xA03). Without it the driver runs from the kept copy (every app but Safari's WebGL), and the watcher offers the
 # system-volume copy once authenticated root is off. --no-system-volume skips it (and leaves authenticated root on).
@@ -38,6 +43,24 @@ VIDEO=0
 NO_APP=0
 GUID=7C436110-AB2A-4BBB-A880-FE41995C9F82
 MOUNTED=
+V="/Library/Application Support/Venera"
+FINISH_PLIST=/Library/LaunchDaemons/local.venera.finish.plist
+FINISH=0
+if [ "${1:-}" = --finish ]; then   # the second pass (local.venera.finish, at the boot after the first)
+  FINISH=1
+  ARGS=()
+  while IFS= read -r a; do ARGS+=("$a"); done <"$V/finish-args" 2>/dev/null
+  if [ ${#ARGS[@]} -gt 0 ]; then set -- "${ARGS[@]}"; else set --; fi
+  # the job stays until the install succeeds (a failure tries again at the next boot), three boots at most
+  TRIES=$(( $(cat "$V/finish-tries" 2>/dev/null || echo 0) + 1 ))
+  echo $TRIES >"$V/finish-tries"
+  printf '\n%s Venera: finishing the install after the restart, try %s of 3 (install.sh %s)\n' "$(date '+%F %T')" $TRIES "$*"
+  if [ $TRIES -ge 3 ]; then
+    rm -f "$FINISH_PLIST" "$V/finish-args" "$V/finish-tries"   # the last try: no job left whatever happens
+  fi
+fi
+finish_done() { [ $FINISH = 1 ] && rm -f "$FINISH_PLIST" "$V/finish-args" "$V/finish-tries"; return 0; }
+ORIG=("$@")
 
 say() { printf '%s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
@@ -105,6 +128,7 @@ SIP_OK=1
 echo "$CSR" | grep -q 'Kext Signing: disabled' || SIP_OK=0
 echo "$CSR" | grep -q 'Filesystem Protections: disabled' || SIP_OK=0
 echo "$CSR" | grep -q 'System Integrity Protection status: disabled' && SIP_OK=1
+RUN_SIP_OK=$SIP_OK   # what the running system allows now (the Auxiliary KC needs it); SIP_OK is what to write
 ARGS=$(nvram boot-args 2>/dev/null | cut -f2-)
 AMFI_OK=0
 case " $ARGS " in *" amfi_get_out_of_my_way=1 "*) AMFI_OK=1 ;; esac
@@ -123,11 +147,20 @@ if [ $SIP_OK = 0 ] || [ $AMFI_OK = 0 ]; then
     die "set them in OpenCore yourself, or run again with --set-security (INSTALL.md, \"Security\")"
   fi
 fi
+TWO_PASS=0
+if [ $RUN_SIP_OK = 0 ]; then
+  [ $FINISH = 1 ] && die "SIP still doesn't allow unsigned kexts and an unrestricted file system after the restart: was the
+  VM started through OpenCore with the config.plist Venera changed? (csrutil status)"
+  TWO_PASS=1
+  say "security: the rest of the install needs SIP's new settings, which start at the restart: this pass changes only"
+  say "  OpenCore's security settings; Venera finishes installing after the restart, then restarts once more"
+fi
 
 # ---- 2. OpenCore ---------------------------------------------------------------------------------------------------
 pl() { plutil "$@" "$CONFIG"; }
 if [ $NO_OC = 0 ]; then
-  if [ -z "$OC_ROOT" ]; then
+  # find_oc: the EFI partition with EFI/OC/config.plist (mounted for us when it wasn't) in FOUND, else empty
+  find_oc() {
     FOUND=
     for p in $(diskutil list | awk '/ EFI / {print $NF}'); do
       mp=$(diskutil info "$p" | awk -F': *' '/Mount Point/ {print $2}')
@@ -144,6 +177,16 @@ if [ $NO_OC = 0 ]; then
       elif [ -n "$fresh" ]; then
         diskutil unmount "$fresh" >/dev/null 2>&1
       fi
+    done
+  }
+  if [ -z "$OC_ROOT" ]; then
+    find_oc
+    # the second pass runs early in the boot, before every disk is published: wait up to two minutes for OpenCore's
+    tries=0
+    while [ -z "$FOUND" ] && [ $FINISH = 1 ] && [ $tries -lt 24 ]; do
+      sleep 5
+      tries=$((tries + 1))
+      find_oc
     done
     [ -n "$FOUND" ] || die "no EFI partition with EFI/OC/config.plist: mount OpenCore's and pass --oc, or --no-opencore"
     OC_ROOT=$FOUND
@@ -171,7 +214,7 @@ if [ $NO_OC = 0 ]; then
       run pl -insert Kernel.Add.$N -json "{\"Arch\":\"x86_64\",\"BundlePath\":\"$1.kext\",\"Comment\":\"$2\",\"Enabled\":true,\"ExecutablePath\":\"Contents/MacOS/$1\",\"MaxKernel\":\"\",\"MinKernel\":\"\",\"PlistPath\":\"Contents/Info.plist\"}"
     fi
   }
-  oc_kext VirtioGPU "Venera core (virtio-gpu)"
+  [ $TWO_PASS = 1 ] || oc_kext VirtioGPU "Venera core (virtio-gpu)"   # the first of two passes: the driver comes in the second
   [ $VIDEO = 1 ] && oc_kext VeneraVideo "Venera video decoding (through the host)"
   OCARGS=$(pl -extract "NVRAM.Add.$GUID.boot-args" raw -o - 2>/dev/null)
   NEW=
@@ -186,7 +229,7 @@ if [ $NO_OC = 0 ]; then
       run pl -replace "NVRAM.Add.$GUID.csr-active-config" -data AwoAAA==   # 0x00000A03: and authenticated root off
     fi
   fi
-  NEW="${NEW# } vgpuaccel=$LEVEL"
+  [ $TWO_PASS = 1 ] || NEW="${NEW# } vgpuaccel=$LEVEL"
   run pl -replace "NVRAM.Add.$GUID.boot-args" -string "${NEW# }"
   # OpenCore writes NVRAM.Add only over variables NVRAM.Delete lists (or that don't exist yet)
   for k in boot-args csr-active-config; do
@@ -201,7 +244,11 @@ if [ $NO_OC = 0 ]; then
     cp "$BACKUP" "$CONFIG"
     die "config.plist didn't validate after the edit; restored the backup"
   }
-  say "OpenCore: VirtioGPU.kext$([ $VIDEO = 1 ] && echo " and VeneraVideo.kext") enabled, boot-args \"${NEW# }\" (backup: $BACKUP)"
+  if [ $TWO_PASS = 1 ]; then
+    say "OpenCore: security settings$([ $VIDEO = 1 ] && echo " and VeneraVideo.kext"), boot-args \"${NEW# }\" (backup: $BACKUP)"
+  else
+    say "OpenCore: VirtioGPU.kext$([ $VIDEO = 1 ] && echo " and VeneraVideo.kext") enabled, boot-args \"${NEW# }\" (backup: $BACKUP)"
+  fi
   cleanup
 else
   say "OpenCore: skipped (--no-opencore). Add payload/OpenCore/VirtioGPU.kext to Kernel > Add and vgpuaccel=$LEVEL"
@@ -209,7 +256,57 @@ else
   [ $VIDEO = 1 ] && say "  And payload/OpenCore/VeneraVideo.kext, for video decoding."
 fi
 
+# ---- the first of two passes ends here: the next boot runs the rest ------------------------------------------------
+if [ $TWO_PASS = 1 ]; then
+  run mkdir -p "$V"
+  run chown root:wheel "$V"
+  run chmod 755 "$V"
+  if ! [ "$HERE" -ef "$V/release" ]; then   # the package runs from there already; a command-line install doesn't
+    run rm -rf "$V/release"
+    run cp -R "$HERE" "$V/release"
+    run chown -R root:wheel "$V/release"
+    run chmod -R go-w "$V/release"
+  fi
+  if [ $DRY = 0 ]; then
+    rm -f "$V/finish-tries"
+    if [ ${#ORIG[@]} -gt 0 ]; then printf '%s\n' "${ORIG[@]}" >"$V/finish-args"; else : >"$V/finish-args"; fi
+    cat >"$FINISH_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>local.venera.finish</string>
+  <key>ProgramArguments</key>
+  <array><string>/bin/bash</string><string>$V/release/install.sh</string><string>--finish</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>$V/install.log</string>
+  <key>StandardErrorPath</key><string>$V/install.log</string>
+</dict>
+</plist>
+PLIST
+    chown root:wheel "$FINISH_PLIST" "$V/finish-args"
+    chmod 644 "$FINISH_PLIST"
+    chmod 600 "$V/finish-args"
+  fi
+  say "  + $FINISH_PLIST (runs once, at the next boot)"
+  say ""
+  say "Restart now: Venera finishes installing after the restart (a minute or two), then restarts once more."
+  exit 0
+fi
+
 # ---- 3. the Auxiliary KC -------------------------------------------------------------------------------------------
+# a first install whose KC rebuild fails takes its kexts out again: left in /Library/Extensions, macOS adds them to
+# the KC by itself at the next boot, and an accelerator with no Metal driver in place leaves WindowServer failing at
+# start (a black screen; round 12)
+FRESH_AUX=1
+[ -e /Library/Extensions/VirtioGPUAccel.kext ] && FRESH_AUX=0
+kc_die() {
+  if [ $FRESH_AUX = 1 ]; then
+    rm -rf /Library/Extensions/VirtioGPUFramebuffer.kext /Library/Extensions/VirtioGPUAccel.kext
+    say "  (took VirtioGPUFramebuffer.kext and VirtioGPUAccel.kext out of /Library/Extensions again)"
+  fi
+  die "$@"
+}
 for k in VirtioGPUFramebuffer VirtioGPUAccel; do
   run rm -rf "/Library/Extensions/$k.kext"
   run cp -R "$PAYLOAD/Extensions/$k.kext" /Library/Extensions/
@@ -225,17 +322,16 @@ if [ $DRY = 0 ]; then
     -B /System/Library/KernelCollections/BootKernelExtensions.kc \
     -S /System/Library/KernelCollections/SystemKernelExtensions.kc \
     --repository /Library/Extensions -A "$KC.venera-new" -z >"$KLOG" 2>&1 ||
-    { tail -20 "$KLOG"; die "kmutil failed (log: $KLOG)"; }
+    { tail -20 "$KLOG"; kc_die "kmutil failed (log: $KLOG)"; }
   for k in VirtioGPUFramebuffer VirtioGPUAccel; do
     kmutil inspect -a x86_64 -A "$KC.venera-new" 2>/dev/null | grep -q "homelab\.$k[^A-Za-z]" ||
-      { tail -20 "$KLOG"; rm -f "$KC.venera-new"; die "kmutil left $k out (log: $KLOG)"; }
+      { tail -20 "$KLOG"; rm -f "$KC.venera-new"; kc_die "kmutil left $k out (log: $KLOG)"; }
   done
-  mv -f "$KC.venera-new" "$KC" || die "couldn't replace $KC (SIP file system protection still on?)"
+  mv -f "$KC.venera-new" "$KC" || kc_die "couldn't replace $KC (SIP file system protection still on?)"
 fi
 say "Auxiliary KC: VirtioGPUFramebuffer and VirtioGPUAccel in"
 
 # ---- 4. the Metal driver -------------------------------------------------------------------------------------------
-V="/Library/Application Support/Venera"
 # the kept copy lives under /Library/GPUBundles: WindowServer's sandbox maps code from there, not from $V
 K=/Library/GPUBundles/Venera
 run mkdir -p "$V" "$K"
@@ -250,6 +346,8 @@ for f in sysvol.sh venera-watch.sh; do run cp "$PAYLOAD/Support/$f" "$V/" && run
 for f in uninstall.sh status.sh; do [ "$HERE/$f" -ef "$V/$f" ] || { run cp "$HERE/$f" "$V/" && run chmod 755 "$V/$f"; }; done
 [ $DRY = 1 ] || { cp "$HERE/VERSION" "$V/VERSION" 2>/dev/null; echo 25G342 >"$V/TESTED_BUILD"; }
 if [ $VIDEO = 1 ]; then run touch "$V/VIDEO"; else run rm -f "$V/VIDEO"; fi   # what the app checks video against
+# without the system-volume copy by choice (the package's "Safari WebGL" unticked): the watcher doesn't offer it
+if [ $NO_SYSVOL = 1 ]; then run touch "$V/NO_SYSVOL"; else run rm -f "$V/NO_SYSVOL"; fi
 # /Library/GPUBundles' bundle is a symlink from now on: to the kept copy until the system-volume copy is in
 [ -L /Library/GPUBundles/VirtioGPUMetal.bundle ] || run rm -rf /Library/GPUBundles/VirtioGPUMetal.bundle
 run ln -sfn "$K/VirtioGPUMetal.bundle" /Library/GPUBundles/VirtioGPUMetal.bundle
@@ -302,3 +400,19 @@ say ""
 say "Installed Venera $(cat "$HERE/VERSION" 2>/dev/null) (level $LEVEL$([ $VIDEO = 1 ] && echo ", video decoding")). Reboot to start it: sudo shutdown -r now"
 say "If the desktop doesn't come back, the driver falls back to the software desktop by itself after two WindowServer"
 say "failures; INSTALL.md, \"Recovery\", has the rest. ./status.sh shows what runs."
+# the second pass restarts by itself: at the login window right away, else after asking whoever is logged in
+finish_done
+if [ $FINISH = 1 ] && [ $DRY = 0 ]; then
+  CUID=$(stat -f %u /dev/console)
+  if [ "$CUID" -ge 501 ] 2>/dev/null; then
+    r=$(launchctl asuser "$CUID" sudo -u "$(stat -f %Su /dev/console)" /usr/bin/osascript \
+      -e 'display dialog "Venera finished installing. Restart to start it?" buttons {"Later", "Restart"} default button "Restart" with title "Venera" giving up after 3600' 2>/dev/null)
+    case $r in
+    *Restart*) say "restarting, as asked"; shutdown -r now ;;
+    *) say "not restarted: Venera starts at the next restart" ;;
+    esac
+  else
+    say "restarting to start Venera (nobody is logged in)"
+    shutdown -r now
+  fi
+fi

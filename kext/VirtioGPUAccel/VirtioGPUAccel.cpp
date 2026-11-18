@@ -23,7 +23,8 @@
 // client is also served from here (type kVGUCAccelType, attached under IOAccelVirtioCarrier services), because
 // WindowServer's sandbox allows the accelerator's user clients and not the core's.
 // Guard: a third WindowServer process that opens the Venus client since the last arm (the first two died) withdraws
-// the display: VirtioGPUWindowServer turns false and the pipe capabilities go (the AGDC can't be terminated and needn't
+// the display; so does a third that opens the display pipe, for a WindowServer that dies before it gets to Metal (a
+// missing or broken Metal bundle: CoreDisplay asserts while it creates the display, round 12): VirtioGPUWindowServer turns false and the pipe capabilities go (the AGDC can't be terminated and needn't
 // be). MetalPluginName stays, so the plugin loads into the next WindowServer, turns CoreDisplay's IOPresentment switch
 // off there and refuses it the device: it composites in software (5c). A root process re-arms with {"VirtioGPUArmWindowServer": true} (acceltest wsarm) or withdraws with
 // {"VirtioGPUWithdraw": true} (acceltest withdraw), without a reboot.
@@ -912,6 +913,8 @@ public:
     unsigned carrierNext_ = 0;
     int wsPids_[4] = {};                      // WindowServer pids that opened the Venus client since the last arm
     unsigned wsCount_ = 0;
+    int pipePids_[4] = {};                    // WindowServer pids that opened the display pipe since the last arm
+    unsigned pipeCount_ = 0;
     volatile SInt32 request_ = 0;
     bool noLegacy_ = true;                    // armed: refuse WindowServer legacy IOAccelSurfaces (type 0); 5b probe             // for armTick after the first arm: 1 withdraw, 2 arm for WindowServer
 
@@ -1391,6 +1394,7 @@ void VirtioGPUAccel::armForWindowServer(const char *why) {
     }
     gIop = 1;
     wsCount_ = 0;
+    pipeCount_ = 0;
     setProperty("MetalPluginName", "VirtioGPUMetal");
     setProperty("MetalPluginClassName", "VGMTLDevice");
     setProperty("VirtioGPUWindowServer", kOSBooleanTrue);
@@ -1519,6 +1523,25 @@ IOReturn VirtioGPUAccel::newUserClient(task_t owningTask, void *securityID, UInt
         PE_parse_boot_argn("-vgpunopipeprobe", &noProbe, sizeof(noProbe));
         if (type == 4 && r == kIOReturnSuccess && handler && *handler && !strcmp(who, "WindowServer") && !noProbe) {
             vg_pipeuc_wrap(*handler);
+        }
+        if (type == 4 && r == kIOReturnSuccess && !strcmp(who, "WindowServer")) {
+            int pid = proc_selfpid();
+            bool seen = false;
+            for (unsigned i = 0; i < pipeCount_ && i < 4; i++) {
+                seen |= pipePids_[i] == pid;
+            }
+            if (!seen) {
+                if (pipeCount_ < 4) {
+                    pipePids_[pipeCount_] = pid;
+                }
+                pipeCount_++;
+                vlog("WindowServer pid %d opens the display pipe (#%u since the arm)", pid, pipeCount_);
+                if (pipeCount_ >= 3 && armed_ == 3) {
+                    setProperty("VirtioGPUGuardWhy", "a third WindowServer on the display pipe since the arm");
+                    vlog("GUARD: a third WindowServer on the display pipe since the arm: withdrawing");
+                    request(1);
+                }
+            }
         }
         return r;
     }

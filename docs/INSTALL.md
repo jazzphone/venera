@@ -62,7 +62,8 @@ VMs you use for testing and development, not for a VM that holds anything you ne
 - runs Venus in the guest (Mesa's Venus driver as a library inside each Metal process); on the host it is
   virglrenderer inside QEMU, so a guest that can reach Venus can reach the host's Vulkan driver;
 - lets only WindowServer register display surfaces with the kernel, and only surfaces the caller created;
-- falls back to the software desktop by itself when WindowServer fails twice with the Metal driver loaded.
+- falls back to the software desktop by itself when WindowServer fails twice, with the Metal driver loaded or before it
+  gets that far (a missing or broken Metal driver).
 
 ## Install
 
@@ -81,6 +82,12 @@ The package runs `install.sh --set-security` with those choices as flags, keeps 
 `/Library/Application Support/Venera/release`, writes what it did to `/Library/Application Support/Venera/install.log`,
 and ends with **Restart**.
 
+**When SIP has to change first** (a VM whose SIP doesn't yet allow unsigned kexts and an unrestricted file system), the
+rest of the install can't run until SIP's new settings start at the restart. The package then changes only OpenCore's
+security settings, and Venera finishes installing by itself after the restart (a minute or two, the one-time job
+`local.venera.finish`), then restarts once more: right away at the login window, or after asking whoever is logged
+in. `install.log` has both passes. A pass that fails tries again at the next boot, three boots at most.
+
 The package isn't signed with a Developer ID yet, so macOS says it can't check it the first time you open it: in
 **System Settings > Privacy & Security**, choose **Open Anyway** (once). A package copied into the VM without a web
 browser or AirDrop (a shared disk, `scp`) carries no quarantine and opens without asking. `packaging/make-pkg.sh` signs
@@ -91,8 +98,8 @@ it when `SIGN_ID="Developer ID Installer: NAME (TEAM)"` names a certificate in t
 In the guest, as an administrator:
 
 ```bash
-tar -xzf Venera-0.1.0.tar.gz
-cd Venera-0.1.0
+tar -xzf Venera-0.1.1.tar.gz
+cd Venera-0.1.1
 sudo ./install.sh --set-security      # or without --set-security when SIP and AMFI are already relaxed
 sudo shutdown -r now
 ```
@@ -139,8 +146,8 @@ Apps that decode with VideoToolbox (Safari, QuickTime, Photos, every AVFoundatio
 (`install.sh --video`). The host's half is `Venera-host-VERSION.tar.gz`, for a Proxmox host with an Intel GPU:
 
 ```bash
-tar -xzf Venera-host-0.1.0.tar.gz
-cd Venera-host-0.1.0
+tar -xzf Venera-host-0.1.1.tar.gz
+cd Venera-host-0.1.1
 ./install-host.sh --vm 108          # as root on the Proxmox host; --dry-run first to see each step
 qm shutdown 108 && qm start 108     # the VM picks up its new device when QEMU starts again
 ```
@@ -221,8 +228,9 @@ and AMFI stay as they are; restore them from a `config.plist.venera-*` backup, o
 
 ## Recovery
 
-- **The desktop falls back by itself**: when WindowServer fails twice with the Metal driver, the accelerator withdraws
-  it and the next WindowServer composites in software on the same framebuffer. `./status.sh` shows
+- **The desktop falls back by itself**: when WindowServer fails twice with the Metal driver, or twice on the display
+  pipe before it gets to Metal (a missing Metal driver), the accelerator withdraws it and the next WindowServer
+  composites in software on the same framebuffer. `./status.sh` shows
   `VirtioGPUGuard` and why.
 - **Software desktop, driver still installed**: set `vgpuaccel=2` in OpenCore's boot-args (or remove it), reboot.
 - **No picture at all**: boot with the OpenCore picker, choose Reset NVRAM or edit `config.plist` from another OS

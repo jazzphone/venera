@@ -1510,3 +1510,37 @@ are untouched. hostvideo/README.md says how it fits together and deploys.
   with the sweep's 16 apps open, 26-57 ms. Remote slowness is mostly the console: QEMU's VNC 30 ms floor, and noVNC's
   tiles over the link; SPICE (already on for virtio-gl) streams changing areas.
 - Codecs: H.264, HEVC 8/10-bit and VP9 decode on the host (HEVC 10 colors right).
+
+## Round 12 (2026-11-18): the first install on a second VM, and 0.1.1
+
+Installing 0.1.0 on a second VM (VM 107: the same macOS build, its own OpenCore, SIP 0x001, on a two-node
+Proxmox cluster with HA) found what VM 108 never could:
+
+- **The first install failed when SIP wasn't relaxed yet.** `--set-security` writes SIP's new value into OpenCore, which
+  starts at the restart, but the install went straight on to rebuild the Auxiliary KC, which needs it now (`kmutil`:
+  "Operation not permitted"). It stopped with the two kexts already in /Library/Extensions; at the restart macOS added
+  them to the KC by itself, so the accelerator offered Metal with no Metal bundle installed. **Fixed** by two passes:
+  the first changes only OpenCore's security settings (and VeneraVideo.kext) and leaves a one-time job
+  (`local.venera.finish`, `install.sh --finish` with the same options), which finishes at the next boot and restarts
+  once more (by itself at the login window, else after a dialog). The job waits up to two minutes for the OpenCore
+  partition (at its first try it ran before the disk was published: "no EFI partition") and stays until the install
+  succeeds, three boots at most. A failed KC rebuild on a first install now takes its kexts out again. Tested on VM
+  108 from SIP 0x001 through the package: both passes, the dialog, the Metal desktop after.
+- **A missing Metal driver left a black screen.** WindowServer asserted in `CoreDisplay_CreateDisplayForCGXDisplayDevice`
+  250 ms after each start, and the guard never fired: it counted WindowServers that opened the Venus client, which
+  only the Metal driver does. **Fixed** in the accelerator (0.6.13): a third WindowServer that opens the display pipe
+  since the arm withdraws too. Tested on VM 108 with the driver moved aside: WindowServers 1 and 2 died, the third
+  withdrew, the fourth ran the software desktop (about 25 s after the login window would have shown).
+- **The watcher warned "no longer on the system volume" on every install without Safari WebGL** (the package's
+  default): it couldn't tell a choice from a macOS update. The installer now records `--no-system-volume`
+  (`NO_SYSVOL`), and the watcher keeps quiet then.
+- **YouTube didn't play: VM 107 had no sound device.** Safari's streaming playback (MSE) won't start without a default
+  output (`-66680 ... Default-Output`, then AVFoundation -11800) and YouTube retried format after format; the video
+  decoder was fine throughout (VP9 on the host GPU). macOS has no driver for QEMU's HDA; USB audio works:
+  `-audiodev spice,id=vsnd -device usb-audio,audiodev=vsnd`. In the install guide's limits.
+- **A cluster.** HA started VM 107 on the other node, which lacked Venus's packages (`mesa-vulkan-drivers`,
+  `virgl-server`, missing from the guide too) and the video socket. `install-host.sh` read VMs with `qm`, which only
+  sees the local node's: on a node that doesn't hold the VM it now sets up only the socket and service (760b761). VM
+  107 starts on either node with graphics, video and sound. Venus and ivshmem block live migration: HA moves it by
+  restarting it.
+- The guide also lacked `host-phys-bits-limit=40` (both VMs needed it).

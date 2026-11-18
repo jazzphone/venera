@@ -16,6 +16,7 @@ fi
 [ -d /System/Library/Extensions/VirtioGPUMetal.bundle ] && echo "  system-volume copy: yes (Safari's WebGL can load it)" ||
   echo "  system-volume copy: no (every app but Safari's WebGL)"
 echo "  authenticated root: $(csrutil authenticated-root status 2>/dev/null | grep -qi disabled && echo off || echo on)"
+[ -f /Library/LaunchDaemons/local.venera.finish.plist ] && echo "  install: finishes after the next restart (local.venera.finish)"
 launchctl print system/local.venera.watch >/dev/null 2>&1 && echo "  watcher: local.venera.watch loaded" ||
   echo "  watcher: not loaded"
 tail -2 "/Library/Application Support/Venera/watch.log" 2>/dev/null | sed 's/^/    /' 

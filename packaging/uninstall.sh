@@ -46,6 +46,10 @@ if [ -f /Library/LaunchAgents/local.venera.helper.plist ]; then
 fi
 [ $DRY = 1 ] || pkill -x Venera 2>/dev/null
 [ -d /Applications/Venera.app ] && run rm -rf /Applications/Venera.app
+# an install's second pass that hasn't run yet
+if [ -f /Library/LaunchDaemons/local.venera.finish.plist ]; then
+  run rm -f /Library/LaunchDaemons/local.venera.finish.plist "/Library/Application Support/Venera/finish-args" "/Library/Application Support/Venera/finish-tries"
+fi
 if [ -f /Library/LaunchDaemons/local.venera.watch.plist ]; then
   [ $DRY = 1 ] || launchctl bootout system/local.venera.watch 2>/dev/null
   run rm -f /Library/LaunchDaemons/local.venera.watch.plist
