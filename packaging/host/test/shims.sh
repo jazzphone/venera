@@ -25,7 +25,8 @@ case $1 in
 enable) shift; for u; do case $u in --*) ;; *) touch "/var/log/shim/enabled.$u" ;; esac; done ;;
 disable) shift; for u; do case $u in --*) ;; *) rm -f "/var/log/shim/enabled.$u" ;; esac; done ;;
 list-units) for f in /var/log/shim/enabled.*; do [ -e "$f" ] && echo "${f#/var/log/shim/enabled.} loaded active running x"; done ;;
-is-active) u=${@: -1}; [ -e "/var/log/shim/enabled.$u" ] || exit 3 ;;
+is-active) u=${@: -1}; if [ -e "/var/log/shim/enabled.$u" ]; then s=active; else s=inactive; fi
+  case " $* " in *" --quiet "*) ;; *) echo $s ;; esac; [ $s = active ] || exit 3 ;;
 esac
 exit 0
 SH

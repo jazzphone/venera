@@ -30,12 +30,25 @@ check "status lists both VMs" 'grep -q "VM 108: device" /tmp/st.log && grep -q "
 check "removing 109 drops its args line" '! grep -q "^args:" /etc/pve/qemu-server/109.conf && [ ! -e /var/log/shim/enabled.venera-videod@109.socket ]'
 ./install-host.sh --vm 108 --vm 300 >/tmp/i3.log 2>&1
 check "an unknown VM is refused before any change" 'grep -q "no VM 300" /tmp/i3.log && ! grep -q "systemctl" /tmp/i3.log'
+# a cluster: VMs on another node (their configs in /etc/pve/nodes/NODE/qemu-server) get this host's socket only
+mkdir -p /etc/pve/nodes/other/qemu-server
+printf 'args: -cpu host %s\ncores: 4\n\n[before]\nargs: -cpu host\n' "${DEV108//108/120}" >/etc/pve/nodes/other/qemu-server/120.conf
+printf 'args: -cpu host\ncores: 4\n' >/etc/pve/nodes/other/qemu-server/121.conf
+cp /etc/pve/nodes/other/qemu-server/120.conf /tmp/120.before; cp /etc/pve/nodes/other/qemu-server/121.conf /tmp/121.before
+./install-host.sh --vm 120 --vm 121 >/tmp/c1.log 2>&1
+check "another node's VMs: sockets here, their configs untouched" '[ -e /var/log/shim/enabled.venera-videod@120.socket ] && [ -e /var/log/shim/enabled.venera-videod@121.socket ] && cmp -s /etc/pve/nodes/other/qemu-server/120.conf /tmp/120.before && cmp -s /etc/pve/nodes/other/qemu-server/121.conf /tmp/121.before'
+check "another node's VMs: what to do there is said" 'grep -q "VM 120 (on other): has its video device" /tmp/c1.log && grep -q "VM 121 is on other: its device goes in there" /tmp/c1.log'
+./install-host.sh --status >/tmp/st2.log 2>&1
+check "status lists another node's VM" 'grep -q "VM 120 (on other): socket active" /tmp/st2.log'
+./install-host.sh --remove-vm 120 >/tmp/c2.log 2>&1
+check "removing another node's VM: socket off, a warning, config untouched" '[ ! -e /var/log/shim/enabled.venera-videod@120.socket ] && grep -q "keeps its device" /tmp/c2.log && cmp -s /etc/pve/nodes/other/qemu-server/120.conf /tmp/120.before'
 ./install-host.sh --uninstall >/tmp/u.log 2>&1; echo "uninstall exit $?"
 check "108 back as it was" '[ "$(args 108)" = "-cpu host,vendor=GenuineIntel -smbios type=2" ]'
 check "only our package removed" 'grep -q "apt-get remove -y intel-media-va-driver" /var/log/shim/apt && grep -qx libva-drm2 /var/log/shim/installed'
 check "files and unit gone, backups kept" '[ ! -e /opt/venera/video ] && [ ! -e /etc/systemd/system/venera-videod@.service ] && [ ! -e /etc/systemd/system/venera-videod@.socket ] && ls /opt/venera/backup/ | grep -q 108'
 check "no instance left enabled" '! ls /var/log/shim/enabled.* >/dev/null 2>&1'
 check "the other VM untouched throughout" 'cmp -s /etc/pve/qemu-server/200.conf /tmp/200.before'
+check "another node's VM untouched by the uninstall" 'cmp -s /etc/pve/nodes/other/qemu-server/121.conf /tmp/121.before'
 # a VM whose args already hold someone else's ivshmem device stays as it is
 printf 'args: -chardev socket,path=/run/other.sock,id=vvideo -device ivshmem-doorbell,chardev=vvideo\n' >/etc/pve/qemu-server/110.conf
 cp /etc/pve/qemu-server/110.conf /tmp/110.before

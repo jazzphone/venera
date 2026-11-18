@@ -24,6 +24,10 @@
 # Important: a VM with the device needs its socket (venera-videod@VMID.socket, enabled at boot) to start; QEMU waits
 # for the service to answer. --remove-vm or --uninstall take the device out first.
 # An older hand-made setup (venera-videod.service, /run/venera-video.sock in the VM's args) is replaced.
+# In a cluster, run it on every node the VM may run on (HA can start it on any of them): on the node that holds the VM
+# it also adds the device to the VM's config (which the cluster shares and moves with the VM); on the others it sets up
+# only the socket and service, so the VM can start there. A VM with the device can't live-migrate (QEMU's ivshmem and
+# Venus devices don't migrate): HA moves it by shutting it down and starting it on the other node.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 PREFIX=/opt/venera
@@ -48,7 +52,21 @@ run() {
   [ $DRY = 1 ] || "$@"
 }
 dev_args() { echo "-chardev socket,path=/run/venera-video-$1.sock,id=vvideo -device ivshmem-doorbell,chardev=vvideo,vectors=1"; }
-vm_args() { qm config "$1" 2>/dev/null | sed -n 's/^args: //p'; }
+# a VM is this node's when its config is in /etc/pve/qemu-server (this node's folder of /etc/pve/nodes); a VM of the
+# cluster's other nodes is read from their folders, and changed only on its own node
+vm_local() { [ -e "/etc/pve/qemu-server/$1.conf" ]; }
+vm_conf() { # the config file of VM $1 on another node
+  local f
+  for f in /etc/pve/nodes/*/qemu-server/"$1".conf; do [ -e "$f" ] && { echo "$f"; return 0; }; done
+  return 1
+}
+vm_node() { local f; f=$(vm_conf "$1") || return 1; f=${f#/etc/pve/nodes/}; echo "${f%%/*}"; }
+vm_args() {
+  local f
+  if vm_local "$1"; then qm config "$1" 2>/dev/null | sed -n 's/^args: //p'
+  elif f=$(vm_conf "$1"); then sed -n '/^\[/q; s/^args: //p' "$f"   # the current config, not a snapshot's
+  fi
+}
 state_get() { sed -n "s/^$1=//p" "$STATE" 2>/dev/null | tail -1; }
 state_set() {
   [ $DRY = 1 ] && return
@@ -79,7 +97,9 @@ command -v qm >/dev/null && command -v pveversion >/dev/null || die "this is for
 # check_vm ID: 0 when the VM can take our device (or has it), else dies saying why; nothing changes
 check_vm() {
   local id=$1 cur want
-  qm config "$id" >/dev/null 2>&1 || die "no VM $id on this host"
+  if vm_local "$id"; then qm config "$id" >/dev/null 2>&1 || die "no VM $id on this host"
+  else vm_conf "$id" >/dev/null || die "no VM $id on this host or the cluster's other nodes"
+  fi
   cur=$(vm_args "$id")
   want=$(dev_args "$id")
   case " $cur " in
@@ -93,6 +113,13 @@ add_vm() {
   check_vm "$id"
   cur=$(vm_args "$id")
   want=$(dev_args "$id")
+  if ! vm_local "$id"; then   # its config is changed on its own node; this node only needs the socket
+    case " $cur " in
+    *" $want "*) say "VM $id (on $(vm_node "$id")): has its video device; this host's socket is ready for when it runs here" ;;
+    *) say "VM $id is on $(vm_node "$id"): its device goes in there (./install-host.sh --vm $id on that node); this host's socket is ready for when it runs here" ;;
+    esac
+    return
+  fi
   case " $cur " in
   *" $want "*) say "VM $id: has its video device already"; return ;;
   esac
@@ -112,16 +139,23 @@ remove_vm() {
   local id=$1 cur want new
   cur=$(vm_args "$id")
   want=$(dev_args "$id")
-  case " $cur " in
-  *" $want "*)
-    new=$(printf '%s' " $cur " | sed "s# $want # #; s/^ *//; s/ *$//")
-    run mkdir -p "$PREFIX/backup"
-    run cp "/etc/pve/qemu-server/$id.conf" "$PREFIX/backup/$id.conf.$(date +%Y%m%d-%H%M%S)"
-    if [ -n "$new" ]; then run qm set "$id" --args "$new"; else run qm set "$id" --delete args; fi
-    say "VM $id: video device taken out (its QEMU keeps it until the VM stops)"
-    ;;
-  *) say "VM $id: no video device of ours" ;;
-  esac
+  if ! vm_local "$id" && vm_conf "$id" >/dev/null; then   # its config is changed on its own node, not here
+    case " $cur " in
+    *" $want "*) warn "VM $id is on $(vm_node "$id") and keeps its device: it can't start on this host now (take the device out there: ./install-host.sh --remove-vm $id)" ;;
+    *) say "VM $id (on $(vm_node "$id")): this host's socket for it off" ;;
+    esac
+  else
+    case " $cur " in
+    *" $want "*)
+      new=$(printf '%s' " $cur " | sed "s# $want # #; s/^ *//; s/ *$//")
+      run mkdir -p "$PREFIX/backup"
+      run cp "/etc/pve/qemu-server/$id.conf" "$PREFIX/backup/$id.conf.$(date +%Y%m%d-%H%M%S)"
+      if [ -n "$new" ]; then run qm set "$id" --args "$new"; else run qm set "$id" --delete args; fi
+      say "VM $id: video device taken out (its QEMU keeps it until the VM stops)"
+      ;;
+    *) say "VM $id: no video device of ours" ;;
+    esac
+  fi
   if systemctl list-unit-files 'venera-videod@.service' >/dev/null 2>&1; then
     run systemctl disable --now "venera-videod@$id.socket" "venera-videod@$id.service"
     run systemctl clean --what=fdstore --what=state "venera-videod@$id.service"
@@ -137,6 +171,16 @@ our_vms() {
   done
 }
 
+# the VMs of the cluster's other nodes that this host has a socket for
+other_nodes_vms() {
+  local u id
+  for u in $(systemctl list-units --all --plain --no-legend 'venera-videod@*.socket' 2>/dev/null | awk '{print $1}'); do
+    case $u in venera-videod@*.socket) ;; *) continue ;; esac
+    id=${u#venera-videod@}; id=${id%.socket}
+    vm_local "$id" || echo "$id"
+  done
+}
+
 case $MODE in
 status)
   say "Venera host: $(cat "$PREFIX/VERSION" 2>/dev/null || echo 'not installed')"
@@ -147,6 +191,9 @@ status)
   for id in $(our_vms); do
     say "  VM $id: device in its args; socket $(systemctl is-active "venera-videod@$id.socket" 2>/dev/null), service $(systemctl is-active "venera-videod@$id.service" 2>/dev/null); VM $(qm status "$id" 2>/dev/null | cut -d' ' -f2)"
   done
+  for id in $(other_nodes_vms); do
+    say "  VM $id (on $(vm_node "$id")): socket $(systemctl is-active "venera-videod@$id.socket" 2>/dev/null), ready for when it runs here"
+  done
   exit 0
   ;;
 remove)
@@ -155,6 +202,7 @@ remove)
   ;;
 uninstall)
   for id in $(our_vms); do remove_vm "$id"; done
+  for id in $(other_nodes_vms); do remove_vm "$id"; done
   for u in $(systemctl list-units --all --plain --no-legend 'venera-videod@*' 2>/dev/null | awk '{print $1}'); do
     run systemctl disable --now "$u"
   done

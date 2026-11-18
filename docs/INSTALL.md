@@ -16,6 +16,10 @@ VM first.
 | Host GPU | Intel Iris Xe (Alder Lake), Mesa ANV | any GPU with a Vulkan 1.3 driver that can export dma-bufs (Mesa ANV or RADV; NVIDIA's driver is untested) |
 | Display | Proxmox's `virtio-gl` display (egl-headless + noVNC) | an OpenGL display backend (`egl-headless`, `gtk,gl=on`, `sdl,gl=on`, `spice-app,gl=on`) |
 
+On Proxmox (Debian 13), the host needs two packages beside its own: `apt install mesa-vulkan-drivers virgl-server`
+(the GPU's Vulkan driver, and Venus's render server: without it the guest's Venus contexts are never really created).
+In a cluster, every node the VM may run on needs them.
+
 On Proxmox, the VM's config needs (`qm set` or `/etc/pve/qemu-server/VMID.conf`):
 
 ```
@@ -29,6 +33,10 @@ On plain QEMU:
 -device virtio-vga-gl,venus=on,blob=on,hostmem=2G -display egl-headless,rendernode=/dev/dri/renderD128
 -object memory-backend-memfd,id=mem,size=8G,share=on -machine memory-backend=mem
 ```
+
+**Also limit the guest's physical address width to 40 bits** (`host-phys-bits-limit=40` in the `-cpu` option, e.g.
+`-cpu host,host-phys-bits-limit=40,...` in the same `args:` line). Without it, the firmware can place the GPU's memory
+window above 2^44, which macOS's kernel can't address, and the driver finds no GPU memory.
 
 `hostmem` is the window the guest maps GPU memory through; 2 GB is plenty for a desktop. Venus needs the guest's
 memory to be shareable with the host renderer (memfd on plain QEMU; Proxmox does it for you).
@@ -156,6 +164,12 @@ frame (a second or two). A host with no usable GPU still serves the VM, answerin
 guest decodes in software. Debugging: `systemctl kill -s USR1 venera-videod@VMID` toggles verbose logging (and message
 dumps in `/var/lib/venera-video/VMID`), `-s USR2` logs its state.
 
+**In a cluster, run it on every node the VM may run on** (HA can start the VM on any of them, and a VM with the device
+won't start where its socket is missing). On the node that holds the VM it also adds the device to the VM's config,
+which the cluster shares; on the others it sets up only the socket and service (`--status` lists them as "ready for
+when it runs here"). Each node needs Venus as well (`mesa-vulkan-drivers` and `virgl-server`, under "Host" above). A VM
+with Venus or the video device can't live-migrate: HA moves it by shutting it down and starting it on the other node.
+
 **A VM with the device needs `VeneraVideo.kext`.** Without it, Apple's VirtIO driver takes the device and hangs on
 it, and the boot doesn't publish the partitions of disks found after it -- the OpenCore disk among them, so an
 installer finds no OpenCore. So install the guest's half before the VM starts with the device; the installer adds
@@ -230,6 +244,11 @@ The accelerator flips at most once per 12 ms by default (`vgpuflipms=N` boot-arg
 
 ## Known limits
 
+- **A VM needs a sound device for YouTube and other streaming sites**: Safari's streaming playback (Media Source
+  Extensions) won't start without a default audio output, and keeps retrying (CoreAudio logs `-66680 ...
+  Default-Output`). macOS has no driver for QEMU's Intel HDA, but drives USB audio itself: add
+  `-audiodev spice,id=vsnd -device usb-audio,audiodev=vsnd` to the VM's `args:` (sound plays in Proxmox's SPICE
+  console; `none` instead of `spice` drops it) and shut the VM down and start it again.
 - One display, in the modes the host offers (1024x768 to 1920x1080 on Proxmox; switching works with the Metal
   desktop running); no HDR, no multiple displays yet.
 - **Proxmox's noVNC console shows at most ~33 fps**: QEMU's VNC server sends an update at most every 30 ms
