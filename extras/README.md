@@ -34,10 +34,9 @@ sudo ./venera-tune.sh server
 | Restart after a freeze | yes | macOS restarts by itself if it hangs |
 | The clock from the network | yes | `time.apple.com`, set now and kept set |
 | No App Nap | yes | apps in the background keep their full speed (servers, scripts in Terminal) |
+| Automatic login | yes | macOS logs in at startup as the user who ran it, so the desktop, its apps and Screen Sharing come back after a restart. An account with no password needs nothing; one with a password asks for it (checked first; macOS keeps it scrambled in `/etc/kcpassword`, as System Settings does). With `--yes`, an account with a password is skipped. Not possible with FileVault on |
 | Remote Login (SSH) | no | on, for every user who can log in |
 | Screen Sharing | no | on (the Mac's Screen Sharing app, or VNC on port 5900) |
-
-Automatic login isn't here: it needs your password, so set it in **System Settings > Users & Groups**.
 
 ## Status and undo
 

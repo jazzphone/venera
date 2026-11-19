@@ -22,7 +22,7 @@ From macOS Recovery (before macOS is installed, after it, or as a rescue), in Te
 Extras (any macOS VM, with or without Venera): "Quieter macOS" turns off background services a VM doesn't need
 (automatic macOS upgrades, photo and media analysis, Siri, Game Center, diagnostics uploads; Spotlight's indexing if
 you want), and "Server Settings" keeps it always on (no sleep or hibernation file, no screen saver, restart after a
-freeze; SSH and Screen Sharing if you want). Double-click one: it asks before each change, and
+freeze, automatic login; SSH and Screen Sharing if you want). Double-click one: it asks before each change, and
   sudo "/Volumes/Venera Tools/Extras/venera-tune.sh" undo
 puts back everything it changed.
 

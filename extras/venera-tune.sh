@@ -6,7 +6,8 @@
 #                                  and media analysis, Siri and Game Center off, no diagnostics upload, Apple's power
 #                                  logging off; Spotlight's indexing and the blur behind menus if you want
 #   sudo ./venera-tune.sh server   always on: no sleep, no hibernation file, no screen saver, restart after a freeze,
-#                                  the clock from the network, no App Nap; SSH and Screen Sharing if you want
+#                                  the clock from the network, no App Nap, automatic login (it asks for the
+#                                  password, when the account has one); SSH and Screen Sharing if you want
 #   sudo ./venera-tune.sh status   each setting as it is now, and which ones this script changed
 #   sudo ./venera-tune.sh undo     puts back everything this script changed, as it was
 #   --yes                          takes each setting's suggestion without asking
@@ -172,8 +173,56 @@ T_screensharing="Screen Sharing on (the Mac's Screen Sharing app, or VNC, on por
 now_screensharing() { lc_state system com.apple.screensharing; }
 do_screensharing() { lc_on com.apple.screensharing /System/Library/LaunchDaemons/com.apple.screensharing.plist; }
 
+T_autologin="Log in by itself at startup (as the user who ran this), so the desktop, its apps and Screen Sharing come back after a restart"
+LW=/Library/Preferences/com.apple.loginwindow
+nopass() { dscl . -authonly "$1" "" >/dev/null 2>&1; }   # an account with no password
+now_autologin() {
+  local who; who=$(defaults read $LW autoLoginUser 2>/dev/null)
+  echo "$([ -n "$who" ] && echo "on, as $who" || echo off)$(fdesetup isactive >/dev/null 2>&1 && echo "; FileVault is on")$([ -n "$U" ] && nopass "$U" && echo "; $U has no password")"
+}
+# /etc/kcpassword, as macOS writes it: the password and a NUL, padded with NULs to a multiple of 12 bytes, each byte
+# XORed with Apple's fixed key (sysadminctl leaves it out for an account with no password, and then nobody is logged
+# in). Bash alone: the password never goes on a command line.
+kcpassword() {   # the password on stdin -> /etc/kcpassword
+  local key="125 137 82 35 210 188 221 234 163 185 31" k b i=0 out=""
+  set -- $key
+  local bytes; bytes="$(od -An -tu1 -v) 0"
+  local n=0; for b in $bytes; do n=$((n + 1)); done
+  while [ $((n % 12)) != 0 ]; do bytes="$bytes 0"; n=$((n + 1)); done
+  for b in $bytes; do
+    eval "k=\${$((i % 11 + 1))}"
+    out="$out$(printf '\\%03o' $((b ^ k)))"; i=$((i + 1))
+  done
+  (umask 077; printf "$out" >/etc/kcpassword); chown root:wheel /etc/kcpassword
+}
+autologin_back() {   # undo: off again, or a note when it was someone else's (that needs their password)
+  rm -f /etc/kcpassword; defaults delete $LW autoLoginUser >/dev/null 2>&1
+  [ -z "${1:-}" ] || echo "automatic login was $1's before: set it again in System Settings > Users & Groups"
+}
+do_autologin() {
+  local cur pw="" try
+  [ -n "$U" ] || { say "(skipped: nobody is logged in)"; return 0; }
+  if fdesetup isactive >/dev/null 2>&1; then
+    say "! FileVault is on, and macOS never logs in by itself with it (System Settings > Privacy & Security > FileVault)"; return 0
+  fi
+  cur=$(defaults read $LW autoLoginUser 2>/dev/null)
+  [ "$cur" = "$U" ] && return 0
+  if ! nopass "$U"; then
+    if [ $YES = 1 ]; then say "(skipped: $U has a password; run it without --yes to type it)"; return 0; fi
+    for try in 1 2 3; do
+      read -r -s -p "    $U's password (macOS keeps it, scrambled, in /etc/kcpassword to log in with): " pw </dev/tty; echo
+      dscl . -authonly "$U" "$pw" >/dev/null 2>&1 && break
+      say "that isn't $U's password"; pw=""
+    done
+    [ -n "$pw" ] || { say "(skipped: no password)"; return 0; }
+  fi
+  undo_add "$(q autologin_back "$cur")"
+  printf '%s' "$pw" | kcpassword && defaults write $LW autoLoginUser "$U" || say "! couldn't turn it on"
+  pw=""
+}
+
 QUIET="updates:y analysis:y siri:y gamecenter:y diagnostics:y powerlog:y spotlight:n transparency:n"
-SERVER="nosleep:y hibernate:y screensaver:y freeze:y time:y appnap:y ssh:n screensharing:n"
+SERVER="nosleep:y hibernate:y screensaver:y freeze:y time:y appnap:y autologin:y ssh:n screensharing:n"
 
 text() { eval "echo \"\$T_$1\""; }
 

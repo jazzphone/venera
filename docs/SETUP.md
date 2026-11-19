@@ -92,7 +92,7 @@ Then open the **Venera Tools** disc on the desktop, its **Extras** folder, and d
   newer macOS can fall back to the slower software desktop until then), and fewer background services using the CPU
   (photo and media analysis, Siri, Game Center, diagnostics uploads);
 - **Server Settings**, if the VM should stay on: never sleep, no hibernation file, no screen saver, restart after a
-  freeze, the clock from the network; SSH and Screen Sharing if you want.
+  freeze, the clock from the network, automatic login; SSH and Screen Sharing if you want.
 
 Each asks before every change (Enter takes the suggestion) and can be undone; [extras/README.md](../extras/README.md)
 has the list. To do it by hand instead, in **System Settings**: **General > Software Update > Automatic Updates**
