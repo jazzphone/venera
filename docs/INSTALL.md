@@ -163,7 +163,8 @@ speaks the QEMU guest agent protocol that Proxmox uses with Linux and Windows gu
 - the VM's **Summary** shows its IP addresses, and `qm agent VMID` answers `get-osinfo`, `get-host-name`, `get-users`,
   `get-fsinfo`, `get-time`, `get-vcpus` and the rest;
 - the host can run commands and copy files in: `qm guest exec` (with `--pass-stdin`), the API's `agent/file-write` and
-  `agent/file-read`;
+  `agent/file-read` (a Proxmox bug: `qm guest exec` sends only part of a command with a character past U+07FF in it,
+  a check mark or an emoji, and times out; the agent drops what it left behind and answers the next request);
 - `qm guest passwd VMID USER` sets a local account's password, as an administrator's reset does (the login keychain
   keeps the old password, and macOS offers to update it at the next login);
 - a backup's `fs-freeze` syncs the disks (APFS can't be frozen from outside the kernel: macOS reports no file system
@@ -171,6 +172,16 @@ speaks the QEMU guest agent protocol that Proxmox uses with Linux and Windows gu
 
 macOS VMs don't sleep or hibernate here, so the suspend commands answer "Unsupported", as do Linux's memory-block
 commands.
+
+**The clipboard.** With the same choice comes `venera-clipboard` (the LaunchAgent `local.venera.clipboard`, in each
+logged-in user's session): copy in macOS and paste in the Proxmox console's clipboard panel, or the other way, as
+spice-vdagent does for Linux guests. It speaks the SPICE agent protocol on QEMU's `com.redhat.spice.0` port
+(through VeneraConsole.kext, which lets the logged-in user open that port and only root the agent's). In Proxmox,
+set the VM's **Hardware > Display > Clipboard** to **VNC** (`vga: virtio-gl,clipboard=vnc`) and restart the VM: QEMU's
+own vdagent then joins the noVNC console's clipboard to it (text, UTF-8). Left at the default, the port goes to a
+SPICE client instead (remote-viewer), which also takes images (PNG). A VM pinned to a machine version below 10.1
+can't live-migrate with the VNC clipboard; the VM script turns it on only where it can (new VMs, Ready, Finish).
+Its messages are in the unified log: `log show --last 1h --predicate 'process == "venera-clipboard"'`.
 
 **Turn it on in Proxmox**: the VM's **Options > QEMU Guest Agent**: on, with **Type** VirtIO (the default), then shut
 the VM down and start it (QEMU adds the port when it starts). The agent also answers on the ISA serial port (Type ISA),

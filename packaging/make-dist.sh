@@ -21,7 +21,7 @@ cp -R build/VirtioGPUMetal.bundle $D/payload/GPUBundles/
 cp packaging/install.sh packaging/uninstall.sh packaging/status.sh $D/
 cp packaging/sysvol.sh packaging/venera-watch.sh packaging/local.venera.watch.plist helper/local.venera.helper.plist $D/payload/Support/
 cp -R build/Venera.app $D/payload/Apps/
-cp build/venera-agent agent/local.venera.agent.plist $D/payload/Support/
+cp build/venera-agent agent/local.venera.agent.plist build/venera-clipboard agent/local.venera.clipboard.plist $D/payload/Support/
 # the translation pool's seed (tools/seed-pool.sh): only one made with this translator
 TR=$(shasum -a 256 build/translator/libnvmtl_translate.dylib | cut -c1-12)
 SEED=$(ls packaging/seed/pool-*-$TR.tar.gz 2>/dev/null | head -1 || true)

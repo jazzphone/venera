@@ -79,6 +79,11 @@ while IFS= read -r d; do
     case "$d" in /private/var/folders/zz/*) run rm -rf "$d" ;; esac
   fi
 done < <(find /private/var/folders /Users/*/Library/Containers -type d -name local.homelab.VirtioGPUMetal -prune 2>/dev/null)
+# the clipboard agent, in the console user's session
+if [ -f /Library/LaunchAgents/local.venera.clipboard.plist ]; then
+  [ $DRY = 1 ] || { [ "$CUID" -ge 501 ] 2>/dev/null && launchctl bootout "gui/$CUID/local.venera.clipboard" 2>/dev/null; }
+  run rm -f /Library/LaunchAgents/local.venera.clipboard.plist
+fi
 # the guest agent, stopped by a one-time job once this has finished (it may be carrying this very uninstall: stopping
 # it now would end this script with it), and mac-guest-agent back if Venera's took its place
 if [ -f /Library/LaunchDaemons/local.venera.agent.plist ]; then

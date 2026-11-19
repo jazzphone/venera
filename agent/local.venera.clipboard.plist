@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Venera's clipboard agent (agent/venera-clipboard.m): the Proxmox console's clipboard, in each logged-in user's
+     session. Its messages are in the unified log (process venera-clipboard). -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>local.venera.clipboard</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/Application Support/Venera/venera-clipboard</string>
+    </array>
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

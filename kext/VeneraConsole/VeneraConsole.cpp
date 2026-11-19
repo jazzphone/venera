@@ -8,8 +8,9 @@
 // port's queued output and completes the buffers, so here the host closing and opening a port is just state: writes
 // go on (QEMU drops them while the host is away) and nothing waits for good.
 //
-// What it offers is a user client (VeneraConsoleAPI.h), root only: list the ports, open one by name, read with a
-// timeout, write with a timeout. No tty. It is matched ahead of Apple's virtio transport (which takes every virtio
+// What it offers is a user client (VeneraConsoleAPI.h): list the ports, open one by name, read with a timeout, write
+// with a timeout. No tty. The guest agent's port runs the host's commands as root, so only root opens it; the others
+// (SPICE's agent channel, for the clipboard) the logged-in user may open too. It is matched ahead of Apple's virtio transport (which takes every virtio
 // PCI device), so it loads through OpenCore, as VirtioGPU.kext and VeneraVideo.kext do.
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOFilterInterruptEventSource.h>
@@ -783,6 +784,7 @@ private:
     void closeDown();
     VeneraConsole *drv_ = nullptr;
     int32_t port_ = -1;
+    bool admin_ = false;
     volatile SInt32 closed_ = 0;
 };
 
@@ -792,8 +794,9 @@ bool VeneraConsoleUserClient::initWithTask(task_t owningTask, void *securityID, 
     if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
         return false;
     }
-    // the host's agent port runs commands as root: only root may hold it
-    return clientHasPrivilege(owningTask, kIOClientPrivilegeAdministrator) == kIOReturnSuccess;
+    admin_ = clientHasPrivilege(owningTask, kIOClientPrivilegeAdministrator) == kIOReturnSuccess;
+    // anyone else: only the user logged in at the console (and only ports other than the agent's, at open)
+    return admin_ || clientHasPrivilege(owningTask, kIOClientPrivilegeLocalUser) == kIOReturnSuccess;
 }
 
 bool VeneraConsoleUserClient::start(IOService *provider) {
@@ -842,6 +845,9 @@ IOReturn VeneraConsoleUserClient::externalMethod(uint32_t selector, IOExternalMe
         }
         char name[57] = {};
         memcpy(name, a->structureInput, a->structureInputSize);
+        if (!admin_ && !strncmp(name, "org.qemu.guest_agent", 20)) {
+            return kIOReturnNotPrivileged;   // the host's agent port runs commands as root: only root may hold it
+        }
         uint32_t id = 0;
         IOReturn rc = drv_->open(name, this, &id);
         if (rc == kIOReturnSuccess) {

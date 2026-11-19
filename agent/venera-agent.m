@@ -3,7 +3,7 @@
 // addresses on the VM's Summary, commands and files from the host, and the clock set; Venera's VM script reads
 // Venera's status and installs upgrades through it.
 //
-//   venera-agent [--device PATH] [--stdio] [--version]
+//   venera-agent [--device PATH] [--stdio] [--answer-max BYTES] [--version]   (VENERA_AGENT_TRACE=1: log every request)
 //
 // The port: QEMU's virtio-serial channel org.qemu.guest_agent.0 when the VM has one (Proxmox's agent type virtio),
 // through Venera's own driver (VeneraConsole.kext) when it is in, else through macOS's tty for it; else the ISA
@@ -721,6 +721,7 @@ static void handle(NSData *json) {
     }
     NSString *cmd = str(req, @"execute");
     id reqId = req[@"id"];
+    if (getenv("VENERA_AGENT_TRACE")) logf_(@"request %@ (%lu bytes)", cmd, (unsigned long)json.length);
     NSDictionary *args = [req[@"arguments"] isKindOfClass:[NSDictionary class]] ? req[@"arguments"] : @{};
     if (!cmd) { reply(GENERIC(@"no \"execute\""), reqId, NO); return; }
     if ([cmd isEqualToString:@"guest-sync"] || [cmd isEqualToString:@"guest-sync-delimited"]) {
@@ -799,6 +800,7 @@ static void serve(int in) {
     int depth = 0;
     BOOL inStr = NO, esc = NO;
     uint8_t chunk[65536];
+    uint64_t lastByte = 0;
     for (;;) {
         ssize_t n;
         if (gConn) {   // VeneraConsole: a read waits up to 2 s, 0 bytes when nothing came
@@ -815,6 +817,17 @@ static void serve(int in) {
             n = read(in, chunk, sizeof chunk);
         }
         if (n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+        // A request left unfinished by a host that went away: Proxmox's `qm guest exec` sends only part of a request
+        // with a character past U+07FF in it (a check mark, an emoji) and gives up, and the rest of it never comes.
+        // Proxmox never sends the 0xFF that would reset the parser, so every later request would land inside that
+        // string. A request arrives in one go; one that has sat with nothing more for longer than Proxmox ever waits
+        // for an answer (5 s) is dropped before the new bytes are read.
+        uint64_t now = monoNs();
+        if (n > 0 && buf.length && lastByte && now - lastByte > 4000000000ull) {
+            logf_(@"dropped an unfinished request (%lu bytes) its host left behind", (unsigned long)buf.length);
+            buf.length = 0; depth = 0; inStr = esc = NO;
+        }
+        if (n > 0) lastByte = now;
         if (n <= 0) {
             if (gStdio) exit(0);
             logf_(@"the port closed (%s): reopening", n < 0 ? strerror(errno) : "end of file");

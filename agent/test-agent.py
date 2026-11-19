@@ -90,6 +90,10 @@ r = json.loads(ask({'execute': 'guest-set-user-password', 'arguments': {'usernam
 check('a crypted password is Unsupported', r.get('error', {}).get('class') == 'Unsupported', r)
 r = json.loads(ask(raw=b'  {"execute": "guest-ping", "id": "a{b}\\"}"}  '))
 check('braces and quotes inside strings, and the id echoed', r == {'return': {}, 'id': 'a{b}"}'}, r)
+p.stdin.write(b'{"execute": "guest-exec", "arguments": {"path": "/bin/echo", "arg": ["half a requ'); p.stdin.flush()
+time.sleep(4.5)   # what Proxmox leaves behind when it sends only part of a request
+r = json.loads(ask({'execute': 'guest-ping'}))
+check('a request its host left unfinished is dropped once the next one comes', r == {'return': {}}, r)
 r = ask(raw=b'{"execute": "guest-pi' + b'\xff{"execute":"guest-sync","arguments":{"id":7}}')
 check('0xFF throws away a half request', r == b'{"return":7}\n', r)
 p.stdin.close()

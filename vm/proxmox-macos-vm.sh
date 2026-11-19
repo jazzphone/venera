@@ -239,6 +239,12 @@ guest() {   # guest COMMAND: runs a shell command in macOS through the guest age
   qm guest exec "$VMID" --timeout 60 -- /bin/sh -c "$1" 2>/dev/null |
     python3 -c 'import json, sys; d = json.load(sys.stdin); print(d.get("out-data", ""), end="")' 2>/dev/null || true
 }
+clipboard_ok() {   # the console's clipboard (vga clipboard=vnc) keeps live migration only from machine 10.1 (Proxmox)
+  local m; m=$(qm config "$VMID" 2>/dev/null | sed -n 's/^machine: //p')
+  case $m in *q35-[0-9]*|*i440fx-[0-9]*|pc-[0-9]*) ;; *) return 0 ;; esac   # unpinned: the newest, fine
+  local v; v=$(grep -o '[0-9][0-9]*\.[0-9][0-9]*' <<<"$m" | head -1)
+  [ -n "$v" ] && [ "$(printf '%s\n10.1\n' "$v" | sort -V | head -1)" = 10.1 ]
+}
 drop_disk() {   # takes the disk in slot $1 out of the VM and deletes its volume (the VM stopped)
   local vol u
   vol=$(qm config "$VMID" | sed -n "s/^$1: \([^,]*\).*/\1/p"); [ -n "$vol" ] || return 0
@@ -296,7 +302,7 @@ finish_vm() {   # macOS and Venera installed: hardware video, the installer disk
     echo "  (no guest agent answers: can't read Venera's status. Venera's installer puts one in, its Proxmox guest agent"
     echo "   choice; on a VM made before 0.1.6 the agent port may be ISA: it answers there too)"
   fi
-  local VIDEO=0 drops=() HASDEV=0 RESTART=0 VIRTIO_AGENT=0
+  local VIDEO=0 drops=() HASDEV=0 RESTART=0 VIRTIO_AGENT=0 CLIP=0
   case " $(qm config "$VMID" | sed -n 's/^args: //p') " in *"/run/venera-video-$VMID.sock"*) HASDEV=1 ;; esac
   gpu_scan
   if [ "$GPU_KIND" = intel ] && [ -n "$HOSTKIT" ]; then
@@ -315,11 +321,16 @@ finish_vm() {   # macOS and Venera installed: hardware video, the installer disk
   done
   # Venera's agent answers on either port; the virtio one is ten times faster than the ISA serial port
   if [[ $st == *"guest agent"* ]] && ! qm config "$VMID" | grep -q '^agent:.*type=virtio'; then VIRTIO_AGENT=1; fi
-  { [ $VIDEO = 1 ] && [ $HASDEV = 0 ]; } || [ ${#drops[@]} -gt 0 ] || [ $VIRTIO_AGENT = 1 ] && RESTART=1
+  # the Proxmox console's clipboard (Venera's clipboard agent on the other end), where live migration keeps working
+  if [[ $st == *"guest agent"* ]] && ! qm config "$VMID" | grep -q '^vga:.*clipboard=vnc'; then
+    if clipboard_ok; then CLIP=1; else echo "  (the console's clipboard: not on a VM pinned below machine 10.1, which then couldn't live-migrate)"; fi
+  fi
+  { [ $VIDEO = 1 ] && [ $HASDEV = 0 ]; } || [ ${#drops[@]} -gt 0 ] || [ $VIRTIO_AGENT = 1 ] || [ $CLIP = 1 ] && RESTART=1
   echo; echo "== The plan"
   [ $VIDEO = 1 ] && echo "  - hardware video: install-host.sh --vm $VMID here${nodes[*]:+ and on ${nodes[*]}}$([ $HASDEV = 1 ] && echo " (the VM has its device: this updates the service)")"
   [ ${#drops[@]} -gt 0 ] && echo "  - take out ${drops[*]} (the recovery disk is deleted; the Venera Tools ISO stays in its storage)"
   [ $VIRTIO_AGENT = 1 ] && echo "  - the guest agent on its virtio port (faster than the ISA serial port)"
+  [ $CLIP = 1 ] && echo "  - the Proxmox console's clipboard shared with macOS (display: clipboard=vnc)"
   [ $up = 1 ] && echo "  - in macOS: set the clock once, Apple's power logging (PerfPowerServices) off (it held a core at ~90%)"
   [ $RESTART = 1 ] && echo "  - shut VM $VMID down and start it again (QEMU picks up the device and disk changes when it starts)"
   yes_no "Go ahead?" || die "nothing changed"
@@ -339,6 +350,7 @@ finish_vm() {   # macOS and Venera installed: hardware video, the installer disk
   if [ $VIDEO = 1 ]; then echo "== hardware video here"; "$HOSTKIT/install-host.sh" --vm "$VMID" | sed 's/^/   /'; fi
   for s in "${drops[@]}"; do drop_disk "$s"; done
   [ $VIRTIO_AGENT = 0 ] || { qm set "$VMID" --agent enabled=1,type=virtio >/dev/null; echo "   guest agent port: virtio"; }
+  [ $CLIP = 0 ] || { qm set "$VMID" --vga "$(qm config "$VMID" | sed -n 's/^vga: //p'),clipboard=vnc" >/dev/null; echo "   display: the console's clipboard on"; }
   [ $RESTART = 0 ] || { echo "== starting VM $VMID"; qm start "$VMID"; }
   echo "== Done. In macOS, the Venera app (Applications) shows what runs. The config before: /root/macos-vm-backup/."
 }
@@ -361,7 +373,7 @@ ready_vm() {   # an existing macOS VM (stopped): the host's packages, the displa
   echo "== the host"; host_prep $VENUS_PKGS genisoimage || die "the packages didn't install (apt)"
   for n in "${nodes[@]}"; do echo "== $n"; on_node "$n" "$(declare -f missing_pkgs host_prep); host_prep $VENUS_PKGS" || die "$n's packages didn't install (apt on $n)"; done
   backup_conf
-  qm set "$VMID" --vga virtio-gl --args "$new" >/dev/null; echo "   display virtio-gl, args updated"
+  qm set "$VMID" --vga "virtio-gl$(clipboard_ok && echo ,clipboard=vnc)" --args "$new" >/dev/null; echo "   display virtio-gl, args updated"
   attach_venera_disk
   echo "== Done. Start VM $VMID, open Install Venera on the Venera Tools CD (on the desktop) and restart when"
   echo "   it says so (when SIP has to change it finishes after one more restart). Then run this again and choose Finish."
@@ -644,7 +656,7 @@ echo "== VM $VMID"
 # console's mouse to one of them; on VM 107 it went to Proxmox's, which macOS had stopped reading, and the mouse died.
 ARGS="-smbios type=2 -device qemu-xhci -device usb-kbd -device usb-tablet -global nec-usb-xhci.msi=off -global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off -cpu host,vendor=GenuineIntel,+invtsc,+hypervisor,kvm=on,vmware-cpuid-freq=on -device isa-applesmc,osk=\"$OSK\""
 VGA=vmware
-if [ $VENERA = 1 ]; then VGA=virtio-gl; ARGS=$(venera_args "$ARGS" $AUDIO)
+if [ $VENERA = 1 ]; then VGA=virtio-gl,clipboard=vnc; ARGS=$(venera_args "$ARGS" $AUDIO)
 elif [ $AUDIO = 1 ]; then ARGS="$ARGS -audiodev spice,id=vsnd -device usb-audio,audiodev=vsnd"; fi
 qm create "$VMID" --name "$NAME" --ostype other --machine q35 --bios ovmf \
   --cores "$CORES" --sockets 1 ${PCORES:+--affinity "$PCORES"} --memory "$MEM" --balloon 0 \

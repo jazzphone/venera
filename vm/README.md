@@ -70,6 +70,9 @@ Run it again with the VM's name:
    - takes out the recovery disk (deleted) and the Venera Tools CD (its ISO stays in the storage, for the next VM);
    - moves the guest agent to its virtio port, when Venera's agent is in and the VM still has the ISA one (made
      before 0.1.6): about ten times faster;
+   - turns on the Proxmox console's clipboard (`vga: ...,clipboard=vnc`), which Venera's clipboard agent answers,
+     unless the VM is pinned to a machine version below 10.1 (it couldn't live-migrate then). New VMs have it from
+     the start;
    - sets the clock once and turns off Apple's power logging, which held a core at ~90% in the VM;
    - shuts the VM down and starts it again, since QEMU picks up a new device only when it starts.
 

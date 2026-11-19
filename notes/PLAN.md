@@ -1865,3 +1865,20 @@ The owner: build our own guest agent rather than lean on mac-guest-agent, make m
      VeneraConsole, 1 and 5 MB outputs, a 5 MB file read (4.9 s, checksum equal), 900 KB stdin, three hang-ups
      mid-answer with the next connection answered in 0.01 s (no drop, no reopen), two reboots through the agent
      (~10 s down, ~21 s to the agent). Snapshot pre-console on VM 108 is the state before the driver.
+- **The clipboard** (the owner: "clipboard sharing wasn't implemented? We should implement it"). Proxmox gives a
+  virtio-gl VM the port com.redhat.spice.0 on a second virtio-serial device: spicevmc by default (a SPICE client), or
+  with `vga: ...,clipboard=vnc` QEMU's own vdagent (ui/vdagent.c), which joins the VNC (noVNC) clipboard to it. Both
+  speak the SPICE agent protocol (vd_agent.h): chunks (port, size) carrying messages; capabilities asked for when the
+  guest opens the port; on demand: GRAB (types) -> REQUEST (type) -> CLIPBOARD (data). `agent/venera-clipboard.m`, a
+  LaunchAgent in each user's session, does that against NSPasteboard (the change count polled twice a second; a grab
+  from the host requested at once; text UTF-8, PNG for SPICE clients; Latin-1 fallback, since QEMU passes a VNC
+  client's plain cut text on as it is). VeneraConsole lets the console user open ports other than the guest agent's.
+  QEMU sends the guest's clipboard only to VNC clients with the extended clipboard (noVNC has it); the test client
+  (scratch vncclip.py) speaks it. On VM 108 through `qm vncproxy`: console -> macOS 1, 3, 12 KB and UTF-8; macOS ->
+  console 9.6 KB UTF-8 across many chunks. Live migration with clipboard=vnc needs machine 10.1+ (VM 107 runs 11.1);
+  the VM script turns it on for new VMs, Ready and Finish where that holds.
+- **A Proxmox bug found on the way**: `qm guest exec` with a character past U+07FF (a check mark) in the command sends
+  only part of the request and times out; Proxmox never sends the 0xFF that resets an agent's parser, so every later
+  request landed inside that unfinished string ("QEMU guest agent is not running" until something sent 0xFF). The
+  agent now drops an unfinished request that has sat with nothing more for 4 s when new bytes come (the next ping was
+  answered 1 s after Proxmox gave up). VENERA_AGENT_TRACE=1 in the agent's environment logs every request.

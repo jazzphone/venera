@@ -12,7 +12,7 @@ screenshots, display sleep and the Dock's window previews work; when anything go
 software compositing by itself. Every app gets Metal and OpenGL from the host GPU (Safari's WebGL included), and
 VideoToolbox decodes H.264, HEVC and VP9 and encodes H.264 and HEVC on the host's GPU with the host half installed.
 Its guest agent lets Proxmox treat macOS like its Linux and Windows guests: clean shutdowns from the Proxmox page, the
-VM's addresses on its Summary, and `qm guest` commands.
+VM's addresses on its Summary, `qm guest` commands, and the console's clipboard shared with macOS.
 
 ## Install
 
@@ -36,6 +36,7 @@ Each release also has the Venera Tools CD on its own (`Venera-Tools-VERSION.iso`
 | `VeneraVideo.kext` | Boot KC (OpenCore) | hardware video decoding and encoding: VideoToolbox's paravirtual decoder and encoder, over a shared-memory device to `venera-videod` on the host |
 | `VeneraConsole.kext` | Boot KC (OpenCore) | QEMU's virtio-serial device (the guest agent's port, SPICE's agent channel) in place of Apple's console driver, which stalls when the host hangs up mid-answer |
 | `venera-agent` | launch daemon | the guest agent: the QEMU guest agent protocol Proxmox speaks (shutdown, addresses, `qm guest exec`, files, passwords) over the VM's agent port |
+| `venera-clipboard` | launch agent | the clipboard: the SPICE agent protocol on `com.redhat.spice.0`, in step with the Mac's pasteboard (Proxmox's noVNC console, or a SPICE client) |
 
 A display frame never touches the guest's CPU: Core Animation renders it on the host GPU, the driver copies it into a
 host-visible "twin" buffer in the same command buffer, and the accelerator points the scanout at that buffer

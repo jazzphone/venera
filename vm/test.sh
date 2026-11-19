@@ -28,6 +28,10 @@ X=$(choices_xml 1 0 1)
 check "the upgrade's choices are a property list Installer reads" 'python3 -c "import plistlib,sys; a=plistlib.loads(sys.argv[1].encode()); assert [(d[\"choiceIdentifier\"], d[\"attributeSetting\"], d[\"choiceAttribute\"]) for d in a] == [(\"video\",1,\"selected\"),(\"app\",0,\"selected\"),(\"webgl\",1,\"selected\"),(\"agent\",1,\"selected\")]" "$X"'
 X=$(choices_xml 1 0 1 0)
 check "the guest agent left out when it was" 'python3 -c "import plistlib,sys; a=plistlib.loads(sys.argv[1].encode()); assert [(d[\"choiceIdentifier\"], d[\"attributeSetting\"], d[\"choiceAttribute\"]) for d in a] == [(\"video\",1,\"selected\"),(\"app\",0,\"selected\"),(\"webgl\",1,\"selected\"),(\"agent\",0,\"selected\")]" "$X"'
+qm() { echo "machine: $MOCK_MACHINE"; }   # clipboard_ok reads the VM's machine
+cb() { MOCK_MACHINE=$1; VMID=999 clipboard_ok && echo on || echo off; }
+check "the console's clipboard where live migration keeps working (machine 10.1 up, or unpinned)" '[ "$(cb q35)" = on ] && [ "$(cb pc-q35-10.1+pve0)" = on ] && [ "$(cb pc-q35-11.1)" = on ] && [ "$(cb pc-q35-9.2+pve1)" = off ] && [ "$(cb pc-i440fx-8.1)" = off ]'
+unset -f qm
 LK='[{"kCGSSessionOnConsoleKey":true,"CGSSessionScreenIsLocked":true}]' NB='[{"kCGSSessionOnConsoleKey":false}]' OP='[{"kCGSSessionOnConsoleKey":true}]'
 check "a locked screen, nobody, and an open one" '[ "$(screen_says <<<"$LK")" = locked ] && [ "$(screen_says <<<"$NB")" = nobody ] && [ "$(screen_says <<<"$OP")" = open ] && [ "$(screen_says <<<"")" = open ]'
 

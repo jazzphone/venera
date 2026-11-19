@@ -18,7 +18,8 @@
 #      questions as notifications and shows what runs; --no-app leaves it out (the watcher then asks in dialogs)
 #   6. the guest agent (local.venera.agent): Proxmox's `qm agent` and `qm guest` (shutdown from the Proxmox page, the
 #      VM's IP addresses, commands and files from the host); it takes the place of mac-guest-agent if that is there.
-#      Its port's driver, VeneraConsole.kext, goes into OpenCore in step 2 (from the next restart).
+#      Its port's driver, VeneraConsole.kext, goes into OpenCore in step 2 (from the next restart). With it, the
+#      clipboard agent (local.venera.clipboard, in each user's session): the Proxmox console's clipboard.
 #      Installed in the first pass too (it needs no restart); --no-agent leaves it out, or takes it out
 # Then reboot. ./uninstall.sh undoes all of it; ./status.sh shows what runs.
 #
@@ -278,6 +279,15 @@ fi
 
 # ---- 6. the guest agent (runs in either pass: it needs no restart) -----------------------------------------------
 AGENT_PLIST=/Library/LaunchDaemons/local.venera.agent.plist
+CLIP_PLIST=/Library/LaunchAgents/local.venera.clipboard.plist
+# the clipboard agent runs in each logged-in user's session: (re)started in the console user's now, the others' at login
+clip_restart() {
+  local u; u=$(stat -f %u /dev/console)
+  [ "$u" -ge 501 ] 2>/dev/null && [ $DRY = 0 ] || return 0
+  launchctl bootout "gui/$u/local.venera.clipboard" 2>/dev/null
+  [ -f "$CLIP_PLIST" ] && launchctl bootstrap "gui/$u" "$CLIP_PLIST"
+  return 0
+}
 OLD_AGENT=/Library/LaunchDaemons/com.macos.guest-agent.plist
 SWAP_PLIST=/Library/LaunchDaemons/local.venera.agent-swap.plist
 # The agent can be carrying this very install (the VM script's Upgrade runs it through the agent): stopping it now
@@ -307,6 +317,11 @@ agent_step() {
   # the choice, for the VM script's Upgrade (it installs again with the same choices)
   if [ $NO_AGENT = 1 ]; then run mkdir -p "$V"; run touch "$V/NO_AGENT"; else run rm -f "$V/NO_AGENT"; fi
   if [ $NO_AGENT = 1 ]; then
+    if [ -f "$CLIP_PLIST" ]; then
+      run rm -f "$CLIP_PLIST" "$V/venera-clipboard"
+      clip_restart
+      say "clipboard agent: taken out (--no-agent)"
+    fi
     if [ -f "$AGENT_PLIST" ]; then
       run rm -f "$AGENT_PLIST" "$V/venera-agent"
       local back=""
@@ -337,6 +352,18 @@ agent_step() {
     run mkdir -p "$V/replaced"
     run mv -f "$OLD_AGENT" "$V/replaced/"
     note="; mac-guest-agent set aside ($V/replaced; uninstall.sh puts it back)"
+  fi
+  # the Proxmox console's clipboard: a LaunchAgent in each user's session (VeneraConsole.kext's com.redhat.spice.0)
+  if [ -x "$PAYLOAD/Support/venera-clipboard" ]; then
+    run cp "$PAYLOAD/Support/venera-clipboard" "$V/venera-clipboard.new"
+    run chown root:wheel "$V/venera-clipboard.new"
+    run chmod 755 "$V/venera-clipboard.new"
+    run mv -f "$V/venera-clipboard.new" "$V/venera-clipboard"
+    run cp "$PAYLOAD/Support/local.venera.clipboard.plist" "$CLIP_PLIST"
+    run chown root:wheel "$CLIP_PLIST"
+    run chmod 644 "$CLIP_PLIST"
+    clip_restart
+    say "clipboard agent: local.venera.clipboard, in each user's session (the Proxmox console's clipboard)"
   fi
   if [ $same = 1 ] && [ -z "$note" ]; then
     say "guest agent: local.venera.agent running, unchanged"
