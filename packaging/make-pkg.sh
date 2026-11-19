@@ -9,8 +9,9 @@
 #   video, app, agent, webgl  each leaves a marker (/Library/Application Support/Venera/.choices/NAME)
 #   core    (hidden)  the release folder, then install.sh with the markers' flags; asks for the restart
 # SIGN_ID="Developer ID Installer: NAME (TEAM)" signs it (productbuild --sign); unsigned otherwise.
-# Then dist/Venera-Tools-VERSION.iso: the package and a read-me (packaging/tools-readme.txt) on a CD image, "Venera
-# Tools", to attach to a VM as a CD drive (macOS shows it on the desktop); no network needed.
+# Then dist/Venera-Tools-VERSION.iso: the package, a read-me (packaging/tools-readme.txt), and for macOS Recovery
+# install-venera with the release's tarball, on a CD image, "Venera Tools", to attach to a VM as a CD drive (macOS
+# shows it on the desktop); no network needed.
 set -euo pipefail
 cd "${0:A:h}/.."
 VERSION=$(cat VERSION)
@@ -95,8 +96,40 @@ productbuild --distribution $B/Distribution.xml --package-path $B/pkgs --resourc
 echo "$OUT ($([[ -n "${SIGN_ID:-}" ]] && echo "signed: $SIGN_ID" || echo unsigned))"
 shasum -a 256 "$OUT"
 # the CD: Venera Tools
-T=$B/tools && rm -rf $T && mkdir -p $T
+T=$B/tools && rm -rf $T && mkdir -p $T/Recovery
 cp "$OUT" $T/
+# For macOS Recovery's Terminal (packaging/recovery/install-venera, at the CD's top), in Recovery/:
+#  - the release's tarball (it keeps what a CD can't: permissions and links), which install-venera unpacks onto an
+#    installed macOS with the one-time job local.venera.finish;
+#  - Venera Stage.pkg, for before macOS is installed: install-venera gives it to macOS's installer (startosinstall
+#    --installpackage), which puts in the release folder and that job at the new system's first startup (no choices:
+#    install.sh reads them from .choices, as the package's core does), with Venera Choice NAME.pkg for each choice
+#    (one marker file each).
+[[ -f dist/Venera-$VERSION.tar.gz ]] || { echo "no dist/Venera-$VERSION.tar.gz: run packaging/make-dist.sh"; exit 1; }
+cp packaging/recovery/install-venera $T/
+cp dist/Venera-$VERSION.tar.gz $T/Recovery/
+S=$B/stage && rm -rf $S && mkdir -p "$S/root/Library/Application Support/Venera" $S/root/Library/LaunchDaemons $S/scripts
+cp -R "$REL" "$S/root/Library/Application Support/Venera/release"
+: >"$S/root/Library/Application Support/Venera/finish-first"
+cp packaging/recovery/local.venera.finish.plist $S/root/Library/LaunchDaemons/
+chmod 644 $S/root/Library/LaunchDaemons/local.venera.finish.plist
+cp packaging/recovery/stage-postinstall $S/scripts/postinstall
+pkgbuild --analyze --root $S/root $S/components.plist >/dev/null
+i=0
+while plutil -extract $i.RootRelativeBundlePath raw -o - $S/components.plist >/dev/null 2>&1; do
+  plutil -replace $i.BundleIsRelocatable -bool NO $S/components.plist
+  plutil -replace $i.BundleOverwriteAction -string upgrade $S/components.plist
+  i=$((i + 1))
+done
+pkgbuild --root $S/root --component-plist $S/components.plist --scripts $S/scripts --identifier local.homelab.venera.stage \
+  --version $VERSION --ownership recommended --install-location / $S/stage.pkg >/dev/null
+productbuild --package $S/stage.pkg "${SIGN[@]}" "$T/Recovery/Venera Stage.pkg" >/dev/null
+for c in video app agent webgl; do
+  mkdir -p "$S/$c/Library/Application Support/Venera/.choices" && : >"$S/$c/Library/Application Support/Venera/.choices/$c"
+  pkgbuild --root $S/$c --identifier local.homelab.venera.choice.$c --version $VERSION --ownership recommended \
+    --install-location / $S/$c.pkg >/dev/null
+  productbuild --package $S/$c.pkg "${SIGN[@]}" "$T/Recovery/Venera Choice $c.pkg" >/dev/null
+done
 sed "s/@VERSION@/$VERSION/g" packaging/tools-readme.txt >"$T/Read Me.txt"
 ISO=dist/Venera-Tools-$VERSION.iso
 rm -f $ISO

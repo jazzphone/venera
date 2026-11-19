@@ -1922,3 +1922,43 @@ the Mesa build pulled unpinned Python packages; the Debian build image and FFmpe
   back), --record (TESTED for a release; node 2's is in packaging/host/TESTED), --hold/--unhold (QEMU, virglrenderer,
   its server, Mesa's Vulkan); the VM script warns when the host isn't on TESTED's versions.
 - Test VMs 110 and 111 and the 61.5 GB qcow2 are gone; OpenCore disks moved are saved in /root on node 2.
+
+## Round 20 (2026-11-19): Venera from macOS Recovery, and Recovery with Venera
+
+The owner's idea: install Venera from the recovery before macOS is installed, with one Terminal command, and keep that
+as the fallback after setup (as long as the Venera Tools CD is attached), letting the user pick the volume (not
+always "Macintosh HD").
+
+- **`install-venera`** (packaging/recovery, at the Tools CD's top; the CD's Recovery/ has the release tarball,
+  `Venera Stage.pkg` and one `Venera Choice NAME.pkg` per choice). It lists the APFS volumes that are or will be
+  macOS (an installed macOS's Data half found by its volume group, whatever it's named; FileVault unlocked with
+  `diskutil apfs unlockVolume`, the user typing) and asks the package's choices.
+  - **Before macOS is installed**: files put onto the erased volume don't last (VM 110: a marker and a LaunchDaemon
+    placed from Recovery were gone after the install; the installer clears the volume, which becomes the Data
+    volume). So it runs macOS's installer itself: `startosinstall --agreetolicense --volume /Volumes/VOL
+    --installpackage "Venera Stage.pkg" [--installpackage "Venera Choice NAME.pkg" ...]`, after showing the license
+    and asking. `--volume` isn't in this version's usage but works (without it, it picks Recovery's own volume);
+    unsigned packages are accepted. The installer adds the packages at the new system's first startup, after
+    launchd read /Library/LaunchDaemons (VM 110: the job ran only a boot later), so the stage's postinstall
+    bootstraps local.venera.finish when installed onto "/". VM 110 end to end (erase from the installer's
+    Recovery, install-venera, about 45 minutes): Venera installed at the first startup (one pass: the VM script's
+    SIP) and the VM restarted into Setup Assistant on the host's GPU. That run gave the stage first, and its install
+    read no choice markers (--no-app --no-agent; the markers landed seconds later): the choice packages go first now,
+    and the stage's pass waits up to a minute for them.
+  - **After**: the release unpacked onto the Data volume, `finish-args`, `finish-first`, the job; install.sh's boot
+    pass may now be a first pass (`finish-first`): with SIP not set for Venera it sets OpenCore's security settings,
+    restarts by itself, and finishes at the next boot. VM 112: a VM-script VM (SIP already set) in one pass, and with
+    OpenCore's csr-active-config 0 and no AMFI argument in two (09:38 security, 09:39 install, Metal desktop).
+  - **remove**: `uninstall.sh --at-boot` (new: waits for OpenCore's disk, takes the job out, restarts). VM 112:
+    from the installer's Recovery, Venera out at the next startup, back on the firmware framebuffer.
+  - install.sh: the boot pass starts the Venera app only in a user's session (it had bootstrapped it into Setup
+    Assistant's, uid 248); the stage's choices come from `.choices` markers, kept as finish-args for a later try.
+- **Recovery with Venera installed had no picture** (since the core kext went into OpenCore: every boot loads it).
+  The core took the virtio-gpu device and its slot holder kept IONDRVFramebuffer off it; Recovery has no Auxiliary
+  KC, so no VirtioGPUFramebuffer, and WindowServer had nothing to draw on (the progress bar stopped; `-v` showed
+  Recovery's apps running). Core 0.5.9: both personalities stand aside in a Recovery or installer boot: an installed
+  macOS's Recovery boots from a RAM disk (`/chosen` boot-ramdmg-extents), the installer's macOS Base System through
+  `bootbase.efi` (`/chosen` booter-name; a normal boot's is boot.efi). `-vgpurecovery` takes the device anyway. VM
+  112 and 110: both recoveries draw with Venera installed; the normal boot keeps the Metal desktop.
+- Found on the way: Proxmox's `qm agent VMID ping` can report success while the agent isn't up (use `qm guest cmd
+  VMID ping`); `pkill -f PATTERN` inside an ssh command matches the command itself.

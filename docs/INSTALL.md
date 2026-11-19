@@ -110,6 +110,36 @@ The package isn't signed with a Developer ID yet, so macOS says it can't check i
 browser or AirDrop (a shared disk, `scp`) carries no quarantine and opens without asking. `packaging/make-pkg.sh` signs
 it when `SIGN_ID="Developer ID Installer: NAME (TEAM)"` names a certificate in the build Mac's keychain.
 
+### From macOS Recovery
+
+The Venera Tools CD also installs Venera from macOS Recovery's Terminal (OpenCore's picker > the macOS installer's
+macOS Base System, or an installed macOS's Recovery; then Utilities > Terminal), with no desktop needed:
+
+```bash
+"/Volumes/Venera Tools/install-venera"            # or: install-venera remove
+```
+
+It lists the APFS volumes that are, or will be, macOS (whatever they're named), asks which, and asks the package's
+choices. Then:
+
+- **Before macOS is installed** (erase the disk in Disk Utility first: APFS): it starts macOS's installer itself
+  (`startosinstall`, after showing Apple's license and asking whether you agree), with Venera added as installer
+  packages (`Recovery/Venera Stage.pkg` and one small package per choice). The installer downloads macOS, as Reinstall
+  macOS does, and restarts by itself; at macOS's first startup Venera installs and the VM restarts once, so Setup
+  Assistant runs on the host's GPU. Files put onto the empty volume by hand wouldn't last: the installer clears it.
+- **After it is installed**, with no package or network at hand: it unpacks the release onto that macOS's Data volume
+  (`/Library/Application Support/Venera/release`) with the one-time startup job `local.venera.finish`, and macOS runs
+  `install.sh` at its next startup with its own tools. When SIP isn't set for Venera yet, that pass sets OpenCore's
+  security settings and restarts, and the next startup installs the rest and restarts once more, by itself
+  (`install.log` has every pass).
+- **As a rescue**: `install-venera` again puts this CD's release back (a broken or half-finished install), and
+  `install-venera remove` runs `uninstall.sh --at-boot` at the next startup and restarts (a driver or a macOS update
+  that left no usable desktop). A FileVault volume asks for a password of one of that Mac's users to unlock it.
+
+Recovery keeps the firmware's display: Venera's core kext stands aside in a Recovery or installer boot (since core
+0.5.9; before it, Recovery started with no picture once Venera was installed, and `-vgpuoff` in OpenCore's boot-args
+was the way in).
+
 ### From the command line
 
 In the guest, as an administrator:
@@ -324,6 +354,8 @@ and AMFI stay as they are; restore them from a `config.plist.venera-*` backup, o
 - **No picture at all**: boot with the OpenCore picker, choose Reset NVRAM or edit `config.plist` from another OS
   (the VM's OpenCore disk can be mounted on the host while the VM is stopped) and disable the `VirtioGPU.kext` entry;
   without it macOS uses the firmware's framebuffer. A snapshot from before the install is the fastest way back.
+- **From macOS Recovery**, with the Venera Tools CD attached: `install-venera remove` takes Venera out at the next
+  startup, and `install-venera` puts it back ("From macOS Recovery", above).
 
 ## Tuning (optional)
 

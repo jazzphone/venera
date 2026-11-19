@@ -1,8 +1,10 @@
 #!/bin/bash
 # Venera uninstaller: run inside the macOS guest, as root.
 #
-#   sudo ./uninstall.sh [--oc /Volumes/EFI] [--no-opencore] [--dry-run]
+#   sudo ./uninstall.sh [--oc /Volumes/EFI] [--no-opencore] [--dry-run] [--at-boot]
 #
+# --at-boot: the one-time startup job (local.venera.remove) the Venera Tools CD's install-venera leaves from macOS
+# Recovery: waits for OpenCore's disk, takes the job out, and restarts when done.
 # Removes the Metal driver, the Venera app, the guest agent (mac-guest-agent back if Venera's took its place), the two
 # Auxiliary KC kexts (and rebuilds the Auxiliary KC from what is left in
 # /Library/Extensions), and in OpenCore the VirtioGPU.kext entry and folder and vgpuaccel from boot-args (config.plist
@@ -12,6 +14,7 @@ set -u
 OC_ROOT=
 NO_OC=0
 DRY=0
+AT_BOOT=0
 GUID=7C436110-AB2A-4BBB-A880-FE41995C9F82
 MOUNTED=
 
@@ -32,12 +35,17 @@ while [ $# -gt 0 ]; do
   --oc) OC_ROOT=$2; shift ;;
   --no-opencore) NO_OC=1 ;;
   --dry-run) DRY=1 ;;
-  -h | --help) sed -n '2,10p' "$0"; exit 0 ;;
+  --at-boot) AT_BOOT=1 ;;
+  -h | --help) sed -n '2,13p' "$0"; exit 0 ;;
   *) die "unknown option $1 (--help)" ;;
   esac
   shift
 done
 [ "$(id -u)" = 0 ] || die "run as root: sudo $0"
+if [ $AT_BOOT = 1 ]; then   # once only, whatever happens
+  printf '\n%s Venera: removing it at startup (install-venera remove)\n' "$(date '+%F %T')"
+  rm -f /Library/LaunchDaemons/local.venera.remove.plist
+fi
 
 # ---- the app, the watcher, the Metal driver and its files ------------------------------------------------------------
 CUID=$(stat -f %u /dev/console)
@@ -140,7 +148,8 @@ fi
 # ---- OpenCore ------------------------------------------------------------------------------------------------------
 pl() { plutil "$@" "$CONFIG"; }
 if [ $NO_OC = 0 ]; then
-  if [ -z "$OC_ROOT" ]; then
+  tries=0
+  while [ -z "$OC_ROOT" ]; do
     for p in $(diskutil list | awk '/ EFI / {print $NF}'); do
       mp=$(diskutil info "$p" | awk -F': *' '/Mount Point/ {print $2}')
       fresh=
@@ -156,7 +165,11 @@ if [ $NO_OC = 0 ]; then
         diskutil unmount "$fresh" >/dev/null 2>&1
       fi
     done
-  fi
+    # at startup the disks come a little later: up to two minutes for OpenCore's
+    [ -z "$OC_ROOT" ] && [ $AT_BOOT = 1 ] && [ $tries -lt 24 ] || break
+    sleep 5
+    tries=$((tries + 1))
+  done
   if [ -z "$OC_ROOT" ]; then
     say "OpenCore: not found; remove VirtioGPU.kext and vgpuaccel from its config.plist yourself"
   else
@@ -200,4 +213,9 @@ if [ $NO_OC = 0 ]; then
 fi
 
 say ""
+if [ $AT_BOOT = 1 ] && [ $DRY = 0 ]; then
+  say "Venera removed; restarting"
+  shutdown -r now
+  exit 0
+fi
 say "Venera removed. Reboot to finish: sudo shutdown -r now"

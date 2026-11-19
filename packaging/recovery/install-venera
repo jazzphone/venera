@@ -1,0 +1,195 @@
+#!/bin/bash
+# install-venera: Venera from macOS Recovery's Terminal, off the Venera Tools CD. For a macOS VM:
+#   - before macOS is installed: on a volume Disk Utility erased, it starts macOS's installer itself with Venera
+#     added (startosinstall --installpackage "Venera Stage.pkg"): at macOS's first startup Venera installs and the VM
+#     restarts once, so Setup Assistant runs on the host's GPU;
+#   - after it is installed: it puts Venera onto that macOS, which installs it at its next startup;
+#   - as a rescue: put it back (a broken or half-finished install), or "remove" it (a driver or a macOS update that
+#     left no usable desktop).
+#
+#   "/Volumes/Venera Tools/install-venera" [install|remove] [VOLUME NAME]
+#
+# On an installed macOS it changes nothing on the running Recovery: it unpacks the release onto that macOS's Data
+# volume (/Library/Application Support/Venera/release) with a one-time startup job, and macOS runs Venera's own
+# install.sh (or uninstall.sh) at its next startup, with its own tools. The job removes itself. Files put onto an
+# empty volume don't last (macOS's installer clears it), hence the installer route there.
+# Recovery's bash is 3.2: nothing newer here.
+set -u
+HERE=$(cd "$(dirname "$0")" && pwd)
+ACTION=install
+VOL=""
+for a in "$@"; do
+  case $a in
+    install|remove) ACTION=$a ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+    *) VOL=$a ;;
+  esac
+done
+say() { printf '%s\n' "$*"; }
+die() { printf 'install-venera: %s\n' "$*" >&2; exit 1; }
+yes_no() { local v; read -r -p "  $1 [${2:-y}]: " v; v=${v:-${2:-y}}; case $v in [Yy]*) return 0 ;; *) return 1 ;; esac; }
+info() { diskutil info "$1" 2>/dev/null | awk -F': *' -v k="$2" '$1 ~ "^ *"k"$" {print $2; exit}'; }
+[ "$(id -u)" = 0 ] || die "run it as root (macOS Recovery's Terminal is)"
+R="$HERE/Recovery"
+TGZ=$(ls "$R"/Venera-[0-9]*.tar.gz 2>/dev/null | tail -1)
+[ -n "$TGZ" ] || die "no Venera release beside this command (Recovery/Venera-VERSION.tar.gz): is the Venera Tools CD mounted?"
+VER=$(basename "$TGZ" .tar.gz); VER=${VER#Venera-}
+
+# ---- the volume ----------------------------------------------------------------------------------------------------
+# candidates: APFS volumes in /Volumes but Recovery's own, this CD, OpenCore's, an installer's, and an installed
+# macOS's other halves (its Data volume, whatever it is named, and Preboot, Recovery, VM, Update)
+NAMES=()
+for v in /Volumes/*; do
+  [ -d "$v" ] || continue
+  n=${v#/Volumes/}
+  case $n in "macOS Base System"*|"Venera Tools"|OPENCORE|EFI|Preboot|Recovery|VM|Update|"Install macOS"*) continue ;; esac
+  diskutil info "$v" 2>/dev/null | grep -q -i "Type (Bundle): *apfs" || continue
+  [ -n "$(info "$v" "APFS Volume Group")" ] && [ ! -f "$v/System/Library/CoreServices/SystemVersion.plist" ] && continue
+  NAMES+=("$n")
+done
+state() {   # what is on volume $1: an installed macOS (its version), or none yet
+  local p="/Volumes/$1/System/Library/CoreServices/SystemVersion.plist"
+  if [ -f "$p" ]; then echo "macOS $(plutil -extract ProductVersion raw -o - "$p" 2>/dev/null)"
+  else echo "no macOS yet: macOS installs onto it, with Venera"; fi
+}
+if [ -z "$VOL" ]; then
+  [ ${#NAMES[@]} -gt 0 ] || die "no APFS volume for macOS: erase the VM's disk in Disk Utility first (APFS), then run this again"
+  if [ ${#NAMES[@]} = 1 ]; then
+    VOL=${NAMES[0]}
+    say "The macOS volume: $VOL ($(state "$VOL"))"
+  else
+    say "Which volume is (or will be) macOS?"
+    i=1; for n in "${NAMES[@]}"; do say "  $i  $n ($(state "$n"))"; i=$((i + 1)); done
+    read -r -p "  Which [1]: " k; k=${k:-1}
+    case $k in ''|*[!0-9]*) die "a number, please" ;; esac
+    [ "$k" -ge 1 ] && [ "$k" -le ${#NAMES[@]} ] || die "no volume $k"
+    VOL=${NAMES[$((k - 1))]}
+  fi
+fi
+[ -d "/Volumes/$VOL" ] || die "no volume named \"$VOL\" (in /Volumes)"
+INSTALLED=0
+[ -f "/Volumes/$VOL/System/Library/CoreServices/SystemVersion.plist" ] && INSTALLED=1
+
+choices() {   # the package's choices; sets VIDEO APP AGENT WEBGL (1 or 0)
+  say "The choices (Enter keeps the one in brackets):"
+  VIDEO=1; APP=1; AGENT=1; WEBGL=0
+  yes_no "Hardware video (needs the host's half: install-host.sh, or the VM script's Finish)?" y || VIDEO=0
+  yes_no "The Venera app (tells you when something needs you)?" y || APP=0
+  yes_no "The Proxmox guest agent and the console's clipboard?" y || AGENT=0
+  yes_no "Safari WebGL (turns off SIP's authenticated root)?" n && WEBGL=1
+  return 0
+}
+
+# ---- before macOS is installed: macOS's installer, with Venera ----------------------------------------------------
+if [ $INSTALLED = 0 ]; then
+  [ $ACTION = remove ] && die "there's no macOS on \"$VOL\" to remove Venera from"
+  APPI=$(ls -d /"Install macOS "*.app /Volumes/*/"Install macOS "*.app 2>/dev/null | head -1)
+  SOI="$APPI/Contents/Resources/startosinstall"
+  [ -x "$SOI" ] || die "no macOS installer here (Install macOS ....app): run this from the macOS installer's Recovery"
+  [ -f "$R/Venera Stage.pkg" ] || die "no Recovery/Venera Stage.pkg on this CD"
+  say ""
+  say "$(basename "$APPI" .app | sed 's/^Install //') installs onto \"$VOL\" with Venera $VER: at macOS's first startup"
+  say "Venera installs and the VM restarts once, then Setup Assistant runs on the host's GPU. The installer downloads"
+  say "macOS from Apple (the VM needs its network), as Reinstall macOS does, and restarts by itself."
+  choices
+  # the choices' markers first: the stage's postinstall starts the install as soon as it is in (VM 110 read no
+  # markers when the stage went first)
+  PKGS=()
+  [ $VIDEO = 1 ] && PKGS+=(--installpackage "$R/Venera Choice video.pkg")
+  [ $APP = 1 ] && PKGS+=(--installpackage "$R/Venera Choice app.pkg")
+  [ $AGENT = 1 ] && PKGS+=(--installpackage "$R/Venera Choice agent.pkg")
+  [ $WEBGL = 1 ] && PKGS+=(--installpackage "$R/Venera Choice webgl.pkg")
+  PKGS+=(--installpackage "$R/Venera Stage.pkg")
+  say ""
+  say "macOS's license comes first (space for the next page, q at its end)."
+  read -r -p "  Enter to read it: " _
+  "$SOI" --license | more
+  yes_no "Do you agree to it?" n || die "nothing changed (Reinstall macOS installs without Venera; run this again after)"
+  yes_no "Install macOS onto \"$VOL\" now?" y || die "nothing changed"
+  # --volume is the installer's own (not in its usage on every version); without it, it would pick Recovery's volume
+  exec "$SOI" --agreetolicense --volume "/Volumes/$VOL" "${PKGS[@]}"
+fi
+
+# ---- an installed macOS: Venera onto it, for its next startup ------------------------------------------------------
+# its Data volume, where its /Library is: the other volume of its volume group (usually "NAME - Data")
+GROUP=$(info "/Volumes/$VOL" "APFS Volume Group")
+SYSDEV=$(info "/Volumes/$VOL" "Device Identifier")
+[ -n "$GROUP" ] || die "\"$VOL\" has macOS but no volume group: is it macOS 10.15 or later?"
+DDEV=""
+for d in $(diskutil list | awk '/APFS Volume/ {print $NF}'); do
+  [ "$d" = "$SYSDEV" ] && continue
+  [ "$(info "$d" "APFS Volume Group")" = "$GROUP" ] && { DDEV=$d; break; }
+done
+[ -n "$DDEV" ] || die "couldn't find the Data volume of \"$VOL\""
+if [ "$(info "$DDEV" "Locked")" = "Yes" ]; then
+  say "\"$(info "$DDEV" "Volume Name")\" is locked (FileVault): unlock it with the password of one of that Mac's users."
+  diskutil apfs unlockVolume "$DDEV" || die "it stayed locked"
+fi
+DATA=$(info "$DDEV" "Mount Point")
+if [ -z "$DATA" ]; then diskutil mount "$DDEV" >/dev/null 2>&1; DATA=$(info "$DDEV" "Mount Point"); fi
+[ -n "$DATA" ] && [ -d "$DATA/Library" ] || die "couldn't mount the Data volume of \"$VOL\" ($DDEV): mount it in Disk Utility, then run this again"
+V="$DATA/Library/Application Support/Venera"
+LD="$DATA/Library/LaunchDaemons"
+
+job() {   # job LABEL SCRIPT ARGS...: a one-time startup job on that macOS that runs SCRIPT (and takes itself out)
+  local label=$1 script=$2; shift 2
+  local args="" a; for a in "$@"; do args="$args<string>$a</string>"; done
+  mkdir -p "$LD" && chown root:wheel "$LD" && chmod 755 "$LD"
+  cat >"$LD/$label.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$label</string>
+  <key>ProgramArguments</key>
+  <array><string>/bin/bash</string><string>$script</string>$args</array>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/Library/Application Support/Venera/install.log</string>
+  <key>StandardErrorPath</key><string>/Library/Application Support/Venera/install.log</string>
+</dict>
+</plist>
+PLIST
+  chown root:wheel "$LD/$label.plist" && chmod 644 "$LD/$label.plist"
+}
+
+copy_release() {   # the release folder, unpacked from the CD onto that macOS, in place of any earlier one
+  mkdir -p "$V" && chown root:wheel "$V" && chmod 755 "$V" || die "couldn't make $V"
+  local u="$V/unpack.$$"
+  rm -rf "$u" && mkdir "$u" && tar -xzf "$TGZ" -C "$u" && [ -x "$u/Venera-$VER/install.sh" ] ||
+    { rm -rf "$u"; die "couldn't unpack $(basename "$TGZ") onto $VOL"; }
+  rm -rf "$V/release" && mv "$u/Venera-$VER" "$V/release" && rm -rf "$u" &&
+    chown -R root:wheel "$V/release" && chmod -R go-w "$V/release" || die "couldn't put Venera onto $VOL"
+}
+
+if [ $ACTION = remove ]; then
+  say ""; say "Venera will be removed from \"$VOL\" at its next startup (uninstall.sh, then a restart)."
+  yes_no "Go ahead?" y || die "nothing changed"
+  rm -rf "$LD/local.venera.finish.plist" "$V/finish-args" "$V/finish-tries" "$V/finish-first" "$V/.choices"
+  copy_release   # this CD's uninstall.sh, whatever was installed before
+  job local.venera.remove "/Library/Application Support/Venera/release/uninstall.sh" --at-boot
+  say "Done. Restart (Apple menu > Restart): Venera is removed during the startup and the VM restarts once more."
+  exit 0
+fi
+
+say ""
+say "Venera $VER onto \"$VOL\": it installs at its next startup, then restarts (a minute or two)."
+choices
+ARGS="--set-security"
+[ $VIDEO = 1 ] && ARGS="$ARGS
+--video"
+[ $APP = 1 ] || ARGS="$ARGS
+--no-app"
+[ $AGENT = 1 ] || ARGS="$ARGS
+--no-agent"
+[ $WEBGL = 1 ] || ARGS="$ARGS
+--no-system-volume"
+yes_no "Go ahead?" y || die "nothing changed"
+copy_release
+printf '%s\n' "$ARGS" >"$V/finish-args"; chown root:wheel "$V/finish-args"; chmod 600 "$V/finish-args"
+rm -rf "$V/finish-tries" "$V/.choices" "$LD/local.venera.remove.plist"
+: >"$V/finish-first"   # install.sh's startup pass may set SIP first (then restarts and finishes)
+job local.venera.finish "/Library/Application Support/Venera/release/install.sh" --finish
+say ""
+say "Done: Venera $VER is on \"$VOL\" with a one-time startup job (local.venera.finish)."
+say "Now restart (Apple menu > Restart). Venera installs during the startup and the VM restarts by itself."
+say "Its log: /Library/Application Support/Venera/install.log"

@@ -52,10 +52,34 @@ MOUNTED=
 V="/Library/Application Support/Venera"
 FINISH_PLIST=/Library/LaunchDaemons/local.venera.finish.plist
 FINISH=0
+FIRST=0
 if [ "${1:-}" = --finish ]; then   # the second pass (local.venera.finish, at the boot after the first)
   FINISH=1
+  # the job left by the Venera Tools CD's install-venera (from macOS Recovery) runs as a first pass: SIP may not be
+  # set for Venera yet, and this boot's pass sets it, then restarts by itself and finishes after that restart
+  [ -e "$V/finish-first" ] && FIRST=1
   ARGS=()
-  while IFS= read -r a; do ARGS+=("$a"); done <"$V/finish-args" 2>/dev/null
+  if [ -f "$V/finish-args" ]; then
+    while IFS= read -r a; do ARGS+=("$a"); done <"$V/finish-args"
+  elif [ -e "$V/finish-first" ]; then
+    # Venera Stage.pkg (install-venera, before macOS was installed): the choices are the markers its choice packages
+    # left, read as Install Venera.pkg's core reads its own. They go in with it, at the same first startup, and
+    # install-venera gives them first; in case the installer took them after the stage (whose postinstall starts this),
+    # a minute for the first marker and a few seconds for the rest (no markers at all: every choice was no)
+    C="$V/.choices"
+    w=0
+    while [ ! -d "$C" ] && [ $w -lt 60 ]; do sleep 2; w=$((w + 2)); done
+    [ -d "$C" ] && sleep 5
+    ARGS=(--set-security)
+    [ -e "$C/video" ] && ARGS+=(--video)
+    [ -e "$C/app" ] || ARGS+=(--no-app)
+    [ -e "$C/agent" ] || ARGS+=(--no-agent)
+    if [ ! -e "$C/webgl" ] && ! csrutil authenticated-root status 2>/dev/null | grep -qi disabled; then
+      ARGS+=(--no-system-volume)
+    fi
+    # kept as finish-args, for a try at a later boot
+    printf '%s\n' "${ARGS[@]}" >"$V/finish-args" && chmod 600 "$V/finish-args" && rm -rf "$C"
+  fi
   if [ ${#ARGS[@]} -gt 0 ]; then set -- "${ARGS[@]}"; else set --; fi
   # the job stays until the install succeeds (a failure tries again at the next boot), three boots at most
   TRIES=$(( $(cat "$V/finish-tries" 2>/dev/null || echo 0) + 1 ))
@@ -76,6 +100,21 @@ die() {
   exit 1
 }
 cleanup() { [ -n "$MOUNTED" ] && diskutil unmount "$MOUNTED" >/dev/null 2>&1; MOUNTED=; }
+restart_now() { # restart_now QUESTION: at the login window (or before Setup Assistant) right away, else ask whoever is logged in
+  local cuid r
+  cuid=$(stat -f %u /dev/console)
+  if [ "$cuid" -ge 501 ] 2>/dev/null; then
+    r=$(launchctl asuser "$cuid" sudo -u "$(stat -f %Su /dev/console)" /usr/bin/osascript \
+      -e "display dialog \"$1\" buttons {\"Later\", \"Restart\"} default button \"Restart\" with title \"Venera\" giving up after 3600" 2>/dev/null)
+    case $r in
+    *Restart*) say "restarting, as asked"; shutdown -r now ;;
+    *) say "not restarted: Venera goes on at the next restart" ;;
+    esac
+  else
+    say "restarting (nobody is logged in)"
+    shutdown -r now
+  fi
+}
 run() { # run CMD...: print it, and run it unless --dry-run
   say "  + $*"
   [ $DRY = 1 ] || "$@"
@@ -156,7 +195,7 @@ if [ $SIP_OK = 0 ] || [ $AMFI_OK = 0 ]; then
 fi
 TWO_PASS=0
 if [ $RUN_SIP_OK = 0 ]; then
-  [ $FINISH = 1 ] && die "SIP still doesn't allow unsigned kexts and an unrestricted file system after the restart: was the
+  [ $FINISH = 1 ] && [ $FIRST = 0 ] && die "SIP still doesn't allow unsigned kexts and an unrestricted file system after the restart: was the
   VM started through OpenCore with the config.plist Venera changed? (csrutil status)"
   TWO_PASS=1
   say "security: the rest of the install needs SIP's new settings, which start at the restart: this pass changes only"
@@ -412,6 +451,12 @@ PLIST
   fi
   say "  + $FINISH_PLIST (runs once, at the next boot)"
   say ""
+  if [ $FINISH = 1 ] && [ $DRY = 0 ]; then   # install-venera's first pass, at boot: restart into the settings
+    rm -f "$V/finish-first"
+    cleanup
+    restart_now "Venera set its security settings. Restart to finish installing it?"
+    exit 0
+  fi
   say "Restart now: Venera finishes installing after the restart (a minute or two), then restarts once more."
   exit 0
 fi
@@ -530,7 +575,8 @@ if [ $NO_APP = 0 ] && [ -d "$PAYLOAD/Apps/Venera.app" ]; then
   run cp "$PAYLOAD/Support/local.venera.helper.plist" /Library/LaunchAgents/
   run chown root:wheel /Library/LaunchAgents/local.venera.helper.plist
   run chmod 644 /Library/LaunchAgents/local.venera.helper.plist
-  [ "$CUID" != 0 ] && run launchctl bootstrap "gui/$CUID" /Library/LaunchAgents/local.venera.helper.plist
+  # a user's session only: not the login window's or Setup Assistant's (_mbsetupuser, 248) at an install at startup
+  [ "$CUID" -ge 501 ] 2>/dev/null && run launchctl bootstrap "gui/$CUID" /Library/LaunchAgents/local.venera.helper.plist
   say "Venera app: /Applications/Venera.app, started at login (local.venera.helper)"
 else
   run rm -rf /Applications/Venera.app /Library/LaunchAgents/local.venera.helper.plist
@@ -543,17 +589,5 @@ say "If the desktop doesn't come back, the driver falls back to the software des
 say "failures; INSTALL.md, \"Recovery\", has the rest. ./status.sh shows what runs."
 # the second pass restarts by itself: at the login window right away, else after asking whoever is logged in
 finish_done
-if [ $FINISH = 1 ] && [ $DRY = 0 ]; then
-  CUID=$(stat -f %u /dev/console)
-  if [ "$CUID" -ge 501 ] 2>/dev/null; then
-    r=$(launchctl asuser "$CUID" sudo -u "$(stat -f %Su /dev/console)" /usr/bin/osascript \
-      -e 'display dialog "Venera finished installing. Restart to start it?" buttons {"Later", "Restart"} default button "Restart" with title "Venera" giving up after 3600' 2>/dev/null)
-    case $r in
-    *Restart*) say "restarting, as asked"; shutdown -r now ;;
-    *) say "not restarted: Venera starts at the next restart" ;;
-    esac
-  else
-    say "restarting to start Venera (nobody is logged in)"
-    shutdown -r now
-  fi
-fi
+rm -f "$V/finish-first"
+[ $FINISH = 1 ] && [ $DRY = 0 ] && restart_now "Venera finished installing. Restart to start it?"

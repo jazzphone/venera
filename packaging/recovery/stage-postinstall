@@ -1,0 +1,7 @@
+#!/bin/bash
+# Venera Stage.pkg's postinstall. Given to macOS's installer by install-venera (startosinstall --installpackage), the
+# package goes in at the new system's first startup, after launchd has read /Library/LaunchDaemons: the one-time job
+# (local.venera.finish: install.sh --finish) starts now, so Venera installs before Setup Assistant gets far, and the
+# VM restarts into it. On any other volume than the running system's, the job runs at that system's next startup.
+[ "$3" = "/" ] && launchctl bootstrap system /Library/LaunchDaemons/local.venera.finish.plist 2>/dev/null
+exit 0

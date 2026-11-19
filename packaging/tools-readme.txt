@@ -9,4 +9,14 @@ Venera for a macOS VM on Proxmox: Metal graphics on the host's GPU, hardware vid
    video and the faster guest agent port, takes out the installer disks (this one too) and restarts the VM.
    Otherwise, in Proxmox: the VM's Options > QEMU Guest Agent: on (type VirtIO), then shut the VM down and start it.
 
+From macOS Recovery (before macOS is installed, after it, or as a rescue), in Terminal (Utilities > Terminal):
+
+    "/Volumes/Venera Tools/install-venera"
+
+   It asks which volume is (or will be) macOS and the choices above. On a volume with no macOS yet (erase the disk in
+   Disk Utility first: APFS), it starts macOS's installer with Venera added: at macOS's first startup Venera installs
+   and the VM restarts once, so Setup Assistant runs on the host's GPU. On an installed macOS it puts Venera in for
+   its next startup. "install-venera remove" takes Venera out the same way (when a driver or a macOS update left no
+   usable desktop). A FileVault volume asks for its password.
+
 The install guide: https://github.com/jazzphone/venera/blob/main/docs/INSTALL.md

@@ -14,6 +14,7 @@
 #include "VirtioGPU.hpp"
 
 #include <IOKit/IOLib.h>
+#include <IOKit/IODeviceTreeSupport.h>
 #include <libkern/c++/OSArray.h>
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSNumber.h>
@@ -104,6 +105,31 @@ uint64_t nowNs() {
     return ns;
 }
 
+// macOS Recovery and the installer: an installed macOS's Recovery boots from a RAM-disk image (the booter leaves
+// /chosen's boot-ramdmg-extents), the installer's own Recovery (macOS Base System) through bootbase.efi (/chosen's
+// booter-name; a normal boot's is boot.efi). There the rest of Venera (the framebuffer and the accelerator, in the
+// Auxiliary KC) never comes: with the device taken, and IONDRVFramebuffer kept off it, WindowServer had nothing to
+// draw on and Recovery showed no picture. Both personalities leave the device to IONDRVFramebuffer and the firmware's
+// framebuffer there; -vgpurecovery takes it anyway. Only reads: a probe must not change the registry.
+bool recoveryBoot() {
+    char arg[8];
+    if (PE_parse_boot_argn("-vgpurecovery", arg, sizeof(arg))) {
+        return false;
+    }
+    IORegistryEntry *chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane);
+    if (!chosen) {
+        return false;
+    }
+    bool recovery = chosen->getProperty("boot-ramdmg-extents") != nullptr;
+    if (OSData *booter = OSDynamicCast(OSData, chosen->getProperty("booter-name"))) {
+        static const char kBase[] = "bootbase.efi";
+        recovery = recovery || (booter->getLength() >= sizeof(kBase) - 1 &&
+                                memcmp(booter->getBytesNoCopy(), kBase, sizeof(kBase) - 1) == 0);
+    }
+    chosen->release();
+    return recovery;
+}
+
 } // namespace
 
 OSDefineMetaClassAndStructors(VirtioGPU, IOService)
@@ -115,6 +141,10 @@ IOService *VirtioGPU::probe(IOService *provider, SInt32 *score) {
     }
     char arg[8];
     if (PE_parse_boot_argn("-vgpuoff", arg, sizeof(arg))) {
+        return nullptr;
+    }
+    if (recoveryBoot()) {
+        IOLog("VirtioGPU: a Recovery or installer boot: leaving the display to the firmware\n");
         return nullptr;
     }
     if (pci->configRead16(kIOPCIConfigVendorID) != 0x1af4 ||
@@ -1388,7 +1418,7 @@ OSDefineMetaClassAndStructors(VirtioGPUFramebufferSlot, IOService)
 IOService *VirtioGPUFramebufferSlot::probe(IOService *provider, SInt32 *score) {
     IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
     char arg[8];
-    if (!pci || PE_parse_boot_argn("-vgpuoff", arg, sizeof(arg)) ||
+    if (!pci || PE_parse_boot_argn("-vgpuoff", arg, sizeof(arg)) || recoveryBoot() ||
         pci->configRead16(kIOPCIConfigVendorID) != 0x1af4 ||
         pci->configRead16(kIOPCIConfigDeviceID) != 0x1050) {
         return nullptr;

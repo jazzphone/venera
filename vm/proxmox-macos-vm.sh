@@ -811,16 +811,22 @@ if [ -n "$BYO_DISK" ]; then
 else
 echo "== Done: VM $VMID ($NAME). Start it from the Proxmox web page, open its Console, and install macOS Tahoe:"
 echo "   at OpenCore's menu pick $([ -n "$BYO_INST" ] && echo "your installer (Install macOS ..., or macOS Base System)" || echo "the macOS Base System"); Disk Utility > View > Show All Devices > erase the VirtIO disk"
-echo "   (APFS, GUID Partition Map) > back, Reinstall macOS Tahoe. It restarts three times, and OpenCore follows it by"
-echo "   itself (into the installer, then Macintosh HD). Setup Assistant can stop on its"
-echo "   last screen with no graphics driver yet: if it hasn't moved in a few minutes, restart the VM (Reboot, or Stop and"
-echo "   Start); the account is made, and macOS starts at the login window."
+if [ $VENERA = 1 ] && [ -n "$TOOLS" ]; then   # the release's CD carries install-venera
+  echo "   (APFS, GUID Partition Map) > back. Then either Reinstall macOS Tahoe, or, to have Venera from the first startup:"
+  echo "   Utilities > Terminal, run \"/Volumes/Venera Tools/install-venera\" and pick the disk you erased (it installs macOS"
+  echo "   with Venera added)."
+else
+  echo "   (APFS, GUID Partition Map) > back, Reinstall macOS Tahoe."
+fi
+echo "   It restarts a few times, and OpenCore follows it by itself (into the installer, then Macintosh HD). Without"
+echo "   Venera, Setup Assistant can stop on its last screen with no graphics driver yet: if it hasn't moved in a few"
+echo "   minutes, restart the VM (Reboot, or Stop and Start); the account is made, and macOS starts at the login window."
 fi
 echo "   After setup, in macOS: automatic updates off (Venera is tested on 26.7.3; a newer macOS may keep the software"
 echo "   desktop); never sleep; set time automatically."
 if [ $VENERA = 1 ]; then
-  if [ -n "$GPKG" ]; then echo "   Then open Install Venera on the Venera Tools CD (on the desktop) and restart when it says so; its Proxmox guest"
-    echo "   agent choice (on) gives Proxmox clean shutdowns and the VM's addresses."
+  if [ -n "$GPKG" ]; then echo "   Then (unless install-venera put it in already) open Install Venera on the Venera Tools CD (on the desktop) and"
+    echo "   restart when it says so; its Proxmox guest agent choice (on) gives Proxmox clean shutdowns and the VM's addresses."
   else echo "   Then copy Venera's guest package (Install Venera VERSION.pkg) into macOS, open it, and restart when it says so."; fi
   echo "   Then run this again and choose Finish$([ $VIDEO = 1 ] && echo ": it turns on hardware video (on every node you set up),") takes out the"
   echo "   installer disks and restarts the VM."

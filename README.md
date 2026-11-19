@@ -24,6 +24,9 @@ For a new VM on Proxmox, `proxmox-macos-vm.sh` in the host package does all of t
 checks the host's GPU, installs what the host needs (on each cluster node), creates a macOS Tahoe VM with OpenCore,
 SIP and AMFI already set, and attaches the Venera Tools CD with the installer package ([vm/README.md](vm/README.md)).
 Each release also has the Venera Tools CD on its own (`Venera-Tools-VERSION.iso`), for installing with no network.
+From macOS Recovery, the CD's `install-venera` installs macOS with Venera already in (Setup Assistant runs on the
+host's GPU), puts Venera onto an installed macOS, or takes it out again ([INSTALL.md](docs/INSTALL.md), "From macOS
+Recovery").
 The script carries what a VM needs (Venera's own OpenCore image, built from acidanthera's OpenCore, and
 `macrecovery.py`), so making a VM downloads only macOS from Apple, or nothing when you bring your own macOS disk or
 installer.

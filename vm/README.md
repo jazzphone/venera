@@ -45,7 +45,8 @@ iCloud. Then it:
   the desktop.
 
 Then, in the VM's console: install macOS from the recovery, open **Install Venera** on the Venera Tools CD (on the
-desktop), and restart when it says so. Its **Proxmox guest agent** choice (on by default) is what lets Proxmox shut
+desktop), and restart when it says so. Or, in the recovery, after erasing the disk: Utilities > Terminal,
+`"/Volumes/Venera Tools/install-venera"`, which installs macOS with Venera already in. Its **Proxmox guest agent** choice (on by default) is what lets Proxmox shut
 macOS down cleanly and show its addresses, and what Finish and Upgrade talk to. Run the script again and choose
 **Finish**.
 
