@@ -83,6 +83,20 @@ BOOL vg_calltrace(void) {
     return on;
 }
 
+// Surface sync log (flag file VirtioGPUMetal-synclog, empty or naming this process): every pull of a surface's CPU
+// bytes into its image, and every surface written on the GPU with no write-back, with its id, size and seeds -- for
+// pieces of old frames on screen (round 21). Rechecked every 2 s, so it can be turned on in a running WindowServer.
+BOOL vg_synclog(void) {
+    static int on = -1;
+    static uint64_t checked;
+    uint64_t now = vg_now();
+    if (on < 0 || now - checked > 2000000000ull) {
+        on = vg_debug_flag("synclog");
+        checked = now;
+    }
+    return on == 1;
+}
+
 // A debugging flag file in /Library/GPUBundles: on when it exists and is empty or names this process (one name a line).
 BOOL vg_debug_flag(const char *name) {
     char path[256];

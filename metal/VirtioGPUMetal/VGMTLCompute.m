@@ -7,6 +7,8 @@
 // `[[buffer(n)]]` is set 0 binding n, the local size is specialization constants 0..2, and a ThreadsDynamic kernel
 // reads a 48-byte push-constant block (thread grid, thread base, threadgroup base, threadgroup grid) per region of
 // KernelDispatch::plan (full groups, then the partial tail of each dimension with its own local size).
+#include <os/lock.h>
+extern os_unfair_lock gVgSurfaceSync;   // VGMTLTexture.m: surface sync state (round 21)
 #import "objects.h"
 #import <mach/mach_time.h>
 #import <objc/runtime.h>
@@ -1359,11 +1361,17 @@ static void vg_surface_debug(VGMTLTexture *t) {
             int32_t dr[4];
             vg_dirty_rect(self, t, dr);
             NSUInteger px = IOSurfaceGetBytesPerElementOfPlane(t->_surface, t->_plane);
-            IOSurfaceLock(t->_surface, 0, NULL);
             // Did anyone else write the surface since we last pulled it? Then the rest of it is newer than our image,
             // and the next bind must pull it (5d): marking it synced kept Safari's page image without what WebKit had
-            // painted on the CPU meanwhile, and Core Animation drew that part black.
-            const BOOL othersWrote = !t->_neverSynced && IOSurfaceGetSeed(t->_surface) != t->_syncedSeed;
+            // painted on the CPU meanwhile, and Core Animation drew that part black. The seed is read before our own
+            // write lock, which bumps it (round 21): read after, every write-back looked like someone else's, the next
+            // bind pulled the surface's bytes back in, and that pull, queued ahead of the next submit, landed on top
+            // of a newer frame already drawn into the image -- WindowServer's screen surfaces went back a frame or
+            // two under a fast drag, and the parts it didn't redraw stayed old: pieces of windows left behind.
+            os_unfair_lock_lock(&gVgSurfaceSync);   // until the seed our unlock makes is recorded (round 21)
+            const uint32_t seedBefore = IOSurfaceGetSeed(t->_surface);
+            IOSurfaceLock(t->_surface, 0, NULL);
+            const BOOL othersWrote = !t->_neverSynced && seedBefore != t->_syncedSeed;
             uint8_t *base = IOSurfaceGetBaseAddressOfPlane(t->_surface, t->_plane);
             const uint8_t *from = t->_staging.map;
             size_t bytes = 0;
@@ -1382,10 +1390,15 @@ static void vg_surface_debug(VGMTLTexture *t) {
             uint32_t seed = 0;
             IOSurfaceUnlock(t->_surface, 0, &seed);
             vg_perf(VG_PERF_WB_COPY, bytes, vg_now() - t0);
+            if (vg_synclog()) {
+                vglog("synclog wrote back: cb %p surface %u rect %d,%d-%d,%d seed now %u%s", self,
+                      IOSurfaceGetID(t->_surface), dr[0], dr[1], dr[2], dr[3], seed, othersWrote ? " (others wrote)" : "");
+            }
             if (!othersWrote) {
                 t->_syncedSeed = seed;   // our own write: no pull needed for it
                 t->_neverSynced = NO;
             }
+            os_unfair_lock_unlock(&gVgSurfaceSync);
             vg_surface_wrote_back(t, seed);   // and none for a process sharing this image (5d)
             vg_surface_debug(t);
         }
@@ -1483,6 +1496,11 @@ static void vg_surface_debug(VGMTLTexture *t) {
                     _allTwinned = NO;
                 }
                 if (shown && !writeBackTwins) {
+                    if (vg_synclog()) {
+                        vglog("synclog shown, no write-back: surface %u %lux%lu seed %u synced %u",
+                              IOSurfaceGetID(t->_surface), (unsigned long)t->_width, (unsigned long)t->_height,
+                              IOSurfaceGetSeed(t->_surface), t->_syncedSeed);
+                    }
                     if (!noWriteBack) {
                         noWriteBack = [NSMutableSet set];
                     }
@@ -1493,7 +1511,18 @@ static void vg_surface_debug(VGMTLTexture *t) {
                 _allTwinned = NO;
             }
             int32_t dr[4];
-            if (!vg_dirty_rect(self, t, dr)) {   // stored, but nothing drawn into it: nothing to copy out
+            BOOL drawn = vg_dirty_rect(self, t, dr);
+            if (vg_synclog() && drawn) {
+                vglog("synclog write: cb %p surface %u %lux%lu rect %d,%d-%d,%d%s%s seed %u synced %u", self,
+                      IOSurfaceGetID(t->_surface), (unsigned long)t->_width, (unsigned long)t->_height, dr[0], dr[1],
+                      dr[2], dr[3], _present ? " present" : "", twinned ? " twinned" : "", IOSurfaceGetSeed(t->_surface),
+                      t->_syncedSeed);
+            }
+            if (!drawn) {   // stored, but nothing drawn into it: nothing to copy out
+                if (vg_synclog()) {
+                    vglog("synclog nothing drawn, no write-back: surface %u %lux%lu", IOSurfaceGetID(t->_surface),
+                          (unsigned long)t->_width, (unsigned long)t->_height);
+                }
                 if (!noWriteBack) {
                     noWriteBack = [NSMutableSet set];
                 }

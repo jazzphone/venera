@@ -1964,3 +1964,28 @@ always "Macintosh HD").
   112 and 110: both recoveries draw with Venera installed; the normal boot keeps the Metal desktop.
 - Found on the way: Proxmox's `qm agent VMID ping` can report success while the agent isn't up (use `qm guest cmd
   VMID ping`); `pkill -f PATTERN` inside an ssh command matches the command itself.
+
+## Round 21 (2026-11-19): pieces of old frames under a fast drag
+
+The owner, in Screen Sharing and in Proxmox's console (VM 107, and VM 108 too): drag a window fast and pieces of it
+stay behind, windows show cut off or for a moment black, pieces stay after a window closes. Not the viewers: the
+blob flips flush the whole screen to QEMU, and Screen Sharing captures the same frames.
+- Seen on VM 108 with tools/vncgrab.py (what the console shows) under a fast qmpinput drag: frames stitched from two
+  moments and strips of earlier frames where only the desktop belonged.
+- A sync log (flag file VirtioGPUMetal-synclog, empty or naming processes: every pull, every write, every write-back
+  and every written surface left without one, with seeds) showed WindowServer's two other screen-sized surfaces (1
+  and 4, rendered by every frame's display command buffers) pulled from their CPU bytes about 385 times each in 5 s,
+  and every write-back of theirs marked "(others wrote)".
+- Cause: the write-back read the surface's seed after taking its write lock, and a write lock bumps the seed: every
+  write-back looked like another process's write, left the image unsynced, and the next bind pulled the bytes back.
+  That pull is queued ahead of the next submit, while a newer frame of the same surface was often already drawn into
+  the image: the surface went back a frame or two, and WindowServer redraws only the damaged parts on top. Fixed by
+  reading the seed before the lock; then a race of the same kind was left (the encoding thread's pull check could see
+  a write-back's bumped seed before the completion thread recorded it): one lock (gVgSurfaceSync) now covers a
+  write-back from the seed read to the seed recorded, and the pull's check.
+- After: the same drag pulls nothing (surfaces 1 and 4: ~380 writes and write-backs each, no pull, no "others
+  wrote"), and the owner's own fast drags show nothing left behind. It also saves two 4 MB copies a frame.
+- Also seen (VM 107's log): twins asked for window-sized surfaces in display command buffers are refused
+  (kIOReturnNotPermitted); harmless, they take the write-back path.
+- tools/check-vtables.py (RX4Darwin's idea, our code): clang's vtable layout for each of our classes against the
+  real one in the KCs, and the 68 forwarders' slots.

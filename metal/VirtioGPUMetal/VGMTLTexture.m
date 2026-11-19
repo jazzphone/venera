@@ -4,6 +4,7 @@
 // creation), so it can be sampled, written as storage, rendered to and copied without layout tracking; the price is
 // some bandwidth on GPUs that compress attachments. replaceRegion / getBytes are synchronous, as Metal's are: a
 // staging buffer and a one-shot command buffer each.
+#include <os/lock.h>
 #import "objects.h"
 
 // ---- formats -----------------------------------------------------------------------------------------------------
@@ -1204,6 +1205,9 @@ id<MTLTexture> vg_texture_view_swz(VGMTLTexture *p, MTLPixelFormat pf, MTLTextur
     return t;
 }
 
+os_unfair_lock gVgSurfaceSync = OS_UNFAIR_LOCK_INIT;
+static void vg_surface_pull_locked(VGMTLTexture *t);
+
 void vg_surface_pull(VGMTLTexture *t) {
     if (t && t->_parent) {
         t = t->_parent;   // a view reads what its texture's surface or buffer holds
@@ -1224,6 +1228,15 @@ void vg_surface_pull(VGMTLTexture *t) {
     if (!t || !t->_surface) {
         return;
     }
+    // One lock for every surface's sync state (round 21): a write-back takes it from reading the seed to recording
+    // the one its unlock made, so this check never sees the seed its write lock bumped before it is recorded (that
+    // half-done state read as someone else's write, and the pull it caused put an older frame over a newer one).
+    os_unfair_lock_lock(&gVgSurfaceSync);
+    vg_surface_pull_locked(t);
+    os_unfair_lock_unlock(&gVgSurfaceSync);
+}
+
+static void vg_surface_pull_locked(VGMTLTexture *t) {
     uint32_t seed = IOSurfaceGetSeed(t->_surface);
     if (!t->_neverSynced && seed == t->_syncedSeed) {
         return;
@@ -1256,6 +1269,10 @@ void vg_surface_pull(VGMTLTexture *t) {
                            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
                            {(uint32_t)t->_width, (uint32_t)rows, 1}};
     vgtrace("surface %u: pull (seed %u, had %u)", IOSurfaceGetID(t->_surface), seed, t->_syncedSeed);
+    if (vg_synclog()) {
+        vglog("synclog pull: surface %u %lux%lu seed %u synced %u%s", IOSurfaceGetID(t->_surface),
+              (unsigned long)t->_width, (unsigned long)t->_height, seed, t->_syncedSeed, t->_neverSynced ? " new" : "");
+    }
     if (t->_shareRes) {
         // A shared image (5d): uploaded now. Left for our next submit, it could land after the other process put a
         // newer frame in the same image, and take it back to this older one.

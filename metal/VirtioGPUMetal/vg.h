@@ -30,6 +30,7 @@ void vg_perf(int kind, uint64_t bytes, uint64_t ns);
 static inline uint64_t vg_now(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 // VGMTL_TRACE=1: step-by-step lines for bisecting a host-side failure (the log is written before each step).
 BOOL vg_tracing(void);
+BOOL vg_synclog(void);   // flag file VirtioGPUMetal-synclog: pulls and skipped write-backs, logged
 #define vgtrace(...)                                                                                                \
     do {                                                                                                            \
         if (vg_tracing()) {                                                                                         \
