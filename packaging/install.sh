@@ -491,7 +491,7 @@ if [ $DRY = 0 ]; then
     --repository /Library/Extensions -A "$KC.venera-new" -z >"$KLOG" 2>&1 ||
     { tail -20 "$KLOG"; kc_die "kmutil failed (log: $KLOG)"; }
   for k in VirtioGPUFramebuffer VirtioGPUAccel; do
-    kmutil inspect -a x86_64 -A "$KC.venera-new" 2>/dev/null | grep -q "homelab\.$k[^A-Za-z]" ||
+    kmutil inspect -a x86_64 -A "$KC.venera-new" 2>/dev/null | grep -q "homelab\.${k}[^A-Za-z]" ||
       { tail -20 "$KLOG"; rm -f "$KC.venera-new"; kc_die "kmutil left $k out (log: $KLOG)"; }
   done
   mv -f "$KC.venera-new" "$KC" || kc_die "couldn't replace $KC (SIP file system protection still on?)"

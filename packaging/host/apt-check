@@ -1,0 +1,28 @@
+#!/bin/bash
+# apt-check: Venera's apt hook (install-host.sh puts it in /opt/venera and /etc/apt/apt.conf.d/80venera). Before apt
+# installs packages, it says which ones Venera's release was tested with at another version (QEMU, virglrenderer,
+# Mesa's Vulkan driver, Intel's VA-API driver: /opt/venera/TESTED), so a Proxmox update that could break a macOS VM's
+# desktop or video doesn't go by unnoticed. It only warns: apt always goes on.
+# apt gives it the .deb files it is about to install, one per line (DPkg::Pre-Install-Pkgs, version 1).
+TESTED=${VENERA_TESTED:-/opt/venera/TESTED}
+[ -r "$TESTED" ] || exit 0
+changed=""
+while IFS= read -r deb; do
+  [ -f "$deb" ] || continue
+  p=$(dpkg-deb -f "$deb" Package 2>/dev/null) || continue
+  want=$(awk -v p="$p" '$1 == p {print $2}' "$TESTED")
+  [ -n "$want" ] || continue
+  v=$(dpkg-deb -f "$deb" Version 2>/dev/null)
+  [ "$v" = "$want" ] || changed="$changed
+  $p $v (Venera was tested with $want)"
+done
+if [ -n "$changed" ]; then
+  {
+    echo
+    echo "Venera: this update changes packages a macOS VM's graphics or video depend on:$changed"
+    echo "  After it, start a macOS VM and look; /opt/venera/install-host.sh --check says what changed and how to go"
+    echo "  back. To keep them as they are until a Venera release is tested on the new ones: install-host.sh --hold."
+    echo
+  } >&2
+fi
+exit 0

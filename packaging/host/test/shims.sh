@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Stand-ins for a Proxmox host's commands, for test-install-host.sh (inside a throwaway Debian container).
 mkdir -p /etc/pve/qemu-server /dev/dri /shim /var/log/shim
 touch /dev/dri/renderD128

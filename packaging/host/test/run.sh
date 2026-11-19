@@ -19,6 +19,7 @@ check "108 gains its device" '[ "$(args 108)" = "-cpu host,vendor=GenuineIntel -
 check "only the missing package installed" '[ "$(cat /var/log/shim/apt)" = "apt-get install -y intel-media-va-driver" ]'
 check "state records it" 'grep -qx "apt_installed=intel-media-va-driver" /opt/venera/state'
 check "program and unit in place" '[ -x /opt/venera/video/bin/venera-videod ] && [ -e /etc/systemd/system/venera-videod@.service ] && [ -e /etc/systemd/system/venera-videod@.socket ] && [ -e /var/log/shim/enabled.venera-videod@108.socket ]'
+check "the apt hook in place, with TESTED" '[ -x /opt/venera/apt-check ] && [ -r /opt/venera/TESTED ] && grep -q "Pre-Install-Pkgs.*/opt/venera/apt-check" /etc/apt/apt.conf.d/80venera'
 check "config backed up" 'ls /opt/venera/backup/108.conf.* >/dev/null 2>&1'
 ./install-host.sh --vm 108 --vm 109 >/tmp/i2.log 2>&1
 check "a second install leaves 108 alone" '[ "$(args 108)" = "-cpu host,vendor=GenuineIntel -smbios type=2 $DEV108" ] && grep -q "VM 108: has its video device already" /tmp/i2.log'
@@ -48,6 +49,7 @@ check "only our package removed" 'grep -q "apt-get remove -y intel-media-va-driv
 check "files and unit gone, backups kept" '[ ! -e /opt/venera/video ] && [ ! -e /etc/systemd/system/venera-videod@.service ] && [ ! -e /etc/systemd/system/venera-videod@.socket ] && ls /opt/venera/backup/ | grep -q 108'
 check "no instance left enabled" '! ls /var/log/shim/enabled.* >/dev/null 2>&1'
 check "the other VM untouched throughout" 'cmp -s /etc/pve/qemu-server/200.conf /tmp/200.before'
+check "the apt hook gone with the uninstall" '[ ! -e /etc/apt/apt.conf.d/80venera ] && [ ! -e /opt/venera/apt-check ] && [ ! -e /opt/venera/TESTED ]'
 check "another node's VM untouched by the uninstall" 'cmp -s /etc/pve/nodes/other/qemu-server/121.conf /tmp/121.before'
 # a VM whose args already hold someone else's ivshmem device stays as it is
 printf 'args: -chardev socket,path=/run/other.sock,id=vvideo -device ivshmem-doorbell,chardev=vvideo\n' >/etc/pve/qemu-server/110.conf

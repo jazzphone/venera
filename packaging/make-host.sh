@@ -25,7 +25,7 @@ docker run --rm --platform linux/amd64 -e EXTRA="-lva-drm" -v ~/src:/src venera-
 rm -rf $D && mkdir -p $D/bin $D/lib $D/licenses
 cp hostvideo/out/bin/venera-videod hostvideo/out/bin/vaprofiles $D/bin/
 cp -P hostvideo/out/ffmpeg/lib/*.so* $D/lib/
-cp packaging/host/install-host.sh packaging/host/TESTED packaging/host/venera-videod@.service packaging/host/venera-videod@.socket VERSION LICENSE NOTICE.md $D/
+cp packaging/host/install-host.sh packaging/host/apt-check packaging/host/TESTED packaging/host/venera-videod@.service packaging/host/venera-videod@.socket VERSION LICENSE NOTICE.md $D/
 # the macOS VM script (MIT, vm/README.md), the OpenCore image and macrecovery.py it uses, and the guest package
 cp vm/proxmox-macos-vm.sh vm/macrecovery.py $D/
 ls build/opencore/OpenCore-Venera-*.img >/dev/null 2>&1 || vm/opencore/build.sh >/dev/null
@@ -44,7 +44,7 @@ if [[ -f "dist/Install Venera $VERSION.pkg" ]]; then
 else
   echo "make-host: no dist/Install Venera $VERSION.pkg (packaging/make-pkg.sh): the host package goes without it" >&2
 fi
-chmod 755 $D/install-host.sh $D/proxmox-macos-vm.sh $D/bin/*
+chmod 755 $D/install-host.sh $D/apt-check $D/proxmox-macos-vm.sh $D/bin/*
 FF=${FFSRC:-$HOME/src/vendor-src/ffmpeg/ffmpeg-7.1.1}
 cp $FF/COPYING.LGPLv2.1 $D/licenses/FFmpeg-LGPL-2.1.txt
 cat >$D/licenses/FFmpeg-SOURCE.txt <<TXT

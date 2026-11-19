@@ -63,7 +63,7 @@ compute) # stage 4b: mtlcompute (allow-listed by VGMTL_ENABLE), then the plugin'
 tool) # tool NAME [ARGS]: one of the test tools as the console user (allow-listed by VGMTL_ENABLE), then the log
   shift
   rm -f /var/tmp/VirtioGPUMetal.log
-  cd $T && sudo -u dev env VGMTL_ENABLE=1 VGMTL_TRACE=${VGMTL_TRACE:-0} ./"$@" 2>&1; echo "$1 exit $?"
+  cd $T && sudo -u dev env VGMTL_ENABLE=1 VGMTL_TRACE=${VGMTL_TRACE:-0} "./$1" "${@:2}" 2>&1; echo "$1 exit $?"
   echo "== plugin log"; cat /var/tmp/VirtioGPUMetal.log 2>/dev/null | tail -40
   ;;
 window) # window [SECONDS]: mtlwindow in dev's GUI session, a screenshot halfway (/var/tmp/vgwin.png), then the log

@@ -19,6 +19,9 @@
 #   - /etc/systemd/system/venera-videod@.socket and @.service, one instance per VM (venera-videod@VMID): systemd holds
 #     the socket from boot and starts the service when the VM connects. The service runs sandboxed (its own dynamic
 #     user, the GPU's render node only, no network, read-only system); a restart keeps the VM's connection.
+#   - /etc/apt/apt.conf.d/80venera, a hook (/opt/venera/apt-check) that warns before apt installs a newer version of
+#     a package Venera was tested with (/opt/venera/TESTED: QEMU, virglrenderer, Mesa's Vulkan driver, VA-API's);
+#     it only warns, apt always goes on
 #   - each VM's `args:` line gains its video device:
 #       -chardev socket,path=/run/venera-video-VMID.sock,id=vvideo -device ivshmem-doorbell,chardev=vvideo,vectors=1
 #     (the VM's config is backed up to /opt/venera/backup first). Nothing else in the VM's config changes.
@@ -38,6 +41,7 @@ PREFIX=/opt/venera
 UNIT=/etc/systemd/system/venera-videod@.service
 SOCK=/etc/systemd/system/venera-videod@.socket
 LEGACY_UNIT=/etc/systemd/system/venera-videod.service
+APTHOOK=/etc/apt/apt.conf.d/80venera
 LEGACY_ARGS="-chardev socket,path=/run/venera-video.sock,id=vvideo -device ivshmem-doorbell,chardev=vvideo,vectors=1"
 STATE=$PREFIX/state
 PKGS="intel-media-va-driver libva-drm2"
@@ -273,7 +277,7 @@ uninstall)
   for u in $(systemctl list-units --all --plain --no-legend 'venera-videod@*' 2>/dev/null | awk '{print $1}'); do
     run systemctl disable --now "$u"
   done
-  for f in "$UNIT" "$SOCK"; do
+  for f in "$UNIT" "$SOCK" "$APTHOOK"; do
     [ -e "$f" ] && run rm -f "$f"
   done
   run systemctl daemon-reload
@@ -285,7 +289,7 @@ uninstall)
   for p in $PKGS; do
     case " $mine " in *" $p "*) ;; *) say "$p: left installed (it was there before Venera)" ;; esac
   done
-  run rm -rf "$PREFIX/video" "$PREFIX/VERSION" "$PREFIX/state"
+  run rm -rf "$PREFIX/video" "$PREFIX/VERSION" "$PREFIX/state" "$PREFIX/TESTED" "$PREFIX/apt-check" "$PREFIX/install-host.sh"
   run rm -rf /var/lib/private/venera-video /var/lib/venera-video
   say "Venera's host half removed. VM config backups stay in $PREFIX/backup (rm -rf $PREFIX when no longer wanted)."
   say "A VM that is running keeps its device until it stops."
@@ -296,7 +300,7 @@ esac
 # ---- install -------------------------------------------------------------------------------------------------------
 [ ${#VMS[@]} -gt 0 ] || die "name the VM(s): --vm VMID (--help)"
 for id in "${VMS[@]}"; do check_vm "$id"; done   # every VM checked before anything changes
-for f in bin/venera-videod lib venera-videod@.service venera-videod@.socket VERSION; do
+for f in bin/venera-videod lib venera-videod@.service venera-videod@.socket VERSION TESTED apt-check; do
   [ -e "$HERE/$f" ] || die "$f is missing: run this from the unpacked Venera-host folder"
 done
 [ "$(uname -m)" = x86_64 ] || die "x86_64 hosts only"
@@ -335,6 +339,15 @@ if [ $DRY = 0 ]; then
     warn "VA-API can't decode H.264 on this GPU (vaprofiles: $(echo "$prof" | head -2 | tr '\n' ' '))"
   fi
 fi
+
+# the apt hook: a warning before a Proxmox update replaces a package this release was tested with (and this script,
+# with TESTED, for its --check afterwards)
+run install -m 755 "$HERE/apt-check" "$HERE/install-host.sh" "$PREFIX/"
+run install -m 644 "$HERE/TESTED" "$PREFIX/"
+if [ $DRY = 0 ]; then
+  printf '%s\n' "// Venera (install-host.sh): warns before apt replaces a package Venera was tested with; --uninstall removes it" \
+    'DPkg::Pre-Install-Pkgs { "/opt/venera/apt-check"; };' >"$APTHOOK"
+else say "  + write $APTHOOK"; fi
 
 # 3. the socket and service, one instance per VM
 run cp "$HERE/venera-videod@.service" "$UNIT"
