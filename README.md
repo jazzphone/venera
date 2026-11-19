@@ -86,6 +86,21 @@ For development against a test VM, `tools/deploy.sh` builds and installs pieces 
 (set the host in `tools/local.env`, from `tools/local.env.example`); `tools/gesture-bench.sh` and
 `tools/drag-perf.sh` measure frame pacing with injected input.
 
+`tools/check-vtables.py` checks the kexts' vtables against a macOS release, before a macOS update can shift a slot
+under us: it compiles each kext as `tools/build.sh` does and compares, slot by slot, the layout clang computes for
+each of our classes (from NullMoth's headers and the SDK's) with its base's real vtable in the kernel collections
+given, and checks that every forwarder in `vendor/nullmoth/accel/vg_tahoe_fwd.h` jumps through the slot of the method
+it forwards. Copy the guest's `/System/Library/KernelCollections/BootKernelExtensions.kc` and
+`SystemKernelExtensions.kc` out first (the IOAccel classes are in the System KC):
+
+```bash
+tools/check-vtables.py --kc BootKernelExtensions.kc --kc SystemKernelExtensions.kc   # exit 1 on a mismatch
+tools/check-vtables.py --kext VirtioGPUAccel --show VGResource --kc ...               # one kext, every slot of a class
+```
+
+Without `--kc` it runs only the forwarder check; a class whose base isn't in the KCs given is checked against its
+nearest ancestor that is (PARTIAL).
+
 ## Layout
 
 - `kext/VirtioGPU/` — the core kext (C++, the macOS SDK's Kernel.framework), injected by OpenCore.

@@ -1989,3 +1989,6 @@ blob flips flush the whole screen to QEMU, and Screen Sharing captures the same 
   (kIOReturnNotPermitted); harmless, they take the write-back path.
 - tools/check-vtables.py (RX4Darwin's idea, our code): clang's vtable layout for each of our classes against the
   real one in the KCs, and the 68 forwarders' slots.
+  Against VM 108's 25G342 Boot and System KCs: every class OK (the IOAccel ones slot by slot against
+  IOAcceleratorFamily2), the 68 forwarders on Apple's method; 7 "signature" notes are enums our headers declare as
+  unsigned int (the same in the binary).
