@@ -1644,6 +1644,14 @@ hardware video encoding, a way to fix what apps ask for that the driver lacks, a
     yet); 10-bit encoding (Main10); encoder messages in the fuzz seeds (the session harness only has decode's);
     `kVTCompressionPropertyKey_Quality` is taken as constant quality without a level.
 
+## Venera 0.1.5 (2026-11-18)
+
+Rounds 16 and 17 packaged: two twins a display surface (core 0.5.8, accelerator 0.6.14, Metal driver 0.4.3: no frame
+copied into the one on screen), CompleteFrames answered 20 ms after the last frame, the translation seed on any macOS
+build, and the VM script's recovery download and install instructions fixed. Tested by upgrading VM 108 from the
+0.1.5-dev test build with the release's VM script: 0 of 3,584 drag frames into the twin on screen, vtenc 1080p 20 of
+20 complete at CompleteFrames.
+
 ## Venera 0.1.4 (2026-11-18)
 
 Round 15 packaged: 4K 10-bit decoding through the host (VeneraVideo 0.2.1, frames spanning two slots) and the host

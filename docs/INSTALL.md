@@ -105,8 +105,8 @@ it when `SIGN_ID="Developer ID Installer: NAME (TEAM)"` names a certificate in t
 In the guest, as an administrator:
 
 ```bash
-tar -xzf Venera-0.1.4.tar.gz
-cd Venera-0.1.4
+tar -xzf Venera-0.1.5.tar.gz
+cd Venera-0.1.5
 sudo ./install.sh --set-security      # or without --set-security when SIP and AMFI are already relaxed
 sudo shutdown -r now
 ```
@@ -162,8 +162,8 @@ package's "Hardware video" choice (`install.sh --video`). The host's half is `Ve
 for a Proxmox host with an Intel GPU:
 
 ```bash
-tar -xzf Venera-host-0.1.4.tar.gz
-cd Venera-host-0.1.4
+tar -xzf Venera-host-0.1.5.tar.gz
+cd Venera-host-0.1.5
 ./install-host.sh --vm 108          # as root on the Proxmox host; --dry-run first to see each step
 qm shutdown 108 && qm start 108     # the VM picks up its new device when QEMU starts again
 ```
