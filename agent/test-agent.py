@@ -95,5 +95,36 @@ check('0xFF throws away a half request', r == b'{"return":7}\n', r)
 p.stdin.close()
 p.wait()
 check('ends at end of input', p.returncode == 0, p.returncode)
+
+
+# answers kept small (a second agent with a 100 KB limit, as on a slow port)
+p = subprocess.Popen([sys.argv[1], '--stdio', '--answer-max', '100000'], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+pid = ret({'execute': 'guest-exec', 'arguments': {'path': '/bin/sh', 'arg': ['-c', 'head -c 300000 /dev/zero; head -c 300000 /dev/zero >&2'],
+                                                  'capture-output': True}})['pid']
+for _ in range(100):
+    raw = ask({'execute': 'guest-exec-status', 'arguments': {'pid': pid}})
+    s = json.loads(raw)['return']
+    if s['exited']:
+        break
+    time.sleep(0.05)
+check('a big output is cut to fit the answer, and says so',
+      len(raw) <= 100000 and s.get('out-truncated') and s.get('err-truncated') and len(base64.b64decode(s['out-data'])) > 40000,
+      (len(raw), {k: v for k, v in s.items() if 'data' not in k}))
+path = tempfile.mktemp()
+open(path, 'wb').write(os.urandom(500000))
+h = ret({'execute': 'guest-file-open', 'arguments': {'path': path}})
+got = b''
+while True:
+    raw = ask({'execute': 'guest-file-read', 'arguments': {'handle': h, 'count': 1048576}})
+    r = json.loads(raw)['return']
+    check_size = len(raw) <= 100000
+    got += base64.b64decode(r['buf-b64'])
+    if r['eof'] or not r['count']:
+        break
+ret({'execute': 'guest-file-close', 'arguments': {'handle': h}})
+check('a file read in pieces that fit, all of it', check_size and got == open(path, 'rb').read(), len(got))
+os.unlink(path)
+p.stdin.close()
+p.wait()
 print('all passed' if not fails else f'{fails} failed')
 sys.exit(1 if fails else 0)

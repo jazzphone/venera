@@ -49,6 +49,11 @@ extern char **environ;
 
 static int gOut = -1;
 static BOOL gStdio = NO;
+// The most an answer may hold (its JSON, in bytes). Proxmox gives up on an answer after 5 s (its default timeout)
+// and hangs up, which is what stalls macOS's virtio console mid-answer; so every answer fits in about 2 s of the
+// port: ~1 MB/s on the virtio port, ~100 KB/s on the ISA serial port. A file read returns less than asked (Proxmox
+// reads again), and command output past it is marked truncated, as QEMU's own agent does past its limit.
+static size_t gAnswerMax = SIZE_MAX;
 
 static void logf_(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
 static void logf_(NSString *fmt, ...) {
@@ -457,10 +462,19 @@ static id execStatus(NSDictionary *a) {
         if (WIFEXITED(st)) r[@"exitcode"] = @(WEXITSTATUS(st));
         else if (WIFSIGNALED(st)) r[@"signal"] = @(WTERMSIG(st));
         if (x.capture) {
-            if (x.outData.length) r[@"out-data"] = [x.outData base64EncodedStringWithOptions:0];
-            if (x.errData.length) r[@"err-data"] = [x.errData base64EncodedStringWithOptions:0];
-            if (x.outTrunc) r[@"out-truncated"] = @YES;
-            if (x.errTrunc) r[@"err-truncated"] = @YES;
+            NSData *o = x.outData, *e = x.errData;
+            size_t room = gAnswerMax == SIZE_MAX ? SIZE_MAX : gAnswerMax / 4 * 3 - 512;   // raw bytes that fit, both streams
+            BOOL ot = x.outTrunc, et = x.errTrunc;
+            if (room != SIZE_MAX && o.length + e.length > room) {   // keep the start of each; stderr gets up to a quarter
+                size_t eKeep = MIN(e.length, room / 4), oKeep = MIN(o.length, room - eKeep);
+                eKeep = MIN(e.length, room - oKeep);
+                if (oKeep < o.length) { o = [o subdataWithRange:NSMakeRange(0, oKeep)]; ot = YES; }
+                if (eKeep < e.length) { e = [e subdataWithRange:NSMakeRange(0, eKeep)]; et = YES; }
+            }
+            if (o.length) r[@"out-data"] = [o base64EncodedStringWithOptions:0];
+            if (e.length) r[@"err-data"] = [e base64EncodedStringWithOptions:0];
+            if (ot) r[@"out-truncated"] = @YES;
+            if (et) r[@"err-truncated"] = @YES;
         }
     }
     @synchronized(gExecs) { [gExecs removeObjectForKey:@(pid.intValue)]; }
@@ -508,6 +522,7 @@ static id fileRead(NSDictionary *a) {
     if (!f) return e;
     int64_t count = num(a, @"count") ? num(a, @"count").longLongValue : 4096;
     if (count < 0 || count > MAX_READ) return BADARG(@"count must be 0 to %u", MAX_READ);
+    if (gAnswerMax != SIZE_MAX) count = MIN(count, (int64_t)(gAnswerMax / 4 * 3) - 256);   // base64 and the rest
     NSMutableData *d = [NSMutableData dataWithLength:(NSUInteger)count];
     size_t n = fread(d.mutableBytes, 1, (size_t)count, f);
     if (ferror(f)) { clearerr(f); return GENERIC(@"read: %s", strerror(errno)); }
@@ -779,8 +794,9 @@ int main(int argc, char **argv) {
         for (int i = 1; i < argc; i++) {
             if (!strcmp(argv[i], "--stdio")) gStdio = YES;
             else if (!strcmp(argv[i], "--device") && i + 1 < argc) dev = @(argv[++i]);
+            else if (!strcmp(argv[i], "--answer-max") && i + 1 < argc) gAnswerMax = strtoull(argv[++i], NULL, 10);
             else if (!strcmp(argv[i], "--version")) { printf("venera-agent %s\n", VENERA_VERSION); return 0; }
-            else { fprintf(stderr, "usage: venera-agent [--device PATH] [--stdio] [--version]\n"); return 2; }
+            else { fprintf(stderr, "usage: venera-agent [--device PATH] [--stdio] [--answer-max BYTES] [--version]\n"); return 2; }
         }
         signal(SIGPIPE, SIG_IGN);
         setup();
@@ -802,7 +818,8 @@ int main(int argc, char **argv) {
                     sleep(3);
                     continue;
                 }
-                logf_(@"on %@", path);
+                gAnswerMax = [path hasPrefix:@"/dev/cu.serial"] ? 200000 : 1500000;
+                logf_(@"on %@ (answers up to %zu KB)", path, gAnswerMax / 1000);
                 last = path;
                 gOut = fd;
                 serve(fd);
