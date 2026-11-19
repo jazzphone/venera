@@ -590,4 +590,7 @@ say "failures; INSTALL.md, \"Recovery\", has the rest. ./status.sh shows what ru
 # the second pass restarts by itself: at the login window right away, else after asking whoever is logged in
 finish_done
 rm -f "$V/finish-first"
-[ $FINISH = 1 ] && [ $DRY = 0 ] && restart_now "Venera finished installing. Restart to start it?"
+if [ $FINISH = 1 ] && [ $DRY = 0 ]; then
+  restart_now "Venera finished installing. Restart to start it?"
+fi
+exit 0   # (a bare `[ ] && ...` last line made a finished install exit 1, and Installer report the package failed)
