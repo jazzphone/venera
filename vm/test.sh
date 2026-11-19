@@ -1,9 +1,11 @@
 #!/bin/bash
 # The VM script's own pieces, without a Proxmox host: the args Venera adds, a cluster node's address, and OpenCore's
-# config.plist edits (against KVM-Opencore v21's own config.plist, $1). Runs anywhere with bash 4+ and python3, e.g.
-#   bash vm/test.sh CONFIG   (on a Proxmox host, say: the build container has no python3)
+# config.plist: Venera's (vm/opencore/config.py over OpenCorePkg's Sample.plist, $1), the VM script's edits on it, and
+# moving an older VM's config ($2, KVM-Opencore v21's, say) onto it. Runs anywhere with bash 4+ and python3, e.g.
+#   bash vm/test.sh SAMPLE OLD-CONFIG   (on a Proxmox host, say: the build container has no python3)
 set -u
-CFG=${1:?the stock config.plist from OpenCore-v21.iso (EFI/OC/config.plist)}
+SAMPLE=${1:?the Docs/Sample.plist of the OpenCorePkg release vm/opencore/build.sh uses}
+OLDCFG=${2:?an older OpenCore config.plist to move (EFI/OC/config.plist of KVM-Opencore v21)}
 MACOS_VM_TEST=1 . "$(dirname "$0")/proxmox-macos-vm.sh"
 set +e
 fail=0
@@ -50,6 +52,7 @@ nodelist {
   }
 }
 C
+CFG=$(mktemp); python3 "$(dirname "$0")/opencore/config.py" "$SAMPLE" "$CFG"
 check "a node's address from corosync" '[ "$(COROSYNC=$W/corosync.conf node_ip pve-a)" = 192.0.2.11 ] && [ "$(COROSYNC=$W/corosync.conf node_ip pve-b)" = 192.0.2.12 ] && [ -z "$(COROSYNC=$W/corosync.conf node_ip pve-c)" ]'
 
 ok_plist() { python3 - "$@" <<'PY'
@@ -58,7 +61,7 @@ c = plistlib.load(open(sys.argv[1], "rb")); what = sys.argv[2]; G = "7C436110-AB
 nv, gen, add = c["NVRAM"], c["PlatformInfo"]["Generic"], [k["BundlePath"] for k in c["Kernel"]["Add"]]
 s = plistlib.load(open(sys.argv[3], "rb"))
 if what == "create":
-    ok = (add.index("VMHide.kext") == add.index("Lilu.kext") + 1 and add.count("VMHide.kext") == 1
+    ok = (add == ["VeneraHide.kext"] and gen["SystemUUID"] != "00000000-0000-0000-0000-000000000000"
           and c["UEFI"]["Output"]["Resolution"] == "1920x1080@32" and c["Misc"]["Boot"]["Timeout"] == 5
           and nv["Add"][G]["boot-args"] == "keepsyms=1 amfi_get_out_of_my_way=1"
           and nv["Add"][G]["csr-active-config"] == bytes.fromhex("03020000")
@@ -72,8 +75,8 @@ sys.exit(0 if ok else 1)
 PY
 }
 cp "$CFG" "$W/c.plist"
-OC_RES=1920x1080 OC_ARGS="keepsyms=1 amfi_get_out_of_my_way=1" OC_CSR=03020000 MODEL=iMac20,1 SERIAL="" MLB="" ROM="" oc_config "$W/c.plist" >"$W/oc.log"
-check "a new VM's OpenCore: VMHide after Lilu, the screen, SIP 0x203, AMFI, the model" 'ok_plist "$W/c.plist" create "$CFG"'
+NEWUUID=1 OC_RES=1920x1080 OC_ARGS="keepsyms=1 amfi_get_out_of_my_way=1" OC_CSR=03020000 MODEL=iMac20,1 SERIAL="" MLB="" ROM="" oc_config "$W/c.plist" >"$W/oc.log"
+check "a new VM's OpenCore: VeneraHide alone, its own UUID, the screen, SIP 0x203, AMFI, the model" 'ok_plist "$W/c.plist" create "$CFG"'
 cp "$W/c.plist" "$W/c1.plist"
 OC_RES=1920x1080 OC_ARGS="keepsyms=1 amfi_get_out_of_my_way=1" OC_CSR=03020000 MODEL=iMac20,1 SERIAL="" MLB="" ROM="" oc_config "$W/c.plist" >/dev/null
 check "OpenCore edited twice is the same" 'python3 -c "import plistlib,sys; sys.exit(plistlib.load(open(\"$W/c.plist\",\"rb\")) != plistlib.load(open(\"$W/c1.plist\",\"rb\")))"'
@@ -85,7 +88,27 @@ cp "$CFG" "$W/w.plist"
 OC_RES=1280x800 OC_ARGS="keepsyms=1 amfi_get_out_of_my_way=1" OC_CSR=030A0000 MODEL=iMac20,1 SERIAL="" oc_config "$W/w.plist" | grep -q "0xA03"
 check "Safari WebGL's SIP is 0xA03" '[ $? = 0 ]'
 
+# an older VM's config (with Venera's kexts and its own identity) moved onto Venera's
+python3 - "$OLDCFG" "$W/old.plist" <<'PY'
+import plistlib, sys
+c = plistlib.load(open(sys.argv[1], "rb"))
+for k in ("VirtioGPU", "VeneraVideo"):
+    c["Kernel"]["Add"].append({"Arch": "x86_64", "BundlePath": k + ".kext", "Comment": "Venera", "Enabled": True,
+                               "ExecutablePath": "Contents/MacOS/" + k, "MaxKernel": "", "MinKernel": "", "PlistPath": "Contents/Info.plist"})
+c["NVRAM"]["Add"]["7C436110-AB2A-4BBB-A880-FE41995C9F82"]["boot-args"] = "keepsyms=1 vgpuaccel=4"
+c["PlatformInfo"]["Generic"]["SystemSerialNumber"] = "C02OWNSERIAL"
+c["UEFI"]["Output"]["Resolution"] = "1280x800@32"
+plistlib.dump(c, open(sys.argv[2], "wb"))
+PY
+cp "$CFG" "$W/moved.plist"; oc_transplant "$W/old.plist" "$W/moved.plist" >/dev/null
+check "an older VM moved to Venera's OpenCore: its kexts, boot-args, identity and screen kept, the old extras gone" 'python3 -c "
+import plistlib, sys
+c = plistlib.load(open(\"$W/moved.plist\", \"rb\")); add = [k[\"BundlePath\"] for k in c[\"Kernel\"][\"Add\"]]
+sys.exit(not (add == [\"VeneraHide.kext\", \"VirtioGPU.kext\", \"VeneraVideo.kext\"]
+    and c[\"NVRAM\"][\"Add\"][\"7C436110-AB2A-4BBB-A880-FE41995C9F82\"][\"boot-args\"] == \"keepsyms=1 vgpuaccel=4\"
+    and c[\"PlatformInfo\"][\"Generic\"][\"SystemSerialNumber\"] == \"C02OWNSERIAL\" and c[\"UEFI\"][\"Output\"][\"Resolution\"] == \"1280x800@32\"
+    and c[\"Misc\"][\"Boot\"][\"PickerMode\"] == \"Builtin\" and not c[\"UEFI\"][\"Drivers\"][1][\"Path\"].startswith(\"OpenCanopy\")))"'
 check "a package that isn't installed is missing" '[ "$(missing_pkgs bash no-such-package-here)" = "no-such-package-here " ]'
-rm -rf "$W"
+rm -rf "$W" "$CFG"
 [ $fail = 0 ] && echo "all passed"
 exit $fail

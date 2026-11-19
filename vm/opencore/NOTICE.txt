@@ -1,0 +1,10 @@
+Venera's OpenCore image (OpenCore-Venera-VERSION.img), made by vm/opencore/build.sh in Venera's repository:
+
+- OpenCore (BOOTx64.efi, OpenCore.efi, OpenRuntime.efi, OpenHfsPlus.efi, OpenPartitionDxe.efi, ResetNvramEntry.efi)
+  from acidanthera's OpenCorePkg release of that version, unmodified. BSD-3-Clause (licenses/OpenCorePkg-BSD-3.txt);
+  https://github.com/acidanthera/OpenCorePkg
+- config.plist: OpenCorePkg's Docs/Sample.plist with Venera's settings (vm/opencore/config.py)
+- ACPI/SSDT-VENERA.aml: Venera's own (vm/opencore/SSDT-VENERA.dsl)
+- Kexts/VeneraHide.kext: Venera's own (kext/VeneraHide), under Venera's license
+
+The VM script also carries macrecovery.py from OpenCorePkg (BSD-3-Clause), unmodified.

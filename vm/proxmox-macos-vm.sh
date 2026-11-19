@@ -4,19 +4,21 @@
 # package (guest/Install Venera VERSION.pkg) beside it. It checks the host, asks its questions, shows the plan, and
 # changes nothing until you say yes. MIT (vm/README.md), like the an earlier project script it grew from.
 #
-#   a new VM:      the host's packages (on each cluster node the VM may run on), OpenCore with SIP and AMFI already as
-#                  Venera needs them, macOS Tahoe's recovery from Apple, the VM with Venus graphics and a sound device,
-#                  and a "Venera" disk with the installer package. Then: install macOS, open Install Venera on that
-#                  disk, restart, and run this again to Finish.
+#   a new VM:      the host's packages (on each cluster node the VM may run on), Venera's OpenCore image (from this
+#                  package) with SIP and AMFI already as Venera needs them, macOS Tahoe's recovery from Apple (or your
+#                  own macOS disk, installer or recovery image), the VM with Venus graphics and a sound device, and the
+#                  Venera Tools CD. Then: install macOS, open Install Venera on that CD, restart, and run this again to
+#                  Finish.
 #   an existing VM: Finish (hardware video on every node, the installer disks out, a restart), Ready for Venera (an
 #                  older macOS VM: the host's packages, the display, the args and the Venera Tools CD), Upgrade Venera (this
 #                  release's host half on every node, then its guest package installed in macOS with the choices it
-#                  has, through the guest agent, and a restart), or its Mac identity.
+#                  has, through the guest agent, and a restart), its Mac identity, or OpenCore (moved to Venera's own
+#                  image, keeping the VM's settings).
 #
 # What each piece is for (each one a dead end without it):
 #   the SMC key             - without it boot stops at "busy timeout ... AppleACPICPU" (WindowServer can't be decrypted)
-#   VMHide + Lilu 1.7       - without it the Apple Account sign-in sees a VM and fails ("Verification failed")
-#   -cpu host (+hypervisor) - hiding the hypervisor from the CPU stops the kernel; VMHide hides it from Apple's checks only
+#   VeneraHide (OpenCore)   - without it the Apple Account sign-in sees a VM and fails ("Verification failed")
+#   -cpu host (+hypervisor) - hiding the hypervisor from the CPU stops the kernel; VeneraHide hides it from Apple's checks
 #   no TRIM on the disk     - Disk Utility's erase TRIMs the whole disk, which shared iSCSI storage clears 2 MB at a time
 #   the guest agent         - Venera's (a Customize choice, on by default) on the virtio agent port: clean shutdowns,
 #                             the VM's addresses in Proxmox, and Finish and Upgrade work through it
@@ -158,12 +160,10 @@ TXT
 }
 
 # ---- OpenCore ------------------------------------------------------------------------------------------------------
-OC_URL=https://github.com/thenickdude/KVM-Opencore/releases/download/v21/OpenCore-v21.iso.gz
-OC_SHA=a2b03ae2fb558e0bce99b57b5aff78e650501e39ecbeff0a8f69a8f25d64d76e   # the unpacked OpenCore-v21.iso
-LILU_URL=https://github.com/acidanthera/Lilu/releases/download/1.7.2/Lilu-1.7.2-RELEASE.zip
-LILU_SHA=53967d7dcfaab01023a33df2e969a89522f13d6654a6a56ac4711b62dabf3ab8
-VMHIDE_URL=https://github.com/Carnations-Botanica/VMHide/releases/download/2.0.0/VMHide-2.0.0-RELEASE.zip
-VMHIDE_SHA=31ffb861192eea52ad166fc0629b411ae48d8507c75935ab875bc61aebaa8dbb
+# Venera's own OpenCore image (vm/opencore/build.sh: acidanthera's OpenCore with Venera's config, ACPI table and
+# VeneraHide), carried in the host package's opencore/ folder; nothing to download
+OCSRC=""; for f in "$HERE"/opencore/OpenCore-Venera-*.img "$HERE"/OpenCore-Venera-*.img; do [ -f "$f" ] && { OCSRC=$f; break; }; done
+OCVER=$(basename "${OCSRC:-x-0}" .img); OCVER=${OCVER##*-}
 MACREC_URL=https://raw.githubusercontent.com/acidanthera/OpenCorePkg/1.0.8/Utilities/macrecovery/macrecovery.py
 MACREC_SHA=3023a9b4ca79a5255d93c00f25ab5df37e6f938b729b797d9ecea56184b17aff
 TAHOE_BOARD=Mac-CFF7D910A743CAAF   # OpenCorePkg's macrecovery list: macOS 26 Tahoe, "-os latest"
@@ -181,15 +181,11 @@ p = sys.argv[1]
 with open(p, "rb") as f: c = plistlib.load(f)
 e = os.environ.get
 if e("OC_RES"):
-    add = c["Kernel"]["Add"]
-    if not any(k["BundlePath"] == "VMHide.kext" for k in add):
-        i = [k["BundlePath"] for k in add].index("Lilu.kext")
-        k = dict(add[i]); k.update({"BundlePath": "VMHide.kext", "ExecutablePath": "Contents/MacOS/VMHide", "PlistPath": "Contents/Info.plist",
-                                    "Comment": "VMHide: hide the VM from Apple Account sign-in", "MinKernel": "", "MaxKernel": "", "Enabled": True})
-        add.insert(i + 1, k)
     c["UEFI"]["Output"]["Resolution"] = e("OC_RES") + "@32"
     c["Misc"]["Boot"]["Timeout"] = 5
-    print("   OpenCore: Lilu 1.7.2 + VMHide,", e("OC_RES") + ", boot menu 5 s")
+    print("   OpenCore %s (Venera's): VeneraHide, %s, boot menu 5 s" % (e("OCVER", "?"), e("OC_RES")))
+if e("NEWUUID"):   # each VM its own hardware UUID (the sample's is zeros)
+    c["PlatformInfo"]["Generic"]["SystemUUID"] = str(uuid.uuid4()).upper()
 nv = c["NVRAM"]
 if e("OC_ARGS") is not None:
     nv["Add"].setdefault("7C436110-AB2A-4BBB-A880-FE41995C9F82", {})["boot-args"] = e("OC_ARGS")
@@ -215,17 +211,53 @@ with open(p, "wb") as f: plistlib.dump(c, f)
 PY
 }
 
-prepare_opencore() {   # on the new OpenCore image $OCIMG: Lilu 1.7.2 + VMHide, the screen size, SIP/AMFI, the identity
-  local w; w=$(mktemp -d)
-  curl -fsL "$LILU_URL" -o "$w/lilu.zip"; curl -fsL "$VMHIDE_URL" -o "$w/vmhide.zip"
-  echo "$LILU_SHA  $w/lilu.zip" | sha256sum -c --quiet || die "Lilu download doesn't match its checksum"
-  echo "$VMHIDE_SHA  $w/vmhide.zip" | sha256sum -c --quiet || die "VMHide download doesn't match its checksum"
-  unzip -q "$w/lilu.zip" -d "$w/lilu"; unzip -q "$w/vmhide.zip" -d "$w/vmhide"
+prepare_opencore() {   # on the new OpenCore image $OCIMG (a copy of Venera's): the screen size, SIP/AMFI, the identity
   oc_mount
-  rm -rf "$MNT/EFI/OC/Kexts/Lilu.kext"
-  cp -R "$(find "$w/lilu" -maxdepth 2 -name Lilu.kext | head -1)" "$(find "$w/vmhide" -maxdepth 2 -name VMHide.kext | head -1)" "$MNT/EFI/OC/Kexts/"
-  OC_RES=$RES OC_ARGS=$BOOTARGS OC_CSR=$CSR MODEL=$MODEL SERIAL=$SERIAL MLB=$MLB ROM=$ROM oc_config "$MNT/EFI/OC/config.plist"
-  oc_umount; rm -rf "$w"
+  OCVER=$OCVER NEWUUID=1 OC_RES=$RES OC_ARGS=$BOOTARGS OC_CSR=$CSR MODEL=$MODEL SERIAL=$SERIAL MLB=$MLB ROM=$ROM oc_config "$MNT/EFI/OC/config.plist"
+  oc_umount
+}
+
+# An existing VM's OpenCore disk moved to Venera's OpenCore: the new EFI folder and config, with what was the VM's own
+# carried over (Venera's kexts and their entries, boot-args and SIP, the Mac identity, the screen size, the menu's
+# timeout); what the old image brought and Venera doesn't need (Lilu, VMHide, WhateverGreen, AppleALC, Broadcom
+# Bluetooth, OpenCanopy and its Resources) is left behind. The VM stopped; the old disk saved first.
+oc_transplant() {   # OLD-config NEW-config: writes the merge into NEW
+  python3 - "$1" "$2" <<'PY'
+import plistlib, sys
+old = plistlib.load(open(sys.argv[1], "rb")); new = plistlib.load(open(sys.argv[2], "rb"))
+mine = ("VirtioGPU.kext", "VeneraVideo.kext", "VeneraConsole.kext")
+kept = [k for k in old["Kernel"]["Add"] if k.get("BundlePath") in mine]
+new["Kernel"]["Add"] += kept
+g = "7C436110-AB2A-4BBB-A880-FE41995C9F82"
+for k in ("boot-args", "csr-active-config"):
+    if k in old["NVRAM"]["Add"].get(g, {}): new["NVRAM"]["Add"][g][k] = old["NVRAM"]["Add"][g][k]
+new["PlatformInfo"]["Generic"] = old["PlatformInfo"]["Generic"]
+for k in ("Automatic", "UpdateSMBIOSMode", "UpdateDataHub", "UpdateNVRAM", "UpdateSMBIOS"):
+    if k in old["PlatformInfo"]: new["PlatformInfo"][k] = old["PlatformInfo"][k]
+new["UEFI"]["Output"]["Resolution"] = old["UEFI"]["Output"].get("Resolution", new["UEFI"]["Output"]["Resolution"])
+new["Misc"]["Boot"]["Timeout"] = old["Misc"]["Boot"].get("Timeout", 5)
+plistlib.dump(new, open(sys.argv[2], "wb"))
+print("   kept:", ", ".join(k["BundlePath"] for k in kept) or "no Venera kexts yet", "| boot-args:",
+      new["NVRAM"]["Add"][g].get("boot-args"), "| model:", new["PlatformInfo"]["Generic"].get("SystemProductName"),
+      "| screen:", new["UEFI"]["Output"]["Resolution"])
+PY
+}
+update_opencore() {   # the VM stopped, OCIMG its OpenCore disk
+  local w old
+  [ -n "$OCSRC" ] || die "Venera's OpenCore image isn't beside this script (the host package's opencore/ folder)"
+  w=$(mktemp -d); mkdir -p "$w/src" "$w/old"
+  mount -o ro,loop,offset=$((2048 * 512)) "$OCSRC" "$w/src"   # its EFI partition starts at sector 2048 (build.sh)
+  oc_mount
+  old=$(ls -d "$MNT"/EFI/OC/Kexts/*.kext 2>/dev/null | xargs -n1 basename 2>/dev/null | tr '\n' ' ')
+  cp "$MNT/EFI/OC/config.plist" "$w/old/config.plist"
+  for k in VirtioGPU VeneraVideo VeneraConsole; do [ -d "$MNT/EFI/OC/Kexts/$k.kext" ] && cp -R "$MNT/EFI/OC/Kexts/$k.kext" "$w/old/"; done
+  echo "   the old EFI folder's kexts: $old"
+  rm -rf "$MNT/EFI"
+  cp -R "$w/src/EFI" "$MNT/"
+  for k in "$w"/old/*.kext; do [ -d "$k" ] && cp -R "$k" "$MNT/EFI/OC/Kexts/"; done
+  oc_transplant "$w/old/config.plist" "$MNT/EFI/OC/config.plist"
+  oc_umount
+  umount "$w/src"; rm -rf "$w"
 }
 
 apply_identity() {   # an existing VM's OpenCore disk: the Mac identity only
@@ -509,17 +541,31 @@ if [ -n "$EXIST" ]; then
   echo "    2  Ready for Venera: an older macOS VM gets Venus graphics, a sound device and the Venera Tools CD"
   echo "    3  Its Mac identity (for iCloud)"
   echo "    4  Upgrade Venera${VER:+ to $VER}: the host half on every node, then the guest package in macOS, and a restart"
+  echo "    5  OpenCore ${OCVER:-?}: move the VM (stopped) to Venera's OpenCore, keeping its settings and identity"
   ask WHAT "Which" "1"
   case $WHAT in
     1) finish_vm; exit 0 ;;
     2) host_versions; [ "$GPU_KIND" != none ] || die "no GPU the host can render on: Venera needs one"; ready_vm; exit 0 ;;
     3) ;;
     4) upgrade_vm; exit 0 ;;
+    5) ;;
     *) die "nothing changed" ;;
   esac
   qm status "$VMID" | grep -q stopped || die "shut VM $VMID down first (Proxmox's Shutdown, or Apple menu > Shut Down), then run this again"
   OCVOL=$(disk_of ide2); [ -n "$OCVOL" ] || die "VM $VMID has no OpenCore disk on ide2"
   OCIMG=$(pvesm path "$OCVOL"); MODE=identity
+  if [ "$WHAT" = 5 ]; then
+    [ -n "$OCSRC" ] || die "Venera's OpenCore image isn't beside this script (the host package's opencore/ folder)"
+    echo; echo "== The plan"
+    echo "  - VM $VMID's OpenCore disk ($OCVOL): OpenCore $OCVER, Venera's config and VeneraHide in place of the old EFI"
+    echo "    folder; kept: Venera's kexts and their entries, boot-args and SIP, the Mac identity, the screen size"
+    echo "  - the old disk saved first, to /root"
+    yes_no "Go ahead?" || die "nothing changed"
+    [[ $OCIMG == /dev/* ]] && lvchange -ay "$OCIMG"
+    BK=/root/opencore-$NAME-$(date +%Y%m%d-%H%M%S).img; dd if="$OCIMG" of="$BK" bs=1M status=none
+    update_opencore
+    echo "== Done (the previous OpenCore disk is saved as $BK; dd it back to undo). Start VM $VMID."; exit 0
+  fi
 else
   MODE=create
   host_versions
@@ -559,7 +605,8 @@ else
   # Apple's SMC key, the same for every Mac (published by the open-source macOS VM projects). The OpenCore image has no
   # VirtualSMC, so without it macOS can't decrypt WindowServer and boot stalls at "busy timeout ... AppleACPICPU".
   OSK="ourhardworkbythesewordsguardedpleasedontsteal(c)AppleComputerInc"
-  BASE=$ISO/OpenCore-v21.iso OCIMG=$ISO/OpenCore-$NAME.iso REC=$ISO/Tahoe-recovery.img
+  [ -n "$OCSRC" ] || die "Venera's OpenCore image isn't beside this script (the host package's opencore/ folder)"
+  OCIMG=$ISO/OpenCore-$NAME.img REC=$ISO/Tahoe-recovery.img
   [ ! -f "$OCIMG" ] || die "$OCIMG is there already (another VM's?): pick another name, or remove it"
   BOOTARGS="keepsyms=1" CSR=""
   if [ $VENERA = 1 ]; then
@@ -594,11 +641,11 @@ if [ $MODE = create ]; then
     echo "  - node $n: KVM ignore_msrs on$(sed -n 2p <<<"$r" | sed 's/^\(..*\)/; install \1/')"
     [ "$(head -1 <<<"$r")" != none ] || warn "$n has no GPU the host can render on: the VM won't start there"
   done
-  echo "  - download into $ISO: the OpenCore image (thenickdude/KVM-Opencore v21) and macOS Tahoe's recovery from Apple"
+  echo "  - OpenCore $OCVER (Venera's own image, from this package) and macOS Tahoe's recovery from Apple, into $ISO"
   echo "  - VM $VMID '$NAME': $CORES cores${PCORES:+ on the performance cores ($PCORES)}, $MEM MB, $DISK GB on $STORAGE"
   echo "    (the OpenCore and recovery images are imported as two small disks there too)"
   echo "  - network: $BRIDGE${VLAN:+, VLAN $VLAN}; starts with the host"
-  echo "  - SMC: QEMU applesmc with Apple's SMC key; CPU: the host's own; OpenCore with Lilu 1.7.2 + VMHide, $RES"
+  echo "  - SMC: QEMU applesmc with Apple's SMC key; CPU: the host's own; OpenCore with VeneraHide, $RES"
   if [ $VENERA = 1 ]; then
     echo "  - Venera: display virtio-gl with Venus, host-phys-bits-limit=40; in OpenCore SIP 0x$([ $WEBGL = 1 ] && echo A03 || echo 203)"
     echo "    and amfi_get_out_of_my_way=1$([ $WEBGL = 1 ] && echo " (authenticated root off, for Safari WebGL)")"
@@ -628,18 +675,12 @@ for n in "${NODES[@]}"; do echo "== node $n"; on_node "$n" "$(declare -f missing
 
 echo "== OpenCore image"
 mkdir -p "$ISO"
-if [ ! -f "$BASE" ]; then
-  curl -fL "$OC_URL" -o /tmp/OpenCore-v21.iso.gz
-  gunzip -c /tmp/OpenCore-v21.iso.gz >"$BASE.part" && rm /tmp/OpenCore-v21.iso.gz
-  echo "$OC_SHA  $BASE.part" | sha256sum -c --quiet || { rm -f "$BASE.part"; die "the OpenCore image doesn't match its checksum"; }
-  mv "$BASE.part" "$BASE"
-fi
-cp "$BASE" "$OCIMG"; prepare_opencore
+cp "$OCSRC" "$OCIMG"; prepare_opencore
 
 echo "== macOS Tahoe recovery, from Apple"
 if [ ! -f "$REC" ]; then
   W=$(mktemp -d); cd "$W"
-  curl -fsL "$MACREC_URL" -o macrecovery.py
+  if [ -f "$HERE/macrecovery.py" ]; then cp "$HERE/macrecovery.py" .; else curl -fsL "$MACREC_URL" -o macrecovery.py; fi   # the package carries it
   echo "$MACREC_SHA  macrecovery.py" | sha256sum -c --quiet || die "macrecovery.py doesn't match its checksum"
   python3 macrecovery.py -b $TAHOE_BOARD -m 00000000000000000 -os latest download   # checks Apple's chunklist
   DMG=""   # Apple sends one of the two (not ls: with pipefail, the one that's missing stopped the script)
@@ -690,4 +731,4 @@ if [ $VENERA = 1 ]; then
   echo "   installer disks and restarts the VM."
 fi
 [ -n "$SERIAL" ] || echo "   Do not sign into an Apple Account in it until you have run this script again with your MacBook's identity."
-echo "   Undo: qm destroy $VMID --purge; rm $OCIMG (and $BASE $REC, which the next VM can use; /etc/modprobe.d/kvm-macos.conf)"
+echo "   Undo: qm destroy $VMID --purge; rm $OCIMG (and $REC, which the next VM can use; /etc/modprobe.d/kvm-macos.conf)"
