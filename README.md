@@ -70,7 +70,9 @@ Take a VM snapshot or backup before installing. Bugs and questions: GitHub issue
 - [docs/INSTALL.md](docs/INSTALL.md): Venera in depth: installing by hand or from Recovery, security settings,
   hardware video, recovery, uninstalling, tuning.
 - [vm/README.md](vm/README.md): everything the VM script does, and its choices for an existing VM (Finish, Upgrade,
-  the Mac identity, moving to Venera's OpenCore).
+  the Mac identity, moving to Venera's OpenCore, startup settings).
+- [extras/README.md](extras/README.md): a quieter macOS (fewer background services using the CPU) and server settings
+  (always on), for any macOS VM; each change can be undone.
 - [notes/PLAN.md](notes/PLAN.md): the research and build log, round by round, with the measurements behind each
   decision.
 

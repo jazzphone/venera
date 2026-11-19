@@ -107,6 +107,8 @@ cp "$OUT" $T/
 #    (one marker file each).
 [[ -f dist/Venera-$VERSION.tar.gz ]] || { echo "no dist/Venera-$VERSION.tar.gz: run packaging/make-dist.sh"; exit 1; }
 cp packaging/recovery/install-venera $T/
+# Extras (extras/): venera-tune.sh's quieter and server settings, with a launcher each to double-click in Finder
+mkdir -p $T/Extras && cp extras/venera-tune.sh extras/*.command extras/README.md $T/Extras/
 cp dist/Venera-$VERSION.tar.gz $T/Recovery/
 S=$B/stage && rm -rf $S && mkdir -p "$S/root/Library/Application Support/Venera" $S/root/Library/LaunchDaemons $S/scripts
 cp -R "$REL" "$S/root/Library/Application Support/Venera/release"

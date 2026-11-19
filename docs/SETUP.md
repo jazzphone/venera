@@ -87,11 +87,16 @@ after setup open **Install Venera** on the **Venera Tools** disc on the desktop.
 Go through it as on any Mac: country, account, and so on. If the VM has a generated identity, choose **Set Up Later**
 for the Apple Account.
 
-Then, in macOS **System Settings**:
-- **General > Software Update > Automatic Updates**: turn off installing macOS updates (Venera is tested on each macOS
-  release before it's supported; a newer macOS can fall back to the slower software desktop until then).
-- **Energy** (or **Lock Screen**): never put the computer to sleep.
-- **General > Date & Time**: set time automatically.
+Then open the **Venera Tools** disc on the desktop, its **Extras** folder, and double-click:
+- **Quieter macOS**: no automatic macOS upgrades (Venera is tested on each macOS release before it's supported; a
+  newer macOS can fall back to the slower software desktop until then), and fewer background services using the CPU
+  (photo and media analysis, Siri, Game Center, diagnostics uploads);
+- **Server Settings**, if the VM should stay on: never sleep, no hibernation file, no screen saver, restart after a
+  freeze, the clock from the network; SSH and Screen Sharing if you want.
+
+Each asks before every change (Enter takes the suggestion) and can be undone; [extras/README.md](../extras/README.md)
+has the list. To do it by hand instead, in **System Settings**: **General > Software Update > Automatic Updates**
+(turn off installing macOS updates), **Energy** (never sleep) and **General > Date & Time** (set time automatically).
 
 ## 5. Finish, on the host
 
