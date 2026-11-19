@@ -1276,7 +1276,7 @@ Measured on VM 108 (snapshots `pre-gl`, `pre-share`, `pre-accel0612`):
   (WindowServer), which then skips the pull of frames already in it (the surface is tagged with seed and resource).
   It works and draws right (mtlwindow, Safari's page), but it saves little here: WindowServer's pull copies for a
   640x480 window drawing every frame went from 37 to 6.5 ms per 5 s, under 1% of a core, inside run-to-run noise of
-  20 points. Correction to 384eaed's message: its "122% -> 29%" compared against a baseline in which my first version
+  20 points. Correction to 2ec1f8b's message: its "122% -> 29%" compared against a baseline in which my first version
   (registered at creation, synchronous uploads) was still running in WindowServer; not a real gain. WindowServer's
   CPU goes to Core Animation and Venus encoding, not the copies. Kept off by default because a first version lost
   Safari's page background (fixed: an image offered before its first layout transition ran).
@@ -1289,7 +1289,7 @@ Measured on VM 108 (snapshots `pre-gl`, `pre-share`, `pre-accel0612`):
 
 Measured on VM 108 (snapshots `pre-core057` and earlier):
 
-- **Spotlight's icons and the Dock's icon shadow** draw (9829b94). RenderBox's path coverage vertex shader
+- **Spotlight's icons and the Dock's icon shadow** draw (8de1ed2). RenderBox's path coverage vertex shader
   binary-searches its segment array by moving a device pointer around a loop; NV's translator, given typed-pointer IR
   (what the guest's LLVM prints), turned that pointer into a null private variable, so every coverage read was 0.
   `vg_opaque_ir.h` rewrites the module's text with opaque pointers first (what LLVM 23 prints for the same bitcode;
@@ -1297,19 +1297,19 @@ Measured on VM 108 (snapshots `pre-core057` and earlier):
   one that failed) and `tools/mtlpath` (RenderBox's own shader on recorded inputs) reproduce it. Spotlight is on the
   driver by default. Also: FPFastMathMode NotNaN|NotInf cleared from translated SPIR-V (`VirtioGPUMetal-fastinf` keeps
   them), `setDepthClipMode:` clamp is a real pipeline variant.
-- **One translation pool** (d5f8a43): the watcher gathers every process's translated shaders into
+- **One translation pool** (504f1b0): the watcher gathers every process's translated shaders into
   `/Library/GPUBundles/Venera/cache` (256 MB cap) and copies them back into each process's own cache; the driver falls
   back to the pool on a miss. Safari's GPU process with its own cache deleted draws the test page at 58-59 fps from the
   start (25 fps translating cold).
-- **Small buffers** (5743b8c): every MTLBuffer was its own mapped Venus allocation, each holding one of the core's
+- **Small buffers** (d563df8): every MTLBuffer was its own mapped Venus allocation, each holding one of the core's
   2048 host-memory ranges for the whole machine; with WindowServer, Safari and a few apps open they ran out (Grapher's
   3D surface: 233 map failures). Buffers up to 256 KB are cut from 4 MB chunks; core 0.5.7 has 16384 ranges.
 - **Venus ring abort** (Mesa patch 0008): eight missed alive checks in a row (~30 s) before `vn_relax` aborts, each
   logged; a host stall of a few seconds no longer takes down every waiting app (Chess aborted once).
-- **App and WindowServer CPU** (316111b): profiled on Safari's GPU test page, the driver's own share is ~5% (surface
+- **App and WindowServer CPU** (16e1599): profiled on Safari's GPU test page, the driver's own share is ~5% (surface
   copies, Venus encoding); the rest is Core Animation's own work. Two wastes fixed on the way (surface roots found by
   IOSurface ID, kept roots evicted least recently used first); no measurable change.
-- **Safari's cold-start black band** (5405fb0; part 4's "seen once"): reproduced with caches cleared (2 of 2 boots).
+- **Safari's cold-start black band** (70bcd75; part 4's "seen once"): reproduced with caches cleared (2 of 2 boots).
   A GPU pass drew the page's animated cells into WebKit's page surface while WebKit painted the rest on the CPU; the
   write-back at completion copied the whole image back over the CPU's part and marked the surface in sync, so neither
   side had it. Now each command buffer keeps a written rectangle per surface (cleared attachments: the pass's area;
@@ -1425,7 +1425,7 @@ are untouched. hostvideo/README.md says how it fits together and deploys.
 
 ## Round 10 (2026-11-17): the Dock's menus, slow icons, and an installer for both halves
 
-- **Dock right-click menus were striped** (2273950): DockHelper's RenderBox fills paths by adding +1 or -1 by
+- **Dock right-click menus were striped** (6424c3c): DockHelper's RenderBox fills paths by adding +1 or -1 by
   `[[front_facing]]` into an RG16Float target; the host's Mesa 25.0.7 Intel compiler gets a select on that boolean
   between 16-bit values wrong (alternate columns 0x0000 / 0xBF80, the halves of a float -1.0). The translator's SPIR-V
   is right. `vg_frontface_ir.h` makes each such select a 32-bit integer select of the bits (VirtioGPUMetal-nofrontface
@@ -1540,7 +1540,7 @@ Proxmox cluster with HA) found what VM 108 never could:
   `-audiodev spice,id=vsnd -device usb-audio,audiodev=vsnd`. In the install guide's limits.
 - **A cluster.** HA started VM 107 on the other node, which lacked Venus's packages (`mesa-vulkan-drivers`,
   `virgl-server`, missing from the guide too) and the video socket. `install-host.sh` read VMs with `qm`, which only
-  sees the local node's: on a node that doesn't hold the VM it now sets up only the socket and service (760b761). VM
+  sees the local node's: on a node that doesn't hold the VM it now sets up only the socket and service (3233d6c). VM
   107 starts on either node with graphics, video and sound. Venus and ivshmem block live migration: HA moves it by
   restarting it.
 - The guide also lacked `host-phys-bits-limit=40` (both VMs needed it).
@@ -1851,7 +1851,7 @@ The owner: build our own guest agent rather than lean on mac-guest-agent, make m
   virtio-console resets cleanly when the host hangs up (read hw/char/virtio-console.c and virtio-serial-bus.c:
   `virtio_serial_close` clears the throttle and discards the queued output, and output while the host is away is
   discarded); Apple's AppleVirtIOConsole doesn't come back from it (Virtualization.framework's host never goes away).
-  1. **Answers sized to Proxmox's wait** (907f019): QMPClient's default timeout is 5 s; answers hold ~2 s of the port
+  1. **Answers sized to Proxmox's wait** (62ea44a): QMPClient's default timeout is 5 s; answers hold ~2 s of the port
      (1.5 MB virtio, 200 KB ISA): exec output cut and marked truncated (5 MB: 1.1 MB back in 2.7 s), file-read
      returns less than asked (a 5 MB file whole in 3.3 s).
   2. **VeneraConsole.kext**: our own virtio-serial (multiport) driver, through OpenCore, reusing VirtioGPU's
@@ -1891,7 +1891,7 @@ packages; plus bringing your own macOS. Found: KVM-Opencore's last release (v21,
 VMHide has no license (can't be mirrored) and one release; NullMoth's translator is one person's (LGPL: mirrorable);
 the Mesa build pulled unpinned Python packages; the Debian build image and FFmpeg's tarball weren't pinned.
 
-- **Venera's OpenCore** (3f18244): vm/opencore/build.sh, OpenCorePkg 1.0.8 (BSD-3, pinned) with config.py over its
+- **Venera's OpenCore** (6110445): vm/opencore/build.sh, OpenCorePkg 1.0.8 (BSD-3, pinned) with config.py over its
   Sample.plist, SSDT-VENERA.dsl (EC, USBX, plugin-type on QEMU's C000: KVM-Opencore's tables, rewritten) and
   VeneraHide; ocvalidate clean; 48 MB; reproducible (fixed GUIDs, serial, times). Read off KVM-Opencore v21's config:
   its five kernel patches all stop at Darwin 23, its EHCI table names 00:07.x (q35's EHCI is 00:1d.7: no effect on
@@ -1906,7 +1906,7 @@ the Mesa build pulled unpinned Python packages; the Debian build image and FFmpe
 - **VeneraHide** (kext/VeneraHide): kern.hv_vmm_present 0 for every process but the four software-update ones,
   as VMHide; no Lilu: the kern sysctl node is exported (sysctl__kern_children), the oid's handler swapped with CR0.WP
   cleared and interrupts off for the one store. VM 108: sysctl reads 0, a copy named softwareupdated reads 1.
-- **Pins and sources** (099e970): packaging/UPSTREAM (OpenCorePkg, Mesa's tarball, FFmpeg, the translator commit and
+- **Pins and sources** (aa7d408): packaging/UPSTREAM (OpenCorePkg, Mesa's tarball, FFmpeg, the translator commit and
   rustc, the Debian digest) read by the builds; mesa/requirements.txt; tools/make-sources.sh makes
   Venera-sources-VERSION.tar (83 MB; the translator built offline from it in 34 s with the network off for cargo).
   The mirror: private prerelease upstream-2026-11-19 (8 files, 75 MB, MIRROR-SHA256SUMS).
