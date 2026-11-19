@@ -1944,7 +1944,9 @@ always "Macintosh HD").
     Recovery, install-venera, about 45 minutes): Venera installed at the first startup (one pass: the VM script's
     SIP) and the VM restarted into Setup Assistant on the host's GPU. That run gave the stage first, and its install
     read no choice markers (--no-app --no-agent; the markers landed seconds later): the choice packages go first now,
-    and the stage's pass waits up to a minute for them.
+    and the stage's pass waits up to a minute for them. Second run (choices first): the install read
+    the choices (app, agent; no video, no WebGL), restarted once, and VM 110 came up at Setup Assistant with the Metal
+    desktop, the Venera app, and the guest agent on VeneraConsole.
   - **After**: the release unpacked onto the Data volume, `finish-args`, `finish-first`, the job; install.sh's boot
     pass may now be a first pass (`finish-first`): with SIP not set for Venera it sets OpenCore's security settings,
     restarts by itself, and finishes at the next boot. VM 112: a VM-script VM (SIP already set) in one pass, and with
