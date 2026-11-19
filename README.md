@@ -101,6 +101,10 @@ tools/check-vtables.py --kext VirtioGPUAccel --show VGResource --kc ...         
 Without `--kc` it runs only the forwarder check; a class whose base isn't in the KCs given is checked against its
 nearest ancestor that is (PARTIAL).
 
+`tools/serial-log.sh VMID on|record|off` (on the Proxmox node) keeps a VM's kernel log on the host, a file per boot:
+macOS's own log loses the last seconds before a hang or panic, the serial port doesn't. `tools/vbltest.m` measures
+what apps see of the display's VBLs (CVDisplayLink, a view's display link, Metal's presented times).
+
 ## Layout
 
 - `kext/VirtioGPU/` — the core kext (C++, the macOS SDK's Kernel.framework), injected by OpenCore.

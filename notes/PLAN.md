@@ -1992,3 +1992,23 @@ blob flips flush the whole screen to QEMU, and Screen Sharing captures the same 
   Against VM 108's 25G342 Boot and System KCs: every class OK (the IOAccel ones slot by slot against
   IOAcceleratorFamily2), the 68 forwarders on Apple's method; 7 "signature" notes are enums our headers declare as
   unsigned int (the same in the binary).
+- **RDNA4's other ideas, measured on VM 108** (the owner asked for all five):
+  - *Kernel log that survives a hang*: our kexts' lines already go to IOLog, so the unified log keeps them across
+    restarts, and a panic leaves its report; what is lost is the last seconds before a hang or panic, which RDNA4's
+    once-a-second copy loses too. The serial port doesn't: tools/serial-log.sh adds one (serial0: socket, serial=3 in
+    OpenCore's boot-args through the agent) and records a file per boot on the host. VM 108: 2,842 lines of a boot,
+    849 of them Venera's; then turned off again.
+  - *The display pipe's own VBL*: WindowServer does call enableVBLInterrupt (each time with a disable in the same
+    millisecond). IOAccelDisplayPipe::signalVBLInterrupt (exported; disassembled: counts the VBL, signals a
+    transaction waiting for one, fires the pipe's VBL event source while enabled) driven at 60 Hz changed nothing:
+    CVDisplayLink 59.3-61/s with no measured refresh period either way, a view's display link ~54-56/s, presented
+    handlers all firing with the same uneven spacing (7-80 ms around 17). Not kept. tools/vbltest.m measures it.
+    The framebuffer's own VBL timer now runs on absolute deadlines (it drifted to ~59.3 Hz re-arming 16.667 ms after
+    each tick): framebuffer 0.5.2.
+  - *System sleep*: Proxmox starts every VM with ICH9-LPC disable_s3=1 and disable_s4=1: no system sleep exists to be
+    delayed; display sleep was checked in round 6.
+  - *useIOP as a backup for the AppleParavirt class name*: no. With useIOP set and the plain class name
+    (-vgpunovendor), CoreDisplay's switch came up on and went off 6 s later (vendor mask 0), and WindowServer came
+    back at the login window. The class name stays the only way in; reverted.
+  - *Metal's first device open*: ~200 ms in a new process (Venus' start), not RDNA4's 15 s.
+  - tools/kcsyms.py lacked its imports (fixed).

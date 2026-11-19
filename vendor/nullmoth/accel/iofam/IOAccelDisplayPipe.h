@@ -16,6 +16,10 @@ public:
     virtual void destroyFramebufferResource(unsigned int, IOAccelResource2*);
     virtual void displayModeWillChange();
     virtual void displayModeDidChange();
+    // Not virtual (Venera, round 21): IOAcceleratorFamily2's own VBL entry point (exported). It counts the VBL, signals
+    // a transaction waiting for one, and, while enableVBLInterrupt's count is non-zero, fires the pipe's VBL event
+    // source. Tried as a 60 Hz VBL for the pipe: no change to display links or present timing, so not used.
+    void signalVBLInterrupt(void *);
     virtual void enableVBLInterrupt();
     virtual void disableVBLInterrupt();
     virtual void enableTransactionInterrupt();

@@ -135,6 +135,7 @@ private:
     IOWorkLoop *vblLoop_ = nullptr;
     IOTimerEventSource *vblTimer_ = nullptr;
     uint64_t vblCount_ = 0;
+    uint64_t vblInterval_ = 0, vblNext_ = 0;   // absolute time: each tick on its deadline, not 16.667 ms after the last (round 21)
     uint32_t presents_ = 0;
 };
 
@@ -249,7 +250,9 @@ bool VirtioGPUFramebuffer::start(IOService *provider) {
         log("VBL timer setup failed");
         return false;
     }
-    vblTimer_->setTimeoutUS(kVblIntervalUs);
+    nanoseconds_to_absolutetime((uint64_t)kVblIntervalUs * 1000, &vblInterval_);
+    vblNext_ = mach_absolute_time() + vblInterval_;
+    vblTimer_->wakeAtTime(vblNext_);
     if (!IOFramebuffer::start(provider)) {
         log("IOFramebuffer::start failed");
         return false;
@@ -609,7 +612,12 @@ void VirtioGPUFramebuffer::vblTick(IOTimerEventSource *) {
         setProperty("VirtioGPUVBLCount", vblCount_, 64);
         setProperty("VirtioGPUPipePresents", presents_, 32);
     }
-    vblTimer_->setTimeoutUS(kVblIntervalUs);
+    uint64_t now = mach_absolute_time();
+    vblNext_ += vblInterval_;
+    if (vblNext_ <= now) {
+        vblNext_ = now + vblInterval_;   // fell behind: from now on, not a burst of catch-up VBLs
+    }
+    vblTimer_->wakeAtTime(vblNext_);   // re-armed 16.667 ms after each tick, it ran at ~59.3 Hz
 }
 
 // ---- the accelerator's display pipe (stage 5a) ----

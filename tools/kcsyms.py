@@ -3,6 +3,7 @@
 # KCs (/System/Library/KernelCollections/*.kc); copy one out over the transfer disk first.
 #   tools/kcsyms.py SystemKernelExtensions.kc com.apple.iokit.IOAcceleratorFamily2 out.pkl
 # KC offsets equal the kext's vmaddr (relative), so a symbol value is also the file offset of its code.
+import pickle, struct, sys
 f=open(sys.argv[1],'rb'); kc=f.read()
 def lcs(off):
     magic,cpu,sub,ft,ncmds,size,flags,res=struct.unpack_from('<IiiIIIII',kc,off)
