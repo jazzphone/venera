@@ -1788,5 +1788,14 @@ drag stops. Looked into on VM 108:
   wasn't reading it (VM 108, working, had #5). `mouse_set 5` in the monitor brought the mouse back at once. Likely the
   upgrade's USB disk on and off the EHCI reset Proxmox's tablet, which took the active slot, not proven. New VMs from
   the script now get only the args' tablet (`--tablet 0`). The trails the owner saw in Proxmox's console remain with
-  two twins; they go a second later, unlike anything recorded with raw VNC frames here, which points to the console's
-  VNC encoding (noVNC asks for Tight with JPEG; QEMU sends fast-changing areas lossy and refreshes them later).
+  two twins; they go a second later. The owner sees them in a plain VNC client too, from away from home.
+- **The trails are the link's speed, not the frames** (2026-11-19). The same circle drag on VM 108 over the magenta
+  backdrop, read through `qm vncproxy` with each row drawn as it arrives (as a viewer draws an update): at full speed no
+  frame holds anything but the window (~55 frames); with the read capped at 150 Mbit/s of raw pixels (a few times less
+  once a real client's encoding compresses it), a frame holds pieces of two window positions, old edges and shadow
+  left behind until the rest of the update arrives. A viewer on a slow link draws half of an update before the
+  other half arrives. Nothing in the guest can change that; a faster link, or a viewer that sends less (macOS Screen
+  Sharing from the guest itself), does. The capped grabber is a scratch variant of tools/vncgrab.py (rows drawn as
+  read, a snapshot every 100 ms, reads paced to N Mbit/s). Care when driving VM 108 by QMP: aim drags at the test
+  window's title bar from a fresh grab (a press too soon after a click is a double click and zooms it; a drag into the
+  menu bar tiles it), and check what is in front first (an earlier drag made Calendar events, since deleted).
