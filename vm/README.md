@@ -127,8 +127,8 @@ Run it again with the VM's name:
 2. **Ready for Venera**, for an older macOS VM (stopped). It installs the host's packages, switches the display to
    `virtio-gl`, adds Venus, the address width and the sound device to its `args:`, and attaches the Venera Tools CD. The
    VM's config is backed up first. Venera's installer then sets SIP and AMFI itself and finishes after a restart.
-3. **Its Mac identity**: writes a Mac identity into OpenCore, yours or a generated one (above). The old OpenCore disk is
-   saved first.
+3. **Its model and Mac identity**: writes a model and Mac identity into OpenCore, yours or a generated one (above),
+   starting from the model the VM has now. The old OpenCore disk is saved first.
 4. **Upgrade Venera**, to the release the script came with, on a running VM that has Venera and the guest agent:
    - this release's host half: `install-host.sh --vm VMID` on each node the VM may run on, the others first (running
      VMs keep their video connections);
@@ -140,6 +140,22 @@ Run it again with the VM's name:
    identity, the screen size, the menu's timeout). What the old image brought that Venera doesn't need goes (Lilu,
    VMHide, WhateverGreen, AppleALC, the Broadcom Bluetooth kexts, OpenCanopy). The old OpenCore disk is saved to
    `/root` first; writing it back undoes the change.
+6. **Startup settings**, the ones people change most, without editing `config.plist`:
+   - **Screen size**: the size macOS's desktop starts at, up to 1920x1200 (QEMU's display reports it to Venera's
+     framebuffer, as `-global virtio-vga-gl.xres/yres` in the VM's `args:`), and OpenCore's menu's and Recovery's;
+   - **Verbose startup** (`-v`): the kernel's messages instead of the Apple logo;
+   - **OpenCore's menu**: its seconds (1-30), to pick another disk or Recovery;
+   - **Venera at startup**: off adds `-vgpuoff`, and macOS starts on the basic display (for a broken desktop);
+   - **Other boot-args** (`keepsyms=1`, `debug=0x100`, ...). Venera's own (`amfi_get_out_of_my_way=1`,
+     `vgpuaccel=N`) are kept;
+   - **Model and Mac identity**: choice 3's questions.
+
+   It shows the settings the VM has, changes them one at a time, then shows the plan. A running VM is shut down first
+   (asked), and started again after (asked). The OpenCore disk is saved to `/root` and the VM's config to
+   `/root/macos-vm-backup` first. Anything else in OpenCore: mount its EFI partition in macOS (the small OpenCore
+   disk's, not the macOS disk's) and edit `EFI/OC/config.plist`.
+
+   Choices 3, 5 and 6 work on a stopped VM; when it's running, the script offers to shut it down.
 
 ### When Proxmox updates
 

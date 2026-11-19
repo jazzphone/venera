@@ -225,7 +225,8 @@ oc_mount() {   # mounts the OpenCore image $OCIMG (a file or a VM disk) at $MNT
 }
 oc_umount() { sync; umount "$MNT"; losetup -d "$LOOP"; rmdir "$MNT"; [[ $OCIMG == /dev/* ]] && lvchange -an "$OCIMG" || true; }
 
-oc_config() {   # edits config.plist $1: settings from the environment (OC_RES, OC_CSR, OC_ARGS, MODEL/SERIAL/MLB/ROM)
+oc_config() {   # edits config.plist $1: settings from the environment (OC_RES, OC_TIMEOUT, OC_CSR, OC_ARGS,
+  # MODEL/SERIAL/MLB/ROM)
   python3 - "$1" <<'PY'
 import os, plistlib, sys, uuid
 p = sys.argv[1]
@@ -233,8 +234,13 @@ with open(p, "rb") as f: c = plistlib.load(f)
 e = os.environ.get
 if e("OC_RES"):
     c["UEFI"]["Output"]["Resolution"] = e("OC_RES") + "@32"
-    c["Misc"]["Boot"]["Timeout"] = 5
-    print("   OpenCore %s (Venera's): VeneraHide, %s, boot menu 5 s" % (e("OCVER", "?"), e("OC_RES")))
+if e("OC_TIMEOUT"):
+    c["Misc"]["Boot"]["Timeout"] = int(e("OC_TIMEOUT"))
+if e("OCVER"):
+    print("   OpenCore %s (Venera's): VeneraHide, %s, boot menu %s s" % (e("OCVER"), e("OC_RES"), e("OC_TIMEOUT", "5")))
+else:
+    if e("OC_RES"): print("   screen at startup:", e("OC_RES"))
+    if e("OC_TIMEOUT"): print("   OpenCore's menu:", e("OC_TIMEOUT"), "s")
 if e("NEWUUID"):   # each VM its own hardware UUID (the sample's is zeros)
     c["PlatformInfo"]["Generic"]["SystemUUID"] = str(uuid.uuid4()).upper()
 nv = c["NVRAM"]
@@ -264,7 +270,7 @@ PY
 
 prepare_opencore() {   # on the new OpenCore image $OCIMG (a copy of Venera's): the screen size, SIP/AMFI, the identity
   oc_mount
-  OCVER=$OCVER NEWUUID=1 OC_RES=$RES OC_ARGS=$BOOTARGS OC_CSR=$CSR MODEL=$MODEL SERIAL=$SERIAL MLB=$MLB ROM=$ROM oc_config "$MNT/EFI/OC/config.plist" ||
+  OCVER=$OCVER NEWUUID=1 OC_RES=$RES OC_TIMEOUT=5 OC_ARGS=$BOOTARGS OC_CSR=$CSR MODEL=$MODEL SERIAL=$SERIAL MLB=$MLB ROM=$ROM oc_config "$MNT/EFI/OC/config.plist" ||
     { oc_umount; die "OpenCore's config.plist couldn't be edited"; }
   oc_umount
 }
@@ -316,6 +322,102 @@ apply_identity() {   # an existing VM's OpenCore disk: the Mac identity only
   oc_mount
   MODEL=$MODEL SERIAL=$SERIAL MLB=$MLB ROM=$ROM oc_config "$MNT/EFI/OC/config.plist"
   oc_umount
+}
+oc_read() {   # config.plist $1's settings as shell assignments: CUR_RES CUR_TIMEOUT CUR_ARGS CUR_MODEL
+  python3 - "$1" <<'PY'
+import plistlib, shlex, sys
+c = plistlib.load(open(sys.argv[1], "rb"))
+v = {"CUR_RES": str(c["UEFI"]["Output"].get("Resolution", "")).split("@")[0],
+     "CUR_TIMEOUT": str(c["Misc"]["Boot"].get("Timeout", 5)),
+     "CUR_ARGS": c["NVRAM"]["Add"].get("7C436110-AB2A-4BBB-A880-FE41995C9F82", {}).get("boot-args", ""),
+     "CUR_MODEL": c["PlatformInfo"]["Generic"].get("SystemProductName", "")}
+for k, x in v.items(): print("%s=%s" % (k, shlex.quote(x)))
+PY
+}
+# The size macOS's desktop starts at is the one QEMU's display reports (its EDID's preferred mode: xres and yres,
+# 1280x800 when not given); VirtioGPUFramebuffer offers it among its modes, up to 1920x1200. OpenCore's resolution is
+# the menu's and Recovery's (and the basic display's, without Venera).
+screen_args() {   # the VM's args line $1 with the display's size $2 (WxH), as -global virtio-vga-gl.xres/yres
+  local a w=${2%x*} h=${2#*x}
+  a=$(sed -E 's/ ?-global virtio-vga-gl\.(xres|yres)=[0-9]+//g' <<<" $1")
+  a="$a -global virtio-vga-gl.xres=$w -global virtio-vga-gl.yres=$h"
+  echo "${a# }"
+}
+screen_size() {   # $1 WxH, $2 1 for a Venera VM: dies unless a size the VM can show
+  [[ $1 =~ ^([0-9]{3,4})x([0-9]{3,4})$ ]] || die "a screen size is like 1280x800"
+  [ "${BASH_REMATCH[1]}" -ge 640 ] && [ "${BASH_REMATCH[2]}" -ge 480 ] || die "the smallest screen is 640x480"
+  [ "$2" != 1 ] || { [ "${BASH_REMATCH[1]}" -le 1920 ] && [ "${BASH_REMATCH[2]}" -le 1200 ]; } ||
+    die "Venera's display goes up to 1920x1200"
+}
+
+# The startup settings people change most, without editing config.plist: the screen size, verbose startup, the
+# menu's seconds, Venera on or off, other boot-args. Venera's own boot-args (amfi_get_out_of_my_way=1, vgpuaccel=N)
+# are kept as they are. The VM stopped, OCIMG its OpenCore disk; DO_ID=1 when the model and identity come next.
+startup_settings() {
+  local cfg a x="" v=0 off=0 own="" k s t ven=0 cur_disp xr yr changes=()
+  oc_mount; cfg=$(oc_read "$MNT/EFI/OC/config.plist"); oc_umount; eval "$cfg"
+  for a in $CUR_ARGS; do
+    case $a in
+      -v) v=1 ;;
+      -vgpuoff) off=1 ;;
+      amfi_get_out_of_my_way=* | vgpuaccel=*) own="$own $a" ;;
+      *) x="$x $a" ;;
+    esac
+  done
+  x=${x# }; own=${own# }
+  qm config "$VMID" | grep -q '^vga: virtio-gl' && ven=1
+  xr=$(qm config "$VMID" | sed -n 's/^args:.*-global virtio-vga-gl\.xres=\([0-9]*\).*/\1/p')
+  yr=$(qm config "$VMID" | sed -n 's/^args:.*-global virtio-vga-gl\.yres=\([0-9]*\).*/\1/p')
+  if [ $ven = 1 ]; then cur_disp=${xr:-1280}x${yr:-800}; else cur_disp=$CUR_RES; fi
+  [[ $cur_disp =~ ^[0-9]+x[0-9]+$ ]] || cur_disp=1280x800
+  local S=$cur_disp V=$v T=$CUR_TIMEOUT OFF=$off X=$x
+  DO_ID=0
+  while :; do
+    echo; echo "  VM $VMID's startup settings (OpenCore's config.plist$([ $ven = 1 ] && echo " and the VM's display")):"
+    echo "    1  Screen size: $S$([ $ven = 1 ] && echo "   (macOS's desktop, up to 1920x1200; Recovery and OpenCore's menu too)")"
+    echo "    2  Verbose startup: $([ $V = 1 ] && echo on || echo off)   (-v: the kernel's messages instead of the Apple logo)"
+    echo "    3  OpenCore's menu: $T s   (the time to pick another disk or Recovery)"
+    echo "    4  Venera at startup: $([ $OFF = 1 ] && echo "off (-vgpuoff: the basic display)" || echo on)"
+    echo "    5  Other boot-args: ${X:-none}${own:+   (kept for Venera: $own)}"
+    echo "    6  Model and Mac identity: ${CUR_MODEL:-?}   (generate new serials, or enter your Mac's: asked next)"
+    ask k "Change which (Enter when done)" ""
+    case $k in
+      "") break ;;
+      1) ask s "Screen size" "$S"; screen_size "$s" $ven; S=$s ;;
+      2) V=$((1 - V)) ;;
+      3) ask t "OpenCore's menu, seconds (1-30)" "$T"; [[ $t =~ ^[0-9]+$ ]] && [ "$t" -ge 1 ] && [ "$t" -le 30 ] || die "1 to 30 seconds"; T=$t ;;
+      4) OFF=$((1 - OFF)) ;;
+      5) ask s "Other boot-args (- for none)" "${X:--}"; [ "$s" = - ] && s=""
+         for a in $s; do case $a in -v | -vgpuoff | amfi_get_out_of_my_way=* | vgpuaccel=*) die "$a has its own setting (or is Venera's)" ;; esac; done
+         X=$s ;;
+      6) DO_ID=1; break ;;
+      *) echo "  (1 to 6, or Enter)" ;;
+    esac
+  done
+  [ "$S" = "$cur_disp" ] || changes+=("screen size $cur_disp -> $S")
+  [ "$V" = "$v" ] || changes+=("verbose startup $([ $V = 1 ] && echo on || echo off)")
+  [ "$T" = "$CUR_TIMEOUT" ] || changes+=("OpenCore's menu $T s")
+  [ "$OFF" = "$off" ] || changes+=("Venera at startup $([ $OFF = 1 ] && echo off || echo on)")
+  [ "$X" = "$x" ] || changes+=("other boot-args: ${X:-none}")
+  [ ${#changes[@]} -gt 0 ] || { [ $DO_ID = 1 ] && return 0; die "nothing changed"; }
+  local args; args=$(echo $X $own $([ $V = 1 ] && echo -v) $([ $OFF = 1 ] && echo -vgpuoff))
+  echo; echo "== The plan"
+  for k in "${changes[@]}"; do echo "  - $k"; done
+  echo "  - boot-args: $args"
+  echo "  - the OpenCore disk saved first, to /root$([ $ven = 1 ] && [ "$S" != "$cur_disp" ] && echo "; the VM's config to /root/macos-vm-backup")"
+  yes_no "Go ahead?" || die "nothing changed"
+  [[ $OCIMG == /dev/* ]] && lvchange -ay "$OCIMG"
+  BK=/root/opencore-$NAME-$(date +%Y%m%d-%H%M%S).img; dd if="$OCIMG" of="$BK" bs=1M status=none
+  oc_mount
+  OC_RES=$([ "$S" = "$cur_disp" ] || echo "$S") OC_TIMEOUT=$([ "$T" = "$CUR_TIMEOUT" ] || echo "$T") OC_ARGS=$args \
+    oc_config "$MNT/EFI/OC/config.plist" || { oc_umount; die "OpenCore's config.plist couldn't be edited (the disk is saved as $BK)"; }
+  oc_umount
+  if [ $ven = 1 ] && [ "$S" != "$cur_disp" ]; then
+    backup_conf
+    qm set "$VMID" --args "$(screen_args "$(qm config "$VMID" | sed -n 's/^args: //p')" "$S")" >/dev/null
+    echo "   the VM's display: $S"
+  fi
+  echo "== Done (the previous OpenCore disk is saved as $BK; dd it back to undo)."
 }
 
 # ---- an existing VM ------------------------------------------------------------------------------------------------
@@ -621,21 +723,34 @@ if [ -n "$EXIST" ]; then
   VMID=$EXIST; echo "  $NAME is VM $VMID already ($(qm status "$VMID" | cut -d' ' -f2))."
   echo "    1  Finish: macOS and Venera are installed (hardware video, the installer disks out, a restart)"
   echo "    2  Ready for Venera: an older macOS VM gets Venus graphics, a sound device and the Venera Tools CD"
-  echo "    3  Its Mac identity (yours, for iCloud, or a generated one)"
+  echo "    3  Its model and Mac identity (generate new serials, or yours, for iCloud)"
   echo "    4  Upgrade Venera${VER:+ to $VER}: the host half on every node, then the guest package in macOS, and a restart"
   echo "    5  OpenCore ${OCVER:-?}: move the VM (stopped) to Venera's OpenCore, keeping its settings and identity"
+  echo "    6  Startup settings: screen size, verbose startup, OpenCore's menu, Venera on or off, boot-args"
   ask WHAT "Which" "1"
   case $WHAT in
     1) finish_vm; exit 0 ;;
     2) host_versions; [ "$GPU_KIND" != none ] || die "no GPU the host can render on: Venera needs one"; ready_vm; exit 0 ;;
     3) ;;
     4) upgrade_vm; exit 0 ;;
-    5) ;;
+    5 | 6) ;;
     *) die "nothing changed" ;;
   esac
-  qm status "$VMID" | grep -q stopped || die "shut VM $VMID down first (Proxmox's Shutdown, or Apple menu > Shut Down), then run this again"
+  if ! qm status "$VMID" | grep -q stopped; then
+    yes_no "VM $VMID is running: shut it down now (from macOS, as the Apple menu does)?" ||
+      die "shut VM $VMID down first (Proxmox's Shutdown, or Apple menu > Shut Down), then run this again"
+    stop_vm
+  fi
   OCVOL=$(disk_of ide2); [ -n "$OCVOL" ] || die "VM $VMID has no OpenCore disk on ide2"
   OCIMG=$(pvesm path "$OCVOL"); MODE=identity
+  if [ "$WHAT" = 6 ]; then
+    startup_settings
+    if [ $DO_ID = 0 ]; then
+      no_yes "Start VM $VMID now?" && qm start "$VMID" && echo "== VM $VMID is starting."
+      exit 0
+    fi
+  fi
+  if [ "$WHAT" != 5 ]; then oc_mount; eval "$(oc_read "$MNT/EFI/OC/config.plist")"; oc_umount; fi
   if [ "$WHAT" = 5 ]; then
     [ -n "$OCSRC" ] || die "Venera's OpenCore image isn't beside this script (the host package's opencore/ folder)"
     echo; echo "== The plan"
@@ -688,8 +803,8 @@ for r in json.load(sys.stdin):
   ask MEM "Memory in MB" "8192"; num "$MEM" "memory"
   [ $VENERA = 0 ] || [ "$MEM" -ge 8192 ] || die "Venera needs 8192 MB or more"
   ask DISK "Disk in GB" "64"; num "$DISK" "the disk size"
-  ask RES "Screen size at boot" "1280x800"
-  [[ $RES =~ ^[0-9]{3,4}x[0-9]{3,4}$ ]] || die "a screen size is like 1280x800"
+  ask RES "Screen size$([ $VENERA = 1 ] && echo " (up to 1920x1200)")" "1280x800"
+  screen_size "$RES" $VENERA
   # where macOS comes from: Apple's recovery, or a disk or installer of your own in an ISO or import folder
   BYO_DISK="" BYO_INST="" SRCS=()
   mapfile -t SRCS < <(macos_sources)
@@ -731,7 +846,7 @@ echo; echo "  The VM's Mac identity (its model, serial, board serial and Wi-Fi M
 echo "    m  enter your Mac's, to sign into iCloud with it (from System Settings > General > About on that Mac)"
 echo "    s  skip: OpenCore's shared sample identity (never sign into iCloud with it)"
 SERIAL="" MLB="" ROM="" GENERATED=0
-ask MODEL "Model identifier (one macOS Tahoe supports)" "iMac20,1"
+ask MODEL "Model identifier (one macOS Tahoe supports)" "${CUR_MODEL:-iMac20,1}"
 ask IDWAY "Generate, your Mac's, or skip (g/m/s)" "$([ -n "$MACSERIAL" ] && [ $MODE != identity ] && echo g || echo m)"
 case $IDWAY in
 g | G)
@@ -837,7 +952,7 @@ echo "== VM $VMID"
 # console's mouse to one of them; on VM 107 it went to Proxmox's, which macOS had stopped reading, and the mouse died.
 ARGS="-smbios type=2 -device qemu-xhci -device usb-kbd -device usb-tablet -global nec-usb-xhci.msi=off -global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off -cpu host,vendor=GenuineIntel,+invtsc,+hypervisor,kvm=on,vmware-cpuid-freq=on -device isa-applesmc,osk=\"$OSK\""
 VGA=vmware
-if [ $VENERA = 1 ]; then VGA=virtio-gl,clipboard=vnc; ARGS=$(venera_args "$ARGS" $AUDIO)
+if [ $VENERA = 1 ]; then VGA=virtio-gl,clipboard=vnc; ARGS=$(screen_args "$(venera_args "$ARGS" $AUDIO)" "$RES")
 elif [ $AUDIO = 1 ]; then ARGS="$ARGS -audiodev spice,id=vsnd -device usb-audio,audiodev=vsnd"; fi
 qm create "$VMID" --name "$NAME" --ostype other --machine q35 --bios ovmf \
   --cores "$CORES" --sockets 1 ${PCORES:+--affinity "$PCORES"} --memory "$MEM" --balloon 0 \

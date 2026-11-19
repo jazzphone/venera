@@ -75,10 +75,10 @@ sys.exit(0 if ok else 1)
 PY
 }
 cp "$CFG" "$W/c.plist"
-NEWUUID=1 OC_RES=1920x1080 OC_ARGS="keepsyms=1 amfi_get_out_of_my_way=1" OC_CSR=03020000 MODEL=iMac20,1 SERIAL="" MLB="" ROM="" oc_config "$W/c.plist" >"$W/oc.log"
+NEWUUID=1 OC_RES=1920x1080 OC_TIMEOUT=5 OC_ARGS="keepsyms=1 amfi_get_out_of_my_way=1" OC_CSR=03020000 MODEL=iMac20,1 SERIAL="" MLB="" ROM="" oc_config "$W/c.plist" >"$W/oc.log"
 check "a new VM's OpenCore: VeneraHide alone, its own UUID, the screen, SIP 0x203, AMFI, the model" 'ok_plist "$W/c.plist" create "$CFG"'
 cp "$W/c.plist" "$W/c1.plist"
-OC_RES=1920x1080 OC_ARGS="keepsyms=1 amfi_get_out_of_my_way=1" OC_CSR=03020000 MODEL=iMac20,1 SERIAL="" MLB="" ROM="" oc_config "$W/c.plist" >/dev/null
+OC_RES=1920x1080 OC_TIMEOUT=5 OC_ARGS="keepsyms=1 amfi_get_out_of_my_way=1" OC_CSR=03020000 MODEL=iMac20,1 SERIAL="" MLB="" ROM="" oc_config "$W/c.plist" >/dev/null
 check "OpenCore edited twice is the same" 'python3 -c "import plistlib,sys; sys.exit(plistlib.load(open(\"$W/c.plist\",\"rb\")) != plistlib.load(open(\"$W/c1.plist\",\"rb\")))"'
 check "it says what it set" 'grep -q "SIP: csr-active-config 0x203" "$W/oc.log" && grep -q "model: iMac20,1" "$W/oc.log"'
 cp "$CFG" "$W/i.plist"
@@ -87,6 +87,13 @@ check "the identity alone changes only PlatformInfo" 'ok_plist "$W/i.plist" iden
 cp "$CFG" "$W/w.plist"
 OC_RES=1280x800 OC_ARGS="keepsyms=1 amfi_get_out_of_my_way=1" OC_CSR=030A0000 MODEL=iMac20,1 SERIAL="" oc_config "$W/w.plist" | grep -q "0xA03"
 check "Safari WebGL's SIP is 0xA03" '[ $? = 0 ]'
+# the startup settings (choice 6): read back what was written, the display's size in the args, the sizes it takes
+cp "$CFG" "$W/s.plist"
+OC_RES=1440x900 OC_TIMEOUT=8 OC_ARGS="keepsyms=1 debug=0x100 amfi_get_out_of_my_way=1 vgpuaccel=4 -v" oc_config "$W/s.plist" >/dev/null
+eval "$(oc_read "$W/s.plist")"
+check "startup settings read back as written" '[ "$CUR_RES" = 1440x900 ] && [ "$CUR_TIMEOUT" = 8 ] && [ "$CUR_ARGS" = "keepsyms=1 debug=0x100 amfi_get_out_of_my_way=1 vgpuaccel=4 -v" ] && [ -n "$CUR_MODEL" ]'
+check "the display's size into the args, once, the rest kept" '[ "$(screen_args "-cpu host -global virtio-vga-gl.xres=1280 -global virtio-vga-gl.yres=800 -global virtio-vga-gl.venus=on" 1920x1080)" = "-cpu host -global virtio-vga-gl.venus=on -global virtio-vga-gl.xres=1920 -global virtio-vga-gl.yres=1080" ] && [ "$(screen_args "-cpu host" 1440x900)" = "-cpu host -global virtio-vga-gl.xres=1440 -global virtio-vga-gl.yres=900" ]'
+check "screen sizes: up to 1920x1200 with Venera, larger without" '(screen_size 1920x1200 1) && ! (screen_size 2560x1440 1 >/dev/null) && (screen_size 2560x1440 0) && ! (screen_size 1920 1 >/dev/null) && ! (screen_size 320x200 0 >/dev/null)'
 
 # an older VM's config (with Venera's kexts and its own identity) moved onto Venera's
 python3 - "$OLDCFG" "$W/old.plist" <<'PY'

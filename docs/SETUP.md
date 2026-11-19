@@ -36,7 +36,7 @@ The questions (Enter keeps the answer in brackets):
 | Hardware video | **Y** (the host's GPU decodes and encodes video for the VM) |
 | Safari WebGL | N, unless you need WebGL in Safari (it turns off one more security setting) |
 | A sound device | Y (YouTube needs one) |
-| Storage, bridge, VLAN, VM number, cores, memory, disk, screen size | the defaults, or yours |
+| Storage, bridge, VLAN, VM number, cores, memory, disk, screen size (up to 1920x1200) | the defaults, or yours |
 | Set up node … too | Y for each node if the VM is in an HA group, so it can run on any of them |
 | Where macOS comes from | **1**, macOS Tahoe's recovery from Apple |
 | Model identifier | Enter (iMac20,1) |
@@ -47,7 +47,7 @@ When it's done it tells you the next steps; they're the ones below.
 **The Mac identity.** Every Mac has a serial number, a board serial and a Wi-Fi address. **g** makes a matching set
 for this VM alone: fine for everything macOS does, but it isn't registered with Apple, so iCloud and iMessage may
 refuse it. To sign into iCloud, use **m** and enter your own Mac's (from **System Information** on that Mac), now or
-later (run the script again and choose **Its Mac identity**).
+later (run the script again and choose **Its model and Mac identity**).
 
 ## 2. Start the VM and open its console
 
@@ -107,7 +107,9 @@ shuts macOS down cleanly, and the console's clipboard is shared with macOS.
 
 Run the setup command again and name the VM:
 - **Upgrade Venera**: a newer release, host and macOS together.
-- **Its Mac identity**: your own Mac's, for iCloud, or a newly generated one.
+- **Its model and Mac identity**: another model, your own Mac's identity for iCloud, or a newly generated one.
+- **Startup settings**: the screen size (up to 1920x1200), verbose startup, OpenCore's menu, Venera on or off at
+  startup, and other boot-args.
 - **OpenCore**: move an older VM to Venera's OpenCore.
 
 ## When something goes wrong
