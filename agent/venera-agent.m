@@ -6,7 +6,8 @@
 //   venera-agent [--device PATH] [--stdio] [--version]
 //
 // The port: QEMU's virtio-serial channel org.qemu.guest_agent.0 when the VM has one (Proxmox's agent type virtio),
-// else the ISA serial port (type isa, /dev/cu.serial*). --stdio reads requests from stdin and answers on stdout (for
+// through Venera's own driver (VeneraConsole.kext) when it is in, else through macOS's tty for it; else the ISA
+// serial port (type isa, /dev/cu.serial*). --stdio reads requests from stdin and answers on stdout (for
 // tests). It runs as root (local.venera.agent): the host already has the whole VM, so this adds nothing it couldn't
 // do; it is a Customize choice in Venera's installer for anyone who doesn't want it.
 //
@@ -18,6 +19,8 @@
 // passwd`), and the suspend and memory-block commands answered as Unsupported.
 #import <Foundation/Foundation.h>
 #import <OpenDirectory/OpenDirectory.h>
+#import <IOKit/IOKitLib.h>
+#include "../kext/VeneraConsole/VeneraConsoleAPI.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <glob.h>
@@ -48,6 +51,7 @@ extern char **environ;
 #define MAX_REQUEST (64u << 20)      // a request bigger than this is dropped (a file-write's base64 fits well inside)
 
 static int gOut = -1;
+static io_connect_t gConn = 0;   // the agent port through VeneraConsole.kext (else gOut, a tty)
 static BOOL gStdio = NO;
 // The most an answer may hold (its JSON, in bytes). Proxmox gives up on an answer after 5 s (its default timeout)
 // and hangs up, which is what stalls macOS's virtio console mid-answer; so every answer fits in about 2 s of the
@@ -117,6 +121,31 @@ static void startWatchdog(void) {
 static void writeAll(const void *p, size_t n) {
     const uint8_t *b = p;
     if (gDropping) return;
+    if (gConn) {   // VeneraConsole: a write waits at most STUCK_SECS for the host to take it, and never wedges the port
+        gBusySince = monoNs();
+        while (n) {
+            uint64_t timeout = STUCK_SECS * 1000, took = 0;
+            uint32_t outs = 1;
+            kern_return_t kr = IOConnectCallMethod(gConn, kVCMethodWrite, &timeout, 1, b, MIN(n, (size_t)1 << 20),
+                                                   &took, &outs, NULL, NULL);
+            if (kr != KERN_SUCCESS) {
+                logf_(@"write: 0x%x: reopening the port", kr);
+                gDropping = YES;
+                gReopen = YES;
+                break;
+            }
+            if (took == 0) {
+                logf_(@"the host stopped reading (no progress in %d s): dropped the rest of an answer (%zu bytes)", STUCK_SECS, n);
+                gDropping = YES;
+                break;
+            }
+            b += took;
+            n -= (size_t)took;
+            gBusySince = monoNs();
+        }
+        gBusySince = 0;
+        return;
+    }
     uint64_t moved = monoNs();
     gBusySince = moved;
     while (n) {
@@ -720,6 +749,31 @@ static NSString *findDevice(void) {
     return found;
 }
 
+// The agent port through VeneraConsole.kext, when it has the virtio-serial devices: the first that has a port of
+// that name and lets us open it.
+static io_connect_t openConsole(void) {
+    io_iterator_t it = 0;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("VeneraConsole"), &it) != KERN_SUCCESS) return 0;
+    io_connect_t found = 0;
+    io_service_t svc;
+    static const char name[] = "org.qemu.guest_agent.0";
+    while (!found && (svc = IOIteratorNext(it))) {
+        io_connect_t c = 0;
+        if (IOServiceOpen(svc, mach_task_self(), 0, &c) == KERN_SUCCESS) {
+            uint64_t id = 0;
+            uint32_t outs = 1;
+            if (IOConnectCallMethod(c, kVCMethodOpen, NULL, 0, name, strlen(name), &id, &outs, NULL, NULL) == KERN_SUCCESS) {
+                found = c;
+            } else {
+                IOServiceClose(c);
+            }
+        }
+        IOObjectRelease(svc);
+    }
+    IOObjectRelease(it);
+    return found;
+}
+
 static int openPort(NSString *path) {
     int fd = open(path.fileSystemRepresentation, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd < 0) return -1;
@@ -746,9 +800,20 @@ static void serve(int in) {
     BOOL inStr = NO, esc = NO;
     uint8_t chunk[65536];
     for (;;) {
-        struct pollfd pf = {.fd = in, .events = POLLIN};
-        if (!gStdio && poll(&pf, 1, -1) < 0 && errno != EINTR) { logf_(@"poll: %s", strerror(errno)); return; }
-        ssize_t n = read(in, chunk, sizeof chunk);
+        ssize_t n;
+        if (gConn) {   // VeneraConsole: a read waits up to 2 s, 0 bytes when nothing came
+            uint64_t timeout = 2000, got = 0;
+            uint32_t outs = 1;
+            size_t size = sizeof chunk;
+            kern_return_t kr = IOConnectCallMethod(gConn, kVCMethodRead, &timeout, 1, NULL, 0, &got, &outs, chunk, &size);
+            if (kr != KERN_SUCCESS) { logf_(@"read: 0x%x: reopening the port", kr); return; }
+            if (size == 0) continue;
+            n = (ssize_t)size;
+        } else {
+            struct pollfd pf = {.fd = in, .events = POLLIN};
+            if (!gStdio && poll(&pf, 1, -1) < 0 && errno != EINTR) { logf_(@"poll: %s", strerror(errno)); return; }
+            n = read(in, chunk, sizeof chunk);
+        }
         if (n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
         if (n <= 0) {
             if (gStdio) exit(0);
@@ -810,6 +875,16 @@ int main(int argc, char **argv) {
         NSString *last = nil;
         for (;;) {   // the port can show up late at boot, or go away: look for it again every few seconds
             @autoreleasepool {
+                if (!dev && (gConn = openConsole())) {   // VeneraConsole.kext first
+                    gAnswerMax = 1500000;
+                    if (![last isEqualToString:@"VeneraConsole"]) logf_(@"on VeneraConsole (answers up to %zu KB)", gAnswerMax / 1000);
+                    last = @"VeneraConsole";
+                    serve(-1);
+                    IOServiceClose(gConn);
+                    gConn = 0;
+                    sleep(1);
+                    continue;
+                }
                 NSString *path = dev ?: findDevice();
                 int fd = path ? openPort(path) : -1;
                 if (fd < 0) {

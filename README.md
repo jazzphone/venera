@@ -34,6 +34,7 @@ Each release also has the Venera Tools CD on its own (`Venera-Tools-VERSION.iso`
 | `VirtioGPUAccel.kext` | Auxiliary KC | an IOAcceleratorFamily2 accelerator: Metal's device, the display pipe WindowServer presents through, VBL, paced flips to the host GPU's frames |
 | `VirtioGPUMetal.bundle` | /Library/GPUBundles | the Metal driver: Metal's API over Vulkan (Mesa's Venus, patched for macOS), Metal shaders translated to SPIR-V, IOSurfaces as host GPU images |
 | `VeneraVideo.kext` | Boot KC (OpenCore) | hardware video decoding and encoding: VideoToolbox's paravirtual decoder and encoder, over a shared-memory device to `venera-videod` on the host |
+| `VeneraConsole.kext` | Boot KC (OpenCore) | QEMU's virtio-serial device (the guest agent's port, SPICE's agent channel) in place of Apple's console driver, which stalls when the host hangs up mid-answer |
 | `venera-agent` | launch daemon | the guest agent: the QEMU guest agent protocol Proxmox speaks (shutdown, addresses, `qm guest exec`, files, passwords) over the VM's agent port |
 
 A display frame never touches the guest's CPU: Core Animation renders it on the host GPU, the driver copies it into a

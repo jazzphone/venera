@@ -15,7 +15,7 @@ tools/build-metal.sh >/dev/null
 tools/build-helper.sh >/dev/null
 tools/build-agent.sh >/dev/null
 rm -rf $D && mkdir -p $D/payload/OpenCore $D/payload/Extensions $D/payload/GPUBundles $D/payload/Support $D/payload/Apps $D/licenses
-cp -R build/VirtioGPU.kext build/VeneraVideo.kext $D/payload/OpenCore/
+cp -R build/VirtioGPU.kext build/VeneraVideo.kext build/VeneraConsole.kext $D/payload/OpenCore/
 cp -R build/VirtioGPUFramebuffer.kext build/VirtioGPUAccel.kext $D/payload/Extensions/
 cp -R build/VirtioGPUMetal.bundle $D/payload/GPUBundles/
 cp packaging/install.sh packaging/uninstall.sh packaging/status.sh $D/

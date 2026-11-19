@@ -1847,3 +1847,21 @@ The owner: build our own guest agent rather than lean on mac-guest-agent, make m
 - Not done: VM 108 runs that test 0.1.6 build (agent from this round; the rest is 0.1.5's). No release yet. VM 107
   still has mac-guest-agent on the ISA port: an Upgrade to the release puts Venera's agent in, and Finish (or the
   Options page plus a restart) moves it to virtio.
+- **Both fixes for the stall** (the owner: "seems like a band aid", then "let's do both"). Why it stalls: QEMU's
+  virtio-console resets cleanly when the host hangs up (read hw/char/virtio-console.c and virtio-serial-bus.c:
+  `virtio_serial_close` clears the throttle and discards the queued output, and output while the host is away is
+  discarded); Apple's AppleVirtIOConsole doesn't come back from it (Virtualization.framework's host never goes away).
+  1. **Answers sized to Proxmox's wait** (907f019): QMPClient's default timeout is 5 s; answers hold ~2 s of the port
+     (1.5 MB virtio, 200 KB ISA): exec output cut and marked truncated (5 MB: 1.1 MB back in 2.7 s), file-read
+     returns less than asked (a 5 MB file whole in 3.3 s).
+  2. **VeneraConsole.kext**: our own virtio-serial (multiport) driver, through OpenCore, reusing VirtioGPU's
+     VirtioPCI transport (its notify table grown to 64 queues). Control queue: DEVICE_READY, DEVICE_ADD -> PORT_READY,
+     PORT_NAME, PORT_OPEN both ways; 16 x 16 KB receive and send buffers a port; a root-only user client (ports, open
+     by name, read and write with timeouts; VeneraConsoleAPI.h), no tty. The agent uses it first, the tty after.
+     Apple's AppleVirtIOPCITransport matches every 1af4 device with no IOProbeScore and still beat ours at 5000 (its
+     probe raises the score): ours sets 1000000 in probe. Two boots hung while getting there: a property set on
+     IOResources from probe, and the shared log array published as a live registry property while being appended to
+     (the hang sat between probe and start); the log is now copied onto the service. On VM 108: the agent on
+     VeneraConsole, 1 and 5 MB outputs, a 5 MB file read (4.9 s, checksum equal), 900 KB stdin, three hang-ups
+     mid-answer with the next connection answered in 0.01 s (no drop, no reopen), two reboots through the agent
+     (~10 s down, ~21 s to the agent). Snapshot pre-console on VM 108 is the state before the driver.

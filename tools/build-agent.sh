@@ -6,6 +6,6 @@ cd "$(dirname "$0")/.."
 VERSION=$(cat VERSION)
 mkdir -p build
 xcrun clang -arch "${ARCH:-x86_64}" -mmacosx-version-min=26.0 -O2 -Wall -Wextra -Wno-unused-parameter -fobjc-arc \
-  -fmodules -framework Foundation -framework OpenDirectory -DVENERA_VERSION="\"$VERSION\"" -o build/venera-agent agent/venera-agent.m
+  -fmodules -framework Foundation -framework OpenDirectory -framework IOKit -DVENERA_VERSION="\"$VERSION\"" -o build/venera-agent agent/venera-agent.m
 codesign -s - --force --timestamp=none build/venera-agent >/dev/null 2>&1
 echo "build/venera-agent ($VERSION)"

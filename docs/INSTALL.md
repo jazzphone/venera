@@ -129,7 +129,7 @@ next to it (`config.plist.venera-DATE`), and then:
 5. starts the watcher (`local.venera.watch`, below);
 6. installs the Venera app and its login item (`local.venera.helper`);
 7. installs and starts the guest agent (`local.venera.agent`, below); this one runs in the first pass too, since it
-   needs no restart.
+   needs no restart. Its port's driver, `VeneraConsole.kext`, goes into OpenCore with step 1.
 
 Options: `--level 2` installs everything with the software desktop (the framebuffer and the accelerator, Metal only
 for allow-listed test tools); `--no-opencore` skips step 1 and 2 for people who manage `config.plist` themselves (add
@@ -182,9 +182,18 @@ It runs as root and answers only on the VM's agent port, which only the Proxmox 
 controls the whole VM, so it can do nothing through the agent that it couldn't do without it. Untick **Proxmox guest
 agent** under Customize (or `install.sh --no-agent`) to go without it. Its log is `/var/log/venera-agent.log`.
 
-A note for anything that talks to it: Proxmox waits a few seconds for each answer, and the virtio port moves about a
-megabyte a second, so a `qm guest exec` whose output is more than a few megabytes times out (the agent drops that
-answer, reopens its port and goes on); copy big files in pieces.
+**Its port's driver.** The virtio agent port is a port of QEMU's virtio-serial device, and Venera drives that device
+itself with `VeneraConsole.kext` (through OpenCore, with this choice, from the next restart). macOS's own driver for
+it (AppleVirtIOConsole, made for Apple's Virtualization framework) stops sending for good when the host hangs up while
+an answer is on its way, and its tty then holds the agent's writes and even its exit; Proxmox hangs up on any answer
+it waited 5 s for. VeneraConsole treats the host closing and opening the port as what QEMU says it is (QEMU discards a
+closed port's output), so nothing waits: tested by hanging up mid-answer three times in a row, the next connection was
+answered at once. Without it (an install without OpenCore, or before the restart) the agent works through macOS's
+driver and gets out of a stall by dropping that answer and reopening the port.
+
+Every answer is kept to about 2 s of the port, so Proxmox never has to hang up: `qm guest exec` output past ~1.1 MB
+comes back cut and marked truncated (as QEMU's own agent does past 16 MB), and `agent/file-read` simply takes more
+pieces (a 5 MB file in about 5 s).
 
 ## Hardware video decoding and encoding
 

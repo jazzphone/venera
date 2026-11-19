@@ -107,7 +107,8 @@ private:
     volatile uint8_t *device_ = nullptr;
     uint32_t notifyMultiplier_ = 0;
     IOMemoryMap *map_ = nullptr;
-    uint16_t notifyOffsets_[16] = {};
+    static constexpr uint16_t kMaxQueues = 64;   // a virtio console has 2 + 2 a port
+    uint16_t notifyOffsets_[kMaxQueues] = {};
 };
 
 } // namespace virtio

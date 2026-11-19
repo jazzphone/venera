@@ -262,19 +262,19 @@ Virtqueue *Transport::setupQueue(uint16_t index, uint16_t maxSize, uint16_t vect
     wr64(common_, kQueueDesc, q->descPhys());
     wr64(common_, kQueueDriver, q->availPhys());
     wr64(common_, kQueueDevice, q->usedPhys());
-    if (index < 16) {
+    if (index < kMaxQueues) {
         notifyOffsets_[index] = rd<uint16_t>(common_, kQueueNotifyOff);
     }
     fence();
     wr<uint16_t>(common_, kQueueEnable, 1);
     probeLog("queue %u: size %u (device max %u) desc 0x%llx notify_off %u", index, size, deviceSize,
-             (unsigned long long)q->descPhys(), index < 16 ? notifyOffsets_[index] : 0);
+             (unsigned long long)q->descPhys(), index < kMaxQueues ? notifyOffsets_[index] : 0);
     return q;
 }
 
 void Transport::notify(Virtqueue *queue) {
     uint16_t index = queue->index();
-    uint32_t off = (index < 16 ? notifyOffsets_[index] : 0) * notifyMultiplier_;
+    uint32_t off = (index < kMaxQueues ? notifyOffsets_[index] : 0) * notifyMultiplier_;
     fence();
     wr<uint16_t>(notify_, off, index);
 }

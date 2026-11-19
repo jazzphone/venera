@@ -3,7 +3,8 @@
 #   VirtioGPU.kext            - the core, injected by OpenCore (Boot kernel collection)
 #   VirtioGPUFramebuffer.kext - the IOFramebuffer, loaded from /Library/Extensions (Auxiliary KC)
 #   VirtioGPUAccel.kext       - the IOAccelerator (stage 4), Auxiliary KC; NV's reconstructed IOAccel headers
-#   VeneraVideo.kext          - hardware video decoding through the host (Apple's paravirtualized VideoToolbox), Auxiliary KC
+#   VeneraVideo.kext          - hardware video decoding through the host (Apple's paravirtualized VideoToolbox), OpenCore
+#   VeneraConsole.kext        - QEMU's virtio-serial device (the guest agent's port) in place of Apple's driver, OpenCore
 set -euo pipefail
 cd "${0:A:h}/.."
 SDK=$(xcrun --sdk macosx --show-sdk-path)
@@ -15,15 +16,17 @@ CXXFLAGS=($COMMON -std=gnu++17 -fno-rtti -fno-exceptions -fapple-kext)
 CFLAGS=($COMMON -std=gnu11)
 
 # only the kexts: build/ also holds the translator, the Metal bundle and the test tools
-rm -rf build/obj build/VirtioGPU.kext build/VirtioGPUFramebuffer.kext build/VirtioGPUAccel.kext build/VeneraVideo.kext && mkdir -p build
-for NAME in VirtioGPU VirtioGPUFramebuffer VirtioGPUAccel VeneraVideo; do
+rm -rf build/obj build/VirtioGPU.kext build/VirtioGPUFramebuffer.kext build/VirtioGPUAccel.kext build/VeneraVideo.kext build/VeneraConsole.kext && mkdir -p build
+for NAME in VirtioGPU VirtioGPUFramebuffer VirtioGPUAccel VeneraVideo VeneraConsole; do
   SRC=kext/$NAME
   EXTRA=()
   [[ $NAME == VirtioGPUAccel ]] && EXTRA=(-DNM_TAHOE -Ivendor/nullmoth/accel -Ivendor/nullmoth/accel/re -Ivendor/nullmoth/accel/iofam -Ivendor/nullmoth/agdc)
   OUT=build/$NAME.kext
   OBJ=build/obj/$NAME
   mkdir -p $OBJ "$OUT/Contents/MacOS"
-  for f in $SRC/*.cpp; do
+  SRCS=($SRC/*.cpp)
+  [[ $NAME == VeneraConsole ]] && SRCS+=(kext/VirtioGPU/VirtioPCI.cpp)   # the virtio-pci transport, shared
+  for f in $SRCS; do
     xcrun clang++ "${CXXFLAGS[@]}" "${EXTRA[@]}" -c "$f" -o "$OBJ/${f:t:r}.o"
   done
   for f in $SRC/*.c; do

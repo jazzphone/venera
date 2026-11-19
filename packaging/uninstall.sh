@@ -172,11 +172,13 @@ if [ $NO_OC = 0 ]; then
       case "$(pl -extract Kernel.Add.$i.BundlePath raw -o - 2>/dev/null)" in
       VirtioGPU.kext) run pl -remove Kernel.Add.$i ;;
       VeneraVideo.kext) [ $KEEP_VIDEO = 1 ] || run pl -remove Kernel.Add.$i ;;
+      VeneraConsole.kext) run pl -remove Kernel.Add.$i ;;
       esac
       i=$((i - 1))
     done
     run rm -rf "$OC_ROOT/EFI/OC/Kexts/VirtioGPU.kext"
     [ $KEEP_VIDEO = 1 ] || run rm -rf "$OC_ROOT/EFI/OC/Kexts/VeneraVideo.kext"
+    run rm -rf "$OC_ROOT/EFI/OC/Kexts/VeneraConsole.kext"
     OCARGS=$(pl -extract "NVRAM.Add.$GUID.boot-args" raw -o - 2>/dev/null)
     NEW=
     for a in $OCARGS; do
@@ -187,7 +189,7 @@ if [ $NO_OC = 0 ]; then
       cp "$BACKUP" "$CONFIG"
       die "config.plist didn't validate after the edit; restored the backup"
     }
-    say "OpenCore: VirtioGPU.kext$([ $KEEP_VIDEO = 1 ] || echo " and VeneraVideo.kext") removed, boot-args \"${NEW# }\" (backup: $BACKUP)"
+    say "OpenCore: VirtioGPU.kext$([ $KEEP_VIDEO = 1 ] || echo ", VeneraVideo.kext"), VeneraConsole.kext removed, boot-args \"${NEW# }\" (backup: $BACKUP)"
     cleanup
   fi
 fi
