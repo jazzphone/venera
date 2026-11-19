@@ -1068,6 +1068,10 @@ IOReturn VirtioGPU::setTwin(task_t task, uint32_t surface, uint32_t resource, ui
 // shown: whether a display transaction has asked for this surface yet (5c round 6). Only those surfaces may skip
 // their CPU write-back: Core Animation also renders screen-sized surfaces it reads on the CPU (a screenshot) in the
 // same display command buffers, and those came out blank.
+// Frames submitted into a twin, and of those, into the twin on screen at the time (round 17): the flip loop runs behind
+// WindowServer, which can come back around to the surface still shown; a viewer reading it then could get a torn
+// frame. VirtioGPUTwinRewrites, every 64 frames.
+static volatile SInt64 gTwinMarks = 0, gTwinRewritesShown = 0;
 IOReturn VirtioGPU::markTwin(task_t task, uint32_t surface, uint32_t frame, bool ready, bool *shown) {
     *shown = false;
     if (!twinLock_ || !surface) {
@@ -1083,6 +1087,18 @@ IOReturn VirtioGPU::markTwin(task_t task, uint32_t surface, uint32_t frame, bool
                 (ready ? twins_[i].ready : twins_[i].submitted) = frame;
                 *shown = twins_[i].shown;
                 r = kIOReturnSuccess;
+                if (!ready) {   // a new frame into this twin
+                    OSIncrementAtomic64(&gTwinMarks);
+                    if (twins_[i].resource && twins_[i].resource == scanoutBlob_) {
+                        OSIncrementAtomic64(&gTwinRewritesShown);
+                    }
+                    if ((gTwinMarks & 63) == 0) {
+                        char line[96];
+                        snprintf(line, sizeof(line), "%lld frames, %lld into the twin on screen", (long long)gTwinMarks,
+                                 (long long)gTwinRewritesShown);
+                        setProperty("VirtioGPUTwinRewrites", line);
+                    }
+                }
             }
             break;
         }

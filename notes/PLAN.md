@@ -1747,3 +1747,21 @@ After the release, the same day:
   (RequestBootVarRouting and WriteFlash are on), so someone has to pick at the menu three times; the script now says so
   instead of "it picks by itself". Setup Assistant needs an account password, and the guest agent is still a manual
   build: the rest is a person's.
+
+## Round 17 (2026-11-18): window pieces left behind in a fast drag
+
+The owner sees pieces of a window left behind while dragging it fast, in Proxmox's console and in VNC, gone once the
+drag stops. Looked into on VM 108:
+- tools/vncgrab.py records the screen as QEMU's VNC server shows it (Proxmox's console: egl-headless reading the GL
+  scanout), through `qm vncproxy` with a one-time ticket; ~15 frames a second. QEMU's screendump has no surface with
+  a blob scanout, and screencapture in the VM needs Screen Recording.
+- tools/teartest.m: a full-screen window turning black and white every frame (no frame of 115 was mixed), and a
+  magenta backdrop to drag the drag test window over: in 116 frames of fast circles the only thing not magenta was one
+  window-sized region (the window and its shadow), never a piece elsewhere.
+- Found: during drags, 12-20% of display frames are copied into the twin on screen at that moment (the core now counts
+  it: VirtioGPUTwinRewrites). Flips run on the accelerator's loop, 12 ms apart at least and ~3-4 ms each, behind
+  WindowServer's frames, and Core Animation comes back around to the surface still shown. A viewer reading the twin
+  during that copy would get a torn frame. None was caught at 15 frames a second, so it isn't shown to be what the
+  owner sees; the fix would be two twins a surface (the copy into the one not on screen).
+- What remains likeliest: VNC viewers draw an update rectangle by rectangle, and drag frames come every 34-60 ms here,
+  so a slower client shows old window pieces until the next update clears them.
