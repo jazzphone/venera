@@ -634,6 +634,12 @@ else
   ask VLAN "VLAN tag (empty for none)" ""
   [ -z "$VLAN" ] || num "$VLAN" "the VLAN tag"
   ask VMID "VM number" "$(pvesh get /cluster/nextid)"; num "$VMID" "the VM number"
+  # a number another VM (or container) has, anywhere in the cluster, is refused before anything is made
+  TAKEN=$(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null | python3 -c '
+import json, sys
+for r in json.load(sys.stdin):
+    if str(r.get("vmid")) == sys.argv[1]: print(r.get("name", "?"), "on", r.get("node", "?")); break' "$VMID" || true)
+  [ -z "$TAKEN" ] || die "$VMID is taken ($TAKEN): pick a free number (Enter takes the next free one)"
   qm status "$VMID" >/dev/null 2>&1 && die "VM $VMID already exists"
   compgen -G "/etc/pve/nodes/*/qemu-server/$VMID.conf" >/dev/null && die "VM $VMID already exists on another node"
   ask CORES "Cores" "4"; num "$CORES" "cores"
