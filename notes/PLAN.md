@@ -2012,3 +2012,13 @@ blob flips flush the whole screen to QEMU, and Screen Sharing captures the same 
     back at the login window. The class name stays the only way in; reverted.
   - *Metal's first device open*: ~200 ms in a new process (Venus' start), not RDNA4's 15 s.
   - tools/kcsyms.py lacked its imports (fixed).
+- **A generated Mac identity** (the owner: "generate everything on our own, including the Wi-Fi MAC", by the model
+  chosen). The VM script's identity step is now generate (default) / your Mac's / skip. Generate uses OpenCorePkg's
+  macserial.linux (shipped in the host package's opencore/ from the pinned release zip): a serial and board serial
+  made as a pair for the model (model code, board code for its board-id, factory and week shared, MLB checksum), a
+  Wi-Fi MAC with an Apple prefix; the UUID was already the VM's own. vm/test.sh caught macserial for Linux giving the
+  same pair every run (no arc4random: a fixed seed); the script supplies the randomness (week, production line, the
+  last of 1-1000 pairs) and gives the 17-character MLB a random 3-digit item with its checksum recomputed (the
+  generator's items repeat in a cycle: 4-12 shared board serials in 300), checked by macserial --verify: 300 of 300
+  serials and board serials distinct. "Your Mac's" decodes the serial (macserial -i) and offers the serial's model when
+  it differs from the VM's. Walked through the create flow on node 2 up to the plan, both ways (nothing created).

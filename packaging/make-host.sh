@@ -32,6 +32,11 @@ ls build/opencore/OpenCore-Venera-*.img >/dev/null 2>&1 || vm/opencore/build.sh 
 mkdir -p $D/opencore && cp build/opencore/OpenCore-Venera-*.img $D/opencore/
 cp vm/opencore/OpenCorePkg-LICENSE.txt $D/licenses/OpenCorePkg-BSD-3.txt
 cp vm/opencore/NOTICE.txt $D/opencore/
+# OpenCorePkg's macserial (Linux), from the same pinned release: the VM script generates a Mac identity with it (a
+# serial and board serial that match each other and the model)
+OCZIP=${VENERA_VENDOR_SRC:-$HOME/src/vendor-src}/opencore/OpenCore-$OPENCORE_VERSION-RELEASE.zip
+echo "$OPENCORE_SHA256  $OCZIP" | shasum -a 256 -c --quiet || { echo "$OCZIP doesn't match its checksum (vm/opencore/build.sh fetches it)"; exit 1; }
+unzip -p $OCZIP Utilities/macserial/macserial.linux >$D/opencore/macserial && chmod 755 $D/opencore/macserial
 cp vm/LICENSE $D/licenses/proxmox-macos-vm-MIT.txt
 if [[ -f "dist/Install Venera $VERSION.pkg" ]]; then
   mkdir -p $D/guest && cp "dist/Install Venera $VERSION.pkg" $D/guest/

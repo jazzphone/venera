@@ -108,6 +108,27 @@ sys.exit(not (add == [\"VeneraHide.kext\", \"VirtioGPU.kext\", \"VeneraVideo.kex
     and c[\"NVRAM\"][\"Add\"][\"7C436110-AB2A-4BBB-A880-FE41995C9F82\"][\"boot-args\"] == \"keepsyms=1 vgpuaccel=4\"
     and c[\"PlatformInfo\"][\"Generic\"][\"SystemSerialNumber\"] == \"C02OWNSERIAL\" and c[\"UEFI\"][\"Output\"][\"Resolution\"] == \"1280x800@32\"
     and c[\"Misc\"][\"Boot\"][\"PickerMode\"] == \"Builtin\" and not c[\"UEFI\"][\"Drivers\"][1][\"Path\"].startswith(\"OpenCanopy\")))"'
+# a generated Mac identity (macserial beside the script, in opencore/, as the host package has it)
+if [ -n "$MACSERIAL" ]; then
+  mlb_ok() {   # a 17-character MLB's checksum (macserial's FORMAT.md)
+    python3 -c '
+import sys
+a = "0123456789ABCDEFGHJKLMNPQRSTUVWXYZ"; m = sys.argv[1]
+sys.exit(not (len(m) == 17 and all(ch in a for ch in m) and
+              sum(((i & 1) == (len(m) & 1)) * 2 * a.index(ch) + a.index(ch) for i, ch in enumerate(m)) % 34 == 0))' "$1"
+  }
+  MODEL=iMac20,1; gen_identity; S1=$SERIAL M1=$MLB R1=$ROM
+  check "a generated identity: the serial is the model's, the board serial's checksum holds, made at the same factory" '[ "$(serial_model "$S1")" = iMac20,1 ] && mlb_ok "$M1" && [ "${S1:0:3}" = "${M1:0:3}" ] && [ $GENERATED = 1 ]'
+  check "its Wi-Fi MAC: an Apple prefix, six bytes" '[[ $R1 =~ ^(00:16:cb|00:1b:63|00:1e:c2|00:23:df|00:25:00|28:cf:e9|3c:07:54|40:6c:8f|68:5b:35|70:cd:60|7c:6d:62|88:63:df|a4:83:e7|ac:87:a3|c8:2a:14|f0:18:98)(:[0-9a-f]{2}){3}$ ]]'
+  gen_identity
+  check "each VM its own: a second one differs" '[ "$SERIAL" != "$S1" ] && [ "$MLB" != "$M1" ] && [ "$ROM" != "$R1" ]'
+  MODEL=MacBookPro16,1; gen_identity
+  check "another model gets its own model code" '[ "$(serial_model "$SERIAL")" = MacBookPro16,1 ] && mlb_ok "$MLB"'
+  O=$( (MODEL=NoSuchMac1,1; gen_identity) 2>&1)
+  check "a model macserial doesn't know stops with a reason" '[[ $O == *"macserial has no identity for model NoSuchMac1,1"* ]]'
+else
+  echo "skip the generated identity (no macserial in opencore/ beside the script)"
+fi
 check "a package that isn't installed is missing" '[ "$(missing_pkgs bash no-such-package-here)" = "no-such-package-here " ]'
 rm -rf "$W" "$CFG"
 [ $fail = 0 ] && echo "all passed"

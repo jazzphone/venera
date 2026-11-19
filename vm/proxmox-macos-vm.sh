@@ -171,6 +171,43 @@ TXT
 # VeneraHide), carried in the host package's opencore/ folder; nothing to download
 OCSRC=""; for f in "$HERE"/opencore/OpenCore-Venera-*.img "$HERE"/OpenCore-Venera-*.img; do [ -f "$f" ] && { OCSRC=$f; break; }; done
 OCVER=$(basename "${OCSRC:-x-0}" .img); OCVER=${OCVER##*-}
+# OpenCorePkg's macserial (Linux, from the same release): a generated Mac identity
+MACSERIAL=""; for f in "$HERE"/opencore/macserial "$HERE"/macserial; do [ -x "$f" ] && { MACSERIAL=$f; break; }; done
+
+# gen_identity: a Mac identity for this VM alone, for $MODEL: macserial's serial and board serial (MLB), made as a
+# pair (the serial's model code is $MODEL's, the MLB's board code fits its board-id, the same factory and week, the
+# MLB's checksum), and a Wi-Fi MAC address (OpenCore's ROM) with one of Apple's prefixes. Valid in form, unique, and
+# registered with no one: macOS takes it; iCloud and iMessage may refuse it.
+gen_identity() {
+  local pair ouis try
+  # macserial for Linux has no arc4random: it seeds its generator the same way every run (one identity for every VM,
+  # vm/test.sh caught it). The randomness is ours: a random week and production line, and the last of a random number
+  # of pairs (its generator's year and board item move on with each one).
+  for try in 1 2 3 4 5; do
+    pair=$("$MACSERIAL" -m "$MODEL" -n $((RANDOM % 1000 + 1)) -w $((RANDOM % 52 + 1)) -e $((RANDOM % 3400)) 2>/dev/null | tail -1)
+    SERIAL=$(awk -F' [|] ' '{print $1}' <<<"$pair"); MLB=$(awk -F' [|] ' '{print $2}' <<<"$pair")
+    [[ $SERIAL =~ ^[A-Z0-9]{10,12}$ && $MLB =~ ^[A-Z0-9]{13,17}$ ]] && break
+  done
+  # Its board item repeats in a cycle (a few in a hundred VMs got the same board serial): in a 17-character MLB the
+  # item (after the location, year and week) is a plain 3-digit number (macserial's FORMAT.md), so it gets a random
+  # one, and the last character is set again so the checksum holds (weights 3 at odd places, 1 at even; mod 34).
+  if [[ $MLB =~ ^[A-Z0-9]{17}$ ]]; then
+    local al=0123456789ABCDEFGHJKLMNPQRSTUVWXYZ m i c sum=0 idx
+    m=${MLB:0:6}$(printf %03d $((RANDOM % 1000)))${MLB:9:7}
+    for ((i = 0; i < 16; i++)); do
+      c=${m:i:1}; idx=${al%%"$c"*}; idx=${#idx}
+      sum=$((sum + (i % 2 == 1 ? 3 : 1) * idx))
+    done
+    MLB=$m${al:$(((34 - sum % 34) % 34)):1}
+    "$MACSERIAL" --verify "$MLB" 2>/dev/null | grep -q '^Valid MLB checksum' || die "a generated board serial failed its checksum ($MLB)"
+  fi
+  [[ $SERIAL =~ ^[A-Z0-9]{10,12}$ && $MLB =~ ^[A-Z0-9]{13,17}$ ]] || die "macserial has no identity for model $MODEL"
+  ouis=(00:16:cb 00:1b:63 00:1e:c2 00:23:df 00:25:00 28:cf:e9 3c:07:54 40:6c:8f 68:5b:35 70:cd:60 7c:6d:62 88:63:df a4:83:e7 ac:87:a3 c8:2a:14 f0:18:98)
+  ROM="${ouis[$((RANDOM % ${#ouis[@]}))]}:$(od -An -N3 -tx1 /dev/urandom | tr -s ' ' ':' | sed 's/^://')"
+  GENERATED=1
+}
+# serial_model SERIAL: the model identifier the serial's model code is (macserial -i), or nothing
+serial_model() { [ -n "$MACSERIAL" ] && "$MACSERIAL" -i "$1" 2>/dev/null | sed -n 's/^ *Model: *[A-Z0-9]* - *\([A-Za-z]*[0-9]*,[0-9]*\).*/\1/p' | head -1; }
 MACREC_URL=https://raw.githubusercontent.com/acidanthera/OpenCorePkg/1.0.8/Utilities/macrecovery/macrecovery.py
 MACREC_SHA=3023a9b4ca79a5255d93c00f25ab5df37e6f938b729b797d9ecea56184b17aff
 TAHOE_BOARD=Mac-CFF7D910A743CAAF   # OpenCorePkg's macrecovery list: macOS 26 Tahoe, "-os latest"
@@ -579,7 +616,7 @@ if [ -n "$EXIST" ]; then
   VMID=$EXIST; echo "  $NAME is VM $VMID already ($(qm status "$VMID" | cut -d' ' -f2))."
   echo "    1  Finish: macOS and Venera are installed (hardware video, the installer disks out, a restart)"
   echo "    2  Ready for Venera: an older macOS VM gets Venus graphics, a sound device and the Venera Tools CD"
-  echo "    3  Its Mac identity (for iCloud)"
+  echo "    3  Its Mac identity (yours, for iCloud, or a generated one)"
   echo "    4  Upgrade Venera${VER:+ to $VER}: the host half on every node, then the guest package in macOS, and a restart"
   echo "    5  OpenCore ${OCVER:-?}: move the VM (stopped) to Venera's OpenCore, keeping its settings and identity"
   ask WHAT "Which" "1"
@@ -683,18 +720,35 @@ for r in json.load(sys.stdin):
   fi
 fi
 
-echo; echo "  Your MacBook's identity, used to sign into iCloud. Press Enter at the serial to skip it for now:"
-echo "  the VM then keeps the shared sample identity from OpenCore and must NOT be signed into iCloud until you run this again."
-SERIAL="" MLB="" ROM=""
+echo; echo "  The VM's Mac identity (its model, serial, board serial and Wi-Fi MAC address):"
+[ -n "$MACSERIAL" ] && echo "    g  generate one for this VM: a serial and board serial made for the model and for each other, and a"
+[ -n "$MACSERIAL" ] && echo "       Wi-Fi MAC address. Unique, but registered with no one: macOS is fine, iCloud and iMessage may refuse it"
+echo "    m  enter your Mac's, to sign into iCloud with it (from System Settings > General > About on that Mac)"
+echo "    s  skip: OpenCore's shared sample identity (never sign into iCloud with it)"
+SERIAL="" MLB="" ROM="" GENERATED=0
 ask MODEL "Model identifier (one macOS Tahoe supports)" "iMac20,1"
-ask SERIAL "Serial number"
-if [ -n "$SERIAL" ]; then
+ask IDWAY "Generate, your Mac's, or skip (g/m/s)" "$([ -n "$MACSERIAL" ] && [ $MODE != identity ] && echo g || echo m)"
+case $IDWAY in
+g | G)
+  [ -n "$MACSERIAL" ] || die "no macserial beside this script (the host package's opencore/ folder): enter your Mac's"
+  gen_identity
+  echo "  generated: $MODEL, serial $SERIAL, board serial $MLB, Wi-Fi MAC $ROM"
+  ;;
+m | M)
+  ask SERIAL "Serial number"
   SERIAL=${SERIAL^^}; [[ $SERIAL =~ ^[A-Z0-9]{10,12}$ ]] || die "that serial doesn't look like a Mac serial"
+  # the serial names a model: the identity is only consistent when the VM claims to be that model
+  SM=$(serial_model "$SERIAL")
+  if [ -n "$SM" ] && [ "$SM" != "$MODEL" ]; then
+    warn "that serial is for model $SM, not $MODEL"
+    if no_yes "Make the VM's model $SM (macOS Tahoe must support it)?"; then MODEL=$SM; fi
+  fi
   ask MLB "Board serial (MLB)"; MLB=${MLB^^}; [[ $MLB =~ ^[A-Z0-9]{13,17}$ ]] || die "that MLB doesn't look right (13-17 letters and digits)"
   ask ROM "Wi-Fi MAC address (aa:bb:cc:dd:ee:ff)"; ROM=${ROM,,}
   [[ $ROM =~ ^([0-9a-f]{2}[:-]){5}[0-9a-f]{2}$ ]] || die "that MAC address doesn't look right"
-elif [ $MODE = identity ]; then die "no identity given: nothing changed"
-fi
+  ;;
+*) [ $MODE = identity ] && die "no identity given: nothing changed" ;;
+esac
 
 # ---- the plan ------------------------------------------------------------------------------------------------------
 echo; echo "== The plan"
@@ -728,7 +782,7 @@ if [ $MODE = create ]; then
   [ $AUDIO = 1 ] && echo "  - a USB sound device (plays in Proxmox's SPICE console)"
   echo "  - a guest agent port (virtio) for Venera's guest agent"
 fi
-if [ -n "$SERIAL" ]; then echo "  - Mac identity: $MODEL, serial ${SERIAL:0:4}..., MAC $ROM"
+if [ -n "$SERIAL" ]; then echo "  - Mac identity$([ $GENERATED = 1 ] && echo " (generated)"): $MODEL, serial ${SERIAL:0:4}..., MAC $ROM"
 else echo "  - Mac identity: the sample one from OpenCore$([ $MODE = create ] && echo ", model $MODEL") (no iCloud until you add yours)"; fi
 yes_no "Go ahead?" || die "nothing changed"
 
@@ -736,7 +790,9 @@ if [ $MODE = identity ]; then
   [[ $OCIMG == /dev/* ]] && lvchange -ay "$OCIMG"
   BK=/root/opencore-$NAME-$(date +%Y%m%d-%H%M%S).img; dd if="$OCIMG" of="$BK" bs=1M status=none
   apply_identity
-  echo "== Done (the previous OpenCore disk is saved as $BK). Start VM $VMID, then sign into your Apple Account inside it."; exit 0
+  if [ $GENERATED = 1 ]; then echo "== Done (the previous OpenCore disk is saved as $BK). Start VM $VMID: it has its generated identity."
+  else echo "== Done (the previous OpenCore disk is saved as $BK). Start VM $VMID, then sign into your Apple Account inside it."; fi
+  exit 0
 fi
 
 # ---- a new VM ------------------------------------------------------------------------------------------------------
@@ -831,5 +887,6 @@ if [ $VENERA = 1 ]; then
   echo "   Then run this again and choose Finish$([ $VIDEO = 1 ] && echo ": it turns on hardware video (on every node you set up),") takes out the"
   echo "   installer disks and restarts the VM."
 fi
-[ -n "$SERIAL" ] || echo "   Do not sign into an Apple Account in it until you have run this script again with your MacBook's identity."
+[ -n "$SERIAL" ] || echo "   Do not sign into an Apple Account in it until you have run this script again with a Mac identity (choice 3)."
+[ $GENERATED = 1 ] && echo "   Its Mac identity is generated: for iCloud and iMessage, your own Mac's is the safe one (this script, choice 3)."
 echo "   Undo: qm destroy $VMID --purge; rm $OCIMG (and $REC, which the next VM can use; /etc/modprobe.d/kvm-macos.conf)"

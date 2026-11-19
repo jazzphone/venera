@@ -25,8 +25,8 @@ a dry run.
 ## A new VM
 
 It asks for the name, Venera's choices (graphics, hardware video, Safari WebGL, a sound device), storage, network,
-cores, memory, disk, the screen size at boot, where macOS comes from (below), and optionally your Mac's identity for
-iCloud. Then it:
+cores, memory, disk, the screen size at boot, where macOS comes from (below), and the VM's Mac identity (below). Then
+it:
 
 - installs what the host is missing, on this node and each node you choose: `mesa-vulkan-drivers` and
   `virgl-server` (Venus), `libgl1` and `libegl1` (QEMU's GL display), and `unzip`, `dmg2img`, `genisoimage` for its
@@ -92,8 +92,20 @@ everything in macOS but software update, so the Apple Account sign-in doesn't tu
 nothing from thenickdude's KVM-Opencore (which older VMs used: its last release, v21, has OpenCore 1.0.0 from 2024).
 The menu is OpenCore's text one, 5 seconds, and lists only macOS volumes.
 
-Without your Mac's identity the VM keeps OpenCore's shared sample serial, as an iMac20,1 (a model Tahoe supports), and
-must not be signed into iCloud until you add yours (the script's third choice for an existing VM).
+**The Mac identity** (the model, serial, board serial and Wi-Fi MAC address OpenCore gives macOS), for the model you
+choose (iMac20,1 by default, one macOS Tahoe supports):
+- **generate** (the default): a serial and board serial made for that model and for each other by OpenCorePkg's
+  `macserial` (in the host package's `opencore/`, from the same pinned release): the serial's model code is the model's,
+  the board serial's board code fits its board-id, both from the same factory and week, the board serial's checksum
+  holds; and a Wi-Fi MAC address with one of Apple's prefixes. Each VM gets its own (the script adds the randomness:
+  `macserial` for Linux has no random source of its own). Valid in form and unique, but registered with Apple for no
+  Mac: macOS takes it, iCloud and iMessage may refuse it.
+- **your Mac's**, to sign into iCloud: its serial, board serial and Wi-Fi MAC address (System Information on that Mac).
+  The script decodes the serial's model and offers to make the VM that model when they differ (a MacBook's serial on
+  an iMac20,1 doesn't match).
+- **skip**: OpenCore's shared sample serial; never sign into iCloud with it.
+
+The script's third choice for an existing VM changes it later (to yours, for iCloud, or a generated one).
 
 ## An existing VM
 
@@ -115,7 +127,7 @@ Run it again with the VM's name:
 2. **Ready for Venera**, for an older macOS VM (stopped). It installs the host's packages, switches the display to
    `virtio-gl`, adds Venus, the address width and the sound device to its `args:`, and attaches the Venera Tools CD. The
    VM's config is backed up first. Venera's installer then sets SIP and AMFI itself and finishes after a restart.
-3. **Its Mac identity**: writes your Mac's model, serial, board serial and ROM into OpenCore. The old OpenCore disk is
+3. **Its Mac identity**: writes a Mac identity into OpenCore, yours or a generated one (above). The old OpenCore disk is
    saved first.
 4. **Upgrade Venera**, to the release the script came with, on a running VM that has Venera and the guest agent:
    - this release's host half: `install-host.sh --vm VMID` on each node the VM may run on, the others first (running
