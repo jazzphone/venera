@@ -1782,3 +1782,11 @@ drag stops. Looked into on VM 108:
   VM script's Upgrade): 0 of 11,584 frames into the twin on screen (one twin: ~15%), fast drags over the magenta
   backdrop 188 frames, nothing left behind. Drags as fast once warm: frames 17.8 ms apart (one twin 17.7-18.3); the
   first drags after a restart are slower (twice the blobs for QEMU to take in the first time each is shown).
+- **VM 107's mouse died after 0.1.5's upgrade** (the owner: "non-responsive"): macOS ran and took keys, but no pointer
+  events arrived (HIDIdleTime kept climbing). VM 107 has two USB tablets, Proxmox's (`tablet: 1`, EHCI, mouse #3 in
+  `info mice`) and the args' (XHCI, #5); QEMU sends the console's mouse to the active one, which was #3, and macOS
+  wasn't reading it (VM 108, working, had #5). `mouse_set 5` in the monitor brought the mouse back at once. Likely the
+  upgrade's USB disk on and off the EHCI reset Proxmox's tablet, which took the active slot, not proven. New VMs from
+  the script now get only the args' tablet (`--tablet 0`). The trails the owner saw in Proxmox's console remain with
+  two twins; they go a second later, unlike anything recorded with raw VNC frames here, which points to the console's
+  VNC encoding (noVNC asks for Tight with JPEG; QEMU sends fast-changing areas lossy and refreshes them later).

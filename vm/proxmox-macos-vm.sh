@@ -618,13 +618,15 @@ if [ ! -f "$REC" ]; then
 fi
 
 echo "== VM $VMID"
+# One tablet: the args' own on the XHCI. Proxmox's (--tablet 1, on the EHCI) beside it made two, and QEMU sends the
+# console's mouse to one of them; on VM 107 it went to Proxmox's, which macOS had stopped reading, and the mouse died.
 ARGS="-smbios type=2 -device qemu-xhci -device usb-kbd -device usb-tablet -global nec-usb-xhci.msi=off -global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off -cpu host,vendor=GenuineIntel,+invtsc,+hypervisor,kvm=on,vmware-cpuid-freq=on -device isa-applesmc,osk=\"$OSK\""
 VGA=vmware
 if [ $VENERA = 1 ]; then VGA=virtio-gl; ARGS=$(venera_args "$ARGS" $AUDIO)
 elif [ $AUDIO = 1 ]; then ARGS="$ARGS -audiodev spice,id=vsnd -device usb-audio,audiodev=vsnd"; fi
 qm create "$VMID" --name "$NAME" --ostype other --machine q35 --bios ovmf \
   --cores "$CORES" --sockets 1 ${PCORES:+--affinity "$PCORES"} --memory "$MEM" --balloon 0 \
-  --vga $VGA --tablet 1 --agent enabled=1,type=isa \
+  --vga $VGA --tablet 0 --agent enabled=1,type=isa \
   --net0 "vmxnet3,bridge=$BRIDGE${VLAN:+,tag=$VLAN},firewall=0" \
   --efidisk0 "$STORAGE:1,efitype=4m,pre-enrolled-keys=0" \
   --virtio0 "$STORAGE:$DISK,cache=none" --onboot 1 \
