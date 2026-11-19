@@ -608,7 +608,10 @@ if [ ! -f "$REC" ]; then
   curl -fsL "$MACREC_URL" -o macrecovery.py
   echo "$MACREC_SHA  macrecovery.py" | sha256sum -c --quiet || die "macrecovery.py doesn't match its checksum"
   python3 macrecovery.py -b $TAHOE_BOARD -m 00000000000000000 -os latest download   # checks Apple's chunklist
-  DMG=$(ls com.apple.recovery.boot/BaseSystem.dmg com.apple.recovery.boot/RecoveryImage.dmg 2>/dev/null | head -1)
+  DMG=""   # Apple sends one of the two (not ls: with pipefail, the one that's missing stopped the script)
+  for d in com.apple.recovery.boot/BaseSystem.dmg com.apple.recovery.boot/RecoveryImage.dmg; do
+    [ -n "$DMG" ] || [ ! -f "$d" ] || DMG=$d
+  done
   [ -n "$DMG" ] || die "Apple's recovery download has no BaseSystem.dmg"
   dmg2img "$DMG" "$REC.part" >/dev/null && mv "$REC.part" "$REC"
   cd /; rm -rf "$W"

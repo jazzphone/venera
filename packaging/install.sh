@@ -346,10 +346,11 @@ for f in sysvol.sh venera-watch.sh; do run cp "$PAYLOAD/Support/$f" "$V/" && run
 for f in uninstall.sh status.sh; do [ "$HERE/$f" -ef "$V/$f" ] || { run cp "$HERE/$f" "$V/" && run chmod 755 "$V/$f"; }; done
 [ $DRY = 1 ] || { cp "$HERE/VERSION" "$V/VERSION" 2>/dev/null; echo 25G342 >"$V/TESTED_BUILD"; }
 if [ $VIDEO = 1 ]; then run touch "$V/VIDEO"; else run rm -f "$V/VIDEO"; fi   # what the app checks video against
-# the translation pool's seed: Core Animation's shaders translated already, for the macOS build they were made on (a
-# fresh install's first boot otherwise spends minutes of WindowServer's CPU translating them). Entries already there
-# stay; only files named by a translation's hash are taken.
-if [ -f "$PAYLOAD/Support/pool.tar.gz" ] && [ "$(cat "$PAYLOAD/Support/pool.build" 2>/dev/null)" = "$BUILD" ]; then
+# the translation pool's seed: Core Animation's shaders translated already (a fresh install's first boot otherwise
+# spends minutes of WindowServer's CPU translating them). A translation is named by the hash of the translator and the
+# shader's own text, so the seed is right on any macOS build: a shader a build changed just isn't found in it, and
+# the ones it kept are. Entries already there stay; only files named by a translation's hash are taken.
+if [ -f "$PAYLOAD/Support/pool.tar.gz" ]; then
   if [ $DRY = 1 ]; then
     say "  + seed the translation pool $K/cache from the package"
   else
@@ -361,7 +362,7 @@ if [ -f "$PAYLOAD/Support/pool.tar.gz" ] && [ "$(cat "$PAYLOAD/Support/pool.buil
         chown root:wheel "$f" && chmod 644 "$f" && mv "$f" "$K/cache/$b" && n=$((n + 1))
       done
     rm -rf "$T"
-    say "translation pool: $n translations from the package (macOS $BUILD)"
+    say "translation pool: $n translations from the package (made on macOS $(tr '+' ' ' <"$PAYLOAD/Support/pool.build" 2>/dev/null); this is $BUILD)"
   fi
 fi
 # without the system-volume copy by choice (the package's "Safari WebGL" unticked): the watcher doesn't offer it
