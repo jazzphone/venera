@@ -1,0 +1,69 @@
+# Checks that run without a Proxmox host or a macOS VM, on every push and pull request:
+# - every shell script parses (macOS's own ones in macOS's bash 3.2, the rest in bash or zsh) and passes ShellCheck's
+#   error level; the Python tools compile;
+# - the VM script's own tests (vm/test.sh) with OpenCorePkg's pinned release (its Sample.plist and macserial);
+# - Venera's guest agent, built for the runner's Mac, through its protocol tests (agent/test-agent.py).
+# What needs a VM or a host GPU (the driver, the installer, the host's video service) is tested by hand: notes/PLAN.md.
+name: checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+
+jobs:
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: zsh and ShellCheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh shellcheck >/dev/null
+      - name: Shell scripts parse
+        run: |
+          fail=0
+          while IFS= read -r f; do
+            case $(head -1 "$f") in
+              *zsh*) zsh -n "$f" || { echo "::error file=$f::zsh can't parse it"; fail=1; } ;;
+              *) bash -n "$f" || { echo "::error file=$f::bash can't parse it"; fail=1; } ;;
+            esac
+          done < <(git ls-files '*.sh' '*.command' packaging/recovery/install-venera packaging/recovery/stage-postinstall)
+          exit $fail
+      - name: ShellCheck (errors)
+        run: |
+          git ls-files '*.sh' '*.command' packaging/recovery/install-venera packaging/recovery/stage-postinstall |
+            while IFS= read -r f; do head -1 "$f" | grep -q zsh || echo "$f"; done |
+            xargs -d '\n' shellcheck -S error
+      - name: Python compiles
+        run: git ls-files '*.py' | xargs python3 -m py_compile
+
+  vm-script:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: OpenCorePkg (pinned, checked)
+        run: |
+          . packaging/UPSTREAM
+          curl -fsSL -o /tmp/oc.zip "$OPENCORE_URL"
+          echo "$OPENCORE_SHA256  /tmp/oc.zip" | sha256sum -c -
+          mkdir /tmp/oc && unzip -q /tmp/oc.zip -d /tmp/oc
+          install -m 755 /tmp/oc/Utilities/macserial/macserial.linux vm/opencore/macserial
+      - name: vm/test.sh
+        run: bash vm/test.sh /tmp/oc/Docs/Sample.plist
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: macOS's own scripts parse in its bash 3.2
+        run: |
+          fail=0
+          for f in packaging/install.sh packaging/uninstall.sh packaging/status.sh packaging/sysvol.sh \
+                   packaging/venera-watch.sh packaging/recovery/install-venera packaging/recovery/stage-postinstall \
+                   extras/venera-tune.sh extras/*.command; do
+            /bin/bash -n "$f" || { echo "::error file=$f::macOS's bash 3.2 can't parse it"; fail=1; }
+          done
+          exit $fail
+      - name: the guest agent's protocol
+        run: |
+          ARCH=$(uname -m) MINOS=$(sw_vers -productVersion | cut -d. -f1).0 tools/build-agent.sh
+          python3 agent/test-agent.py build/venera-agent

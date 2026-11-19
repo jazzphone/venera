@@ -2,10 +2,10 @@
 # The VM script's own pieces, without a Proxmox host: the args Venera adds, a cluster node's address, and OpenCore's
 # config.plist: Venera's (vm/opencore/config.py over OpenCorePkg's Sample.plist, $1), the VM script's edits on it, and
 # moving an older VM's config ($2, KVM-Opencore v21's, say) onto it. Runs anywhere with bash 4+ and python3, e.g.
-#   bash vm/test.sh SAMPLE OLD-CONFIG   (on a Proxmox host, say: the build container has no python3)
+#   bash vm/test.sh SAMPLE [OLD-CONFIG]   (on a Proxmox host, say, or GitHub's checks: .github/workflows/checks.yml)
 set -u
 SAMPLE=${1:?the Docs/Sample.plist of the OpenCorePkg release vm/opencore/build.sh uses}
-OLDCFG=${2:?an older OpenCore config.plist to move (EFI/OC/config.plist of KVM-Opencore v21)}
+OLDCFG=${2:-$SAMPLE}   # an older OpenCore config.plist to move (KVM-Opencore v21's, say); OpenCorePkg's sample stands in
 MACOS_VM_TEST=1 . "$(dirname "$0")/proxmox-macos-vm.sh"
 set +e
 fail=0
