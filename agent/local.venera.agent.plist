@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Venera's guest agent (agent/venera-agent.m): Proxmox's `qm agent` and `qm guest exec` over the VM's agent port. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>local.venera.agent</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/Application Support/Venera/venera-agent</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>AbandonProcessGroup</key>
+    <true/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/var/root</string>
+    </dict>
+    <key>StandardErrorPath</key>
+    <string>/var/log/venera-agent.log</string>
+</dict>
+</plist>

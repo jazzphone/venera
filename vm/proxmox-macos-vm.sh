@@ -9,7 +9,7 @@
 #                  and a "Venera" disk with the installer package. Then: install macOS, open Install Venera on that
 #                  disk, restart, and run this again to Finish.
 #   an existing VM: Finish (hardware video on every node, the installer disks out, a restart), Ready for Venera (an
-#                  older macOS VM: the host's packages, the display, the args and the Venera disk), Upgrade Venera (this
+#                  older macOS VM: the host's packages, the display, the args and the Venera Tools CD), Upgrade Venera (this
 #                  release's host half on every node, then its guest package installed in macOS with the choices it
 #                  has, through the guest agent, and a restart), or its Mac identity.
 #
@@ -18,7 +18,8 @@
 #   VMHide + Lilu 1.7       - without it the Apple Account sign-in sees a VM and fails ("Verification failed")
 #   -cpu host (+hypervisor) - hiding the hypervisor from the CPU stops the kernel; VMHide hides it from Apple's checks only
 #   no TRIM on the disk     - Disk Utility's erase TRIMs the whole disk, which shared iSCSI storage clears 2 MB at a time
-#   the guest agent         - clean shutdowns, and Finish reads Venera's status through it
+#   the guest agent         - Venera's (a Customize choice, on by default) on the virtio agent port: clean shutdowns,
+#                             the VM's addresses in Proxmox, and Finish and Upgrade work through it
 #   virtio-gl + Venus       - the GPU the guest's Metal runs on (vga: virtio-gl, -global virtio-vga-gl.venus/blob/hostmem)
 #   host-phys-bits-limit=40 - without it the firmware can put the GPU's memory window above 2^44, which macOS's kernel
 #                             can't address: the driver finds no GPU memory
@@ -120,6 +121,7 @@ sys.exit(0 if d.get("shared") or d.get("type") in ("nfs", "cifs", "rbd", "cephfs
 VER=$(cat "$HERE/VERSION" 2>/dev/null || true)
 HOSTKIT=""; [ -x "$HERE/install-host.sh" ] && [ -x "$HERE/bin/venera-videod" ] && HOSTKIT=$HERE
 GPKG=""; for f in "$HERE"/guest/*.pkg "$HERE"/*.pkg; do [ -f "$f" ] && { GPKG=$f; break; }; done
+TOOLS=""; for f in "$HERE"/guest/Venera-Tools-*.iso "$HERE"/Venera-Tools-*.iso; do [ -f "$f" ] && { TOOLS=$f; break; }; done
 
 venera_args() {   # the VM's args line with Venera's pieces added (each only once): $1 the line, $2 1 for the sound device
   local a=$1 g
@@ -134,21 +136,25 @@ venera_args() {   # the VM's args line with Venera's pieces added (each only onc
   if [ "$2" = 1 ]; then case " $a " in *usb-audio*) ;; *) a="$a -audiodev spice,id=vsnd -device usb-audio,audiodev=vsnd" ;; esac; fi
   echo "${a# }"
 }
-venera_disk() {   # $1 the image to write: an ISO with the guest package and a note, which macOS mounts as "Venera"
+venera_disk() {   # $1 the image to write: the Venera Tools CD (the release's, or made here from the guest package)
+  if [ -n "$TOOLS" ]; then cp "$TOOLS" "$1"; return; fi
   local d; d=$(mktemp -d)
   cp "$GPKG" "$d/$(basename "$GPKG")"
   cat >"$d/Read Me.txt" <<TXT
-Venera ${VER:-} for this VM
+Venera Tools ${VER:-}
 
-1. Open "$(basename "$GPKG")" (Customize has the video, app and Safari WebGL choices).
+Venera for a macOS VM on Proxmox: Metal graphics on the host's GPU, hardware video, and the Proxmox guest agent.
+
+1. Open "$(basename "$GPKG")". Customize has the choices: hardware video, the Venera app and the Proxmox
+   guest agent (all on), and Safari WebGL (off: it changes a security setting).
 2. Restart when it says so.
-3. On the Proxmox host, run proxmox-macos-vm.sh again and choose Finish: it turns on hardware video, takes out the
-   installer disks (this one too) and restarts the VM.
+3. If the VM was made by proxmox-macos-vm.sh, run it again on the Proxmox host and choose Finish: it turns on hardware
+   video and the faster guest agent port, takes out the installer disks (this one too) and restarts the VM.
+   Otherwise, in Proxmox: the VM's Options > QEMU Guest Agent: on (type VirtIO), then shut the VM down and start it.
 
-SIP and AMFI are already set in OpenCore as Venera needs them, so the package installs in one pass.
 The install guide: https://github.com/jazzphone/venera/blob/main/docs/INSTALL.md
 TXT
-  genisoimage -quiet -V Venera -J -r -o "$1" "$d"; rm -rf "$d"
+  genisoimage -quiet -V "Venera Tools" -J -r -o "$1" "$d"; rm -rf "$d"
 }
 
 # ---- OpenCore ------------------------------------------------------------------------------------------------------
@@ -237,6 +243,7 @@ drop_disk() {   # takes the disk in slot $1 out of the VM and deletes its volume
   local vol u
   vol=$(qm config "$VMID" | sed -n "s/^$1: \([^,]*\).*/\1/p"); [ -n "$vol" ] || return 0
   qm set "$VMID" --delete "$1" >/dev/null
+  case $vol in *:iso/*) echo "   $1 ($vol) taken out (the ISO stays in the storage)"; return 0 ;; esac
   u=$(qm config "$VMID" | awk -v v="$vol" -F': ' '$1 ~ /^unused/ && $2 == v {print $1}')
   [ -z "$u" ] || qm disk unlink "$VMID" --idlist "$u" --force 1 >/dev/null
   echo "   $1 ($vol) taken out and deleted"
@@ -258,14 +265,23 @@ stop_vm() {   # shuts the VM down (from macOS, as the Apple menu does) and waits
   local i; for i in $(seq 1 120); do qm status "$VMID" 2>/dev/null | grep -q stopped && return 0; sleep 5; done
   die "VM $VMID didn't shut down in 10 minutes: shut it down from macOS, then run this again"
 }
-attach_venera_disk() {   # a Venera disk in ide1 (made from the guest package), unless one is there
+iso_storage() {   # an active storage that holds ISOs: a shared one first (HA may start the VM on another node)
+  pvesh get /nodes/"$(hostname)"/storage --content iso --output-format json 2>/dev/null | python3 -c '
+import json, sys
+st = [s for s in json.load(sys.stdin) if s.get("active")]
+st.sort(key=lambda s: not s.get("shared"))
+print(st[0]["storage"] if st else "")'
+}
+attach_venera_disk() {   # the Venera Tools CD in ide1 (macOS shows it on the desktop), unless ide1 is in use
   [ -n "$GPKG" ] || return 0
-  if [ -n "$(disk_of ide1)" ]; then echo "   ide1 is in use: no Venera disk (copy the package in yourself)"; return 0; fi
-  local img; img=$(mktemp --suffix=.iso); venera_disk "$img"
-  qm disk import "$VMID" "$img" "$STORAGE" --format raw >/dev/null; rm -f "$img"
-  local u; u=$(qm config "$VMID" | sed -n 's/^\(unused[0-9]*\): .*/\1/p' | tail -1)
-  qm set "$VMID" --ide1 "$(qm config "$VMID" | sed -n "s/^$u: //p"),cache=unsafe" >/dev/null
-  echo "   ide1: the Venera disk ($(basename "$GPKG"))"
+  if [ -n "$(disk_of ide1)" ]; then echo "   ide1 is in use: no Venera Tools CD (copy the package in yourself)"; return 0; fi
+  local st iso path
+  st=$(iso_storage); [ -n "$st" ] || { echo "   no storage holds ISOs here: no Venera Tools CD (copy the package in yourself)"; return 0; }
+  iso="Venera-Tools-${VER:-guest}.iso"
+  path=$(pvesm path "$st:iso/$iso") || return 0
+  [ -f "$path" ] || venera_disk "$path"
+  qm set "$VMID" --ide1 "$st:iso/$iso,media=cdrom" >/dev/null
+  echo "   ide1: the Venera Tools CD ($st:iso/$iso)"
 }
 
 finish_vm() {   # macOS and Venera installed: hardware video, the installer disks out, a restart; the old clean-ups
@@ -273,13 +289,14 @@ finish_vm() {   # macOS and Venera installed: hardware video, the installer disk
   echo; echo "== Finish VM $VMID"
   qm agent "$VMID" ping >/dev/null 2>&1 && up=1
   if [ $up = 1 ]; then
-    st=$(guest 'V="/Library/Application Support/Venera"; [ -e "$V/VERSION" ] && echo "Venera $(cat "$V/VERSION") in macOS"; [ -e "$V/VIDEO" ] && echo "with its video choice"; kextstat 2>/dev/null | grep -q VeneraVideo && echo "VeneraVideo.kext loaded"')
+    st=$(guest 'V="/Library/Application Support/Venera"; [ -e "$V/VERSION" ] && echo "Venera $(cat "$V/VERSION") in macOS"; [ -e "$V/VIDEO" ] && echo "with its video choice"; kextstat 2>/dev/null | grep -q VeneraVideo && echo "VeneraVideo.kext loaded"; [ -f /Library/LaunchDaemons/local.venera.agent.plist ] && echo "Venera'"'"'s guest agent"')
     if [ -n "$st" ]; then echo "$st" | sed 's/^/  /'
-    else warn "Venera isn't installed in macOS yet: open Install Venera on the Venera disk first (or go on without it)"; fi
+    else warn "Venera isn't installed in macOS yet: open Install Venera on the Venera Tools CD first (or go on without it)"; fi
   else
-    echo "  (no guest agent in macOS: can't read Venera's status; mac-guest-agent gives it one)"
+    echo "  (no guest agent answers: can't read Venera's status. Venera's installer puts one in, its Proxmox guest agent"
+    echo "   choice; on a VM made before 0.1.6 the agent port may be ISA: it answers there too)"
   fi
-  local VIDEO=0 drops=() HASDEV=0 RESTART=0
+  local VIDEO=0 drops=() HASDEV=0 RESTART=0 VIRTIO_AGENT=0
   case " $(qm config "$VMID" | sed -n 's/^args: //p') " in *"/run/venera-video-$VMID.sock"*) HASDEV=1 ;; esac
   gpu_scan
   if [ "$GPU_KIND" = intel ] && [ -n "$HOSTKIT" ]; then
@@ -294,12 +311,15 @@ finish_vm() {   # macOS and Venera installed: hardware video, the installer disk
   fi
   if [ $VIDEO = 1 ]; then for n in $(vm_other_nodes); do no_yes "Hardware video on $n too (HA may start the VM there)?" && nodes+=("$n"); done; fi
   for s in ide0 ide1; do
-    [ -n "$(disk_of $s)" ] && yes_no "Take out and delete $s ($(disk_of $s): the macOS recovery or the Venera disk)?" && drops+=("$s")
+    [ -n "$(disk_of $s)" ] && yes_no "Take out $s ($(disk_of $s): the macOS recovery or the Venera Tools CD)?" && drops+=("$s")
   done
-  { [ $VIDEO = 1 ] && [ $HASDEV = 0 ]; } || [ ${#drops[@]} -gt 0 ] && RESTART=1
+  # Venera's agent answers on either port; the virtio one is ten times faster than the ISA serial port
+  if [[ $st == *"guest agent"* ]] && ! qm config "$VMID" | grep -q '^agent:.*type=virtio'; then VIRTIO_AGENT=1; fi
+  { [ $VIDEO = 1 ] && [ $HASDEV = 0 ]; } || [ ${#drops[@]} -gt 0 ] || [ $VIRTIO_AGENT = 1 ] && RESTART=1
   echo; echo "== The plan"
   [ $VIDEO = 1 ] && echo "  - hardware video: install-host.sh --vm $VMID here${nodes[*]:+ and on ${nodes[*]}}$([ $HASDEV = 1 ] && echo " (the VM has its device: this updates the service)")"
-  [ ${#drops[@]} -gt 0 ] && echo "  - take out and delete ${drops[*]}"
+  [ ${#drops[@]} -gt 0 ] && echo "  - take out ${drops[*]} (the recovery disk is deleted; the Venera Tools ISO stays in its storage)"
+  [ $VIRTIO_AGENT = 1 ] && echo "  - the guest agent on its virtio port (faster than the ISA serial port)"
   [ $up = 1 ] && echo "  - in macOS: set the clock once, Apple's power logging (PerfPowerServices) off (it held a core at ~90%)"
   [ $RESTART = 1 ] && echo "  - shut VM $VMID down and start it again (QEMU picks up the device and disk changes when it starts)"
   yes_no "Go ahead?" || die "nothing changed"
@@ -318,11 +338,12 @@ finish_vm() {   # macOS and Venera installed: hardware video, the installer disk
   done
   if [ $VIDEO = 1 ]; then echo "== hardware video here"; "$HOSTKIT/install-host.sh" --vm "$VMID" | sed 's/^/   /'; fi
   for s in "${drops[@]}"; do drop_disk "$s"; done
+  [ $VIRTIO_AGENT = 0 ] || { qm set "$VMID" --agent enabled=1,type=virtio >/dev/null; echo "   guest agent port: virtio"; }
   [ $RESTART = 0 ] || { echo "== starting VM $VMID"; qm start "$VMID"; }
   echo "== Done. In macOS, the Venera app (Applications) shows what runs. The config before: /root/macos-vm-backup/."
 }
 
-ready_vm() {   # an existing macOS VM (stopped): the host's packages, the display, the args, the Venera disk
+ready_vm() {   # an existing macOS VM (stopped): the host's packages, the display, the args, the Venera Tools CD
   local cur new AUDIO=1 nodes=() n
   qm status "$VMID" | grep -q stopped || die "shut VM $VMID down first, then run this again"
   STORAGE=$(qm config "$VMID" | sed -n 's/^virtio0: \([^:]*\):.*/\1/p'); [ -n "$STORAGE" ] || STORAGE=local-lvm
@@ -334,7 +355,7 @@ ready_vm() {   # an existing macOS VM (stopped): the host's packages, the displa
   echo "  - here${nodes[*]:+ and on ${nodes[*]}}: install $(missing_pkgs $VENUS_PKGS genisoimage)(those missing), KVM ignore_msrs on"
   echo "  - VM $VMID: display virtio-gl (was $(qm config "$VMID" | sed -n 's/^vga: //p'))"
   [ "$new" = "$cur" ] || echo "  - its args gain: $(comm -13 <(tr ' ' '\n' <<<"$cur" | sort -u) <(tr ' ' '\n' <<<"$new" | sort -u) | tr '\n' ' ')"
-  [ -n "$GPKG" ] && echo "  - a Venera disk in ide1 with $(basename "$GPKG")"
+  [ -n "$GPKG" ] && echo "  - the Venera Tools CD in ide1 with $(basename "$GPKG")"
   echo "  (the config is backed up to /root/macos-vm-backup first)"
   yes_no "Go ahead?" || die "nothing changed"
   echo "== the host"; host_prep $VENUS_PKGS genisoimage || die "the packages didn't install (apt)"
@@ -342,14 +363,14 @@ ready_vm() {   # an existing macOS VM (stopped): the host's packages, the displa
   backup_conf
   qm set "$VMID" --vga virtio-gl --args "$new" >/dev/null; echo "   display virtio-gl, args updated"
   attach_venera_disk
-  echo "== Done. Start VM $VMID, open Install Venera on the Venera disk (Finder's sidebar, Locations) and restart when"
+  echo "== Done. Start VM $VMID, open Install Venera on the Venera Tools CD (on the desktop) and restart when"
   echo "   it says so (when SIP has to change it finishes after one more restart). Then run this again and choose Finish."
 }
 
-choices_xml() {   # Installer's choice changes for the guest package: $1 video, $2 app, $3 webgl (each 0 or 1)
+choices_xml() {   # Installer's choice changes for the guest package: $1 video, $2 app, $3 webgl, $4 agent (each 0 or 1)
   local c
   printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><array>'
-  for c in "video $1" "app $2" "webgl $3"; do
+  for c in "video $1" "app $2" "webgl $3" "agent ${4:-1}"; do
     printf '<dict><key>attributeSetting</key><integer>%s</integer><key>choiceAttribute</key><string>selected</string><key>choiceIdentifier</key><string>%s</string></dict>' "${c#* }" "${c% *}"
   done
   printf '</array></plist>\n'
@@ -388,20 +409,21 @@ print("nobody" if not on else "locked" if on[0].get("CGSSessionScreenIsLocked") 
 }
 
 upgrade_vm() {   # a VM with Venera: this release's host half on every node, then its guest package in macOS, a restart
-  local st cur="" video=0 app=0 webgl=0 user="" HASDEV=0 nodes=() n img mnt out k
+  local st cur="" video=0 app=0 agent=1 webgl=0 user="" HASDEV=0 nodes=() n img mnt out k
   [ -n "$GPKG" ] || die "no guest package beside this script: run it from the unpacked Venera-host folder"
   echo; echo "== Upgrade VM $VMID to Venera ${VER:-?}"
   qm status "$VMID" | grep -q running || die "VM $VMID isn't running: start it (the upgrade goes in through the guest agent), then run this again"
   qm agent "$VMID" ping >/dev/null 2>&1 || die "VM $VMID's guest agent doesn't answer: copy $(basename "$GPKG") into macOS and open it instead"
-  st=$(guest 'V="/Library/Application Support/Venera"; [ -e "$V/VERSION" ] && echo "version $(cat "$V/VERSION")"; [ -e "$V/VIDEO" ] && echo video; [ -d /Applications/Venera.app ] && echo app; [ -e "$V/NO_SYSVOL" ] && echo nosysvol; csrutil authenticated-root status 2>/dev/null | grep -qi disabled && echo authroot-off; stat -f %Su /dev/console')
+  st=$(guest 'V="/Library/Application Support/Venera"; [ -e "$V/VERSION" ] && echo "version $(cat "$V/VERSION")"; [ -e "$V/VIDEO" ] && echo video; [ -d /Applications/Venera.app ] && echo app; [ -e "$V/NO_SYSVOL" ] && echo nosysvol; [ -e "$V/NO_AGENT" ] && echo noagent; csrutil authenticated-root status 2>/dev/null | grep -qi disabled && echo authroot-off; stat -f %Su /dev/console')
   cur=$(sed -n 's/^version //p' <<<"$st")
   [ -n "$cur" ] || die "Venera isn't installed in VM $VMID's macOS: open Install Venera there (Ready for Venera makes the disk)"
   grep -qx video <<<"$st" && video=1
   grep -qx app <<<"$st" && app=1
+  grep -qx noagent <<<"$st" && agent=0
   grep -qx authroot-off <<<"$st" && ! grep -qx nosysvol <<<"$st" && webgl=1
   user=$(tail -1 <<<"$st"); [ "$user" = root ] && user=""
   case " $(qm config "$VMID" | sed -n 's/^args: //p') " in *"/run/venera-video-$VMID.sock"*) HASDEV=1 ;; esac
-  echo "  macOS has Venera $cur: hardware video $([ $video = 1 ] && echo on || echo off), the Venera app $([ $app = 1 ] && echo on || echo off), Safari WebGL (the system-volume copy) $([ $webgl = 1 ] && echo on || echo off)"
+  echo "  macOS has Venera $cur: hardware video $([ $video = 1 ] && echo on || echo off), the Venera app $([ $app = 1 ] && echo on || echo off), the guest agent $([ $agent = 1 ] && echo on || echo off), Safari WebGL (the system-volume copy) $([ $webgl = 1 ] && echo on || echo off)"
   if [ $HASDEV = 1 ]; then
     [ -n "$HOSTKIT" ] || die "VM $VMID has hardware video but Venera's host half isn't beside this script"
     for n in $(vm_other_nodes); do no_yes "The host half on $n too (HA may start the VM there)?" && nodes+=("$n"); done
@@ -433,7 +455,7 @@ upgrade_vm() {   # a VM with Venera: this release's host half on every node, the
     mnt=$(guest "ls -d /Volumes/*/'$(basename "$GPKG")' 2>/dev/null | head -1"); [ -n "$mnt" ] && break; sleep 5
   done
   if [ -z "$mnt" ]; then usb_disk del; rm -f "$img"; die "macOS didn't mount the USB disk in 2 minutes (did its screen lock?): nothing installed"; fi
-  guest "printf '%s' '$(choices_xml $video $app $webgl)' > /private/var/tmp/venera-choices.xml" >/dev/null
+  guest "printf '%s' '$(choices_xml $video $app $webgl $agent)' > /private/var/tmp/venera-choices.xml" >/dev/null
   out=$(guest_rc 900 "/usr/sbin/installer -pkg '$mnt' -target / -applyChoiceChangesXML /private/var/tmp/venera-choices.xml 2>&1; rm -f /private/var/tmp/venera-choices.xml")
   sed 's/^/   /' <<<"$out" | grep -v '^   rc='
   guest "diskutil eject '$(dirname "$mnt")' >/dev/null 2>&1" >/dev/null; sleep 2; usb_disk del; rm -f "$img"
@@ -472,7 +494,7 @@ for r in json.load(sys.stdin):
 if [ -n "$EXIST" ]; then
   VMID=$EXIST; echo "  $NAME is VM $VMID already ($(qm status "$VMID" | cut -d' ' -f2))."
   echo "    1  Finish: macOS and Venera are installed (hardware video, the installer disks out, a restart)"
-  echo "    2  Ready for Venera: an older macOS VM gets Venus graphics, a sound device and the Venera disk"
+  echo "    2  Ready for Venera: an older macOS VM gets Venus graphics, a sound device and the Venera Tools CD"
   echo "    3  Its Mac identity (for iCloud)"
   echo "    4  Upgrade Venera${VER:+ to $VER}: the host half on every node, then the guest package in macOS, and a restart"
   ask WHAT "Which" "1"
@@ -568,13 +590,13 @@ if [ $MODE = create ]; then
   if [ $VENERA = 1 ]; then
     echo "  - Venera: display virtio-gl with Venus, host-phys-bits-limit=40; in OpenCore SIP 0x$([ $WEBGL = 1 ] && echo A03 || echo 203)"
     echo "    and amfi_get_out_of_my_way=1$([ $WEBGL = 1 ] && echo " (authenticated root off, for Safari WebGL)")"
-    if [ -n "$GPKG" ]; then echo "  - a Venera disk with $(basename "$GPKG"), to open once macOS is installed"; fi
+    if [ -n "$GPKG" ]; then echo "  - the Venera Tools CD with $(basename "$GPKG"), to open once macOS is installed"; fi
     [ $VIDEO = 1 ] && echo "  - hardware video: set up at Finish (the device waits for VeneraVideo.kext in macOS)"
   else
     echo "  - display: VMware SVGA (no Venera)"
   fi
   [ $AUDIO = 1 ] && echo "  - a USB sound device (plays in Proxmox's SPICE console)"
-  echo "  - a guest agent port (ISA serial) for mac-guest-agent"
+  echo "  - a guest agent port (virtio) for Venera's guest agent"
 fi
 if [ -n "$SERIAL" ]; then echo "  - Mac identity: $MODEL, serial ${SERIAL:0:4}..., MAC $ROM"
 else echo "  - Mac identity: the sample one from OpenCore$([ $MODE = create ] && echo ", model $MODEL") (no iCloud until you add yours)"; fi
@@ -626,7 +648,7 @@ if [ $VENERA = 1 ]; then VGA=virtio-gl; ARGS=$(venera_args "$ARGS" $AUDIO)
 elif [ $AUDIO = 1 ]; then ARGS="$ARGS -audiodev spice,id=vsnd -device usb-audio,audiodev=vsnd"; fi
 qm create "$VMID" --name "$NAME" --ostype other --machine q35 --bios ovmf \
   --cores "$CORES" --sockets 1 ${PCORES:+--affinity "$PCORES"} --memory "$MEM" --balloon 0 \
-  --vga $VGA --tablet 0 --agent enabled=1,type=isa \
+  --vga $VGA --tablet 0 --agent enabled=1,type=virtio \
   --net0 "vmxnet3,bridge=$BRIDGE${VLAN:+,tag=$VLAN},firewall=0" \
   --efidisk0 "$STORAGE:1,efitype=4m,pre-enrolled-keys=0" \
   --virtio0 "$STORAGE:$DISK,cache=none" --onboot 1 \
@@ -647,10 +669,10 @@ echo "   and Macintosh HD once it has (macOS Base System again goes back to the 
 echo "   last screen with no graphics driver yet: if it hasn't moved in a few minutes, restart the VM (Reboot, or Stop and"
 echo "   Start); the account is made, and macOS starts at the login window."
 echo "   After setup, in macOS: automatic updates off (Venera is tested on 26.7.3; a newer macOS may keep the software"
-echo "   desktop); never sleep; set time automatically. The guest agent: build mac-guest-agent (MIT) from source and run"
-echo "   its --install (Finish reads Venera's status through it)."
+echo "   desktop); never sleep; set time automatically."
 if [ $VENERA = 1 ]; then
-  if [ -n "$GPKG" ]; then echo "   Then open Install Venera on the Venera disk (Finder's sidebar, Locations) and restart when it says so."
+  if [ -n "$GPKG" ]; then echo "   Then open Install Venera on the Venera Tools CD (on the desktop) and restart when it says so; its Proxmox guest"
+    echo "   agent choice (on) gives Proxmox clean shutdowns and the VM's addresses."
   else echo "   Then copy Venera's guest package (Install Venera VERSION.pkg) into macOS, open it, and restart when it says so."; fi
   echo "   Then run this again and choose Finish$([ $VIDEO = 1 ] && echo ": it turns on hardware video (on every node you set up),") takes out the"
   echo "   installer disks and restarts the VM."

@@ -7,9 +7,9 @@ VM first.
 
 **A new VM on Proxmox:** `proxmox-macos-vm.sh`, in the host package, sets up everything below for you before macOS is
 installed: the host's packages (on each cluster node the VM may run on), OpenCore with SIP and AMFI already relaxed, a
-macOS Tahoe VM with the `virtio-gl` display, Venus, the address width and a sound device, and a disk with the guest
-package. After macOS is installed, open the package from that disk, restart, and run the script again to Finish (video
-decoding on every node, the installer disks out). [vm/README.md](../vm/README.md) has the details. The rest of this
+macOS Tahoe VM with the `virtio-gl` display, Venus, the address width, a sound device and the guest agent's virtio
+port, and the Venera Tools CD with the guest package. After macOS is installed, open the package from that CD (it is on
+the desktop), restart, and run the script again to Finish (video decoding on every node, the installer disks out). [vm/README.md](../vm/README.md) has the details. The rest of this
 page is for an existing VM, or a host other than Proxmox.
 
 ## What you need
@@ -76,13 +76,17 @@ VMs you use for testing and development, not for a VM that holds anything you ne
 
 ### With the installer package
 
-Copy `Install Venera VERSION.pkg` into the guest and open it. Under **Customize**:
+Copy `Install Venera VERSION.pkg` into the guest and open it, or, with no network or shared folder, attach the
+**Venera Tools CD** (`Venera-Tools-VERSION.iso`, a release file with the package and a read-me): upload it to an ISO
+storage in Proxmox (Datacenter > the storage > ISO Images > Upload), add it in the VM's Hardware as a CD/DVD drive,
+and macOS shows "Venera Tools" on the desktop. Under **Customize**:
 
 | Choice | Default | What it does |
 |---|---|---|
 | Graphics driver | always | everything below ("From the command line", steps 1-5) |
 | Hardware video decoding | on | `VeneraVideo.kext` through OpenCore, for decoding and encoding; needs the host's half ("Hardware video decoding and encoding", below) |
 | Venera app | on | `/Applications/Venera.app`, started at login (below, "The Venera app") |
+| Proxmox guest agent | on | Venera's guest agent, so Proxmox works with the VM as with Linux and Windows guests (below, "The Proxmox guest agent") |
 | Safari WebGL | off | turns off SIP's authenticated root in OpenCore and puts the Metal driver on the system volume; when authenticated root is already off, the driver goes there anyway |
 
 The package runs `install.sh --set-security` with those choices as flags, keeps the release folder in
@@ -123,14 +127,16 @@ next to it (`config.plist.venera-DATE`), and then:
    (`/System/Library/Extensions`, with a new blessed system snapshot) when authenticated root is off, and
    `/Library/GPUBundles/VirtioGPUMetal.bundle` pointing at it;
 5. starts the watcher (`local.venera.watch`, below);
-6. installs the Venera app and its login item (`local.venera.helper`).
+6. installs the Venera app and its login item (`local.venera.helper`);
+7. installs and starts the guest agent (`local.venera.agent`, below); this one runs in the first pass too, since it
+   needs no restart.
 
 Options: `--level 2` installs everything with the software desktop (the framebuffer and the accelerator, Metal only
 for allow-listed test tools); `--no-opencore` skips step 1 and 2 for people who manage `config.plist` themselves (add
 `VirtioGPU.kext` with `ExecutablePath` `Contents/MacOS/VirtioGPU`, and `vgpuaccel=4` to boot-args);
 `--no-system-volume` leaves the system volume (and authenticated root) alone; `--video` adds `VeneraVideo.kext` to
-OpenCore (hardware video decoding); `--no-app` leaves out the Venera app; `--dry-run` prints every change without
-making it.
+OpenCore (hardware video decoding); `--no-app` leaves out the Venera app; `--no-agent` leaves out the guest agent (or
+takes it out); `--dry-run` prints every change without making it.
 
 ### The Venera app
 
@@ -145,6 +151,40 @@ something needs you, as a notification (macOS asks once whether Venera may send 
 Open it from Applications to see what runs: the desktop (Metal on the host's GPU, or the software desktop), where the
 Metal driver loads from, video decoding, the version, and a button for the watcher's log. With notifications off, a
 question waits in its window. "Show Venera in the menu bar" puts the same in a menu bar item.
+
+### The Proxmox guest agent
+
+Venera's own guest agent (`/Library/Application Support/Venera/venera-agent`, the launch daemon `local.venera.agent`)
+speaks the QEMU guest agent protocol that Proxmox uses with Linux and Windows guests. With it:
+
+- **Shutdown** and **Reboot** on the Proxmox page (and `qm shutdown`, HA, a node's shutdown) shut macOS down cleanly,
+  with no "quit the apps?" dialogs; without an agent Proxmox presses the virtual power button, which macOS answers with
+  a dialog that nobody sees;
+- the VM's **Summary** shows its IP addresses, and `qm agent VMID` answers `get-osinfo`, `get-host-name`, `get-users`,
+  `get-fsinfo`, `get-time`, `get-vcpus` and the rest;
+- the host can run commands and copy files in: `qm guest exec` (with `--pass-stdin`), the API's `agent/file-write` and
+  `agent/file-read`;
+- `qm guest passwd VMID USER` sets a local account's password, as an administrator's reset does (the login keychain
+  keeps the old password, and macOS offers to update it at the next login);
+- a backup's `fs-freeze` syncs the disks (APFS can't be frozen from outside the kernel: macOS reports no file system
+  frozen, and the backup goes on as crash-consistent), and `fstrim` says APFS trims by itself.
+
+macOS VMs don't sleep or hibernate here, so the suspend commands answer "Unsupported", as do Linux's memory-block
+commands.
+
+**Turn it on in Proxmox**: the VM's **Options > QEMU Guest Agent**: on, with **Type** VirtIO (the default), then shut
+the VM down and start it (QEMU adds the port when it starts). The agent also answers on the ISA serial port (Type ISA),
+about ten times slower; a VM made by `proxmox-macos-vm.sh` before 0.1.6 has that one, and its Finish switches it. The
+agent takes the place of `mac-guest-agent` if that is installed (its launch daemon is set aside in
+`/Library/Application Support/Venera/replaced`; `uninstall.sh` puts it back).
+
+It runs as root and answers only on the VM's agent port, which only the Proxmox host can reach: the host already
+controls the whole VM, so it can do nothing through the agent that it couldn't do without it. Untick **Proxmox guest
+agent** under Customize (or `install.sh --no-agent`) to go without it. Its log is `/var/log/venera-agent.log`.
+
+A note for anything that talks to it: Proxmox waits a few seconds for each answer, and the virtio port moves about a
+megabyte a second, so a `qm guest exec` whose output is more than a few megabytes times out (the agent drops that
+answer, reopens its port and goes on); copy big files in pieces.
 
 ## Hardware video decoding and encoding
 

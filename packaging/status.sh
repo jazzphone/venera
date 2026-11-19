@@ -20,6 +20,10 @@ echo "  authenticated root: $(csrutil authenticated-root status 2>/dev/null | gr
 launchctl print system/local.venera.watch >/dev/null 2>&1 && echo "  watcher: local.venera.watch loaded" ||
   echo "  watcher: not loaded"
 tail -2 "/Library/Application Support/Venera/watch.log" 2>/dev/null | sed 's/^/    /' 
+if launchctl print system/local.venera.agent >/dev/null 2>&1; then
+  echo "  guest agent: local.venera.agent loaded ($(tail -1 /var/log/venera-agent.log 2>/dev/null | cut -c21- | cut -c1-90))"
+elif [ -f /Library/LaunchDaemons/com.macos.guest-agent.plist ]; then echo "  guest agent: mac-guest-agent (not Venera's)"
+else echo "  guest agent: none (Proxmox can't shut the VM down cleanly or show its addresses)"; fi
 echo
 echo "== display"
 ioreg -w0 -rc VirtioGPUAccel -d1 2>/dev/null | grep -E '"(VirtioGPUArmState|VirtioGPUGuard|VirtioGPUGuardWhy|MetalPluginName|VirtioGPUBlobFlips|VirtioGPUPipeTiming)"' |

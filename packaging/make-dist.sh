@@ -13,6 +13,7 @@ D=dist/$NAME
 tools/build.sh >/dev/null
 tools/build-metal.sh >/dev/null
 tools/build-helper.sh >/dev/null
+tools/build-agent.sh >/dev/null
 rm -rf $D && mkdir -p $D/payload/OpenCore $D/payload/Extensions $D/payload/GPUBundles $D/payload/Support $D/payload/Apps $D/licenses
 cp -R build/VirtioGPU.kext build/VeneraVideo.kext $D/payload/OpenCore/
 cp -R build/VirtioGPUFramebuffer.kext build/VirtioGPUAccel.kext $D/payload/Extensions/
@@ -20,6 +21,7 @@ cp -R build/VirtioGPUMetal.bundle $D/payload/GPUBundles/
 cp packaging/install.sh packaging/uninstall.sh packaging/status.sh $D/
 cp packaging/sysvol.sh packaging/venera-watch.sh packaging/local.venera.watch.plist helper/local.venera.helper.plist $D/payload/Support/
 cp -R build/Venera.app $D/payload/Apps/
+cp build/venera-agent agent/local.venera.agent.plist $D/payload/Support/
 # the translation pool's seed (tools/seed-pool.sh): only one made with this translator
 TR=$(shasum -a 256 build/translator/libnvmtl_translate.dylib | cut -c1-12)
 SEED=$(ls packaging/seed/pool-*-$TR.tar.gz 2>/dev/null | head -1 || true)

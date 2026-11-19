@@ -20,6 +20,7 @@
         <line choice="graphics"/>
         <line choice="video"/>
         <line choice="app"/>
+        <line choice="agent"/>
         <line choice="webgl"/>
         <line choice="core"/>
     </choices-outline>
@@ -36,6 +37,10 @@
         description="A small app that runs at login: it tells you when something needs you (a macOS update took the driver off the system volume, the desktop fell back to software, the host's video service isn't running) and shows what runs. No menu bar icon unless you turn it on.">
         <pkg-ref id="local.homelab.venera.app"/>
     </choice>
+    <choice id="agent" title="Proxmox guest agent" start_selected="true"
+        description="Lets Proxmox work with this VM as it does with Linux and Windows guests: Shutdown and Reboot from the Proxmox page shut macOS down cleanly, the VM's Summary shows its IP addresses, and the host can run commands and copy files in (qm guest exec, file-write), set an account's password (qm guest passwd) and set the clock. Turn on QEMU Guest Agent in the VM's Options (VirtIO is fastest). It runs as root and answers only the Proxmox host, which already controls the VM. Takes the place of mac-guest-agent if that is installed.">
+        <pkg-ref id="local.homelab.venera.agent"/>
+    </choice>
     <choice id="webgl" title="Safari WebGL (changes a security setting)" start_selected="false"
         description="Safari's graphics process only loads drivers from the system volume. This turns off SIP's authenticated root (csr 0x800, in OpenCore) and puts the Metal driver on the system volume, so WebGL in Safari uses the host's GPU. Every other app uses the GPU without it. If authenticated root is already off, the driver goes on the system volume whether or not this is chosen.">
         <pkg-ref id="local.homelab.venera.webgl"/>
@@ -46,6 +51,7 @@
     <pkg-ref id="local.homelab.venera.prep" version="@VERSION@">prep.pkg</pkg-ref>
     <pkg-ref id="local.homelab.venera.video" version="@VERSION@">video.pkg</pkg-ref>
     <pkg-ref id="local.homelab.venera.app" version="@VERSION@">app.pkg</pkg-ref>
+    <pkg-ref id="local.homelab.venera.agent" version="@VERSION@">agent.pkg</pkg-ref>
     <pkg-ref id="local.homelab.venera.webgl" version="@VERSION@">webgl.pkg</pkg-ref>
     <pkg-ref id="local.homelab.venera.core" version="@VERSION@" onConclusion="RequireRestart">core.pkg</pkg-ref>
 </installer-gui-script>

@@ -1801,3 +1801,49 @@ drag stops. Looked into on VM 108:
   read, a snapshot every 100 ms, reads paced to N Mbit/s). Care when driving VM 108 by QMP: aim drags at the test
   window's title bar from a fresh grab (a press too soon after a click is a double click and zooms it; a drag into the
   menu bar tiles it), and check what is in front first (an earlier drag made Calendar events, since deleted).
+
+## Round 18 (2026-11-19): Venera's own guest agent, the Venera Tools CD
+
+The owner: build our own guest agent rather than lean on mac-guest-agent, make macOS a first-class Proxmox guest
+(everything Linux and Windows guests get), a Customize choice on by default, and an offline "Venera Tools" CD.
+
+- **agent/venera-agent.m** (Objective-C, Foundation + OpenDirectory, ~800 lines; `tools/build-agent.sh`): the QEMU
+  guest agent protocol on the virtio port `org.qemu.guest_agent.0` (preferred) or the ISA serial port. Commands:
+  sync/sync-delimited, ping, info, get-osinfo, get-host-name, get-timezone, get-time, set-time, get-vcpus,
+  network-get-interfaces, get-fsinfo, get-users, get-load, shutdown, exec/exec-status (stdin, separate or merged
+  output, PATH lookup, 16 MB per stream), file-open/read/write/seek/flush/close, fsfreeze-* (sync only: APFS can't be
+  frozen from user space), fstrim (says APFS trims at mount), set-user-password (OpenDirectory's reset: the login
+  keychain keeps the old password), suspend-* and memory blocks as Unsupported. `agent/test-agent.py` checks the
+  protocol through `--stdio` (23 checks; build it for the Mac you run it on).
+- On VM 108, through Proxmox: ping, osinfo, exec with stdin (`--pass-stdin`), file-write/file-read via the API,
+  fsinfo, users, freeze/thaw, fstrim, passwd (on a throwaway account: the new password authenticates, the old one
+  doesn't; deleted after), `qm shutdown` in 10 s with no dialogs, `qm reboot` in 9 s, agent up ~22 s after start.
+- **Speed**: the ISA serial port moves ~100 KB/s each way, which is why mac-guest-agent "hung" on 4 KB arguments and
+  big outputs (Proxmox gives up on an answer after a few seconds). The virtio port moves ~1 MB/s. New VMs get
+  `agent: type=virtio`; Finish moves an older VM to it when Venera's agent is in. `vm-remote.sh push` now goes through
+  `--pass-stdin` in 512 KB pieces: 3 MB in 14 s (the 66 KB agent took 2.5 minutes the old way).
+- **The virtio port stalls** when Proxmox closes its end while an answer is on its way (a 5 MB exec output timed out):
+  macOS's virtio console then takes no more output, a blocking write waits for good, and even the close at exit waits
+  on the tty's drain (launchd showed the exited agent as still running). Reading the host socket, and reconnecting
+  QEMU's chardev, don't free it; the guest closing and reopening the port does. So the port is non-blocking; a write
+  with no progress for 5 s flushes the queue (tcflush), drops the rest of that answer, and the agent reopens the
+  port: answering again ~6 s after the timeout. A watchdog (20 s stuck) flushes and exits as a last resort.
+- Learned on the way: QEMU's `chardev-change` to the same socket path deletes the socket (the old backend unlinks it
+  after the new one listens): change to a temporary path and back. launchd stops retrying a job whose program wasn't
+  executable when it tried (EX_CONFIG, "spawn scheduled" for good): install.sh makes the binary executable before the
+  rename. `send-key` through QMP lost a key-up (a key repeated); `input-send-event` with explicit downs and ups
+  doesn't.
+- **Installer**: a "Proxmox guest agent" choice (on; `install.sh --no-agent`, remembered as NO_AGENT for the script's
+  Upgrade), installed in the first pass too. It sets mac-guest-agent's daemon aside (uninstall.sh puts it back). The
+  agent can be carrying the install itself (Upgrade runs through it), and launchd stops a job's whole process group,
+  so the switch is a one-time job (local.venera.agent-swap) that waits until no install.sh runs; the agent's commands
+  run in their own process group and its job has AbandonProcessGroup. Tested on VM 108 as the Upgrade does it: a test
+  0.1.6 package from the Tools CD as a USB disk, `installer` through the agent: rc=0 read by Proxmox, the new agent up
+  3 s later, then a reboot through the agent onto the Metal desktop.
+- **Venera Tools CD**: make-pkg.sh also makes `dist/Venera-Tools-VERSION.iso` (the package and a read-me,
+  `packaging/tools-readme.txt`), carried in the host package's guest/ folder. The VM script attaches it as a CD drive
+  from an ISO storage (a shared one first: a NAS share), so macOS shows it on the desktop; Finish takes
+  the drive out and leaves the ISO. vm/test.sh: 18 checks.
+- Not done: VM 108 runs that test 0.1.6 build (agent from this round; the rest is 0.1.5's). No release yet. VM 107
+  still has mac-guest-agent on the ISA port: an Upgrade to the release puts Venera's agent in, and Finish (or the
+  Options page plus a restart) moves it to virtio.

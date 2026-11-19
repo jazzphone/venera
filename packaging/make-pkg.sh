@@ -2,12 +2,15 @@
 # make-pkg: "dist/Install Venera VERSION.pkg" from the release folder make-dist.sh assembled (dist/Venera-VERSION).
 #
 # The package puts the release folder in /Library/Application Support/Venera/release and runs its install.sh, with
-# the Customize choices as flags: Video decoding (--video), the Venera app (else --no-app), Safari WebGL (else
-# --no-system-volume, unless authenticated root is already off). Packages, in install order:
+# the Customize choices as flags: Video decoding (--video), the Venera app (else --no-app), the guest agent (else
+# --no-agent), Safari WebGL (else --no-system-volume, unless authenticated root is already off). Packages, in install
+# order:
 #   prep    (hidden)  clears the choice markers
-#   video, app, webgl  each leaves a marker (/Library/Application Support/Venera/.choices/NAME)
+#   video, app, agent, webgl  each leaves a marker (/Library/Application Support/Venera/.choices/NAME)
 #   core    (hidden)  the release folder, then install.sh with the markers' flags; asks for the restart
 # SIGN_ID="Developer ID Installer: NAME (TEAM)" signs it (productbuild --sign); unsigned otherwise.
+# Then dist/Venera-Tools-VERSION.iso: the package and a read-me (packaging/tools-readme.txt) on a CD image, "Venera
+# Tools", to attach to a VM as a CD drive (macOS shows it on the desktop); no network needed.
 set -euo pipefail
 cd "${0:A:h}/.."
 VERSION=$(cat VERSION)
@@ -25,13 +28,14 @@ script() { # script NAME BODY: a scripts-only folder with a postinstall
   chmod 755 $B/scripts/$1/postinstall
 }
 script prep "rm -rf '$C'; mkdir -p '$C'; exit 0"
-for c in video app webgl; do script $c "mkdir -p '$C' && touch '$C/$c'; exit 0"; done
+for c in video app agent webgl; do script $c "mkdir -p '$C' && touch '$C/$c'; exit 0"; done
 script core "$(cat <<'SH'
 V="/Library/Application Support/Venera"
 C="$V/.choices"
 ARGS=(--set-security)
 [ -e "$C/video" ] && ARGS+=(--video)
 [ -e "$C/app" ] || ARGS+=(--no-app)
+[ -e "$C/agent" ] || ARGS+=(--no-agent)
 if [ ! -e "$C/webgl" ] && ! csrutil authenticated-root status 2>/dev/null | grep -qi disabled; then
   ARGS+=(--no-system-volume)
 fi
@@ -44,7 +48,7 @@ exit "${PIPESTATUS[0]}"
 SH
 )"
 
-for c in prep video app webgl; do
+for c in prep video app agent webgl; do
   pkgbuild --nopayload --scripts $B/scripts/$c --identifier local.homelab.venera.$c --version $VERSION \
     $B/pkgs/$c.pkg >/dev/null
 done
@@ -90,3 +94,12 @@ SIGN=()
 productbuild --distribution $B/Distribution.xml --package-path $B/pkgs --resources $B/res "${SIGN[@]}" "$OUT" >/dev/null
 echo "$OUT ($([[ -n "${SIGN_ID:-}" ]] && echo "signed: $SIGN_ID" || echo unsigned))"
 shasum -a 256 "$OUT"
+# the CD: Venera Tools
+T=$B/tools && rm -rf $T && mkdir -p $T
+cp "$OUT" $T/
+sed "s/@VERSION@/$VERSION/g" packaging/tools-readme.txt >"$T/Read Me.txt"
+ISO=dist/Venera-Tools-$VERSION.iso
+rm -f $ISO
+hdiutil makehybrid -quiet -iso -joliet -default-volume-name "Venera Tools" -o $ISO $T
+echo "$ISO"
+shasum -a 256 $ISO

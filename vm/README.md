@@ -37,11 +37,15 @@ cores, memory, disk, the screen size at boot, and optionally your Mac's identity
   `amfi_get_out_of_my_way=1`). Venera's installer then runs in one pass, with no restart to change SIP first;
 - creates a q35 / OVMF VM: the host's own CPU with `host-phys-bits-limit=40`, QEMU's `applesmc` with the SMC key, the
   `virtio-gl` display with Venus (blob resources, a 2 GB host memory window), a USB sound device (YouTube needs one),
-  vmxnet3, a virtio disk with no TRIM, USB keyboard and tablet, and an ISA serial port for `mac-guest-agent`;
-- attaches a **Venera disk** with the guest package and a read-me.
+  vmxnet3, a virtio disk with no TRIM, USB keyboard and tablet, and the guest agent's virtio port;
+- attaches the **Venera Tools CD** (the release's `Venera-Tools-VERSION.iso`, or one made from the guest package) as a
+  CD drive, from an ISO storage (a shared one when there is one, so HA can start the VM on any node). macOS shows it on
+  the desktop.
 
-Then, in the VM's console: install macOS from the recovery, open **Install Venera** on the Venera disk (Finder's
-sidebar, Locations), and restart when it says so. Run the script again and choose **Finish**.
+Then, in the VM's console: install macOS from the recovery, open **Install Venera** on the Venera Tools CD (on the
+desktop), and restart when it says so. Its **Proxmox guest agent** choice (on by default) is what lets Proxmox shut
+macOS down cleanly and show its addresses, and what Finish and Upgrade talk to. Run the script again and choose
+**Finish**.
 
 What to expect on the way, before Venera is in:
 
@@ -63,13 +67,15 @@ Run it again with the VM's name:
 1. **Finish**, once macOS and Venera are installed. It reads Venera's status in macOS through the guest agent, then:
    - turns on hardware video (decoding and encoding): `install-host.sh --vm VMID` on each node the VM may run on, the others first,
      so the VM finds its socket wherever HA starts it;
-   - takes out and deletes the recovery and Venera disks;
+   - takes out the recovery disk (deleted) and the Venera Tools CD (its ISO stays in the storage, for the next VM);
+   - moves the guest agent to its virtio port, when Venera's agent is in and the VM still has the ISA one (made
+     before 0.1.6): about ten times faster;
    - sets the clock once and turns off Apple's power logging, which held a core at ~90% in the VM;
    - shuts the VM down and starts it again, since QEMU picks up a new device only when it starts.
 
    The video device waits until Finish because macOS hangs on it without `VeneraVideo.kext`.
 2. **Ready for Venera**, for an older macOS VM (stopped). It installs the host's packages, switches the display to
-   `virtio-gl`, adds Venus, the address width and the sound device to its `args:`, and attaches the Venera disk. The
+   `virtio-gl`, adds Venus, the address width and the sound device to its `args:`, and attaches the Venera Tools CD. The
    VM's config is backed up first. Venera's installer then sets SIP and AMFI itself and finishes after a restart.
 3. **Its Mac identity**: writes your Mac's model, serial, board serial and ROM into OpenCore. The old OpenCore disk is
    saved first.

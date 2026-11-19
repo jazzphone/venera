@@ -3,7 +3,8 @@
 #
 #   sudo ./uninstall.sh [--oc /Volumes/EFI] [--no-opencore] [--dry-run]
 #
-# Removes the Metal driver, the Venera app, the two Auxiliary KC kexts (and rebuilds the Auxiliary KC from what is left in
+# Removes the Metal driver, the Venera app, the guest agent (mac-guest-agent back if Venera's took its place), the two
+# Auxiliary KC kexts (and rebuilds the Auxiliary KC from what is left in
 # /Library/Extensions), and in OpenCore the VirtioGPU.kext entry and folder and vgpuaccel from boot-args (config.plist
 # backed up first). SIP and amfi_get_out_of_my_way are left as they are: put them back from a config.plist backup
 # (EFI/OC/config.plist.venera-*) or by hand. Then reboot: the VM is back on the firmware's framebuffer.
@@ -78,6 +79,33 @@ while IFS= read -r d; do
     case "$d" in /private/var/folders/zz/*) run rm -rf "$d" ;; esac
   fi
 done < <(find /private/var/folders /Users/*/Library/Containers -type d -name local.homelab.VirtioGPUMetal -prune 2>/dev/null)
+# the guest agent, stopped by a one-time job once this has finished (it may be carrying this very uninstall: stopping
+# it now would end this script with it), and mac-guest-agent back if Venera's took its place
+if [ -f /Library/LaunchDaemons/local.venera.agent.plist ]; then
+  run rm -f /Library/LaunchDaemons/local.venera.agent.plist
+  START=""
+  if [ -f "/Library/Application Support/Venera/replaced/com.macos.guest-agent.plist" ]; then
+    run mv "/Library/Application Support/Venera/replaced/com.macos.guest-agent.plist" /Library/LaunchDaemons/
+    START="launchctl bootstrap system /Library/LaunchDaemons/com.macos.guest-agent.plist;"
+    say "guest agent: mac-guest-agent back once this has finished"
+  fi
+  SW=/Library/LaunchDaemons/local.venera.agent-swap.plist
+  if [ $DRY = 0 ]; then
+    cat >"$SW" <<PL
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>local.venera.agent-swap</string>
+  <key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string>
+  <string>sleep 10; while pgrep -f "Venera/release/install.sh|uninstall.sh" >/dev/null; do sleep 2; done; launchctl bootout system/local.venera.agent 2>/dev/null; sleep 1; $START rm -f '$SW'; launchctl bootout system/local.venera.agent-swap</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>LaunchOnlyOnce</key><true/>
+</dict></plist>
+PL
+    chown root:wheel "$SW" && chmod 644 "$SW" && launchctl bootstrap system "$SW"
+  fi
+  say "guest agent: local.venera.agent stops once this has finished"
+fi
 run rm -rf "/Library/Application Support/Venera"
 # the installer package's receipts (Install Venera.pkg), so a reinstall starts clean
 for r in $(pkgutil --pkgs 2>/dev/null | grep '^local\.homelab\.venera\.'); do run pkgutil --forget "$r" >/dev/null; done

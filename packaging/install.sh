@@ -1,8 +1,8 @@
 #!/bin/bash
 # Venera installer: run inside the macOS guest, as root, from the unpacked release folder.
 #
-#   sudo ./install.sh [--level 4|2] [--video] [--no-app] [--oc /Volumes/EFI] [--no-opencore] [--set-security]
-#                     [--no-system-volume] [--dry-run]
+#   sudo ./install.sh [--level 4|2] [--video] [--no-app] [--no-agent] [--oc /Volumes/EFI] [--no-opencore]
+#                     [--set-security] [--no-system-volume] [--dry-run]
 #
 # What it does (each step says what it changed; nothing is downloaded):
 #   1. checks the guest: x86_64 macOS 26, a virtio-gpu device, SIP and AMFI as the driver needs them
@@ -16,6 +16,9 @@
 #      which keeps it there across macOS updates, asking before it reinstalls
 #   5. the Venera app (/Applications/Venera.app, started at login by local.venera.helper): it asks the watcher's
 #      questions as notifications and shows what runs; --no-app leaves it out (the watcher then asks in dialogs)
+#   6. the guest agent (local.venera.agent): Proxmox's `qm agent` and `qm guest` (shutdown from the Proxmox page, the
+#      VM's IP addresses, commands and files from the host); it takes the place of mac-guest-agent if that is there.
+#      Installed in the first pass too (it needs no restart); --no-agent leaves it out, or takes it out
 # Then reboot. ./uninstall.sh undoes all of it; ./status.sh shows what runs.
 #
 # When --set-security has to change SIP, steps 3-5 can't run until the restart (rebuilding the Auxiliary KC needs SIP's
@@ -41,6 +44,7 @@ DRY=0
 FORCE=0
 VIDEO=0
 NO_APP=0
+NO_AGENT=0
 GUID=7C436110-AB2A-4BBB-A880-FE41995C9F82
 MOUNTED=
 V="/Library/Application Support/Venera"
@@ -86,7 +90,8 @@ while [ $# -gt 0 ]; do
   --force) FORCE=1 ;;
   --video) VIDEO=1 ;;
   --no-app) NO_APP=1 ;;
-  -h | --help) sed -n '2,31p' "$0"; exit 0 ;;
+  --no-agent) NO_AGENT=1 ;;
+  -h | --help) sed -n '2,34p' "$0"; exit 0 ;;
   *) die "unknown option $1 (--help)" ;;
   esac
   shift
@@ -255,6 +260,81 @@ else
   say "  to boot-args yourself (INSTALL.md)."
   [ $VIDEO = 1 ] && say "  And payload/OpenCore/VeneraVideo.kext, for hardware video."
 fi
+
+# ---- 6. the guest agent (runs in either pass: it needs no restart) -----------------------------------------------
+AGENT_PLIST=/Library/LaunchDaemons/local.venera.agent.plist
+OLD_AGENT=/Library/LaunchDaemons/com.macos.guest-agent.plist
+SWAP_PLIST=/Library/LaunchDaemons/local.venera.agent-swap.plist
+# The agent can be carrying this very install (the VM script's Upgrade runs it through the agent): stopping it now
+# would end this script with it (launchd stops a job's whole process group). A one-time job of its own makes the
+# switch once no install.sh runs any more (and at least ten seconds from now), after the host has read how it went.
+agent_switch_later() {   # $1: the agent to start then ("" for none); stops both agents first
+  [ $DRY = 1 ] && { say "  + (once this has finished) stop the running agent${1:+, start $1}"; return; }
+  local start=""
+  [ -n "$1" ] && start="launchctl bootstrap system '$1';"
+  cat >"$SWAP_PLIST" <<PL
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>local.venera.agent-swap</string>
+  <key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string>
+  <string>sleep 10; while pgrep -f "Venera/release/install.sh|uninstall.sh" >/dev/null; do sleep 2; done; launchctl bootout system/com.macos.guest-agent 2>/dev/null; launchctl bootout system/local.venera.agent 2>/dev/null; sleep 1; $start rm -f '$SWAP_PLIST'; launchctl bootout system/local.venera.agent-swap</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>LaunchOnlyOnce</key><true/>
+</dict></plist>
+PL
+  chown root:wheel "$SWAP_PLIST" && chmod 644 "$SWAP_PLIST"
+  launchctl bootout system/local.venera.agent-swap 2>/dev/null
+  launchctl bootstrap system "$SWAP_PLIST"
+}
+agent_running() { launchctl print system/local.venera.agent >/dev/null 2>&1 || launchctl print system/com.macos.guest-agent >/dev/null 2>&1; }
+agent_step() {
+  # the choice, for the VM script's Upgrade (it installs again with the same choices)
+  if [ $NO_AGENT = 1 ]; then run mkdir -p "$V"; run touch "$V/NO_AGENT"; else run rm -f "$V/NO_AGENT"; fi
+  if [ $NO_AGENT = 1 ]; then
+    if [ -f "$AGENT_PLIST" ]; then
+      run rm -f "$AGENT_PLIST" "$V/venera-agent"
+      local back=""
+      if [ -f "$V/replaced/com.macos.guest-agent.plist" ]; then run mv "$V/replaced/com.macos.guest-agent.plist" "$OLD_AGENT"; back=$OLD_AGENT; fi
+      agent_switch_later "$back"
+      say "guest agent: taken out (--no-agent)${back:+; mac-guest-agent back}"
+    else
+      say "guest agent: not installed (--no-agent)"
+    fi
+    return 0
+  fi
+  [ -x "$PAYLOAD/Support/venera-agent" ] || { warn "this release has no guest agent: left as it is"; return 0; }
+  local same=0 was=0
+  agent_running && was=1
+  cmp -s "$PAYLOAD/Support/venera-agent" "$V/venera-agent" && cmp -s "$PAYLOAD/Support/local.venera.agent.plist" "$AGENT_PLIST" &&
+    launchctl print system/local.venera.agent >/dev/null 2>&1 && same=1
+  run mkdir -p "$V"
+  # in place by a rename, executable before launchd sees it (a job it can't start, it stops trying)
+  run cp "$PAYLOAD/Support/venera-agent" "$V/venera-agent.new"
+  run chown root:wheel "$V/venera-agent.new"
+  run chmod 755 "$V/venera-agent.new"
+  run mv -f "$V/venera-agent.new" "$V/venera-agent"
+  run cp "$PAYLOAD/Support/local.venera.agent.plist" "$AGENT_PLIST"
+  run chown root:wheel "$AGENT_PLIST"
+  run chmod 644 "$AGENT_PLIST"
+  local note=""
+  if [ -f "$OLD_AGENT" ]; then   # both would take the agent port
+    run mkdir -p "$V/replaced"
+    run mv -f "$OLD_AGENT" "$V/replaced/"
+    note="; mac-guest-agent set aside ($V/replaced; uninstall.sh puts it back)"
+  fi
+  if [ $same = 1 ] && [ -z "$note" ]; then
+    say "guest agent: local.venera.agent running, unchanged"
+  elif [ $was = 1 ]; then
+    agent_switch_later "$AGENT_PLIST"
+    say "guest agent: local.venera.agent, starting in place of the running one once this has finished$note"
+  else
+    run launchctl bootstrap system "$AGENT_PLIST"
+    say "guest agent: local.venera.agent running$note"
+  fi
+}
+
+agent_step
 
 # ---- the first of two passes ends here: the next boot runs the rest ------------------------------------------------
 if [ $TWO_PASS = 1 ]; then

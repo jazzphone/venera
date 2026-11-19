@@ -24,6 +24,7 @@ cp vm/proxmox-macos-vm.sh $D/
 cp vm/LICENSE $D/licenses/proxmox-macos-vm-MIT.txt
 if [[ -f "dist/Install Venera $VERSION.pkg" ]]; then
   mkdir -p $D/guest && cp "dist/Install Venera $VERSION.pkg" $D/guest/
+  [[ -f dist/Venera-Tools-$VERSION.iso ]] && cp dist/Venera-Tools-$VERSION.iso $D/guest/
 else
   echo "make-host: no dist/Install Venera $VERSION.pkg (packaging/make-pkg.sh): the host package goes without it" >&2
 fi

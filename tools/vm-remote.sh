@@ -51,19 +51,19 @@ inject() {
 }
 
 # Installs a kext into /Library/Extensions and builds it into the Auxiliary kernel collection.
-# This guest agent (mac-guest-agent) takes neither Proxmox's --pass-stdin (MIME base64) nor
-# file-write, so the tarball goes in as base64 text, 1 KB per exec argument (4 KB hangs the agent). No network involved.
+# Files go in through the guest agent's stdin (qm guest exec --pass-stdin, which Proxmox caps at 1 MiB a call), in
+# 512 KB pieces appended in place. No network involved. (Before Venera's own agent, mac-guest-agent took neither
+# --pass-stdin nor file-write, and files went in as base64 text 1 KB per exec argument.)
 push_file() { # push_file LOCAL REMOTE
-  local b64 i n chunk
-  b64=$(base64 -w0 "$1")
-  n=${#b64}
-  qm guest exec $VM --timeout 20 -- /bin/sh -c "rm -f '$2.b64'" >/dev/null || return 1
-  for ((i = 0; i < n; i += 1024)); do
-    chunk=${b64:i:1024}
-    qm guest exec $VM --timeout 20 -- /bin/sh -c "printf %s '$chunk' >> '$2.b64'" >/dev/null || return 1
+  local size i
+  size=$(stat -c %s "$1")
+  qm guest exec $VM --timeout 20 -- /bin/sh -c "rm -f '$2.part'" >/dev/null || return 1
+  for ((i = 0; i * 524288 < size || i == 0; i++)); do
+    dd if="$1" bs=524288 skip=$i count=1 status=none |
+      qm guest exec $VM --timeout 60 --pass-stdin 1 -- /bin/sh -c "cat >> '$2.part'" >/dev/null || return 1
   done
-  qm guest exec $VM --timeout 20 -- /bin/sh -c "base64 -D -i '$2.b64' -o '$2' && rm '$2.b64'" >/dev/null || return 1
-  echo "pushed $1 ($n base64 bytes) to $2"
+  qm guest exec $VM --timeout 20 -- /bin/sh -c "mv -f '$2.part' '$2'" >/dev/null || return 1
+  echo "pushed $1 ($size bytes) to $2"
 }
 
 aux_install() { # aux_install TGZ "NAME [NAME...]": every named kext in the tarball, one AuxKC rebuild
