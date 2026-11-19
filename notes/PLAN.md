@@ -2022,3 +2022,10 @@ blob flips flush the whole screen to QEMU, and Screen Sharing captures the same 
   generator's items repeat in a cycle: 4-12 shared board serials in 300), checked by macserial --verify: 300 of 300
   serials and board serials distinct. "Your Mac's" decodes the serial (macserial -i) and offers the serial's model when
   it differs from the VM's. Walked through the create flow on node 2 up to the plan, both ways (nothing created).
+
+### 0.1.7 (2026-11-19)
+
+- The VM script's Upgrade stopped at a `qm>` prompt when run in a terminal (the one-line setup): `qm monitor` reads the
+  terminal instead of its stdin there. `hmp()` sends each command through `PVE::QemuServer::Monitor::mon_cmd`
+  (288625b); tested in a pty on node 2 (attach, duplicate refused, detach). Released as v0.1.7 (pre-release), nothing
+  else changed; get-venera fetches it.
