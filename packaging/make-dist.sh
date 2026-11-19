@@ -22,9 +22,12 @@ cp packaging/install.sh packaging/uninstall.sh packaging/status.sh $D/
 cp packaging/sysvol.sh packaging/venera-watch.sh packaging/local.venera.watch.plist helper/local.venera.helper.plist $D/payload/Support/
 cp -R build/Venera.app $D/payload/Apps/
 cp build/venera-agent agent/local.venera.agent.plist build/venera-clipboard agent/local.venera.clipboard.plist $D/payload/Support/
-# the translation pool's seed (tools/seed-pool.sh): only one made with this translator
+# the translation pool's seed (tools/seed-pool.sh): only one made with this translator, and only in a build of your
+# own (VENERA_PRIVATE_SEED=1): it is translated from macOS's own shaders (Apple's), so releases never carry it, and a
+# fresh install's first boot translates them itself (round 21)
 TR=$(shasum -a 256 build/translator/libnvmtl_translate.dylib | cut -c1-12)
-SEED=$(ls packaging/seed/pool-*-$TR.tar.gz 2>/dev/null | head -1 || true)
+SEED=""
+[[ ${VENERA_PRIVATE_SEED:-} = 1 ]] && SEED=$(ls packaging/seed/pool-*-$TR.tar.gz 2>/dev/null | head -1 || true)
 if [[ -n $SEED ]]; then
   cp $SEED $D/payload/Support/pool.tar.gz
   echo ${${SEED:t}#pool-} | cut -d- -f1 >$D/payload/Support/pool.build

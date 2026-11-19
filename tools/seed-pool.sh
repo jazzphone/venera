@@ -1,5 +1,7 @@
 #!/bin/zsh
-# seed-pool (0.1.2): VM 108's translation pool (/Library/GPUBundles/Venera/cache) as the package's seed, so a fresh
+# seed-pool (0.1.2): for builds of your own only (make-dist.sh takes it with VENERA_PRIVATE_SEED=1): the seed is
+# translated from macOS's shaders (Apple's), so it is never committed (packaging/seed/ is ignored) or released.
+# VM 108's translation pool (/Library/GPUBundles/Venera/cache) as the package's seed, so a fresh
 # install's first boot finds Core Animation's shaders already translated (a fresh install translated 167 shaders, 125 s
 # of CPU, 104 s of it WindowServer's, in its first minutes). Translations are keyed by the translator and the shader
 # text, so the seed is good for one translator on any macOS build (a build's changed shaders just aren't in it):

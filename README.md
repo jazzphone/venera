@@ -153,7 +153,7 @@ what apps see of the display's VBLs (CVDisplayLink, a view's display link, Metal
 - `kext/VirtioGPU/` — the core kext (C++, the macOS SDK's Kernel.framework), injected by OpenCore.
 - `kext/VirtioGPUFramebuffer/`, `kext/VirtioGPUAccel/` — the IOFramebuffer and the IOAccelerator (Auxiliary KC).
 - `metal/VirtioGPUMetal/` — the Metal driver bundle.
-- `mesa/` — the Venus patches and build script (`mesa/out/` holds a prebuilt `libvulkan_virtio.dylib`).
+- `mesa/` — the Venus patches and build script (`mesa/build-mesa.sh` builds `mesa/out/libvulkan_virtio.dylib`).
 - `vendor/nullmoth/` — nvidia-macos-driver's reconstructed IOAccel headers.
 - `packaging/` — the release builder, installer, uninstaller and status script; `docs/` — the install guide.
 - `tools/` — build, deploy and measurement scripts; `notes/` — plan, findings, device dumps.

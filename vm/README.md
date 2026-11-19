@@ -153,10 +153,10 @@ security fixes wait too, so it's off unless you ask).
 
 ## Where it came from
 
-It began as an earlier project's VM script (an earlier macOS VM script,
-2026-11-12), which made the VM these drivers were developed in. The comments at the top say what each piece is for and
+It began as the author's script for a macOS VM in an earlier project (2026-11-12), which made the VM these drivers
+were developed in. The comments at the top say what each piece is for and
 what broke without it. `vm/test.sh` tests its pieces that need no Proxmox host: the args, a cluster node's address,
 Venera's OpenCore config and the script's edits to it, and moving an older VM's config (KVM-Opencore's) onto it.
 
-**License:** this folder is MIT (`vm/LICENSE`, an earlier project's license), not Venera's PolyForm Noncommercial. It contains
+**License:** this folder is MIT (`vm/LICENSE`, the earlier project's license), not Venera's PolyForm Noncommercial. It contains
 Apple's SMC key (the `OSK` string QEMU's `applesmc` needs), as every open-source macOS VM project publishes it.

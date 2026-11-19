@@ -6,3 +6,5 @@ hostvideo/fuzz/out/
 hostvideo/fuzz/gen/
 tools/fcfold/bench/target/
 tools/fcfold/bench/Cargo.lock
+packaging/seed/
+mesa/out/

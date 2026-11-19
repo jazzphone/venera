@@ -2,7 +2,7 @@
 # A macOS Tahoe VM on Proxmox VE, ready for Venera (Metal, OpenGL and hardware video on the host's GPU).
 # Run as root on the Proxmox host, from the unpacked Venera-host-VERSION folder: it uses install-host.sh and the guest
 # package (guest/Install Venera VERSION.pkg) beside it. It checks the host, asks its questions, shows the plan, and
-# changes nothing until you say yes. MIT (vm/README.md), like the an earlier project script it grew from.
+# changes nothing until you say yes. MIT (vm/README.md), like the script it grew from.
 #
 #   a new VM:      the host's packages (on each cluster node the VM may run on), Venera's OpenCore image (from this
 #                  package) with SIP and AMFI already as Venera needs them, macOS Tahoe's recovery from Apple (or your

@@ -1550,7 +1550,7 @@ Proxmox cluster with HA) found what VM 108 never could:
 - VM 107 upgraded to 0.1.1 (one pass: SIP was already relaxed). The guest agent's ISA serial port timed out on even 20
   KB of stdin, and VM 107's VLAN can't reach the Mac, so the release went in on a USB drive hot-added through QEMU's
   monitor (an ISO, `usb-storage` on `ehci.0`: macOS ignored it on the xhci's hub), ejected and detached after.
-- `vm/proxmox-macos-vm.sh` (an earlier project's VM script, MIT) is now Venera's VM maker, shipped in the host package with the
+- `vm/proxmox-macos-vm.sh` (the author's earlier macOS VM script, MIT) is now Venera's VM maker, shipped in the host package with the
   guest package. It checks the host (Intel CPU, the GPU through sysfs: Intel for everything, AMD without video; QEMU
   9.2+, virglrenderer 1.0+), installs the Venus packages on each node the VM may run on (only when its storage is
   shared), and makes a macOS Tahoe VM (macrecovery's Mac-CFF7D910A743CAAF, `-os latest`). OpenCore gets SIP 0x203 (0xA03
