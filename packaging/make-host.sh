@@ -25,7 +25,7 @@ docker run --rm --platform linux/amd64 -e EXTRA="-lva-drm" -v ~/src:/src venera-
 rm -rf $D && mkdir -p $D/bin $D/lib $D/licenses
 cp hostvideo/out/bin/venera-videod hostvideo/out/bin/vaprofiles $D/bin/
 cp -P hostvideo/out/ffmpeg/lib/*.so* $D/lib/
-cp packaging/host/install-host.sh packaging/host/venera-videod@.service packaging/host/venera-videod@.socket VERSION LICENSE NOTICE.md $D/
+cp packaging/host/install-host.sh packaging/host/TESTED packaging/host/venera-videod@.service packaging/host/venera-videod@.socket VERSION LICENSE NOTICE.md $D/
 # the macOS VM script (MIT, vm/README.md), the OpenCore image and macrecovery.py it uses, and the guest package
 cp vm/proxmox-macos-vm.sh vm/macrecovery.py $D/
 ls build/opencore/OpenCore-Venera-*.img >/dev/null 2>&1 || vm/opencore/build.sh >/dev/null

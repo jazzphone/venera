@@ -39,10 +39,13 @@ docker run --rm --platform linux/amd64 -v "$PWD/$B:/b" $DEBIAN sh -ec '
   export SOURCE_DATE_EPOCH=1767225600 TZ=UTC
   find EFI -exec touch -h -d @$SOURCE_DATE_EPOCH {} +
   truncate -s 48M '$IMG'
-  sgdisk -q -U 56454E45-5241-4F43-0000-000000000001 -n 1:2048:0 -t 1:EF00 -c 1:EFI \
-    -u 1:56454E45-5241-4F43-0000-000000000002 '$IMG'
-  mformat -i '$IMG'@@1M -F -N 56454E52 -v OPENCORE ::
+  # (not sgdisk -q: quiet, it writes no partition table and still says it succeeded)
+  sgdisk -o -U 56454E45-5241-4F43-0000-000000000001 -n 1:2048:0 -t 1:EF00 -c 1:EFI \
+    -u 1:56454E45-5241-4F43-0000-000000000002 '$IMG' >/dev/null
+  END=$(sgdisk -i 1 '$IMG' | sed -n "s/^Last sector: \([0-9]*\).*/\1/p")
+  mformat -i '$IMG'@@1M -T $((END - 2048 + 1)) -F -N 56454E52 -v OPENCORE ::   # the FAT ends where the partition does
   mcopy -i '$IMG'@@1M -s -m EFI ::
-  mdir -i '$IMG'@@1M -/ ::EFI | grep -c -E "efi|aml|plist|VeneraHide" '
+  mdir -i '$IMG'@@1M -/ ::EFI | grep -c -E "efi|aml|plist|VeneraHide"
+  sgdisk -v '$IMG' | grep -q "No problems found" && sgdisk -p '$IMG' | grep -q "EF00  EFI" || { sgdisk -p '$IMG'; echo "the partition table is wrong"; exit 1; } '
 rm -rf $OUT && mkdir -p $OUT && mv $B/$IMG $OUT/ && rm -rf $B
 (cd $OUT && shasum -a 256 $IMG | tee $IMG.sha256)

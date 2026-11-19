@@ -9,8 +9,14 @@ VM first.
 installed: the host's packages (on each cluster node the VM may run on), OpenCore with SIP and AMFI already relaxed, a
 macOS Tahoe VM with the `virtio-gl` display, Venus, the address width, a sound device and the guest agent's virtio
 port, and the Venera Tools CD with the guest package. After macOS is installed, open the package from that CD (it is on
-the desktop), restart, and run the script again to Finish (video decoding on every node, the installer disks out). [vm/README.md](../vm/README.md) has the details. The rest of this
-page is for an existing VM, or a host other than Proxmox.
+the desktop), restart, and run the script again to Finish (video decoding on every node, the installer disks out). [vm/README.md](../vm/README.md) has the details (Venera's own OpenCore image, bringing your
+own macOS disk or installer, moving an older VM to Venera's OpenCore). The rest of this page is for an existing VM,
+or a host other than Proxmox.
+
+**After a Proxmox update**, run `./install-host.sh --check` from the host package: it compares the host's QEMU,
+virglrenderer, Venus render server, Mesa Vulkan and VA-API drivers with the versions the release was tested on
+(`TESTED`), checks each piece, and prints the commands that go back to the tested versions if something changed.
+`--hold` keeps those packages where they are through updates (their security fixes too) until `--unhold`.
 
 ## What you need
 

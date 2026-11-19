@@ -99,6 +99,13 @@ host_versions() {   # dies when QEMU or virglrenderer are too old for Venus
   dpkg --compare-versions "$q" ge 9.2 || die "pve-qemu-kvm $q: Venus needs QEMU 9.2 or later (Proxmox VE 9)"
   v=$(dpkg-query -W -f '${Version}' libvirglrenderer1 2>/dev/null || true)
   [ -z "$v" ] || dpkg --compare-versions "$v" ge 1.0 || die "virglrenderer $v: Venus needs 1.0 or later (Proxmox VE 9)"
+  # the versions this release was tested on (the host package's TESTED): say so when Proxmox has moved on
+  local p want have d=""
+  for p in pve-qemu-kvm libvirglrenderer1 virgl-server mesa-vulkan-drivers; do
+    want=$(awk -v p="$p" '$1 == p {print $2}' "$HERE/TESTED" 2>/dev/null); have=$(dpkg-query -W -f '${Version}' "$p" 2>/dev/null || true)
+    [ -z "$want" ] || [ -z "$have" ] || [ "$want" = "$have" ] || d="$d $p $have (tested $want);"
+  done
+  [ -z "$d" ] || warn "this host's graphics stack isn't the one Venera ${VER:-} was tested on:$d install-host.sh --check says how to go back"
 }
 
 # the cluster's other nodes, and a way to run commands on them (the cluster's own SSH keys, host keys checked)
@@ -170,7 +177,14 @@ TAHOE_BOARD=Mac-CFF7D910A743CAAF   # OpenCorePkg's macrecovery list: macOS 26 Ta
 
 oc_mount() {   # mounts the OpenCore image $OCIMG (a file or a VM disk) at $MNT
   [[ $OCIMG == /dev/* ]] && lvchange -ay "$OCIMG"   # shared LVM keeps a stopped VM's disks inactive
-  LOOP=$(losetup -fP --show "$OCIMG"); MNT=$(mktemp -d); mount "${LOOP}p1" "$MNT"
+  LOOP=$(losetup -fP --show "$OCIMG"); MNT=$(mktemp -d)
+  # the partition's node shows up a moment after the loop device (udev): wait for it, else mount at its offset
+  local i; for i in $(seq 1 30); do [ -b "${LOOP}p1" ] && break; udevadm settle 2>/dev/null || sleep 0.1; done
+  local start; start=$(partx -g -o START -n 1 "$LOOP" 2>/dev/null || true)
+  if [ -b "${LOOP}p1" ]; then mount "${LOOP}p1" "$MNT" || die "couldn't mount the OpenCore image's EFI partition"
+  elif [ -n "$start" ]; then mount -o offset=$((start * 512)) "$LOOP" "$MNT" || die "couldn't mount the OpenCore image's EFI partition"
+  else losetup -d "$LOOP"; rmdir "$MNT"; die "$OCIMG has no partition table OpenCore's EFI partition can be found in"; fi
+  [ -f "$MNT/EFI/OC/config.plist" ] || { oc_umount; die "$OCIMG has no EFI/OC/config.plist"; }
 }
 oc_umount() { sync; umount "$MNT"; losetup -d "$LOOP"; rmdir "$MNT"; [[ $OCIMG == /dev/* ]] && lvchange -an "$OCIMG" || true; }
 
@@ -213,7 +227,8 @@ PY
 
 prepare_opencore() {   # on the new OpenCore image $OCIMG (a copy of Venera's): the screen size, SIP/AMFI, the identity
   oc_mount
-  OCVER=$OCVER NEWUUID=1 OC_RES=$RES OC_ARGS=$BOOTARGS OC_CSR=$CSR MODEL=$MODEL SERIAL=$SERIAL MLB=$MLB ROM=$ROM oc_config "$MNT/EFI/OC/config.plist"
+  OCVER=$OCVER NEWUUID=1 OC_RES=$RES OC_ARGS=$BOOTARGS OC_CSR=$CSR MODEL=$MODEL SERIAL=$SERIAL MLB=$MLB ROM=$ROM oc_config "$MNT/EFI/OC/config.plist" ||
+    { oc_umount; die "OpenCore's config.plist couldn't be edited"; }
   oc_umount
 }
 
@@ -303,6 +318,31 @@ stop_vm() {   # shuts the VM down (from macOS, as the Apple menu does) and waits
   local i; for i in $(seq 1 120); do qm status "$VMID" 2>/dev/null | grep -q stopped && return 0; sleep 5; done
   die "VM $VMID didn't shut down in 10 minutes: shut it down from macOS, then run this again"
 }
+# Bring your own macOS: the files in the ISO storages' template/iso folders and their import folders (where Proxmox
+# keeps disk images to import) that could be a macOS disk or a macOS installer or recovery image. One line each:
+# PATH <tab> disk|installer <tab> size in GB. Venera's own files (OpenCore, the Tools CD) and other OSes' ISOs that
+# say what they are in their name are left out.
+macos_sources() {
+  local st base f size kind
+  for st in $(pvesm status --content iso 2>/dev/null | awk 'NR>1 && $3=="active" {print $1}'); do
+    base=$(pvesm path "$st:iso/x.iso" 2>/dev/null) || continue; base=${base%/template/iso/x.iso}
+    for f in "$base"/template/iso/* "$base"/import/*; do
+      [ -f "$f" ] || continue
+      case ${f##*/} in
+        OpenCore-*|Venera-Tools-*|*.part|*debian*|*ubuntu*|*SERVER_EVAL*|*[Ww]indows*|*Win1*|*virtio-win*|*proxmox*) continue ;;
+      esac
+      size=$(( $(stat -c %s "$f") / 1073741824 ))
+      case ${f,,} in
+        *.qcow2|*.vmdk|*.vhdx|*.vhd|*.vdi) kind=disk ;;
+        *.dmg) kind=installer ;;
+        *.iso|*.img|*.cdr|*.raw) if [ "$size" -ge 20 ]; then kind=disk; else kind=installer; fi ;;
+        *) continue ;;
+      esac
+      printf '%s\t%s\t%s\n' "$f" "$kind" "$size"
+    done
+  done
+}
+
 iso_storage() {   # an active storage that holds ISOs: a shared one first (HA may start the VM on another node)
   pvesh get /nodes/"$(hostname)"/storage --content iso --output-format json 2>/dev/null | python3 -c '
 import json, sys
@@ -584,7 +624,7 @@ else
       for n in $(other_nodes); do no_yes "Set up node $n too (HA may start the VM there)?" && NODES+=("$n"); done
     else echo "  ($STORAGE is this node's own: the VM stays here, the other nodes aren't set up)"; fi
   fi
-  echo; echo "  ISO storage (where the OpenCore and macOS recovery images are downloaded, ~1.5 GB):"; pvesm status --content iso | sed 's/^/    /'
+  echo; echo "  ISO storage (the VM's OpenCore image and macOS's recovery from Apple go there, ~2.5 GB):"; pvesm status --content iso | sed 's/^/    /'
   ask ISOSTORE "Storage for the downloads" "local"
   pvesm status --content iso | awk 'NR>1{print $1}' | grep -qx "$ISOSTORE" || die "$ISOSTORE can't hold ISO images"
   ISO=$(dirname "$(pvesm path "$ISOSTORE:iso/probe.iso")")
@@ -602,6 +642,28 @@ else
   ask DISK "Disk in GB" "64"; num "$DISK" "the disk size"
   ask RES "Screen size at boot" "1280x800"
   [[ $RES =~ ^[0-9]{3,4}x[0-9]{3,4}$ ]] || die "a screen size is like 1280x800"
+  # where macOS comes from: Apple's recovery, or a disk or installer of your own in an ISO or import folder
+  BYO_DISK="" BYO_INST="" SRCS=()
+  mapfile -t SRCS < <(macos_sources)
+  if [ ${#SRCS[@]} -gt 0 ]; then
+    echo "  Where macOS comes from:"
+    echo "    1  macOS Tahoe's recovery from Apple (installs the newest Tahoe over the network)"
+    for i in "${!SRCS[@]}"; do
+      IFS=$'\t' read -r f k g <<<"${SRCS[$i]}"
+      echo "    $((i + 2))  $f ($g GB): $([ "$k" = disk ] && echo "a disk with macOS on it, used as the VM's disk" || echo "a macOS installer or recovery image, booted to install")"
+    done
+    ask SRC "Which" "1"; num "$SRC" "the choice"
+    if [ "$SRC" -ge 2 ] && [ "$SRC" -le $((${#SRCS[@]} + 1)) ]; then
+      IFS=$'\t' read -r f k g <<<"${SRCS[$((SRC - 2))]}"
+      case ${f,,} in *.iso|*.img|*.cdr|*.raw)
+        if [ "$k" = disk ]; then no_yes "$(basename "$f") is $g GB: a disk with macOS installed on it?" || k=installer
+        else yes_no "$(basename "$f") is $g GB: an installer or recovery image (No: a disk with macOS installed)?" || k=disk; fi ;;
+      esac
+      if [ "$k" = disk ]; then BYO_DISK=$f; [ "$g" -le "$DISK" ] || DISK=$g; else BYO_INST=$f; fi
+    elif [ "$SRC" != 1 ]; then die "no choice $SRC"; fi
+  else
+    echo "  (macOS from Apple's recovery: no disk or installer image of your own in an ISO storage's template/iso or import folder)"
+  fi
   # Apple's SMC key, the same for every Mac (published by the open-source macOS VM projects). The OpenCore image has no
   # VirtualSMC, so without it macOS can't decrypt WindowServer and boot stalls at "busy timeout ... AppleACPICPU".
   OSK="ourhardworkbythesewordsguardedpleasedontsteal(c)AppleComputerInc"
@@ -641,9 +703,12 @@ if [ $MODE = create ]; then
     echo "  - node $n: KVM ignore_msrs on$(sed -n 2p <<<"$r" | sed 's/^\(..*\)/; install \1/')"
     [ "$(head -1 <<<"$r")" != none ] || warn "$n has no GPU the host can render on: the VM won't start there"
   done
-  echo "  - OpenCore $OCVER (Venera's own image, from this package) and macOS Tahoe's recovery from Apple, into $ISO"
+  if [ -n "$BYO_DISK" ]; then echo "  - OpenCore $OCVER (Venera's own image, from this package), and your macOS disk $BYO_DISK as the VM's disk"
+    echo "    (imported, at least $DISK GB; it must be an Intel (x86) macOS; Venera is made for macOS 26 Tahoe)"
+  elif [ -n "$BYO_INST" ]; then echo "  - OpenCore $OCVER (Venera's own image, from this package), and your installer $BYO_INST to install from"
+  else echo "  - OpenCore $OCVER (Venera's own image, from this package) and macOS Tahoe's recovery from Apple, into $ISO"; fi
   echo "  - VM $VMID '$NAME': $CORES cores${PCORES:+ on the performance cores ($PCORES)}, $MEM MB, $DISK GB on $STORAGE"
-  echo "    (the OpenCore and recovery images are imported as two small disks there too)"
+  echo "    (the OpenCore$([ -n "$BYO_DISK" ] || echo " and $([ -n "$BYO_INST" ] && echo installer || echo recovery)") image$([ -n "$BYO_DISK" ] || echo s) imported as small disks there too)"
   echo "  - network: $BRIDGE${VLAN:+, VLAN $VLAN}; starts with the host"
   echo "  - SMC: QEMU applesmc with Apple's SMC key; CPU: the host's own; OpenCore with VeneraHide, $RES"
   if [ $VENERA = 1 ]; then
@@ -677,8 +742,16 @@ echo "== OpenCore image"
 mkdir -p "$ISO"
 cp "$OCSRC" "$OCIMG"; prepare_opencore
 
-echo "== macOS Tahoe recovery, from Apple"
-if [ ! -f "$REC" ]; then
+if [ -n "$BYO_INST" ]; then
+  echo "== your installer: $BYO_INST"
+  case ${BYO_INST,,} in
+    *.dmg) REC=$ISO/$(basename "${BYO_INST%.*}").img
+           [ -f "$REC" ] || { dmg2img "$BYO_INST" "$REC.part" >/dev/null && mv "$REC.part" "$REC"; } || die "dmg2img couldn't read $BYO_INST" ;;
+    *) REC=$BYO_INST ;;
+  esac
+fi
+[ -n "$BYO_DISK" ] || [ -n "$BYO_INST" ] || echo "== macOS Tahoe recovery, from Apple"
+if [ -z "$BYO_DISK" ] && [ ! -f "$REC" ]; then
   W=$(mktemp -d); cd "$W"
   if [ -f "$HERE/macrecovery.py" ]; then cp "$HERE/macrecovery.py" .; else curl -fsL "$MACREC_URL" -o macrecovery.py; fi   # the package carries it
   echo "$MACREC_SHA  macrecovery.py" | sha256sum -c --quiet || die "macrecovery.py doesn't match its checksum"
@@ -704,23 +777,40 @@ qm create "$VMID" --name "$NAME" --ostype other --machine q35 --bios ovmf \
   --vga $VGA --tablet 0 --agent enabled=1,type=virtio \
   --net0 "vmxnet3,bridge=$BRIDGE${VLAN:+,tag=$VLAN},firewall=0" \
   --efidisk0 "$STORAGE:1,efitype=4m,pre-enrolled-keys=0" \
-  --virtio0 "$STORAGE:$DISK,cache=none" --onboot 1 \
+  $([ -n "$BYO_DISK" ] || echo --virtio0 "$STORAGE:$DISK,cache=none") --onboot 1 \
   --description "macOS Tahoe, made by proxmox-macos-vm.sh${VER:+ (Venera $VER)}" >/dev/null   # no discard: a TRIM over iSCSI crawls
-echo "== importing the OpenCore and recovery images as disks"
-qm disk import "$VMID" "$OCIMG" "$STORAGE" --format raw >/dev/null
-qm disk import "$VMID" "$REC" "$STORAGE" --format raw >/dev/null
-OCDISK=$(qm config "$VMID" | sed -n 's/^unused0: //p'); RECDISK=$(qm config "$VMID" | sed -n 's/^unused1: //p')
-[ -n "$OCDISK" ] && [ -n "$RECDISK" ] || die "the imported disks didn't show up (qm config $VMID)"
-qm set "$VMID" --ide2 "$OCDISK,cache=unsafe" --ide0 "$RECDISK,cache=unsafe" --boot order=ide2 --args "$ARGS" >/dev/null
+if [ -n "$BYO_DISK" ]; then
+  echo "== importing the OpenCore image and your macOS disk"
+  qm disk import "$VMID" "$OCIMG" "$STORAGE" --format raw >/dev/null
+  qm disk import "$VMID" "$BYO_DISK" "$STORAGE" >/dev/null || die "Proxmox couldn't import $BYO_DISK (qm disk import)"
+  OCDISK=$(qm config "$VMID" | sed -n 's/^unused0: //p'); MDISK=$(qm config "$VMID" | sed -n 's/^unused1: //p')
+  [ -n "$OCDISK" ] && [ -n "$MDISK" ] || die "the imported disks didn't show up (qm config $VMID)"
+  qm set "$VMID" --ide2 "$OCDISK,cache=unsafe" --virtio0 "$MDISK,cache=none" --boot order=ide2 --args "$ARGS" >/dev/null
+  CUR=$(qm config "$VMID" | sed -n 's/^virtio0: .*size=\([0-9]*\)G.*/\1/p')
+  [ -z "$CUR" ] || [ "$CUR" -ge "$DISK" ] || qm disk resize "$VMID" virtio0 "${DISK}G" >/dev/null
+else
+  echo "== importing the OpenCore and $([ -n "$BYO_INST" ] && echo installer || echo recovery) images as disks"
+  qm disk import "$VMID" "$OCIMG" "$STORAGE" --format raw >/dev/null
+  qm disk import "$VMID" "$REC" "$STORAGE" --format raw >/dev/null
+  OCDISK=$(qm config "$VMID" | sed -n 's/^unused0: //p'); RECDISK=$(qm config "$VMID" | sed -n 's/^unused1: //p')
+  [ -n "$OCDISK" ] && [ -n "$RECDISK" ] || die "the imported disks didn't show up (qm config $VMID)"
+  qm set "$VMID" --ide2 "$OCDISK,cache=unsafe" --ide0 "$RECDISK,cache=unsafe" --boot order=ide2 --args "$ARGS" >/dev/null
+fi
 [ $VENERA = 1 ] && attach_venera_disk
 
+if [ -n "$BYO_DISK" ]; then
+  echo "== Done: VM $VMID ($NAME), on your macOS disk. Start it from the Proxmox web page and open its Console: OpenCore's"
+  echo "   menu lists the disk's macOS (pick it if it isn't first). A disk from another hypervisor may want its old tools"
+  echo "   (VMware Tools, Parallels Tools) removed in macOS. If the disk was made bigger, Disk Utility can grow its container."
+else
 echo "== Done: VM $VMID ($NAME). Start it from the Proxmox web page, open its Console, and install macOS Tahoe:"
-echo "   at OpenCore's menu pick the macOS Base System; Disk Utility > View > Show All Devices > erase the VirtIO disk"
-echo "   (APFS, GUID Partition Map) > back, Reinstall macOS Tahoe. It restarts a few times, and OpenCore's menu starts on"
-echo "   macOS Base System each time: press an arrow key within 5 s to stop it, then pick macOS Installer while it installs,"
-echo "   and Macintosh HD once it has (macOS Base System again goes back to the recovery). Setup Assistant can stop on its"
+echo "   at OpenCore's menu pick $([ -n "$BYO_INST" ] && echo "your installer (Install macOS ..., or macOS Base System)" || echo "the macOS Base System"); Disk Utility > View > Show All Devices > erase the VirtIO disk"
+echo "   (APFS, GUID Partition Map) > back, Reinstall macOS Tahoe. It restarts a few times: if OpenCore's menu starts on"
+echo "   macOS Base System then, press an arrow key within 5 s to stop it, and pick macOS Installer while it installs and"
+echo "   Macintosh HD once it has (macOS Base System again goes back to the recovery). Setup Assistant can stop on its"
 echo "   last screen with no graphics driver yet: if it hasn't moved in a few minutes, restart the VM (Reboot, or Stop and"
 echo "   Start); the account is made, and macOS starts at the login window."
+fi
 echo "   After setup, in macOS: automatic updates off (Venera is tested on 26.7.3; a newer macOS may keep the software"
 echo "   desktop); never sleep; set time automatically."
 if [ $VENERA = 1 ]; then

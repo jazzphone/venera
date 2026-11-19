@@ -24,6 +24,15 @@ For a new VM on Proxmox, `proxmox-macos-vm.sh` in the host package does all of t
 checks the host's GPU, installs what the host needs (on each cluster node), creates a macOS Tahoe VM with OpenCore,
 SIP and AMFI already set, and attaches the Venera Tools CD with the installer package ([vm/README.md](vm/README.md)).
 Each release also has the Venera Tools CD on its own (`Venera-Tools-VERSION.iso`), for installing with no network.
+The script carries what a VM needs (Venera's own OpenCore image, built from acidanthera's OpenCore, and
+`macrecovery.py`), so making a VM downloads only macOS from Apple, or nothing when you bring your own macOS disk or
+installer.
+
+**What it depends on.** Everything Venera is built from outside this repository (OpenCorePkg, Mesa, FFmpeg, NullMoth's
+translator, the build image) is listed with its checksum in `packaging/UPSTREAM`, and each release has a
+`Venera-sources-VERSION.tar` with all of it, so it can be rebuilt offline if an upstream project goes away. On the
+host it depends on Proxmox's QEMU, virglrenderer and Mesa: `install-host.sh --check` compares them with the versions a
+release was tested on (`TESTED`) and says how to go back after an update that breaks something.
 
 ## How it works
 
@@ -50,8 +59,21 @@ On a Mac with Xcode 26 (x86_64 target), Rust (for the translator) and a Mesa che
 ```bash
 tools/build-translator.sh     # once: the Metal-to-SPIR-V translator (LGPL), from nvidia-macos-driver's translator/
 mesa/build-mesa.sh            # once: Mesa's Venus for macOS with mesa/patches/
-packaging/make-dist.sh        # the kexts, the Metal bundle and dist/Venera-VERSION.tar.gz
+packaging/make-dist.sh        # everything below, into dist/
 ```
+
+A release is these files, each attached to its GitHub release:
+
+| File | What |
+|---|---|
+| `Venera-VERSION.tar.gz` | the guest's files and `install.sh` |
+| `Install Venera VERSION.pkg` | the same as an installer package |
+| `Venera-Tools-VERSION.iso` | the package on a CD image, for a VM with no network |
+| `Venera-host-VERSION.tar.gz` | the Proxmox host's half: hardware video, `install-host.sh` (with `TESTED`), the VM script with Venera's OpenCore image and `macrecovery.py`, the guest package and Tools CD |
+| `Venera-sources-VERSION.tar` | everything it was built from, to rebuild it offline (`tools/make-sources.sh`) |
+
+Before a release: `install-host.sh --record` on the test host into `packaging/host/TESTED`, and any new upstream
+version with its checksum in `packaging/UPSTREAM`.
 
 For development against a test VM, `tools/deploy.sh` builds and installs pieces over the Proxmox host's guest agent
 (set the host in `tools/local.env`, from `tools/local.env.example`); `tools/gesture-bench.sh` and

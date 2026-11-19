@@ -68,7 +68,9 @@ c['Misc']['Debug']['Target'] = 3
 c['Misc']['Entries'] = []
 c['Misc']['Tools'] = []
 s = c['Misc']['Security']
-s['ScanPolicy'] = 0                      # every disk: the installer, the recovery, virtio and IDE alike
+# APFS and HFS+ only (macOS, its installer and recovery; not OpenCore's own FAT disk, which listed as an entry and was
+# booted by default), on SATA, SAS, SCSI, NVMe, ATAPI, USB and PCI (virtio) devices; the two lock bits as OpenCore's
+s['ScanPolicy'] = 0x0001 | 0x0002 | 0x0100 | 0x0200 | 0x013F0000
 s['SecureBootModel'] = 'Disabled'        # Venera's kexts and its relaxed SIP
 s['Vault'] = 'Optional'
 s['AllowSetDefault'] = True

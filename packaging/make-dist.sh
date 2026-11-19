@@ -43,3 +43,5 @@ shasum -a 256 dist/$NAME.tar.gz
 ls -la dist/$NAME.tar.gz
 packaging/make-pkg.sh
 [[ -n "${NO_HOST:-}" ]] || packaging/make-host.sh
+# everything this release was built from, for rebuilding it offline (tools/make-sources.sh)
+[[ -n "${NO_SOURCES:-}" ]] || tools/make-sources.sh

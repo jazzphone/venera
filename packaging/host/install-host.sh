@@ -6,6 +6,10 @@
 #   ./install-host.sh --remove-vm VMID           take one VM's video device out (the rest stays)
 #   ./install-host.sh --uninstall                take everything out again, every VM's device first
 #   ./install-host.sh --status                   what is installed and running
+#   ./install-host.sh --check                    after a Proxmox update: the host's graphics and video stack against
+#                                                the versions this release was tested on (TESTED), and how to go back
+#   ./install-host.sh --hold | --unhold          keep those packages at their versions through updates (or stop)
+#   ./install-host.sh --record                   print this host's versions in TESTED's form (for a release)
 #   add --dry-run to see the steps without doing them
 #
 # What it changes (and --uninstall undoes):
@@ -80,6 +84,10 @@ while [ $# -gt 0 ]; do
   --remove-vm) [ -n "${2:-}" ] || die "--remove-vm needs a VM id"; MODE=remove; VMS+=("$2"); shift ;;
   --uninstall) MODE=uninstall ;;
   --status) MODE=status ;;
+  --check) MODE=check ;;
+  --record) MODE=record ;;
+  --hold) MODE=hold ;;
+  --unhold) MODE=unhold ;;
   --dry-run) DRY=1 ;;
   -h | --help) sed -n '2,30p' "$0"; exit 0 ;;
   *) die "unknown option $1 (--help)" ;;
@@ -89,6 +97,56 @@ done
 for v in "${VMS[@]}"; do
   case $v in '' | *[!0-9]*) die "a VM id is a number: $v" ;; esac
 done
+
+# ---- the host's stack: what Venera depends on and doesn't control (Proxmox's packages) ------------------------------
+# Venus needs QEMU's virtio-gpu, virglrenderer and its render server, and Mesa's Vulkan driver for the host's GPU to
+# speak the protocol the guest's driver speaks; hardware video needs Intel's VA-API driver. A Proxmox update can
+# change any of them. TESTED (beside this script) has the versions this release was tested with.
+STACK="pve-qemu-kvm libvirglrenderer1 virgl-server mesa-vulkan-drivers libgl1 libegl1 intel-media-va-driver libva-drm2"
+HOLD="pve-qemu-kvm libvirglrenderer1 virgl-server mesa-vulkan-drivers"
+pkg_ver() { dpkg-query -W -f '${Version}' "$1" 2>/dev/null || true; }
+stack_record() {
+  local p
+  echo "# the host stack this release was tested on (install-host.sh --record on the test host, $(date +%F))"
+  for p in $STACK; do echo "$p $(pkg_ver "$p")"; done
+  echo "kernel $(uname -r)"
+}
+stack_check() {   # prints what differs from TESTED, checks the pieces; returns 1 when something is wrong
+  local p want have bad=0 diff=0 rs gpu
+  say "== the host's graphics and video stack"
+  for p in $STACK kernel; do
+    if [ "$p" = kernel ]; then have=$(uname -r); else have=$(pkg_ver "$p"); fi
+    want=$(awk -v p="$p" '$1 == p {print $2}' "$HERE/TESTED" 2>/dev/null)
+    if [ -z "$have" ]; then
+      case $p in intel-media-va-driver|libva-drm2) say "  $p: not installed (only hardware video needs it)" ;;
+        *) say "  $p: NOT INSTALLED"; bad=1 ;; esac
+    elif [ -z "$want" ] || [ "$want" = "$have" ]; then say "  $p: $have${want:+ (as tested)}"
+    else say "  $p: $have (tested: $want)"; diff=1; fi
+  done
+  rs=$(dpkg -L virgl-server 2>/dev/null | grep -m1 'virgl_render_server$' || true)
+  if [ -z "$rs" ]; then say "  Venus's render server: missing (virgl-server)"; bad=1
+  elif ldd "$rs" | grep -q "not found"; then say "  Venus's render server: libraries missing: $(ldd "$rs" | grep "not found" | tr -s ' ' | tr '\n' ';')"; bad=1
+  else say "  Venus's render server: $rs, its libraries all found"; fi
+  gpu=$(ls /dev/dri/renderD* 2>/dev/null | head -1)
+  if [ -z "$gpu" ]; then say "  GPU render node: none (/dev/dri/renderD*)"; bad=1; else say "  GPU render node: $gpu"; fi
+  ls /usr/share/vulkan/icd.d/*.json >/dev/null 2>&1 && say "  Vulkan drivers: $(ls /usr/share/vulkan/icd.d/ | sed 's/_icd.*//' | tr '\n' ' ')" ||
+    { say "  Vulkan drivers: none (mesa-vulkan-drivers)"; bad=1; }
+  if [ -x "$HERE/bin/vaprofiles" ] && [ -n "$gpu" ]; then
+    local va; va=$(LIBVA_MESSAGING_LEVEL=0 LD_LIBRARY_PATH=$HERE/lib "$HERE/bin/vaprofiles" "$gpu" 2>/dev/null)
+    say "  VA-API (hardware video): $(head -1 <<<"$va"): $(grep -c "^  decode" <<<"$va") decode and $(grep -c "^  encode" <<<"$va") encode profiles"
+  fi
+  if [ $diff = 1 ]; then
+    say ""
+    say "  Something changed since this release was tested. Start a macOS VM and look: if its desktop or video broke, go"
+    say "  back to the tested versions (Proxmox keeps older ones in its repository), then start the VMs again:"
+    for p in $STACK; do
+      want=$(awk -v p="$p" '$1 == p {print $2}' "$HERE/TESTED" 2>/dev/null); have=$(pkg_ver "$p")
+      [ -n "$want" ] && [ -n "$have" ] && [ "$want" != "$have" ] && say "    apt install $p=$want"
+    done
+    say "  and keep them there until a Venera release is tested on the new ones: ./install-host.sh --hold"
+  fi
+  [ $bad = 0 ]
+}
 
 [ "$(id -u)" = 0 ] || die "run as root"
 command -v qm >/dev/null && command -v pveversion >/dev/null || die "this is for a Proxmox VE host (no qm / pveversion)"
@@ -182,6 +240,15 @@ other_nodes_vms() {
 }
 
 case $MODE in
+check)
+  stack_check && say "" && say "OK: everything Venera needs is there." || { say ""; say "Something Venera needs is missing (above)."; exit 1; }
+  exit 0 ;;
+record) stack_record; exit 0 ;;
+hold | unhold)
+  say "apt-mark $MODE $HOLD"
+  [ $DRY = 1 ] || apt-mark "$MODE" $HOLD
+  [ $DRY = 0 ] && [ $MODE = hold ] && say "Held: Proxmox updates leave them as they are (their security fixes too) until ./install-host.sh --unhold."
+  exit 0 ;;
 status)
   say "Venera host: $(cat "$PREFIX/VERSION" 2>/dev/null || echo 'not installed')"
   for p in $PKGS; do

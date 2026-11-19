@@ -25,16 +25,18 @@ a dry run.
 ## A new VM
 
 It asks for the name, Venera's choices (graphics, hardware video, Safari WebGL, a sound device), storage, network,
-cores, memory, disk, the screen size at boot, and optionally your Mac's identity for iCloud. Then it:
+cores, memory, disk, the screen size at boot, where macOS comes from (below), and optionally your Mac's identity for
+iCloud. Then it:
 
 - installs what the host is missing, on this node and each node you choose: `mesa-vulkan-drivers` and
   `virgl-server` (Venus), `libgl1` and `libegl1` (QEMU's GL display), and `unzip`, `dmg2img`, `genisoimage` for its
   own work; and turns on KVM's `ignore_msrs`;
-- downloads the OpenCore image (thenickdude/KVM-Opencore v21) and macOS Tahoe's recovery from Apple (OpenCorePkg's
-  `macrecovery.py`), each checked against its checksum or Apple's chunklist;
-- prepares OpenCore: Lilu 1.7.2 and VMHide (so the Apple Account sign-in doesn't see a VM), the screen size, and
-  **SIP and AMFI already as Venera needs them** (`csr-active-config` 0x203, or 0xA03 with Safari WebGL;
-  `amfi_get_out_of_my_way=1`). Venera's installer then runs in one pass, with no restart to change SIP first;
+- copies **Venera's OpenCore image** from the host package (`opencore/OpenCore-Venera-VERSION.img`, below) and sets in
+  it the screen size, a hardware UUID of the VM's own, and **SIP and AMFI already as Venera needs them**
+  (`csr-active-config` 0x203, or 0xA03 with Safari WebGL; `amfi_get_out_of_my_way=1`). Venera's installer then runs
+  in one pass, with no restart to change SIP first;
+- downloads macOS Tahoe's recovery from Apple with OpenCorePkg's `macrecovery.py` (carried in the package, checked
+  against Apple's chunklist), unless you brought your own macOS. That is the only download;
 - creates a q35 / OVMF VM: the host's own CPU with `host-phys-bits-limit=40`, QEMU's `applesmc` with the SMC key, the
   `virtio-gl` display with Venus (blob resources, a 2 GB host memory window), a USB sound device (YouTube needs one),
   vmxnet3, a virtio disk with no TRIM, USB keyboard and tablet, and the guest agent's virtio port;
@@ -49,13 +51,45 @@ macOS down cleanly and show its addresses, and what Finish and Upgrade talk to. 
 
 What to expect on the way, before Venera is in:
 
-- **OpenCore's menu at each restart.** The installer restarts the VM a few times, and OpenCore's menu starts on macOS
-  Base System each time, not where the install is going: press an arrow key within 5 seconds to stop it, then pick
-  macOS Installer while it installs, and Macintosh HD once it has (macOS Base System again goes back to the recovery).
+- **OpenCore's menu at each restart.** The installer restarts the VM a few times. With KVM-Opencore's OpenCore 1.0.0
+  the menu started on macOS Base System each time instead of where the install was going; if Venera's OpenCore does
+  too, press an arrow key within its 5 seconds to stop it, then pick macOS Installer while it installs, and Macintosh
+  HD once it has (macOS Base System again goes back to the recovery).
 - **Setup Assistant can stop on its last screen.** Without a graphics driver macOS draws in software, and the last
   step into the desktop can sit there for good. If it hasn't moved in a few minutes, restart the VM from the Proxmox
   page (Reboot, or Stop and Start): the account is already made, and macOS starts at the login window. The desktop is
   plain (no wallpaper) and slow until Venera is installed.
+
+### Where macOS comes from
+
+By default, Apple's recovery for macOS Tahoe, which installs the newest Tahoe over the network. Or your own: the
+script looks in every ISO storage's `template/iso` folder and its `import` folder (where Proxmox keeps disk images to
+import) and offers what it finds:
+
+- **a disk with macOS installed** (`.qcow2`, `.vmdk`, `.vhdx`, `.vdi`, or a raw `.img` / `.raw` of 20 GB or more):
+  imported as the VM's disk, made as big as the disk size you gave if it is smaller. No install: the VM boots it. It
+  must be an Intel (x86) macOS (from VMware Fusion, VirtualBox or Parallels on an Intel Mac, or another Proxmox VM);
+  Apple Silicon VMs can't run here. Remove the old hypervisor's tools in macOS afterwards.
+- **a macOS installer image** you made on a Mac (`createinstallmedia` onto a disk image, saved as `.img`, `.iso`,
+  `.cdr` or `.dmg`): booted to install, offline, the version you chose (26.7.3, say, which Venera is tested on, where
+  Apple's recovery gives the newest Tahoe).
+- **a recovery image** you kept (`BaseSystem.dmg` or the `.img` an earlier run made): installs over the network, but
+  doesn't depend on Apple still serving that recovery.
+
+An `InstallAssistant.pkg` can't be used as it is: making a bootable installer from it needs macOS. On a Mac, install
+it (it becomes "Install macOS Tahoe" in Applications), then `sudo /Applications/Install\ macOS\ Tahoe.app/Contents/Resources/createinstallmedia --volume /Volumes/Installer`
+onto an 18 GB disk image made with Disk Utility, and copy the image to the ISO storage.
+
+### Venera's OpenCore
+
+`vm/opencore/build.sh` makes it at release time from acidanthera's OpenCorePkg release (1.0.8 now, BSD-3; the version
+and checksum are in `packaging/UPSTREAM`) with three things of Venera's own: the config (`config.py`: OpenCore's
+`Sample.plist` with what a QEMU q35 VM needs), one ACPI table (`SSDT-VENERA.dsl`: an EC device, the USB power
+properties, the CPU's power-management plugin type) and **VeneraHide.kext**, which keeps `kern.hv_vmm_present` from
+everything in macOS but software update, so the Apple Account sign-in doesn't turn the VM away. OpenCore's
+`ocvalidate` checks the config, and the same sources always make the same image. There is no Lilu, no VMHide and
+nothing from thenickdude's KVM-Opencore (which older VMs used: its last release, v21, has OpenCore 1.0.0 from 2024).
+The menu is OpenCore's text one, 5 seconds, and lists only macOS volumes.
 
 Without your Mac's identity the VM keeps OpenCore's shared sample serial, as an iMac20,1 (a model Tahoe supports), and
 must not be signed into iCloud until you add yours (the script's third choice for an existing VM).
@@ -88,13 +122,28 @@ Run it again with the VM's name:
    - the guest package from a USB disk it plugs into the running VM, installed through the guest agent with the
      choices macOS has now (hardware video, the Venera app, the system-volume copy for Safari WebGL);
    - the disk unplugged, then macOS restarted. Whoever is logged in loses unsaved work: the plan says who that is.
+5. **OpenCore**: moves the VM (stopped) to Venera's OpenCore image from this package: its EFI folder and config are
+   replaced, and what was the VM's own is carried over (Venera's kexts and their entries, boot-args and SIP, the Mac
+   identity, the screen size, the menu's timeout). What the old image brought that Venera doesn't need goes (Lilu,
+   VMHide, WhateverGreen, AppleALC, the Broadcom Bluetooth kexts, OpenCanopy). The old OpenCore disk is saved to
+   `/root` first; writing it back undoes the change.
+
+### When Proxmox updates
+
+Venera's host side depends on packages Proxmox ships and updates: QEMU, virglrenderer and its render server, Mesa's
+Vulkan driver, Intel's VA-API driver. The host package's `TESTED` lists the versions a release was tested on, and the
+script warns when the host has moved on. After a Proxmox update, `install-host.sh --check` compares them, checks each
+piece (the render server's libraries, the GPU's render node, the Vulkan and VA-API drivers), and if something changed
+prints the `apt install PACKAGE=VERSION` lines that go back to the tested ones (Proxmox keeps older versions in its
+repository). `install-host.sh --hold` keeps those packages where they are through updates until `--unhold` (their
+security fixes wait too, so it's off unless you ask).
 
 ## Where it came from
 
 It began as an earlier project's VM script (an earlier macOS VM script,
 2026-11-12), which made the VM these drivers were developed in. The comments at the top say what each piece is for and
 what broke without it. `vm/test.sh` tests its pieces that need no Proxmox host: the args, a cluster node's address,
-and the OpenCore edits against KVM-Opencore's own `config.plist`.
+Venera's OpenCore config and the script's edits to it, and moving an older VM's config (KVM-Opencore's) onto it.
 
 **License:** this folder is MIT (`vm/LICENSE`, an earlier project's license), not Venera's PolyForm Noncommercial. It contains
 Apple's SMC key (the `OSK` string QEMU's `applesmc` needs), as every open-source macOS VM project publishes it.

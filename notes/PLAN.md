@@ -1882,3 +1882,43 @@ The owner: build our own guest agent rather than lean on mac-guest-agent, make m
   request landed inside that unfinished string ("QEMU guest agent is not running" until something sent 0xFF). The
   agent now drops an unfinished request that has sat with nothing more for 4 s when new bytes come (the next ping was
   answered 1 s after Proxmox gave up). VENERA_AGENT_TRACE=1 in the agent's environment logs every request.
+
+## Round 19 (2026-11-19): what Venera depends on
+
+The owner: how fragile are the dependencies (OpenCore, unmaintained projects), and fix it: our own OpenCore, a
+VMHide of our own, copies of everything in our releases, bundle what can be, pin the build, and ideas for Proxmox's
+packages; plus bringing your own macOS. Found: KVM-Opencore's last release (v21, OpenCore 1.0.0) is from March 2024;
+VMHide has no license (can't be mirrored) and one release; NullMoth's translator is one person's (LGPL: mirrorable);
+the Mesa build pulled unpinned Python packages; the Debian build image and FFmpeg's tarball weren't pinned.
+
+- **Venera's OpenCore** (3f18244): vm/opencore/build.sh, OpenCorePkg 1.0.8 (BSD-3, pinned) with config.py over its
+  Sample.plist, SSDT-VENERA.dsl (EC, USBX, plugin-type on QEMU's C000: KVM-Opencore's tables, rewritten) and
+  VeneraHide; ocvalidate clean; 48 MB; reproducible (fixed GUIDs, serial, times). Read off KVM-Opencore v21's config:
+  its five kernel patches all stop at Darwin 23, its EHCI table names 00:07.x (q35's EHCI is 00:1d.7: no effect on
+  VM 108) and its LPC property a PciRoot(0x1) path (no effect either), and its Broadcom, audio, graphics and USB-map
+  kexts do nothing in a VM. Two bugs on the way: `sgdisk -q` writes no partition table and still exits 0 (the first
+  images had no partition; VM 108's move worked only because it rewrote files in its old partition), and ScanPolicy 0
+  listed OpenCore's own FAT disk first and booted it at the timeout (now APFS and HFS+ only, KVM-Opencore's devices
+  plus USB). A fresh VM (110) boots Apple's recovery on it; VMs 108 and 109 moved with the new choice 5 (VM 108: all
+  six Venera kexts, the Metal desktop; VM 109: its login window). Not tested: a full install's restarts (accepting
+  Apple's license on a new VM needs the owner's OK), so the note about OpenCore's menu at those restarts stays, made
+  conditional.
+- **VeneraHide** (kext/VeneraHide): kern.hv_vmm_present 0 for every process but the four software-update ones,
+  as VMHide; no Lilu: the kern sysctl node is exported (sysctl__kern_children), the oid's handler swapped with CR0.WP
+  cleared and interrupts off for the one store. VM 108: sysctl reads 0, a copy named softwareupdated reads 1.
+- **Pins and sources** (099e970): packaging/UPSTREAM (OpenCorePkg, Mesa's tarball, FFmpeg, the translator commit and
+  rustc, the Debian digest) read by the builds; mesa/requirements.txt; tools/make-sources.sh makes
+  Venera-sources-VERSION.tar (83 MB; the translator built offline from it in 34 s with the network off for cargo).
+  The mirror: private prerelease upstream-2026-11-19 (8 files, 75 MB, MIRROR-SHA256SUMS).
+- **Bring your own macOS**: the script lists ISO storages' template/iso and import files that could be a macOS disk
+  (qcow2, vmdk, vhdx, vdi, or an image of 20 GB or more: imported as the VM's disk) or an installer or recovery
+  (.dmg through dmg2img, or a smaller image: booted to install). VM 111 from VM 109's disk as a qcow2 in the NFS
+  import folder: OpenCore listed Macintosh HD and its recovery, macOS reached the login window. VM 110 from the kept
+  Tahoe-recovery.img as "your installer": the recovery. Also: the OpenCore mount waits for the loop device's
+  partition node (it came late and the mount failed), and every OpenCore step dies on failure (one run went on and
+  made a VM with an unedited image).
+- **Proxmox's packages**: install-host.sh --check (versions against TESTED, the render server's libraries, the GPU's
+  render node, the Vulkan and VA-API drivers; when something changed, the `apt install PACKAGE=VERSION` lines that go
+  back), --record (TESTED for a release; node 2's is in packaging/host/TESTED), --hold/--unhold (QEMU, virglrenderer,
+  its server, Mesa's Vulkan); the VM script warns when the host isn't on TESTED's versions.
+- Test VMs 110 and 111 and the 61.5 GB qcow2 are gone; OpenCore disks moved are saved in /root on node 2.
