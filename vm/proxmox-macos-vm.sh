@@ -503,16 +503,21 @@ d = json.load(sys.stdin)
 print(d.get("out-data", "") + d.get("err-data", ""), end="")
 print("rc=%s" % d.get("exitcode", "?"))' 2>/dev/null || echo "rc=?"
 }
+hmp() {   # hmp COMMAND: one QEMU monitor command in the running VM, through Proxmox's own monitor call; `qm monitor`
+  # reads the keyboard instead of its input when it runs in a terminal, and leaves you at its qm> prompt
+  perl -MPVE::QemuServer::Monitor=mon_cmd -e \
+    'print mon_cmd($ARGV[0], "human-monitor-command", "command-line" => $ARGV[1])' "$VMID" "$1" 2>&1 </dev/null
+}
 usb_disk() {   # usb_disk add IMAGE | del: the image as a USB drive in the running VM, on the EHCI bus (macOS ignores
   # a drive on the XHCI's hub); QEMU drops the drive with the device, and both are gone at the VM's next start
   if [ "$1" = add ]; then
     local o
-    o=$(qm monitor "$VMID" <<<"drive_add 0 if=none,id=venera-upg,file=$2,format=raw,readonly=on" 2>&1
-      qm monitor "$VMID" <<<"device_add usb-storage,drive=venera-upg,id=venera-upgdev,bus=ehci.0,removable=on" 2>&1)
-    if grep -q -i -E 'error|could not|not found|duplicate' <<<"$o"; then echo "$o" | grep -v '^qm>' >&2; return 1; fi
+    o=$(hmp "drive_add 0 if=none,id=venera-upg,file=$2,format=raw,readonly=on"
+      hmp "device_add usb-storage,drive=venera-upg,id=venera-upgdev,bus=ehci.0,removable=on")
+    if grep -q -i -E 'error|could not|not found|duplicate|not running|died' <<<"$o"; then echo "$o" >&2; return 1; fi
     return 0
   fi
-  qm monitor "$VMID" <<<"device_del venera-upgdev" >/dev/null 2>&1 || true
+  hmp "device_del venera-upgdev" >/dev/null 2>&1 || true
 }
 
 screen_state() {   # open, locked or nobody: macOS mounts a new USB disk only while someone is logged in, unlocked
@@ -571,7 +576,7 @@ upgrade_vm() {   # a VM with Venera: this release's host half on every node, the
       *) break ;;
     esac
   done
-  usb_disk add "$img" || { rm -f "$img"; die "the USB disk didn't attach (qm monitor $VMID)"; }
+  usb_disk add "$img" || { rm -f "$img"; die "the USB disk didn't attach"; }
   mnt=""; for n in $(seq 1 24); do
     mnt=$(guest "ls -d /Volumes/*/'$(basename "$GPKG")' 2>/dev/null | head -1"); [ -n "$mnt" ] && break; sleep 5
   done
