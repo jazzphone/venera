@@ -11,6 +11,11 @@ NAME=Venera-host-$VERSION
 D=dist/$NAME
 docker image inspect venera-hostvideo-build >/dev/null 2>&1 ||
   docker build --platform linux/amd64 -t venera-hostvideo-build hostvideo >/dev/null
+. packaging/UPSTREAM   # FFmpeg's version and checksum
+FFTAR=${VENERA_VENDOR_SRC:-$HOME/src/vendor-src}/ffmpeg/ffmpeg-$FFMPEG_VERSION.tar.xz
+[[ -f $FFTAR ]] || { mkdir -p ${FFTAR:h} && curl -fsSL -o $FFTAR $FFMPEG_URL; }
+echo "$FFMPEG_SHA256  $FFTAR" | shasum -a 256 -c --quiet || { echo "$FFTAR doesn't match its checksum (packaging/UPSTREAM)"; exit 1; }
+[[ -d ${FFTAR%.tar.xz} ]] || tar -xJf $FFTAR -C ${FFTAR:h}
 [[ -d hostvideo/out/ffmpeg/lib ]] || docker run --rm --platform linux/amd64 -v ~/src:/src venera-hostvideo-build \
   /src/macos-virtio-gpu/hostvideo/build-ffmpeg.sh
 docker run --rm --platform linux/amd64 -v ~/src:/src venera-hostvideo-build /src/macos-virtio-gpu/hostvideo/build.sh \

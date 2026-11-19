@@ -14,7 +14,12 @@ MACOS_MIN="${MACOS_MIN:-26.0}"
 SDK="$(xcrun --sdk macosx --show-sdk-path)"
 OUT="$HERE/out"
 
-# 1. Mesa source: clone/fetch the tag, fresh branch, apply the patch series.
+# 1. Mesa source: clone/fetch the tag, fresh branch, apply the patch series. Offline (MESA_TARBALL, the release
+#    tarball from packaging/UPSTREAM, as Venera-sources-VERSION.tar carries it): a git repository made from it.
+if [ ! -d "$MESA_DIR/.git" ] && [ -n "${MESA_TARBALL:-}" ]; then
+  mkdir -p "$MESA_DIR" && tar -xJf "$MESA_TARBALL" -C "$MESA_DIR" --strip-components 1
+  (cd "$MESA_DIR" && git init -q && git add -A && git -c user.name=build -c user.email=build@localhost commit -qm "$MESA_TAG" && git tag "$MESA_TAG")
+fi
 if [ ! -d "$MESA_DIR/.git" ]; then
   git clone --depth 1 --branch "$MESA_TAG" \
     https://gitlab.freedesktop.org/mesa/mesa.git "$MESA_DIR"
@@ -30,7 +35,8 @@ git -c user.name=build -c user.email=build@localhost \
 if [ ! -x .venv/bin/meson ]; then
   PY="$(command -v python3.12 || command -v python3.11 || command -v python3)"
   "$PY" -m venv .venv
-  .venv/bin/pip install -q meson ninja mako pyyaml packaging setuptools
+  # pinned (requirements.txt); offline from PIP_WHEELS (a folder of the wheels, as Venera-sources-VERSION.tar has)
+  .venv/bin/pip install -q ${PIP_WHEELS:+--no-index --find-links "$PIP_WHEELS"} -r "$HERE/requirements.txt"
 fi
 export PATH="$MESA_DIR/.venv/bin:$PATH"   # so meson finds the venv's python3
 

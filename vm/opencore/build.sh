@@ -7,17 +7,18 @@
 # and VeneraHide.kext. OpenCore's own ocvalidate checks the config. No KVM-Opencore, no Lilu.
 set -euo pipefail
 cd "${0:A:h}/../.."
-OCVER=1.0.8
-OCSHA=2011e8b7216ecb2645d97ea710df965947edd406846e92050b9bc4190be6d27b
+. packaging/UPSTREAM   # the version, address and checksum of OpenCorePkg, and the Debian image
+OCVER=$OPENCORE_VERSION OCSHA=$OPENCORE_SHA256 DEBIAN=$DEBIAN_IMAGE
 OCZIP=${VENERA_VENDOR_SRC:-$HOME/src/vendor-src}/opencore/OpenCore-$OCVER-RELEASE.zip
-DEBIAN=debian:trixie@sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6
 [[ -d build/VeneraHide.kext ]] || { echo "no build/VeneraHide.kext: run tools/build.sh"; exit 1; }
 if [[ ! -f $OCZIP ]]; then
   mkdir -p ${OCZIP:h}
-  curl -fsSL -o $OCZIP https://github.com/acidanthera/OpenCorePkg/releases/download/$OCVER/OpenCore-$OCVER-RELEASE.zip
+  curl -fsSL -o $OCZIP $OPENCORE_URL
 fi
 echo "$OCSHA  $OCZIP" | shasum -a 256 -c --quiet || { echo "$OCZIP doesn't match its checksum"; exit 1; }
-B=build/opencore
+# a fresh work folder each run (Docker Desktop's file sharing can show a just-deleted folder's old contents)
+B=build/opencore-work-$$
+OUT=build/opencore
 rm -rf $B && mkdir -p $B/oc $B/EFI/BOOT $B/EFI/OC/ACPI $B/EFI/OC/Drivers $B/EFI/OC/Kexts
 (cd $B/oc && unzip -q $OCZIP)
 cp $B/oc/X64/EFI/BOOT/BOOTx64.efi $B/EFI/BOOT/
@@ -34,10 +35,14 @@ docker run --rm --platform linux/amd64 -v "$PWD/$B:/b" $DEBIAN sh -ec '
   oc/Utilities/ocvalidate/ocvalidate.linux EFI/OC/config.plist > ocvalidate.log 2>&1 || true
   grep -q "Found 0 issues\|No issues found" ocvalidate.log || { cat ocvalidate.log; exit 1; }
   tail -1 ocvalidate.log
+  # the same sources make the same image: fixed disk and partition GUIDs, volume serial and times
+  export SOURCE_DATE_EPOCH=1767225600 TZ=UTC
+  find EFI -exec touch -h -d @$SOURCE_DATE_EPOCH {} +
   truncate -s 48M '$IMG'
-  sgdisk -q -n 1:2048:0 -t 1:EF00 -c 1:EFI '$IMG'
-  mformat -i '$IMG'@@1M -F -v OPENCORE ::
-  mcopy -i '$IMG'@@1M -s EFI ::
+  sgdisk -q -U 56454E45-5241-4F43-0000-000000000001 -n 1:2048:0 -t 1:EF00 -c 1:EFI \
+    -u 1:56454E45-5241-4F43-0000-000000000002 '$IMG'
+  mformat -i '$IMG'@@1M -F -N 56454E52 -v OPENCORE ::
+  mcopy -i '$IMG'@@1M -s -m EFI ::
   mdir -i '$IMG'@@1M -/ ::EFI | grep -c -E "efi|aml|plist|VeneraHide" '
-mv $B/$IMG build/opencore-$IMG.tmp && rm -rf $B && mkdir -p $B && mv build/opencore-$IMG.tmp $B/$IMG
-(cd $B && shasum -a 256 $IMG | tee $IMG.sha256)
+rm -rf $OUT && mkdir -p $OUT && mv $B/$IMG $OUT/ && rm -rf $B
+(cd $OUT && shasum -a 256 $IMG | tee $IMG.sha256)
