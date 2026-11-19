@@ -133,7 +133,9 @@ Run it again with the VM's name:
 4. **Upgrade Venera**, to the release the script came with, on a running VM that has Venera and the guest agent:
    - this release's host half: `install-host.sh --vm VMID` on each node the VM may run on, the others first (running
      VMs keep their video connections);
-   - the guest package from a USB disk it plugs into the running VM, installed through the guest agent with the
+   - the guest package copied into macOS through the guest agent (whatever the screen shows: locked, at the login
+     window, or in use; an older agent that can't take it gets a USB disk plugged into the running VM instead, which
+     macOS mounts only while someone is logged in with the screen unlocked), installed through the guest agent with the
      choices macOS has now (hardware video, the Venera app, the system-volume copy for Safari WebGL);
    - the disk unplugged, then macOS restarted. Whoever is logged in loses unsaved work: the plan says who that is.
 5. **OpenCore**: moves the VM (stopped) to Venera's OpenCore image from this package: its EFI folder and config are

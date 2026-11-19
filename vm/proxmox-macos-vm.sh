@@ -531,7 +531,7 @@ attach_venera_disk() {   # the Venera Tools CD in ide1 (macOS shows it on the de
 finish_vm() {   # macOS and Venera installed: hardware video, the installer disks out, a restart; the old clean-ups
   local st="" up=0 nodes=() n
   echo; echo "== Finish VM $VMID"
-  qm agent "$VMID" ping >/dev/null 2>&1 && up=1
+  qm guest cmd "$VMID" ping >/dev/null 2>&1 && up=1
   if [ $up = 1 ]; then
     st=$(guest 'V="/Library/Application Support/Venera"; [ -e "$V/VERSION" ] && echo "Venera $(cat "$V/VERSION") in macOS"; [ -e "$V/VIDEO" ] && echo "with its video choice"; kextstat 2>/dev/null | grep -q VeneraVideo && echo "VeneraVideo.kext loaded"; [ -f /Library/LaunchDaemons/local.venera.agent.plist ] && echo "Venera'"'"'s guest agent"')
     if [ -n "$st" ]; then echo "$st" | sed 's/^/  /'
@@ -637,6 +637,22 @@ hmp() {   # hmp COMMAND: one QEMU monitor command in the running VM, through Pro
   perl -MPVE::QemuServer::Monitor=mon_cmd -e \
     'print mon_cmd($ARGV[0], "human-monitor-command", "command-line" => $ARGV[1])' "$VMID" "$1" 2>&1 </dev/null
 }
+# agent_put LOCAL REMOTE: a file into macOS through the guest agent (guest-file-write, 4 MB at a time, through
+# Proxmox's own agent call), checked by its SHA-256 there. Venera's agent takes it whatever the screen shows; an older
+# agent that can't fails here, and the Upgrade takes a USB disk instead.
+agent_put() {
+  perl -MPVE::QemuServer::Monitor=mon_cmd -MMIME::Base64 -e '
+    my ($vmid, $src, $dst) = @ARGV;
+    open(my $in, "<:raw", $src) or die "$src: $!\n";
+    my $h = mon_cmd($vmid, "guest-file-open", path => $dst, mode => "wb", timeout => 30);
+    my ($buf, $n);
+    while ($n = read($in, $buf, 4 << 20)) {
+      my $r = mon_cmd($vmid, "guest-file-write", handle => $h, "buf-b64" => encode_base64($buf, ""), timeout => 60);
+      die "wrote $r->{count} of $n bytes\n" if $r->{count} != $n;
+    }
+    mon_cmd($vmid, "guest-file-close", handle => $h, timeout => 30);' "$VMID" "$1" "$2" </dev/null 2>/dev/null || return 1
+  [ "$(guest "shasum -a 256 '$2' | cut -d' ' -f1")" = "$(sha256sum "$1" | cut -d' ' -f1)" ]
+}
 usb_disk() {   # usb_disk add IMAGE | del: the image as a USB drive in the running VM, on the EHCI bus (macOS ignores
   # a drive on the XHCI's hub); QEMU drops the drive with the device, and both are gone at the VM's next start
   if [ "$1" = add ]; then
@@ -668,7 +684,7 @@ upgrade_vm() {   # a VM with Venera: this release's host half on every node, the
   [ -n "$GPKG" ] || die "no guest package beside this script: run it from the unpacked Venera-host folder"
   echo; echo "== Upgrade VM $VMID to Venera ${VER:-?}"
   qm status "$VMID" | grep -q running || die "VM $VMID isn't running: start it (the upgrade goes in through the guest agent), then run this again"
-  qm agent "$VMID" ping >/dev/null 2>&1 || die "VM $VMID's guest agent doesn't answer: copy $(basename "$GPKG") into macOS and open it instead"
+  qm guest cmd "$VMID" ping >/dev/null 2>&1 || die "VM $VMID's guest agent doesn't answer: copy $(basename "$GPKG") into macOS and open it instead"
   st=$(guest 'V="/Library/Application Support/Venera"; [ -e "$V/VERSION" ] && echo "version $(cat "$V/VERSION")"; [ -e "$V/VIDEO" ] && echo video; [ -d /Applications/Venera.app ] && echo app; [ -e "$V/NO_SYSVOL" ] && echo nosysvol; [ -e "$V/NO_AGENT" ] && echo noagent; csrutil authenticated-root status 2>/dev/null | grep -qi disabled && echo authroot-off; stat -f %Su /dev/console')
   cur=$(sed -n 's/^version //p' <<<"$st")
   [ -n "$cur" ] || die "Venera isn't installed in VM $VMID's macOS: open Install Venera there (Ready for Venera makes the disk)"
@@ -685,9 +701,9 @@ upgrade_vm() {   # a VM with Venera: this release's host half on every node, the
   fi
   echo; echo "== The plan"
   [ $HASDEV = 1 ] && echo "  - the host half: install-host.sh --vm $VMID here${nodes[*]:+ and on ${nodes[*]}} (running VMs keep their video connections)"
-  echo "  - in macOS: $(basename "$GPKG") from a USB disk, with the same choices, then a restart"
+  echo "  - in macOS: $(basename "$GPKG") through the guest agent, with the same choices, then a restart"
+  echo "    (an older guest agent that can't take it: from a USB disk, while someone is logged in with the screen unlocked)"
   [ -z "$user" ] || echo "    ($user is logged in: the restart closes their apps, and anything unsaved is lost)"
-  echo "    (macOS takes the disk only while someone is logged in with the screen unlocked: this waits for that)"
   yes_no "Go ahead?" || die "nothing changed"
   for n in "${nodes[@]}"; do   # the other nodes first: the VM needs its socket wherever it starts
     echo "== the host half on $n"
@@ -696,6 +712,22 @@ upgrade_vm() {   # a VM with Venera: this release's host half on every node, the
   done
   if [ $HASDEV = 1 ]; then echo "== the host half here"; "$HOSTKIT/install-host.sh" --vm "$VMID" | sed 's/^/   /'; fi
   echo "== the guest package"
+  local via=agent pkg=/private/var/tmp/venera-upgrade.pkg
+  if agent_put "$GPKG" "$pkg"; then
+    echo "   copied in through the guest agent"; mnt=$pkg
+  else
+    via=usb; guest "rm -f '$pkg'" >/dev/null
+    echo "   the guest agent couldn't take it: a USB disk instead"
+    usb_upgrade_disk || exit 1
+  fi
+  guest "printf '%s' '$(choices_xml $video $app $webgl $agent)' > /private/var/tmp/venera-choices.xml" >/dev/null
+  out=$(guest_rc 900 "/usr/sbin/installer -pkg '$mnt' -target / -applyChoiceChangesXML /private/var/tmp/venera-choices.xml 2>&1; rm -f /private/var/tmp/venera-choices.xml")
+  sed 's/^/   /' <<<"$out" | grep -v '^   rc='
+  if [ $via = usb ]; then guest "diskutil eject '$(dirname "$mnt")' >/dev/null 2>&1" >/dev/null; sleep 2; usb_disk del; rm -f "$img"
+  else guest "rm -f '$pkg'" >/dev/null; fi
+  grep -qx 'rc=0' <<<"$out" || die "the install failed: its log is /Library/Application Support/Venera/install.log in macOS; nothing restarted"
+}
+usb_upgrade_disk() {   # the guest package on a USB disk in the running VM, mounted by macOS: sets img and mnt
   mkdir -p /root/venera; img=/root/venera/venera-upgrade-$VMID.iso
   venera_disk "$img"
   while :; do   # loginwindow turns the disk away (and ejects it) while the screen is locked or nobody is logged in
@@ -710,15 +742,12 @@ upgrade_vm() {   # a VM with Venera: this release's host half on every node, the
     mnt=$(guest "ls -d /Volumes/*/'$(basename "$GPKG")' 2>/dev/null | head -1"); [ -n "$mnt" ] && break; sleep 5
   done
   if [ -z "$mnt" ]; then usb_disk del; rm -f "$img"; die "macOS didn't mount the USB disk in 2 minutes (did its screen lock?): nothing installed"; fi
-  guest "printf '%s' '$(choices_xml $video $app $webgl $agent)' > /private/var/tmp/venera-choices.xml" >/dev/null
-  out=$(guest_rc 900 "/usr/sbin/installer -pkg '$mnt' -target / -applyChoiceChangesXML /private/var/tmp/venera-choices.xml 2>&1; rm -f /private/var/tmp/venera-choices.xml")
-  sed 's/^/   /' <<<"$out" | grep -v '^   rc='
-  guest "diskutil eject '$(dirname "$mnt")' >/dev/null 2>&1" >/dev/null; sleep 2; usb_disk del; rm -f "$img"
-  grep -qx 'rc=0' <<<"$out" || die "the install failed: its log is /Library/Application Support/Venera/install.log in macOS; nothing restarted"
+}
+upgrade_restart() {   # after upgrade_vm: macOS restarted, and what runs once it's back
   echo "== restarting macOS"
   qm guest exec "$VMID" --timeout 10 -- /sbin/shutdown -r now >/dev/null 2>&1 || true
   sleep 30
-  for n in $(seq 1 60); do qm agent "$VMID" ping >/dev/null 2>&1 && break; sleep 5; done
+  for n in $(seq 1 60); do qm guest cmd "$VMID" ping >/dev/null 2>&1 && break; sleep 5; done
   sleep 20
   st=$(guest 'V="/Library/Application Support/Venera"; echo "Venera $(cat "$V/VERSION")"; kextstat 2>/dev/null | grep -o "VeneraVideo ([0-9.]*)"; ioreg -rc VirtioGPUAccel -d1 2>/dev/null | sed -n "s/.*\"VirtioGPUArmState\" = \"\(.*\)\"/desktop: \1/p"')
   if [ -n "$st" ]; then sed 's/^/   /' <<<"$st"; else warn "macOS's guest agent hasn't answered since the restart: check the VM's console"; fi
@@ -759,7 +788,7 @@ if [ -n "$EXIST" ]; then
     1) finish_vm; exit 0 ;;
     2) host_versions; [ "$GPU_KIND" != none ] || die "no GPU the host can render on: Venera needs one"; ready_vm; exit 0 ;;
     3) ;;
-    4) upgrade_vm; exit 0 ;;
+    4) upgrade_vm; upgrade_restart; exit 0 ;;
     5 | 6) ;;
     *) die "nothing changed" ;;
   esac
