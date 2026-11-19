@@ -50,15 +50,22 @@ public:
     // caller's own resources; a resource's destruction drops its twin and takes it off the screen.
     void addClient(class VirtioGPUUserClient *c);
     void removeClient(class VirtioGPUUserClient *c);
-    IOReturn setTwin(task_t task, uint32_t surface, uint32_t resource, uint32_t width, uint32_t height, uint32_t stride);
+    IOReturn setTwin(task_t task, uint32_t surface, uint32_t resource, uint32_t width, uint32_t height, uint32_t stride,
+                     uint32_t resource2 = 0);
     void forgetResource(uint32_t resource);
+    // Two twins a surface since round 17 (resource2; 0 for a plugin before it): each frame goes into the one not on
+    // the screen (markTwin picks it), so a viewer never reads a twin while a frame is copied into it. cur is the one
+    // the last frame went into, the one a transaction shows.
     struct Twin {
         uint32_t surface, resource, width, height, stride;
         uint32_t submitted, ready;   // frame numbers (kVGUCTwinMark)
         task_t task;                 // whose it is
         bool shown;                  // a display transaction asked for it (twinFor): a real display surface
+        uint32_t resource2;
+        uint32_t cur;                // 0: resource, 1: resource2
+        uint32_t res() const { return cur ? resource2 : resource; }
     };
-    IOReturn markTwin(task_t task, uint32_t surface, uint32_t frame, bool ready, bool *shown);
+    IOReturn markTwin(task_t task, uint32_t surface, uint32_t frame, bool ready, bool *shown, uint32_t *use = nullptr);
     // 5d: IOSurface image memory shared between processes' Venus contexts (kVGUCShareSurface / kVGUCImportSurface).
     struct Share {
         uint32_t surface, resource;

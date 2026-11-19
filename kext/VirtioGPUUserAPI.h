@@ -47,11 +47,13 @@ enum {
     kVGUCScanoutBlob = 8,
     /* stage 5c, WindowServer only: scalar in: IOSurface id, blob resource id (0 = forget it), width, height, stride.
      * The blob (one of this process's Venus allocations) holds a copy of that surface's frames: the display pipe
-     * scans it out instead of copying the surface through the CPU. */
+     * scans it out instead of copying the surface through the CPU. Core 0.5.8: a sixth scalar, a second blob, makes
+     * two twins, so a frame goes into the one not on screen (kVGUCTwinMark says which). */
     kVGUCSetTwin = 9,
     /* stage 5c, the twin's owner only: scalar in: IOSurface id, frame number, 0 = submitted / 1 = ready (its GPU copy
      * is done). The display pipe flips to a twin only once the frame a transaction asked for is ready, so WindowServer
-     * needn't wait for the GPU before presenting. */
+     * needn't wait for the GPU before presenting. scalar out: shown on a display yet (core 0.5.5); for "submitted",
+     * the twin this frame goes into, 0 or 1 (core 0.5.8, with two twins; copy the frame into that one). */
     kVGUCTwinMark = 10,
     /* 5d, core 0.5.6: the caller's image memory behind an IOSurface, for another process's Venus context to import
      * instead of copying the surface through the CPU. scalar in: IOSurface id, blob resource id (0 = forget it),

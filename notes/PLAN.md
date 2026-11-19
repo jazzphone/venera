@@ -1765,3 +1765,12 @@ drag stops. Looked into on VM 108:
   owner sees; the fix would be two twins a surface (the copy into the one not on screen).
 - What remains likeliest: VNC viewers draw an update rectangle by rectangle, and drag frames come every 34-60 ms here,
   so a slower client shows old window pieces until the next update clears them.
+- **Fixed (the owner: "fix the race now"): two twins a surface** (core 0.5.8, accelerator 0.6.14, Metal driver 0.4.3).
+  The plugin makes a second blob for each display surface and passes it as kVGUCSetTwin's sixth scalar; at each
+  frame kVGUCTwinMark (submitted) answers which twin to copy into: the other one than last time, unless that one is
+  on screen. The transaction shows the twin the latest frame went into (twinFor), and the flip loop no longer flips
+  to a queued frame whose twin a newer frame of its surface is being copied into. An older plugin or core keeps one
+  twin. `/Library/GPUBundles/VirtioGPUMetal-onetwin` keeps one for comparing. On VM 108 (the release-to-be through the
+  VM script's Upgrade): 0 of 11,584 frames into the twin on screen (one twin: ~15%), fast drags over the magenta
+  backdrop 188 frames, nothing left behind. Drags as fast once warm: frames 17.8 ms apart (one twin 17.7-18.3); the
+  first drags after a restart are slower (twice the blobs for QEMU to take in the first time each is shown).

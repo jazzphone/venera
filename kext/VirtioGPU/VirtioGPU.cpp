@@ -1015,16 +1015,18 @@ void VirtioGPU::removeClient(VirtioGPUUserClient *c) {
 }
 
 IOReturn VirtioGPU::setTwin(task_t task, uint32_t surface, uint32_t resource, uint32_t width, uint32_t height,
-                            uint32_t stride) {
+                            uint32_t stride, uint32_t resource2) {
     if (!twinLock_ || !surface) {
         return kIOReturnBadArgument;
     }
     IOLockLock(twinLock_);
     if (resource) {
-        bool owned = false;
-        for (unsigned i = 0; i < kMaxClients && !owned; i++) {
-            owned = clients_[i] && clients_[i]->owns(task, resource);
+        bool owned = false, owned2 = !resource2;
+        for (unsigned i = 0; i < kMaxClients; i++) {
+            owned = owned || (clients_[i] && clients_[i]->owns(task, resource));
+            owned2 = owned2 || (clients_[i] && clients_[i]->owns(task, resource2));
         }
+        owned = owned && owned2 && resource2 != resource;
         // Only the screen's own size (5c round 3): a window snapshot (the Dock's minimize preview) written in a
         // display frame qualified too, lost its CPU write-back to the twin, and the Dock read blank memory.
         bool screenSized = width == scanoutWidth_ && height == scanoutHeight_;
@@ -1043,7 +1045,7 @@ IOReturn VirtioGPU::setTwin(task_t task, uint32_t surface, uint32_t resource, ui
             free = i;
         }
     }
-    uint32_t old = slot < kMaxTwins ? twins_[slot].resource : 0;
+    uint32_t old = slot < kMaxTwins ? twins_[slot].resource : 0, old2 = slot < kMaxTwins ? twins_[slot].resource2 : 0;
     if (!resource) {
         if (slot < kMaxTwins) {
             twins_[slot] = {};
@@ -1056,10 +1058,13 @@ IOReturn VirtioGPU::setTwin(task_t task, uint32_t surface, uint32_t resource, ui
             IOLockUnlock(twinLock_);
             return kIOReturnNoSpace;
         }
-        twins_[slot] = {surface, resource, width, height, stride, 0, 0, task, false};
+        twins_[slot] = {surface, resource, width, height, stride, 0, 0, task, false, resource2, 0};
     }
     IOLockUnlock(twinLock_);
-    if (old && old != resource && scanoutBlob_ == old) {
+    uint32_t on = scanoutBlob_;
+    bool oldGone = on == old && old != resource && old != resource2;
+    bool old2Gone = on == old2 && old2 != resource && old2 != resource2;
+    if (on && (oldGone || old2Gone)) {
         setScanoutBlob(0, 0, 0, 0, 0);   // what was on screen is going away
     }
     return kIOReturnSuccess;
@@ -1072,7 +1077,7 @@ IOReturn VirtioGPU::setTwin(task_t task, uint32_t surface, uint32_t resource, ui
 // WindowServer, which can come back around to the surface still shown; a viewer reading it then could get a torn
 // frame. VirtioGPUTwinRewrites, every 64 frames.
 static volatile SInt64 gTwinMarks = 0, gTwinRewritesShown = 0;
-IOReturn VirtioGPU::markTwin(task_t task, uint32_t surface, uint32_t frame, bool ready, bool *shown) {
+IOReturn VirtioGPU::markTwin(task_t task, uint32_t surface, uint32_t frame, bool ready, bool *shown, uint32_t *use) {
     *shown = false;
     if (!twinLock_ || !surface) {
         return kIOReturnBadArgument;
@@ -1084,12 +1089,20 @@ IOReturn VirtioGPU::markTwin(task_t task, uint32_t surface, uint32_t frame, bool
             if (twins_[i].task != task) {
                 r = kIOReturnNotPermitted;
             } else {
-                (ready ? twins_[i].ready : twins_[i].submitted) = frame;
-                *shown = twins_[i].shown;
+                Twin &t = twins_[i];
+                if (!ready && t.resource2) {   // a new frame: into the twin not on screen, the other one than last time
+                    uint32_t other = t.cur ^ 1u, on = scanoutBlob_;
+                    t.cur = (other ? t.resource2 : t.resource) != on ? other : t.cur;
+                }
+                if (use) {
+                    *use = t.cur;
+                }
+                (ready ? t.ready : t.submitted) = frame;
+                *shown = t.shown;
                 r = kIOReturnSuccess;
                 if (!ready) {   // a new frame into this twin
                     OSIncrementAtomic64(&gTwinMarks);
-                    if (twins_[i].resource && twins_[i].resource == scanoutBlob_) {
+                    if (t.res() && t.res() == scanoutBlob_) {
                         OSIncrementAtomic64(&gTwinRewritesShown);
                     }
                     if ((gTwinMarks & 63) == 0) {
@@ -1178,7 +1191,7 @@ void VirtioGPU::forgetResource(uint32_t resource) {
     }
     IOLockLock(twinLock_);
     for (unsigned i = 0; i < kMaxTwins; i++) {
-        if (twins_[i].resource == resource) {
+        if (twins_[i].resource == resource || (twins_[i].resource2 && twins_[i].resource2 == resource)) {
             twins_[i] = {};
         }
     }
@@ -1315,7 +1328,8 @@ IOReturn VirtioGPU::callPlatformFunction(const OSSymbol *name, bool wait, void *
             return kIOReturnNotFound;
         }
         uint32_t *out = static_cast<uint32_t *>(p2);
-        out[0] = t.resource, out[1] = t.width, out[2] = t.height, out[3] = t.stride, out[4] = t.submitted, out[5] = t.ready;
+        out[0] = t.res(), out[1] = t.width, out[2] = t.height, out[3] = t.stride;
+        out[4] = t.submitted, out[5] = t.ready;
         return kIOReturnSuccess;
     }
     if (name->isEqualTo(kVGPUScanoutBlob)) {

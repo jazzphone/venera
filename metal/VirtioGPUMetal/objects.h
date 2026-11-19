@@ -64,6 +64,10 @@ id<MTLBuffer> vg_new_buffer_nocopy(id<MTLDevice> device, void *pointer, NSUInteg
     // kext shows with SET_SCANOUT_BLOB instead of copying the surface through the CPU.
     vg_buffer _twin;
     uint32_t _twinRes;
+    // Its second twin (round 17, core 0.5.8): each frame goes into the one the kext says isn't on screen (_twinUse), so
+    // nothing is copied into what a viewer may be reading. Empty with an older core.
+    vg_buffer _twin2;
+    uint32_t _twinUse;
     uint32_t _twinGen;   // frames copied into the twin so far (kVGUCTwinMark)
     BOOL _twinRefused;   // the kext said no (not the screen's size): no twin, the CPU write-back stays
     uint32_t _hotWrites;   // display command buffers in a row that wrote it, each within 100 ms of the last (5c round 6)
@@ -92,7 +96,9 @@ void vg_cmd_wrote_rect(id cmd, VGMTLTexture *t, int32_t x0, int32_t y0, int32_t 
 // Display-surface twins (5c): make and register one for a root surface texture that qualifies (WindowServer, BGRA,
 // screen-sized); forget it (the kext first) before the texture goes.
 BOOL vg_twin_ensure(VGMTLTexture *t);
-BOOL vg_twin_mark(uint32_t surface, uint32_t frame, BOOL ready);   // YES: shown on the display already
+BOOL vg_debug_flag(const char *name);   // /Library/GPUBundles/VirtioGPUMetal-NAME (VGMTLDevice.m)
+// YES: shown on the display already. use (a submitted frame): which twin to copy it into, 0 or 1.
+BOOL vg_twin_mark(uint32_t surface, uint32_t frame, BOOL ready, uint32_t *use);
 int vg_snap_wanted(void);
 VGMTLTexture *vg_twinned_shown(void);   // the twinned surface the kext flipped to last
 void vg_snap_write(VGMTLTexture *t, int number);

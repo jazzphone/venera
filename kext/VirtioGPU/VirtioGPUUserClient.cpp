@@ -133,7 +133,8 @@ IOReturn VirtioGPUUserClient::externalMethod(uint32_t selector, IOExternalMethod
         }
         return core_->setTwin(task_, (uint32_t)args->scalarInput[0], (uint32_t)args->scalarInput[1],
                               (uint32_t)args->scalarInput[2], (uint32_t)args->scalarInput[3],
-                              (uint32_t)args->scalarInput[4]);
+                              (uint32_t)args->scalarInput[4],
+                              args->scalarInputCount >= 6 ? (uint32_t)args->scalarInput[5] : 0);   // round 17
     }
     case kVGUCTwinMark:
         if (args->scalarInputCount < 3) {
@@ -141,10 +142,14 @@ IOReturn VirtioGPUUserClient::externalMethod(uint32_t selector, IOExternalMethod
         }
     {
         bool shown = false;
+        uint32_t use = 0;
         IOReturn r = core_->markTwin(task_, (uint32_t)args->scalarInput[0], (uint32_t)args->scalarInput[1],
-                                     args->scalarInput[2] != 0, &shown);
+                                     args->scalarInput[2] != 0, &shown, &use);
         if (args->scalarOutputCount >= 1) {   // since core 0.5.5: shown on a display yet
             args->scalarOutput[0] = shown ? 1 : 0;
+        }
+        if (args->scalarOutputCount >= 2) {   // since core 0.5.8: which of the surface's two twins this frame goes into
+            args->scalarOutput[1] = use;
         }
         return r;
     }

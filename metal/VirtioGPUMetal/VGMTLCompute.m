@@ -1311,7 +1311,7 @@ static void vg_surface_debug(VGMTLTexture *t) {
     if (_twinFrames) {   // the twins are written: the kext may flip to these frames
         const uint32_t *pair = _twinFrames.bytes;
         for (NSUInteger i = 0; i < _twinFrames.length / (2 * sizeof(uint32_t)); i++) {
-            vg_twin_mark(pair[2 * i], pair[2 * i + 1], YES);
+            vg_twin_mark(pair[2 * i], pair[2 * i + 1], YES, NULL);
         }
         _twinFrames = nil;
     }
@@ -1455,12 +1455,15 @@ static void vg_surface_debug(VGMTLTexture *t) {
             // (VGMTL_TWIN_WRITEBACK=1 keeps it).
             BOOL twinned = (_present || t->_twinRes) && vg_twin_ensure(t);
             if (twinned) {
+                // number this copy: submitted now, ready when the fence is (the kext flips only to a ready frame). The
+                // kext also says which of the two twins to copy it into: the one not on screen (round 17).
+                uint32_t pair[2] = {IOSurfaceGetID(t->_surface), ++t->_twinGen}, use = 0;
+                BOOL shown = vg_twin_mark(pair[0], pair[1], NO, &use);
+                t->_twinUse = use && t->_twin2.buffer ? 1 : 0;
                 VkBufferImageCopy tc = {0, (uint32_t)t->_width, (uint32_t)t->_height, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                                         {0, 0, 0}, {(uint32_t)t->_width, (uint32_t)t->_height, 1}};
-                gVk.vkCmdCopyImageToBuffer(_cb, t->_image, VK_IMAGE_LAYOUT_GENERAL, t->_twin.buffer, 1, &tc);
-                // number this copy: submitted now, ready when the fence is (the kext flips only to a ready frame)
-                uint32_t pair[2] = {IOSurfaceGetID(t->_surface), ++t->_twinGen};
-                BOOL shown = vg_twin_mark(pair[0], pair[1], NO);
+                gVk.vkCmdCopyImageToBuffer(_cb, t->_image, VK_IMAGE_LAYOUT_GENERAL,
+                                           t->_twinUse ? t->_twin2.buffer : t->_twin.buffer, 1, &tc);
                 if (!_twinFrames) {
                     _twinFrames = [NSMutableData data];
                 }

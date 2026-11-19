@@ -500,13 +500,17 @@ static void presentTick(OSObject *, IOTimerEventSource *) {
         IOService *core = coreService();
         // A frame must be in its twin (its GPU copy done) before it is shown: the newest one the plugin has marked
         // ready goes, older ones are dropped. None ready: look again every ms; after 100 ms the newest goes anyway.
+        // Not a twin a newer frame of its surface is being copied into right now (two twins a surface, core 0.5.8:
+        // the surface's latest frame went into the same twin and isn't ready): that would show it half copied.
         int pick = -1;
         for (int i = n - 1; i >= 0 && pick < 0; i--) {
             uint32_t now[6] = {};
             if (!core || !q[i].twin[4] ||
                 core->callPlatformFunction(gSymTwinFor, false, (void *)(uintptr_t)q[i].twin[5], now, nullptr,
-                                           nullptr) != kIOReturnSuccess ||
-                (int32_t)(now[5] - q[i].twin[4]) >= 0) {
+                                           nullptr) != kIOReturnSuccess) {
+                pick = i;
+            } else if ((int32_t)(now[5] - q[i].twin[4]) >= 0 &&
+                       !(now[0] == q[i].twin[0] && now[4] != q[i].twin[4] && (int32_t)(now[5] - now[4]) < 0)) {
                 pick = i;
             }
         }

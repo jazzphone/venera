@@ -186,14 +186,22 @@ BOOL vg_twin_ensure(VGMTLTexture *t) {
     if (vg_buffer_create((VkDeviceSize)stride * t->_height, &t->_twin)) {
         return NO;
     }
-    uint32_t res = vg_memory_res_id(t->_twin.memory);
+    uint32_t res = vg_memory_res_id(t->_twin.memory), res2 = 0;
+    // the second (round 17); one will do. /Library/GPUBundles/VirtioGPUMetal-onetwin keeps to one.
+    if (!vg_debug_flag("onetwin") && !vg_buffer_create((VkDeviceSize)stride * t->_height, &t->_twin2)) {
+        res2 = vg_memory_res_id(t->_twin2.memory);
+    }
     io_connect_t c = vg_twin_conn();
-    uint64_t in[5] = {IOSurfaceGetID(t->_surface), res, t->_width, t->_height, stride};
-    kern_return_t kr = res && c ? IOConnectCallScalarMethod(c, kVGUCSetTwin, in, 5, NULL, NULL) : KERN_FAILURE;
-    vglog("twin for surface %u (%lux%lu): blob %u -> 0x%x", IOSurfaceGetID(t->_surface), (unsigned long)t->_width,
-          (unsigned long)t->_height, res, kr);
+    uint64_t in[6] = {IOSurfaceGetID(t->_surface), res, t->_width, t->_height, stride, res2};
+    kern_return_t kr = res && c ? IOConnectCallScalarMethod(c, kVGUCSetTwin, in, 6, NULL, NULL) : KERN_FAILURE;
+    vglog("twin for surface %u (%lux%lu): blobs %u %u -> 0x%x", IOSurfaceGetID(t->_surface), (unsigned long)t->_width,
+          (unsigned long)t->_height, res, res2, kr);
+    if (!res2) {
+        vg_buffer_destroy(&t->_twin2);
+    }
     if (kr != KERN_SUCCESS) {
         vg_buffer_destroy(&t->_twin);   // not the screen's: keep the write-back, and don't hold 4 MB for nothing
+        vg_buffer_destroy(&t->_twin2);
         t->_twinRefused = YES;
         return NO;
     }
@@ -280,23 +288,30 @@ int vg_snap_wanted(void) {
 
 void vg_snap_write(VGMTLTexture *t, int number) {
     char base[PATH_MAX];
-    if (!t->_twin.map || !confstr(_CS_DARWIN_USER_CACHE_DIR, base, sizeof(base))) {
+    const vg_buffer *tw = t->_twinUse && t->_twin2.map ? &t->_twin2 : &t->_twin;   // the one the last frame went into
+    if (!tw->map || !confstr(_CS_DARWIN_USER_CACHE_DIR, base, sizeof(base))) {
         return;
     }
     char path[PATH_MAX + 80];
     snprintf(path, sizeof(path), "%slocal.homelab.VirtioGPUMetal/snap-%d.png", base, number);
-    vg_write_png(path, t->_twin.map, (uint32_t)t->_width, (uint32_t)t->_height, (uint32_t)t->_width * 4);
+    vg_write_png(path, tw->map, (uint32_t)t->_width, (uint32_t)t->_height, (uint32_t)t->_width * 4);
     vglog("snapshot %d: surface %u -> %s", number, IOSurfaceGetID(t->_surface), path);
 }
 
 // Returns whether a display transaction has shown the surface yet (core 0.5.5; an older core says no, which keeps
 // the CPU write-back: slower, never wrong).
-BOOL vg_twin_mark(uint32_t surface, uint32_t frame, BOOL ready) {
+BOOL vg_twin_mark(uint32_t surface, uint32_t frame, BOOL ready, uint32_t *use) {
+    if (use) {
+        *use = 0;
+    }
     io_connect_t c = vg_twin_conn();
     if (c) {
-        uint64_t in[3] = {surface, frame, ready ? 1 : 0}, out[1] = {0};
-        uint32_t n = 1;
+        uint64_t in[3] = {surface, frame, ready ? 1 : 0}, out[2] = {0, 0};
+        uint32_t n = 2;
         if (IOConnectCallScalarMethod(c, kVGUCTwinMark, in, 3, out, &n) == KERN_SUCCESS && n >= 1) {
+            if (use && n >= 2) {
+                *use = (uint32_t)out[1] & 1;   // core 0.5.8; an older one says nothing: the first twin
+            }
             return out[0] != 0;
         }
     }
@@ -312,7 +327,9 @@ void vg_twin_forget(VGMTLTexture *t) {
         }
     }
     t->_twinRes = 0;
+    t->_twinUse = 0;
     vg_buffer_destroy(&t->_twin);   // destroying the blob also takes it off the screen (the kext)
+    vg_buffer_destroy(&t->_twin2);
 }
 
 // ---- staging pool (5c) ---------------------------------------------------------------------------------------------
