@@ -89,7 +89,9 @@ OC_RES=1280x800 OC_ARGS="keepsyms=1 amfi_get_out_of_my_way=1" OC_CSR=030A0000 MO
 check "Safari WebGL's SIP is 0xA03" '[ $? = 0 ]'
 # the startup settings (choice 6): read back what was written, the display's size in the args, the sizes it takes
 cp "$CFG" "$W/s.plist"
-OC_RES=1440x900 OC_TIMEOUT=8 OC_ARGS="keepsyms=1 debug=0x100 amfi_get_out_of_my_way=1 vgpuaccel=4 -v" oc_config "$W/s.plist" >/dev/null
+OC_RES=1440x900 OC_TIMEOUT=8 OC_TRIM=on OC_ARGS="keepsyms=1 debug=0x100 amfi_get_out_of_my_way=1 vgpuaccel=4 -v" oc_config "$W/s.plist" >/dev/null
+eval "$(oc_read "$W/s.plist")"
+check "TRIM written and read back" '[ "$CUR_TRIM" = on ] && OC_TRIM=off oc_config "$W/s.plist" >/dev/null && eval "$(oc_read "$W/s.plist")" && [ "$CUR_TRIM" = off ]'
 eval "$(oc_read "$W/s.plist")"
 check "startup settings read back as written" '[ "$CUR_RES" = 1440x900 ] && [ "$CUR_TIMEOUT" = 8 ] && [ "$CUR_ARGS" = "keepsyms=1 debug=0x100 amfi_get_out_of_my_way=1 vgpuaccel=4 -v" ] && [ -n "$CUR_MODEL" ]'
 check "the display's size into the args, once, the rest kept" '[ "$(screen_args "-cpu host -global virtio-vga-gl.xres=1280 -global virtio-vga-gl.yres=800 -global virtio-vga-gl.venus=on" 1920x1080)" = "-cpu host -global virtio-vga-gl.venus=on -global virtio-vga-gl.xres=1920 -global virtio-vga-gl.yres=1080" ] && [ "$(screen_args "-cpu host" 1440x900)" = "-cpu host -global virtio-vga-gl.xres=1440 -global virtio-vga-gl.yres=900" ]'

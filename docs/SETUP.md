@@ -37,6 +37,7 @@ The questions (Enter keeps the answer in brackets):
 | Safari WebGL | N, unless you need WebGL in Safari (it turns off one more security setting) |
 | A sound device | Y (YouTube needs one) |
 | Storage, bridge, VLAN, VM number, cores, memory, disk, screen size (up to 1920x1200) | the defaults, or yours |
+| TRIM (thin storage only, like local-lvm) | **Y**: the space macOS frees goes back to the storage |
 | Set up node … too | Y for each node if the VM is in an HA group, so it can run on any of them |
 | Where macOS comes from | **1**, macOS Tahoe's recovery from Apple |
 | Model identifier | Enter (iMac20,1) |

@@ -39,7 +39,8 @@ it:
   against Apple's chunklist), unless you brought your own macOS. That is the only download;
 - creates a q35 / OVMF VM: the host's own CPU with `host-phys-bits-limit=40`, QEMU's `applesmc` with the SMC key, the
   `virtio-gl` display with Venus (blob resources, a 2 GB host memory window), a USB sound device (YouTube needs one),
-  vmxnet3, a virtio disk with no TRIM, USB keyboard and tablet, and the guest agent's virtio port;
+  vmxnet3, a virtio disk (with TRIM on thin storage, asked: local-lvm, ZFS, Ceph or a disk file take freed space back;
+  thick LVM and iSCSI can't, and a TRIM over iSCSI crawls), USB keyboard and tablet, and the guest agent's virtio port;
 - attaches the **Venera Tools CD** (the release's `Venera-Tools-VERSION.iso`, or one made from the guest package) as a
   CD drive, from an ISO storage (a shared one when there is one, so HA can start the VM on any node). macOS shows it on
   the desktop.
@@ -148,7 +149,9 @@ Run it again with the VM's name:
    - **Venera at startup**: off adds `-vgpuoff`, and macOS starts on the basic display (for a broken desktop);
    - **Other boot-args** (`keepsyms=1`, `debug=0x100`, ...). Venera's own (`amfi_get_out_of_my_way=1`,
      `vgpuaccel=N`) are kept;
-   - **Model and Mac identity**: choice 3's questions.
+   - **Model and Mac identity**: choice 3's questions;
+   - **TRIM**: the space macOS frees goes back to the storage (the disk's `discard` and OpenCore's APFS TRIM),
+     on thin storage only (local-lvm, ZFS, Ceph, a disk file).
 
    It shows the settings the VM has, changes them one at a time, then shows the plan. A running VM is shut down first
    (asked), and started again after (asked). The OpenCore disk is saved to `/root` and the VM's config to

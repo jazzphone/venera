@@ -19,7 +19,8 @@
 #   the SMC key             - without it boot stops at "busy timeout ... AppleACPICPU" (WindowServer can't be decrypted)
 #   VeneraHide (OpenCore)   - without it the Apple Account sign-in sees a VM and fails ("Verification failed")
 #   -cpu host (+hypervisor) - hiding the hypervisor from the CPU stops the kernel; VeneraHide hides it from Apple's checks
-#   no TRIM on the disk     - Disk Utility's erase TRIMs the whole disk, which shared iSCSI storage clears 2 MB at a time
+#   TRIM only on thin storage - Disk Utility's erase TRIMs the whole disk, which shared iSCSI storage clears 2 MB at a
+#                             time; on thin storage (local-lvm, ZFS, Ceph, a file) TRIM gives freed space back
 #   the guest agent         - Venera's (a Customize choice, on by default) on the virtio agent port: clean shutdowns,
 #                             the VM's addresses in Proxmox, and Finish and Upgrade work through it
 #   virtio-gl + Venus       - the GPU the guest's Metal runs on (vga: virtio-gl, -global virtio-vga-gl.venus/blob/hostmem)
@@ -118,6 +119,14 @@ on_node() {   # on_node NODE COMMAND: runs COMMAND (one string) as root on NODE
   local ip; ip=$(node_ip "$1"); [ -n "$ip" ] || { echo "no address for $1 in corosync.conf" >&2; return 1; }
   ssh -o BatchMode=yes -o ConnectTimeout=8 -o HostKeyAlias="$1" -o StrictHostKeyChecking=yes \
     -o UserKnownHostsFile="/etc/pve/nodes/$1/ssh_known_hosts /etc/pve/priv/known_hosts" "root@$ip" "$2"
+}
+# thin storage: space a disk frees can go back to it (TRIM). Thick LVM and iSCSI LUNs can't take it back, and a TRIM
+# over iSCSI crawls (Disk Utility's erase TRIMs the whole disk, 2 MB at a time)
+storage_thin() {
+  case $(pvesm status 2>/dev/null | awk -v s="$1" '$1 == s {print $2}') in
+    lvm | iscsi | iscsidirect | "") return 1 ;;
+    *) return 0 ;;
+  esac
 }
 storage_shared() {   # 0 when a storage is shared between the nodes (a VM on it can run on any of them)
   pvesh get "/storage/$1" --output-format json 2>/dev/null | python3 -c '
@@ -225,7 +234,7 @@ oc_mount() {   # mounts the OpenCore image $OCIMG (a file or a VM disk) at $MNT
 }
 oc_umount() { sync; umount "$MNT"; losetup -d "$LOOP"; rmdir "$MNT"; [[ $OCIMG == /dev/* ]] && lvchange -an "$OCIMG" || true; }
 
-oc_config() {   # edits config.plist $1: settings from the environment (OC_RES, OC_TIMEOUT, OC_CSR, OC_ARGS,
+oc_config() {   # edits config.plist $1: settings from the environment (OC_RES, OC_TIMEOUT, OC_TRIM, OC_CSR, OC_ARGS,
   # MODEL/SERIAL/MLB/ROM)
   python3 - "$1" <<'PY'
 import os, plistlib, sys, uuid
@@ -236,11 +245,14 @@ if e("OC_RES"):
     c["UEFI"]["Output"]["Resolution"] = e("OC_RES") + "@32"
 if e("OC_TIMEOUT"):
     c["Misc"]["Boot"]["Timeout"] = int(e("OC_TIMEOUT"))
+if e("OC_TRIM"):   # APFS's TRIM at mount: macOS's own timeout (-1), or none (0)
+    c["Kernel"]["Quirks"]["SetApfsTrimTimeout"] = -1 if e("OC_TRIM") == "on" else 0
 if e("OCVER"):
     print("   OpenCore %s (Venera's): VeneraHide, %s, boot menu %s s" % (e("OCVER"), e("OC_RES"), e("OC_TIMEOUT", "5")))
 else:
     if e("OC_RES"): print("   screen at startup:", e("OC_RES"))
     if e("OC_TIMEOUT"): print("   OpenCore's menu:", e("OC_TIMEOUT"), "s")
+    if e("OC_TRIM"): print("   APFS TRIM:", e("OC_TRIM"))
 if e("NEWUUID"):   # each VM its own hardware UUID (the sample's is zeros)
     c["PlatformInfo"]["Generic"]["SystemUUID"] = str(uuid.uuid4()).upper()
 nv = c["NVRAM"]
@@ -270,7 +282,7 @@ PY
 
 prepare_opencore() {   # on the new OpenCore image $OCIMG (a copy of Venera's): the screen size, SIP/AMFI, the identity
   oc_mount
-  OCVER=$OCVER NEWUUID=1 OC_RES=$RES OC_TIMEOUT=5 OC_ARGS=$BOOTARGS OC_CSR=$CSR MODEL=$MODEL SERIAL=$SERIAL MLB=$MLB ROM=$ROM oc_config "$MNT/EFI/OC/config.plist" ||
+  OCVER=$OCVER NEWUUID=1 OC_RES=$RES OC_TIMEOUT=5 OC_TRIM=$TRIM OC_ARGS=$BOOTARGS OC_CSR=$CSR MODEL=$MODEL SERIAL=$SERIAL MLB=$MLB ROM=$ROM oc_config "$MNT/EFI/OC/config.plist" ||
     { oc_umount; die "OpenCore's config.plist couldn't be edited"; }
   oc_umount
 }
@@ -323,14 +335,15 @@ apply_identity() {   # an existing VM's OpenCore disk: the Mac identity only
   MODEL=$MODEL SERIAL=$SERIAL MLB=$MLB ROM=$ROM oc_config "$MNT/EFI/OC/config.plist"
   oc_umount
 }
-oc_read() {   # config.plist $1's settings as shell assignments: CUR_RES CUR_TIMEOUT CUR_ARGS CUR_MODEL
+oc_read() {   # config.plist $1's settings as shell assignments: CUR_RES CUR_TIMEOUT CUR_ARGS CUR_MODEL CUR_TRIM
   python3 - "$1" <<'PY'
 import plistlib, shlex, sys
 c = plistlib.load(open(sys.argv[1], "rb"))
 v = {"CUR_RES": str(c["UEFI"]["Output"].get("Resolution", "")).split("@")[0],
      "CUR_TIMEOUT": str(c["Misc"]["Boot"].get("Timeout", 5)),
      "CUR_ARGS": c["NVRAM"]["Add"].get("7C436110-AB2A-4BBB-A880-FE41995C9F82", {}).get("boot-args", ""),
-     "CUR_MODEL": c["PlatformInfo"]["Generic"].get("SystemProductName", "")}
+     "CUR_MODEL": c["PlatformInfo"]["Generic"].get("SystemProductName", ""),
+     "CUR_TRIM": "off" if c["Kernel"]["Quirks"].get("SetApfsTrimTimeout", -1) == 0 else "on"}
 for k, x in v.items(): print("%s=%s" % (k, shlex.quote(x)))
 PY
 }
@@ -354,7 +367,7 @@ screen_size() {   # $1 WxH, $2 1 for a Venera VM: dies unless a size the VM can 
 # menu's seconds, Venera on or off, other boot-args. Venera's own boot-args (amfi_get_out_of_my_way=1, vgpuaccel=N)
 # are kept as they are. The VM stopped, OCIMG its OpenCore disk; DO_ID=1 when the model and identity come next.
 startup_settings() {
-  local cfg a x="" v=0 off=0 own="" k s t ven=0 cur_disp xr yr changes=()
+  local cfg a x="" v=0 off=0 own="" k s t ven=0 cur_disp xr yr changes=() disk trim_now
   oc_mount; cfg=$(oc_read "$MNT/EFI/OC/config.plist"); oc_umount; eval "$cfg"
   for a in $CUR_ARGS; do
     case $a in
@@ -370,7 +383,9 @@ startup_settings() {
   yr=$(qm config "$VMID" | sed -n 's/^args:.*-global virtio-vga-gl\.yres=\([0-9]*\).*/\1/p')
   if [ $ven = 1 ]; then cur_disp=${xr:-1280}x${yr:-800}; else cur_disp=$CUR_RES; fi
   [[ $cur_disp =~ ^[0-9]+x[0-9]+$ ]] || cur_disp=1280x800
-  local S=$cur_disp V=$v T=$CUR_TIMEOUT OFF=$off X=$x
+  disk=$(qm config "$VMID" | sed -n 's/^virtio0: //p')
+  if [ -n "$disk" ] && [[ ,$disk, == *,discard=on,* ]] && [ "$CUR_TRIM" = on ]; then trim_now=on; else trim_now=off; fi
+  local S=$cur_disp V=$v T=$CUR_TIMEOUT OFF=$off X=$x R=$trim_now
   DO_ID=0
   while :; do
     echo; echo "  VM $VMID's startup settings (OpenCore's config.plist$([ $ven = 1 ] && echo " and the VM's display")):"
@@ -380,6 +395,7 @@ startup_settings() {
     echo "    4  Venera at startup: $([ $OFF = 1 ] && echo "off (-vgpuoff: the basic display)" || echo on)"
     echo "    5  Other boot-args: ${X:-none}${own:+   (kept for Venera: $own)}"
     echo "    6  Model and Mac identity: ${CUR_MODEL:-?}   (generate new serials, or enter your Mac's: asked next)"
+    [ -z "$disk" ] || echo "    7  TRIM: $R   (space macOS frees goes back to ${disk%%:*}; thin storage only)"
     ask k "Change which (Enter when done)" ""
     case $k in
       "") break ;;
@@ -391,7 +407,10 @@ startup_settings() {
          for a in $s; do case $a in -v | -vgpuoff | amfi_get_out_of_my_way=* | vgpuaccel=*) die "$a has its own setting (or is Venera's)" ;; esac; done
          X=$s ;;
       6) DO_ID=1; break ;;
-      *) echo "  (1 to 6, or Enter)" ;;
+      7) [ -n "$disk" ] || { echo "  (no virtio0 disk)"; continue; }
+         if [ "$R" = off ] && ! storage_thin "${disk%%:*}"; then echo "  (${disk%%:*} isn't thin storage: it can't take space back)"; continue; fi
+         [ "$R" = on ] && R=off || R=on ;;
+      *) echo "  (1 to 7, or Enter)" ;;
     esac
   done
   [ "$S" = "$cur_disp" ] || changes+=("screen size $cur_disp -> $S")
@@ -399,6 +418,7 @@ startup_settings() {
   [ "$T" = "$CUR_TIMEOUT" ] || changes+=("OpenCore's menu $T s")
   [ "$OFF" = "$off" ] || changes+=("Venera at startup $([ $OFF = 1 ] && echo off || echo on)")
   [ "$X" = "$x" ] || changes+=("other boot-args: ${X:-none}")
+  [ "$R" = "$trim_now" ] || changes+=("TRIM $R (OpenCore's APFS TRIM and the disk's discard)")
   [ ${#changes[@]} -gt 0 ] || { [ $DO_ID = 1 ] && return 0; die "nothing changed"; }
   local args; args=$(echo $X $own $([ $V = 1 ] && echo -v) $([ $OFF = 1 ] && echo -vgpuoff))
   echo; echo "== The plan"
@@ -410,12 +430,19 @@ startup_settings() {
   BK=/root/opencore-$NAME-$(date +%Y%m%d-%H%M%S).img; dd if="$OCIMG" of="$BK" bs=1M status=none
   oc_mount
   OC_RES=$([ "$S" = "$cur_disp" ] || echo "$S") OC_TIMEOUT=$([ "$T" = "$CUR_TIMEOUT" ] || echo "$T") OC_ARGS=$args \
+    OC_TRIM=$([ "$R" = "$trim_now" ] || echo "$R") \
     oc_config "$MNT/EFI/OC/config.plist" || { oc_umount; die "OpenCore's config.plist couldn't be edited (the disk is saved as $BK)"; }
   oc_umount
   if [ $ven = 1 ] && [ "$S" != "$cur_disp" ]; then
     backup_conf
     qm set "$VMID" --args "$(screen_args "$(qm config "$VMID" | sed -n 's/^args: //p')" "$S")" >/dev/null
     echo "   the VM's display: $S"
+  fi
+  if [ "$R" != "$trim_now" ]; then
+    [ $ven = 1 ] && [ "$S" != "$cur_disp" ] || backup_conf
+    local nd; nd=$(sed -E 's/,discard=[a-z]+//' <<<"$disk"); [ "$R" = on ] && nd="$nd,discard=on"
+    qm set "$VMID" --virtio0 "$nd" >/dev/null
+    echo "   the disk: $nd"
   fi
   echo "== Done (the previous OpenCore disk is saved as $BK; dd it back to undo)."
 }
@@ -776,6 +803,10 @@ else
   echo; echo "  VM storage (its disks):"; pvesm status --content images | sed 's/^/    /'
   ask STORAGE "Storage for the VM's disks" "local-lvm"
   pvesm status --content images | awk 'NR>1{print $1}' | grep -qx "$STORAGE" || die "$STORAGE can't hold VM disks"
+  TRIM=off
+  if storage_thin "$STORAGE"; then
+    no_yes "TRIM: give the space macOS frees back to $STORAGE (it's thin storage)?" && TRIM=on
+  else echo "  ($STORAGE is $(pvesm status | awk -v s="$STORAGE" '$1 == s {print $2}'): no TRIM, it can't take space back)"; fi
   if [ -n "$(other_nodes)" ]; then
     if storage_shared "$STORAGE"; then
       for n in $(other_nodes); do no_yes "Set up node $n too (HA may start the VM there)?" && NODES+=("$n"); done
@@ -887,7 +918,7 @@ if [ $MODE = create ]; then
     echo "    (imported, at least $DISK GB; it must be an Intel (x86) macOS; Venera is made for macOS 26 Tahoe)"
   elif [ -n "$BYO_INST" ]; then echo "  - OpenCore $OCVER (Venera's own image, from this package), and your installer $BYO_INST to install from"
   else echo "  - OpenCore $OCVER (Venera's own image, from this package) and macOS Tahoe's recovery from Apple, into $ISO"; fi
-  echo "  - VM $VMID '$NAME': $CORES cores${PCORES:+ on the performance cores ($PCORES)}, $MEM MB, $DISK GB on $STORAGE"
+  echo "  - VM $VMID '$NAME': $CORES cores${PCORES:+ on the performance cores ($PCORES)}, $MEM MB, $DISK GB on $STORAGE$([ $TRIM = on ] && echo ", TRIM on")"
   echo "    (the OpenCore$([ -n "$BYO_DISK" ] || echo " and $([ -n "$BYO_INST" ] && echo installer || echo recovery)") image$([ -n "$BYO_DISK" ] || echo s) imported as small disks there too)"
   echo "  - network: $BRIDGE${VLAN:+, VLAN $VLAN}; starts with the host"
   echo "  - SMC: QEMU applesmc with Apple's SMC key; CPU: the host's own; OpenCore with VeneraHide, $RES"
@@ -959,15 +990,15 @@ qm create "$VMID" --name "$NAME" --ostype other --machine q35 --bios ovmf \
   --vga $VGA --tablet 0 --agent enabled=1,type=virtio \
   --net0 "vmxnet3,bridge=$BRIDGE${VLAN:+,tag=$VLAN},firewall=0" \
   --efidisk0 "$STORAGE:1,efitype=4m,pre-enrolled-keys=0" \
-  $([ -n "$BYO_DISK" ] || echo --virtio0 "$STORAGE:$DISK,cache=none") --onboot 1 \
-  --description "macOS Tahoe, made by proxmox-macos-vm.sh${VER:+ (Venera $VER)}" >/dev/null   # no discard: a TRIM over iSCSI crawls
+  $([ -n "$BYO_DISK" ] || echo --virtio0 "$STORAGE:$DISK,cache=none$([ $TRIM = on ] && echo ,discard=on)") --onboot 1 \
+  --description "macOS Tahoe, made by proxmox-macos-vm.sh${VER:+ (Venera $VER)}" >/dev/null
 if [ -n "$BYO_DISK" ]; then
   echo "== importing the OpenCore image and your macOS disk"
   qm disk import "$VMID" "$OCIMG" "$STORAGE" --format raw >/dev/null
   qm disk import "$VMID" "$BYO_DISK" "$STORAGE" >/dev/null || die "Proxmox couldn't import $BYO_DISK (qm disk import)"
   OCDISK=$(qm config "$VMID" | sed -n 's/^unused0: //p'); MDISK=$(qm config "$VMID" | sed -n 's/^unused1: //p')
   [ -n "$OCDISK" ] && [ -n "$MDISK" ] || die "the imported disks didn't show up (qm config $VMID)"
-  qm set "$VMID" --ide2 "$OCDISK,cache=unsafe" --virtio0 "$MDISK,cache=none" --boot order=ide2 --args "$ARGS" >/dev/null
+  qm set "$VMID" --ide2 "$OCDISK,cache=unsafe" --virtio0 "$MDISK,cache=none$([ $TRIM = on ] && echo ,discard=on)" --boot order=ide2 --args "$ARGS" >/dev/null
   CUR=$(qm config "$VMID" | sed -n 's/^virtio0: .*size=\([0-9]*\)G.*/\1/p')
   [ -z "$CUR" ] || [ "$CUR" -ge "$DISK" ] || qm disk resize "$VMID" virtio0 "${DISK}G" >/dev/null
 else
