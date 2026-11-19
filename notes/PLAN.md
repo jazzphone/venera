@@ -2029,3 +2029,11 @@ blob flips flush the whole screen to QEMU, and Screen Sharing captures the same 
   terminal instead of its stdin there. `hmp()` sends each command through `PVE::QemuServer::Monitor::mon_cmd`
   (288625b); tested in a pty on node 2 (attach, duplicate refused, detach). Released as v0.1.7 (pre-release), nothing
   else changed; get-venera fetches it.
+
+### 0.1.8 (2026-11-19)
+
+- The VM script's **Startup settings** (choice 6, 02ad20d): screen size (QEMU's xres/yres for the desktop, up to the
+  framebuffer's 1920x1200, plus OpenCore's resolution), verbose, the menu's seconds, -vgpuoff, other boot-args, then
+  choice 3's model and identity (which now defaults to the VM's model). Choices 3/5/6 offer to shut a running VM down.
+  A new VM's screen size sets the desktop too. Tested on VM 108 (snapshot, rolled back): 1920x1080 Metal desktop.
+  Released as v0.1.8 (pre-release); nothing inside macOS changed.
