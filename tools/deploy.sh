@@ -83,19 +83,18 @@ video-kext) # hardware video decoding, the guest half: VeneraVideo.kext through 
   "${SCP[@]}" -r build/VeneraVideo.kext $HOST:/root/vgpu/
   "${SSH[@]}" $HOST 'bash /root/vgpu/vm-remote.sh deploy /root/vgpu/VeneraVideo.kext'
   ;;
-video-host) # the host half: venera-videod and its FFmpeg into /root/vgpu/video, the service restarted. The VM loses its
-            # ivshmem connection then (QEMU has no reconnect): restart VM 108 after (tools/redeploy.sh --no-build).
+video-host) # the host half: venera-videod into /opt/venera/video (the installer's layout; its FFmpeg stays) and VM
+            # 108's service restarted. The VM keeps its device: systemd holds the shared memory and QEMU's connection.
   docker image inspect venera-hostvideo-build >/dev/null 2>&1 ||
     docker build --platform linux/amd64 -t venera-hostvideo-build hostvideo >/dev/null
   [ -d hostvideo/out/ffmpeg/lib ] || docker run --rm --platform linux/amd64 -v ~/src:/src venera-hostvideo-build \
     /src/macos-virtio-gpu/hostvideo/build-ffmpeg.sh
   docker run --rm --platform linux/amd64 -v ~/src:/src venera-hostvideo-build /src/macos-virtio-gpu/hostvideo/build.sh \
-    venera-videod vatest | tail -1
-  tar -czf build/hostvideo.tgz -C hostvideo/out bin -C ffmpeg lib -C ../../packaging venera-videod.service
-  "${SCP[@]}" build/hostvideo.tgz $HOST:/root/vgpu/
-  "${SSH[@]}" $HOST 'mkdir -p /root/vgpu/video && cd /root/vgpu/video && tar -xzf /root/vgpu/hostvideo.tgz && chown -R root:root . &&
-    mv -f venera-videod.service /etc/systemd/system/ && systemctl daemon-reload && systemctl enable venera-videod >/dev/null 2>&1;
-    systemctl restart venera-videod && systemctl is-active venera-videod'
+    venera-videod | tail -1
+  "${SCP[@]}" hostvideo/out/bin/venera-videod $HOST:/root/vgpu/venera-videod.dev
+  "${SSH[@]}" $HOST '[ -d /opt/venera/video/lib ] || { echo "no host half yet: run install-host.sh --vm 108 first"; exit 1; }
+    install -m755 /root/vgpu/venera-videod.dev /opt/venera/video/bin/venera-videod &&
+    systemctl restart venera-videod@108.service && systemctl is-active venera-videod@108.service'
   ;;
 mtl) # tools/deploy.sh mtl arm|disarm|probe: run tools/metal-vm.sh in the VM
   shift
