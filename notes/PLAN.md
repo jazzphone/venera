@@ -1715,3 +1715,35 @@ After the release, the same day:
   VeneraVideo replaces; nothing in VideoToolbox reads it, and VeneraVideo's own table (96 surfaces) needs none.
 - Checks: the session and ring fuzzers on the new slot code (1.4 M and 212 k runs, nothing found); the widget movie's
   555 frames to ProRes and HEVC; vtenc's small exports, 8 of 8 complete.
+
+## Round 16 (2026-11-18): cleanup, and items 5-8 looked into
+
+- **Cleanup.** node 2's local-lvm (VM 108 alone) was 93% full: VM 108's 8 snapshots held ~67 GB of old blocks (the
+  4K exports of round 15 wrote tens of GB). Kept clean-dev and a new rel-014 (0.1.4 installed); the other 7 deleted:
+  76%. Old kits (0.1.2, 0.1.3) gone from both nodes, node 2's /root/vgpu test output (~450 MB, and the pre-0.1.1
+  /root/vgpu/video install) gone, dist/ keeps 0.1.4. deploy.sh video-host now installs over /opt/venera/video.
+- **5, encoding one frame at a time.** Apple's host (VTParavirtualizationHostEncoderSession, in VideoToolbox) answers
+  efrm as soon as the frame is in its encoder, Asynchronous, sends Eemt as a request, and answers CompleteFrames after
+  VTCompressionSessionCompleteFrames, which waits for the guest's answers. Tried here (efrm at once, inf 1): 206-220
+  fps against 178-181 at 1080p, but the last frame came after CompleteFrames in 20 of 20 runs (exports drop it). The
+  guest can't answer a request while VeneraVideo holds its send (the workaround for Intel VideoToolbox's 32-bit reply
+  timeout; VideoToolboxParavirtualizationSupport keeps its lock across the call), so it stays one frame at a time.
+  The old 1-in-20 late last frame is fixed: CompleteFrames is answered 20 ms after the last frame (150 of 150 runs).
+  Overlap needs another answer to the reply timeout: a send that returns at once with the answer delivered before
+  the process waits, or patching the 32-bit conversion in the guest.
+- **6, translation per function-constant set.** tools/fcfold: folding the specialized text (literal comparisons at the
+  type's width, branches, dead blocks and phi entries, single-entry phis, uncalled functions) before translation makes
+  WindowServer's uber shader 2.7-9.5x faster to translate (~400 ms -> 41-289 ms on the Mac, 12 sets), the SPIR-V
+  computing the same (opcode counts equal but for unused loads). Two bugs found on the way (an unlabeled entry
+  block's number; i8 255 is -1) show why the check matters. The real pass belongs in the translator after
+  fc_air_specialize; a new translator means a new seed (its hash is in every key).
+- **7, the seed on other builds.** Keys are the translator's hash and the shader's text, so the seed is right on any
+  build; install.sh now always puts it in, and seed-pool.sh merges builds into one seed. Not measured on another build:
+  VM 109's recovery was 26.6.2 but the installer put on 26.7.3 (Apple's latest), the build VM 108 has.
+- **8, the new-VM path end to end (VM 109, node 2, NAS storage, vmbr0).** Found and fixed: the recovery
+  lookup failed under pipefail after the download (Apple sends BaseSystem.dmg alone). Recovery, Disk Utility, the
+  installer and Setup Assistant run on Venus graphics before any driver. Found, not fixed: at each of the install's
+  restarts OpenCore's menu defaults to macOS Base System (its first entry), not the installer or the disk macOS chose
+  (RequestBootVarRouting and WriteFlash are on), so someone has to pick at the menu three times; the script now says so
+  instead of "it picks by itself". Setup Assistant needs an account password, and the guest agent is still a manual
+  build: the rest is a person's.

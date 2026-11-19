@@ -639,8 +639,9 @@ qm set "$VMID" --ide2 "$OCDISK,cache=unsafe" --ide0 "$RECDISK,cache=unsafe" --bo
 
 echo "== Done: VM $VMID ($NAME). Start it from the Proxmox web page, open its Console, and install macOS Tahoe:"
 echo "   at OpenCore's menu pick the macOS Base System; Disk Utility > View > Show All Devices > erase the VirtIO disk"
-echo "   (APFS, GUID Partition Map) > back, Reinstall macOS Tahoe. It restarts a few times (pick the disk's installer, then"
-echo "   the disk itself, at OpenCore's menu; it picks the last one by itself after 5 s)."
+echo "   (APFS, GUID Partition Map) > back, Reinstall macOS Tahoe. It restarts a few times, and OpenCore's menu starts on"
+echo "   macOS Base System each time: press an arrow key within 5 s to stop it, then pick macOS Installer while it installs,"
+echo "   and Macintosh HD once it has (macOS Base System again goes back to the recovery)."
 echo "   After setup, in macOS: automatic updates off (Venera is tested on 26.7.3; a newer macOS may keep the software"
 echo "   desktop); never sleep; set time automatically. The guest agent: build mac-guest-agent (MIT) from source and run"
 echo "   its --install (Finish reads Venera's status through it)."
