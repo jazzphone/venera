@@ -273,6 +273,12 @@ OSDefineMetaClassAndStructors(VGSysMemory, IOAccelSysMemory)
 // contiguous kernel memory: the family's own getPhysicalSegment reads one base at +0xc8 (Tahoe 25G342) for the length
 // at +0x40. Nothing reads it on the GPU side; frames still reach the screen by performTransaction's copies from the
 // IOSurfaces. -vgpunovidmem refuses again (the stage 5a behavior).
+// A display surface at 2560x1600 asks for 16 MB, at 4K 33 MB, and contiguous blocks that big are rare once macOS has
+// run a while (Retina modes came up black: every transaction's prepare failed). Since nothing reads this memory, one
+// spare block, taken when the accelerator starts (the RAM is still in one piece then) and as big as the largest mode,
+// stands in for every allocation that can't get its own (0.7.0).
+static IOBufferMemoryDescriptor *gSpareVidMem;
+static constexpr uint64_t kSpareVidMemBytes = 3840ULL * 2400 * 4;
 class VGVidMemory : public IOAccelVidMemory {
     OSDeclareDefaultStructors(VGVidMemory)
     NM_TAHOE_FWD(VGVidMemory)
@@ -293,11 +299,20 @@ public:
         }
         buf_ = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
             kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous, round_page(want), 0xFFFFFFFFFFFFF000ULL);
-        if (!buf_) {
+        if (!buf_ && gSpareVidMem && want <= gSpareVidMem->getLength()) {
+            static uint32_t spared = 0;
+            buf_ = gSpareVidMem;
+            buf_->retain();
+            if (spared++ < 4) {
+                vgaccel_log("VidMemory allocPhysical(%llu bytes): no contiguous RAM, the spare block stands in",
+                            (unsigned long long)want);
+            }
+        } else if (!buf_) {
             vgaccel_log("VidMemory allocPhysical(%llu bytes) -> false (no contiguous RAM)", (unsigned long long)want);
             return false;
+        } else {
+            bzero(buf_->getBytesNoCopy(), buf_->getLength());
         }
-        bzero(buf_->getBytesNoCopy(), buf_->getLength());
         *(volatile uint64_t *)((uint8_t *)this + kPhysOff) = buf_->getPhysicalAddress();
         if (logged++ < 8) {
             vgaccel_log("VidMemory allocPhysical(%llu bytes) -> phys 0x%llx", (unsigned long long)want,
@@ -1145,6 +1160,12 @@ bool VirtioGPUAccel::start(IOService *provider) {
         return false;
     }
     gAccel = this;
+    if (!gSpareVidMem) {
+        gSpareVidMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+            kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous, round_page(kSpareVidMemBytes), 0xFFFFFFFFFFFFF000ULL);
+        vlog("start: spare video memory block (%llu bytes) %s", (unsigned long long)kSpareVidMemBytes,
+             gSpareVidMem ? "taken" : "NOT available (Retina modes may come up black)");
+    }
     vlog("start: vgpuaccel=%u, calling IOGraphicsAccelerator2::start", gate);
     bool ok = IOGraphicsAccelerator2::start(provider);
     vlog("IOGraphicsAccelerator2::start -> %d", ok);

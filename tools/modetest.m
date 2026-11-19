@@ -1,6 +1,7 @@
 // modetest (stage 5c): list the main display's modes, or switch to one and back, as the console user.
 //   modetest                 list modes (the current one marked)
-//   modetest W H [SECONDS]   switch to WxH, stay SECONDS (default 5), switch back; prints what CoreGraphics reports
+//   modetest W H [SECONDS] [2x]   switch to WxH (2x: the Retina one, twice the pixels), stay SECONDS (default 5; 0
+//                            stays), switch back; prints what CoreGraphics reports
 #import <CoreGraphics/CoreGraphics.h>
 #import <Foundation/Foundation.h>
 
@@ -24,10 +25,12 @@ int main(int argc, char **argv) {
         }
         size_t w = strtoul(argv[1], NULL, 10), h = strtoul(argv[2], NULL, 10);
         int secs = argc > 3 ? atoi(argv[3]) : 5;
+        const int retina = argc > 4 && !strcmp(argv[4], "2x");
         CGDisplayModeRef want = NULL;
         for (id o in modes) {
             CGDisplayModeRef m = (__bridge CGDisplayModeRef)o;
-            if (CGDisplayModeGetWidth(m) == w && CGDisplayModeGetHeight(m) == h) {
+            if (CGDisplayModeGetWidth(m) == w && CGDisplayModeGetHeight(m) == h &&
+                (CGDisplayModeGetPixelWidth(m) == 2 * w) == retina) {
                 want = m;
                 break;
             }
@@ -42,6 +45,10 @@ int main(int argc, char **argv) {
         CGDisplayModeRef now = CGDisplayCopyDisplayMode(d);
         show(now, "now ");
         CGDisplayModeRelease(now);
+        if (secs == 0) {   // stays (for the login session)
+            CGDisplayModeRelease(cur);
+            return e == kCGErrorSuccess ? 0 : 1;
+        }
         [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:secs]];
         e = CGDisplaySetDisplayMode(d, cur, NULL);
         printf("back -> %d\n", e);

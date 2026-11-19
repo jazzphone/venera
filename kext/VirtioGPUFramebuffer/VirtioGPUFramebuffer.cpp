@@ -38,11 +38,16 @@ struct Mode {
     uint32_t height;
 };
 
-// Mode IDs are index + 1. The host's preferred size is added if it isn't here.
-const Mode kBaseModes[] = {{1024, 768}, {1280, 800}, {1440, 900}, {1680, 1050}, {1920, 1080}};
-constexpr unsigned kMaxModes = 8;
-constexpr uint32_t kMaxWidth = 1920;
-constexpr uint32_t kMaxHeight = 1200;
+// Mode IDs are index + 1. The host's preferred size is added if it isn't here. The larger ones are for Retina: with
+// Venera's display override (install.sh: scale-resolutions for QEMU's display), macOS offers 2560x1600 as "looks like
+// 1280x800" at twice the pixels, which a Retina Mac's Screen Sharing shows sharp. VRAM is sized for the largest mode
+// (3840x2160: 32 MB of contiguous RAM); when that much isn't there, the modes above 1920x1200 go.
+const Mode kBaseModes[] = {{1024, 768},  {1280, 800},  {1440, 900},  {1680, 1050}, {1920, 1080},
+                           {1920, 1200}, {2560, 1440}, {2560, 1600}, {2880, 1800}, {3840, 2160}};
+constexpr unsigned kMaxModes = 12;
+constexpr uint32_t kMaxWidth = 3840;
+constexpr uint32_t kMaxHeight = 2400;
+constexpr uint32_t kSmallArea = 1920 * 1200; // the fallback's largest
 constexpr uint32_t kFlushIntervalMs = 33;
 constexpr uint32_t kVblIntervalUs = 16667; // 60 Hz, the rate the modes advertise
 constexpr unsigned kMaxVblClients = 4;
@@ -216,12 +221,38 @@ bool VirtioGPUFramebuffer::start(IOService *provider) {
         preferredMode_ = 2; // 1280x800
     }
 
-    vramBytes_ = round_page(kMaxWidth * kMaxHeight * 4);
-    vram_ = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
-        kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous, vramBytes_, 0xFFFFFFFFFFFFF000ULL);
-    if (!vram_ || vram_->prepare() != kIOReturnSuccess) {
+    for (int attempt = 0; attempt < 2 && !vram_; attempt++) {
+        uint32_t area = 0;
+        for (unsigned i = 0; i < modeCount_; i++) {
+            area = modes_[i].width * modes_[i].height > area ? modes_[i].width * modes_[i].height : area;
+        }
+        vramBytes_ = (uint32_t)round_page(area * 4);
+        vram_ = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+            kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous, vramBytes_, 0xFFFFFFFFFFFFF000ULL);
+        if (vram_ && vram_->prepare() != kIOReturnSuccess) {
+            OSSafeReleaseNULL(vram_);
+        }
+        if (!vram_ && attempt == 0) { // keep the modes up to 1920x1200 (the preferred one too, if it fits)
+            log("VRAM allocation (%u bytes) failed: modes up to 1920x1200 only", vramBytes_);
+            const Mode prefMode = modes_[preferredMode_ - 1];
+            unsigned n = 0;
+            preferredMode_ = 0;
+            for (unsigned i = 0; i < modeCount_; i++) {
+                if (modes_[i].width * modes_[i].height <= kSmallArea) {
+                    modes_[n++] = modes_[i];
+                    if (modes_[i].width == prefMode.width && modes_[i].height == prefMode.height) {
+                        preferredMode_ = (IODisplayModeID)n;
+                    }
+                }
+            }
+            modeCount_ = n;
+            if (!preferredMode_) {
+                preferredMode_ = 2; // 1280x800
+            }
+        }
+    }
+    if (!vram_) {
         log("VRAM allocation (%u bytes) failed", vramBytes_);
-        OSSafeReleaseNULL(vram_);
         OSSafeReleaseNULL(edid_);
         nub_ = nullptr;
         return false;
@@ -359,6 +390,9 @@ IOReturn VirtioGPUFramebuffer::getInformationForDisplayMode(IODisplayModeID id,
     info->refreshRate = 60 << 16;
     info->maxDepthIndex = 0;
     info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag;
+    if (m->width >= 2560) { // can back a Retina mode (the display override's scale-resolutions name these sizes)
+        info->flags |= kDisplayModeValidForHiResFlag;
+    }
     if (id == preferredMode_) {
         info->flags |= kDisplayModeDefaultFlag;
     }

@@ -74,6 +74,10 @@ if [ -d /System/Library/Extensions/VirtioGPUMetal.bundle ]; then
   fi
 fi
 run rm -rf /Library/GPUBundles/VirtioGPUMetal.bundle /Library/GPUBundles/Venera
+# the Retina display override (Venera's, for QEMU's display)
+OVR=/Library/Displays/Contents/Resources/Overrides/DisplayVendorID-4914
+[ -e "$OVR/DisplayProductID-1234" ] && run rm -f "$OVR/DisplayProductID-1234"
+[ -d "$OVR" ] && rmdir "$OVR" 2>/dev/null
 for f in /Library/GPUBundles/VirtioGPUMetal-*; do [ -e "$f" ] && run rm -f "$f"; done
 # translated shaders (and WindowServer's display snapshots) every process kept, in its own cache folder
 # These folders are the users': root never walks one with rm (a user could swap a folder for a link mid-delete and

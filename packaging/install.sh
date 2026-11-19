@@ -14,6 +14,7 @@
 #      (/System/Library/Extensions, a new blessed snapshot: sysvol.sh) where Safari's sandboxed graphics process can
 #      load it, and /Library/GPUBundles/VirtioGPUMetal.bundle pointing at it; and the watcher (local.venera.watch),
 #      which keeps it there across macOS updates, asking before it reinstalls
+#      ... and the Retina display override (/Library/Displays/.../DisplayVendorID-4914/DisplayProductID-1234)
 #   5. the Venera app (/Applications/Venera.app, started at login by local.venera.helper): it asks the watcher's
 #      questions as notifications and shows what runs; --no-app leaves it out (the watcher then asks in dialogs)
 #   6. the guest agent (local.venera.agent): Proxmox's `qm agent` and `qm guest` (shutdown from the Proxmox page, the
@@ -552,6 +553,31 @@ if [ $NO_SYSVOL = 0 ]; then
   else
     SYSVOL="kept copy until authenticated root is off (then the watcher offers the system-volume copy; Safari's WebGL needs it)"
   fi
+fi
+# Retina: macOS's display override for QEMU's display (vendor 0x4914 "RHT", product 0x1234) with scale-resolutions,
+# so the framebuffer's larger modes are offered at twice the pixels too (2560x1600 as "looks like 1280x800")
+OVR=/Library/Displays/Contents/Resources/Overrides/DisplayVendorID-4914
+run mkdir -p "$OVR"
+if [ $DRY = 0 ]; then
+  cat >"$OVR/DisplayProductID-1234" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>DisplayProductName</key><string>Venera (QEMU display)</string>
+  <key>DisplayVendorID</key><integer>18708</integer>
+  <key>DisplayProductID</key><integer>4660</integer>
+  <key>scale-resolutions</key>
+  <array>
+    <data>AAAKAAAABaAAAAABACAAAA==</data>
+    <data>AAAKAAAABkAAAAABACAAAA==</data>
+    <data>AAALQAAABwgAAAABACAAAA==</data>
+    <data>AAAPAAAACHAAAAABACAAAA==</data>
+  </array>
+</dict>
+</plist>
+PLIST
+  chmod 644 "$OVR/DisplayProductID-1234"
 fi
 # the watcher
 run cp "$PAYLOAD/Support/local.venera.watch.plist" /Library/LaunchDaemons/
