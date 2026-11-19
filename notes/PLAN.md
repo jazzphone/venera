@@ -1754,7 +1754,9 @@ After the release, the same day:
   restarts OpenCore's menu defaults to macOS Base System (its first entry), not the installer or the disk macOS chose
   (RequestBootVarRouting and WriteFlash are on), so someone has to pick at the menu three times; the script now says so
   instead of "it picks by itself". Setup Assistant needs an account password, and the guest agent is still a manual
-  build: the rest is a person's.
+  build: the rest is a person's. The owner made the account (2026-11-19): Setup Assistant then sat on its last screen
+  (software drawing, no driver yet) until a restart, after which the login window and the desktop came up. The VM
+  README and the script's closing steps now say so; a fix would mean Venera in before Setup Assistant.
 
 ## Round 17 (2026-11-18): window pieces left behind in a fast drag
 

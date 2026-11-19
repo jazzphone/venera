@@ -43,6 +43,16 @@ cores, memory, disk, the screen size at boot, and optionally your Mac's identity
 Then, in the VM's console: install macOS from the recovery, open **Install Venera** on the Venera disk (Finder's
 sidebar, Locations), and restart when it says so. Run the script again and choose **Finish**.
 
+What to expect on the way, before Venera is in:
+
+- **OpenCore's menu at each restart.** The installer restarts the VM a few times, and OpenCore's menu starts on macOS
+  Base System each time, not where the install is going: press an arrow key within 5 seconds to stop it, then pick
+  macOS Installer while it installs, and Macintosh HD once it has (macOS Base System again goes back to the recovery).
+- **Setup Assistant can stop on its last screen.** Without a graphics driver macOS draws in software, and the last
+  step into the desktop can sit there for good. If it hasn't moved in a few minutes, restart the VM from the Proxmox
+  page (Reboot, or Stop and Start): the account is already made, and macOS starts at the login window. The desktop is
+  plain (no wallpaper) and slow until Venera is installed.
+
 Without your Mac's identity the VM keeps OpenCore's shared sample serial, as an iMac20,1 (a model Tahoe supports), and
 must not be signed into iCloud until you add yours (the script's third choice for an existing VM).
 
