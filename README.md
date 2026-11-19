@@ -1,35 +1,78 @@
 # Venera
 
-Accelerated graphics for x86_64 macOS virtual machines on QEMU/KVM, with no GPU passthrough. Venera is a
-virtio-gpu driver for macOS: the guest's Metal runs on the host's GPU through virtio-gpu's Venus (Vulkan) protocol,
-WindowServer composites the desktop with it, and finished frames go to the screen straight from the host GPU.
+**Accelerated graphics for macOS virtual machines on Proxmox and QEMU/KVM, with no GPU passthrough.**
+
+Venera is a virtio-gpu driver for macOS. The guest's Metal runs on the host's GPU through virtio-gpu's Venus (Vulkan)
+protocol: WindowServer composites the desktop with Metal, every app gets Metal and OpenGL, video decodes and encodes
+on the host GPU, and finished frames go to the screen straight from the host GPU. The host GPU isn't handed to the
+VM: it stays the host's, and several VMs can share it.
 
 Named after the Soviet Venera probes, the first to reach Venus, the protocol it speaks.
 
-**Status: experimental, home-lab.** Tested on macOS Tahoe 26.7.3 (25G342) in a Proxmox VE 9.2 VM (pve-qemu 11.1.3,
-virglrenderer 1.1.0) on an Intel Iris Xe host. Window drags, scrolling, live resize and minimizing run at 40-60 fps;
-screenshots, display sleep and the Dock's window previews work; when anything goes wrong the desktop falls back to
-software compositing by itself. Every app gets Metal and OpenGL from the host GPU (Safari's WebGL included), and
-VideoToolbox decodes H.264, HEVC and VP9 and encodes H.264 and HEVC on the host's GPU with the host half installed.
-Its guest agent lets Proxmox treat macOS like its Linux and Windows guests: clean shutdowns from the Proxmox page, the
-VM's addresses on its Summary, `qm guest` commands, and the console's clipboard shared with macOS.
+## What it does
 
-## Install
+- **A GPU-accelerated macOS desktop.** WindowServer composites with Metal on the host GPU: window drags, scrolling,
+  live resize and minimizing at 45-60 fps, with the Liquid Glass look, translucency and animations intact.
+- **Metal and OpenGL for every app.** Safari (with WebGL, optionally), Preview, QuickTime, Maps, Photos, Freeform and
+  the rest run their graphics on the host GPU; Core Image, Core Animation and games' OpenGL go through the driver.
+- **Hardware video.** VideoToolbox decodes H.264, HEVC (up to 4K, 10-bit) and VP9 and encodes H.264 and HEVC on the
+  host's GPU (Intel VA-API on the host), so YouTube, video calls and exports don't load the VM's CPU.
+- **A first-class Proxmox guest.** Venera's guest agent gives Proxmox clean shutdowns, the VM's IP addresses on its
+  Summary page and `qm guest` commands, like its Linux and Windows guests; the console's clipboard is shared with macOS.
+- **A macOS VM in one command.** The setup script creates a macOS Tahoe VM ready for Venera: Venera's own OpenCore
+  build, macOS downloaded from Apple, a Mac identity (serial, board serial, Wi-Fi address) generated for the VM's
+  model, and HA clusters handled (every node set up).
+- **Venera from macOS Recovery.** One command in Recovery installs macOS with Venera already in, so Setup Assistant
+  runs on the host's GPU; the same command repairs or removes Venera when a desktop is broken.
+- **Safe by default.** If anything goes wrong, the desktop falls back to software compositing by itself; a watcher
+  keeps the driver in place across macOS updates and asks before it acts; the Venera app (menu bar) says when
+  something needs you; `uninstall.sh` takes everything out again.
 
-Download a release (or build one, below), then follow [docs/INSTALL.md](docs/INSTALL.md): the host needs
-`virtio-vga-gl` with Venus and blob resources, the guest OpenCore with SIP and AMFI relaxed, and `install.sh` does
-the rest. `uninstall.sh` removes everything again.
+## Quick start
 
-For a new VM on Proxmox, `proxmox-macos-vm.sh` in the host package does all of that before macOS is installed: it
-checks the host's GPU, installs what the host needs (on each cluster node), creates a macOS Tahoe VM with OpenCore,
-SIP and AMFI already set, and attaches the Venera Tools CD with the installer package ([vm/README.md](vm/README.md)).
-Each release also has the Venera Tools CD on its own (`Venera-Tools-VERSION.iso`), for installing with no network.
-From macOS Recovery, the CD's `install-venera` installs macOS with Venera already in (Setup Assistant runs on the
-host's GPU), puts Venera onto an installed macOS, or takes it out again ([INSTALL.md](docs/INSTALL.md), "From macOS
-Recovery").
-The script carries what a VM needs (Venera's own OpenCore image, built from acidanthera's OpenCore, and
-`macrecovery.py`), so making a VM downloads only macOS from Apple, or nothing when you bring your own macOS disk or
-installer.
+On a Proxmox VE node's shell (Datacenter > your node > **Shell**), paste:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/jazzphone/venera/main/get-venera.sh)"
+```
+
+It downloads the newest release's host package, checks it, and starts the setup script, which asks a few questions
+and shows its plan before it changes anything. Then start the VM, and in macOS Recovery erase the disk and run one
+command. **[docs/SETUP.md](docs/SETUP.md) walks through it, screen by screen.**
+
+## Requirements
+
+| | |
+|---|---|
+| Host | Proxmox VE 9 (tested: 9.2), or QEMU 9.2+ built with virglrenderer 1.0+ (Venus) on Linux |
+| Host GPU | a GPU with a Vulkan 1.3 driver that exports dma-bufs: Intel (tested: Iris Xe, Mesa ANV) or AMD (Mesa RADV, untested); hardware video needs an Intel GPU (VA-API) |
+| Guest | macOS Tahoe (tested: 26.7.3), x86_64, booted through OpenCore |
+
+## Status
+
+**Experimental, home-lab.** Tested on macOS Tahoe 26.7.3 (25G342) in Proxmox VE 9.2 (pve-qemu 11.1.3,
+virglrenderer 1.1.0) on an Intel Iris Xe host, in daily use there. Known limits:
+
+- One display, 1024x768 to 1920x1080; no HDR yet.
+- Proxmox's noVNC console shows at most ~33 fps (QEMU's VNC refresh); the guest draws at 50-60. SPICE, or a display
+  that isn't VNC, shows the rest.
+- A newer macOS than the tested one can fall back to the software desktop until Venera is tested on it: turn off
+  automatic macOS updates in the VM.
+- NVIDIA host GPUs are untested; Apple silicon hosts and arm64 macOS are out of scope.
+- A generated Mac identity is unique but not registered with Apple: iCloud and iMessage may refuse it. Use your own
+  Mac's identity for those.
+
+Take a VM snapshot or backup before installing. Bugs and questions: GitHub issues.
+
+## Documentation
+
+- [docs/SETUP.md](docs/SETUP.md): a new macOS VM with Venera, step by step.
+- [docs/INSTALL.md](docs/INSTALL.md): Venera in depth: installing by hand or from Recovery, security settings,
+  hardware video, recovery, uninstalling, tuning.
+- [vm/README.md](vm/README.md): everything the VM script does, and its choices for an existing VM (Finish, Upgrade,
+  the Mac identity, moving to Venera's OpenCore).
+- [notes/PLAN.md](notes/PLAN.md): the research and build log, round by round, with the measurements behind each
+  decision.
 
 **What it depends on.** Everything Venera is built from outside this repository (OpenCorePkg, Mesa, FFmpeg, NullMoth's
 translator, the build image) is listed with its checksum in `packaging/UPSTREAM`, and each release has a
@@ -115,11 +158,15 @@ what apps see of the display's VBLs (CVDisplayLink, a view's display link, Metal
 - `packaging/` — the release builder, installer, uninstaller and status script; `docs/` — the install guide.
 - `tools/` — build, deploy and measurement scripts; `notes/` — plan, findings, device dumps.
 - `vm/` — the script that makes a macOS VM on Proxmox ready for Venera (MIT).
+- `get-venera.sh` — the one-line setup: downloads the newest release's host package and starts the VM script.
 
 ## License
 
 PolyForm Noncommercial 1.0.0 (`LICENSE`): free for personal, research and other noncommercial use. Mesa's parts are
 MIT and the translator is LGPL-3.0-or-later; [NOTICE.md](NOTICE.md) has the details.
+
+Venera is not affiliated with or endorsed by Apple. Apple's macOS license permits running macOS only on
+Apple-branded hardware: whether and how you run macOS in a VM is your responsibility.
 
 Venera stands on [nvidia-macos-driver](https://github.com/nullmoth/nvidia-macos-driver) (NullMoth Systems), whose
 reconstructed IOAcceleratorFamily2 headers, Metal plugin approach and translator made a third-party Metal driver
