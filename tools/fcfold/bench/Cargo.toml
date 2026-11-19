@@ -1,0 +1,14 @@
+# fcfold bench: the translator's per-set path on a dumped function (VirtioGPUMetal-fcdump), and plain translation of a
+# text (--ll), and its SPIR-V disassembled (--dis). Builds against the translator checkout tools/build-translator.sh uses.
+#   CARGO_HOME=~/src/vendor-src/cargo-home cargo build --release
+#   target/release/fcb DUMP-BASE N                 specialize, then translate, N sets (FCB_DUMP=DIR writes each text)
+#   target/release/fcb --ll TEXT.ll fragment OUT.spv
+#   target/release/fcb --dis OUT.spv
+[package]
+name = "fcb"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+metal2vulkan = { path = "../../../../vendor-src/nvidia-macos-driver/translator/translator", features = ["serde"] }
+[profile.release]
+debug = 1

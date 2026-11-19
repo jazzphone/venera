@@ -4,3 +4,5 @@ dist/
 tools/local.env
 hostvideo/fuzz/out/
 hostvideo/fuzz/gen/
+tools/fcfold/bench/target/
+tools/fcfold/bench/Cargo.lock
