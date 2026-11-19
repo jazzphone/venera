@@ -71,12 +71,16 @@ A release is these files, each attached to its GitHub release:
 |---|---|
 | `Venera-VERSION.tar.gz` | the guest's files and `install.sh` |
 | `Install Venera VERSION.pkg` | the same as an installer package |
-| `Venera-Tools-VERSION.iso` | the package on a CD image, for a VM with no network |
+| `Venera-Tools-VERSION.iso` | the package on a CD image, for a VM with no network, and for macOS Recovery `install-venera` with `Recovery/` (the release's tarball, `Venera Stage.pkg` and the choice packages), all built by `make-pkg.sh` from the same release |
 | `Venera-host-VERSION.tar.gz` | the Proxmox host's half: hardware video, `install-host.sh` (with `TESTED`), the VM script with Venera's OpenCore image and `macrecovery.py`, the guest package and Tools CD |
 | `Venera-sources-VERSION.tar` | everything it was built from, to rebuild it offline (`tools/make-sources.sh`) |
 
 Before a release: `install-host.sh --record` on the test host into `packaging/host/TESTED`, and any new upstream
-version with its checksum in `packaging/UPSTREAM`.
+version with its checksum in `packaging/UPSTREAM`. And the release's Tools CD from macOS Recovery on a test VM (never
+the build or daily VMs): `install-venera` before macOS is installed (erase, then it installs macOS with Venera; the
+VM comes back at Setup Assistant on the host's GPU with the app and the guest agent), onto an installed macOS, and
+`install-venera remove`; and both recoveries (the installer's macOS Base System and an installed macOS's Recovery)
+come up with a picture while Venera is installed.
 
 For development against a test VM, `tools/deploy.sh` builds and installs pieces over the Proxmox host's guest agent
 (set the host in `tools/local.env`, from `tools/local.env.example`); `tools/gesture-bench.sh` and
