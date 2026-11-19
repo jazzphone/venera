@@ -811,9 +811,8 @@ if [ -n "$BYO_DISK" ]; then
 else
 echo "== Done: VM $VMID ($NAME). Start it from the Proxmox web page, open its Console, and install macOS Tahoe:"
 echo "   at OpenCore's menu pick $([ -n "$BYO_INST" ] && echo "your installer (Install macOS ..., or macOS Base System)" || echo "the macOS Base System"); Disk Utility > View > Show All Devices > erase the VirtIO disk"
-echo "   (APFS, GUID Partition Map) > back, Reinstall macOS Tahoe. It restarts a few times: if OpenCore's menu starts on"
-echo "   macOS Base System then, press an arrow key within 5 s to stop it, and pick macOS Installer while it installs and"
-echo "   Macintosh HD once it has (macOS Base System again goes back to the recovery). Setup Assistant can stop on its"
+echo "   (APFS, GUID Partition Map) > back, Reinstall macOS Tahoe. It restarts three times, and OpenCore follows it by"
+echo "   itself (into the installer, then Macintosh HD). Setup Assistant can stop on its"
 echo "   last screen with no graphics driver yet: if it hasn't moved in a few minutes, restart the VM (Reboot, or Stop and"
 echo "   Start); the account is made, and macOS starts at the login window."
 fi

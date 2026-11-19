@@ -51,10 +51,10 @@ macOS down cleanly and show its addresses, and what Finish and Upgrade talk to. 
 
 What to expect on the way, before Venera is in:
 
-- **OpenCore's menu at each restart.** The installer restarts the VM a few times. With KVM-Opencore's OpenCore 1.0.0
-  the menu started on macOS Base System each time instead of where the install was going; if Venera's OpenCore does
-  too, press an arrow key within its 5 seconds to stop it, then pick macOS Installer while it installs, and Macintosh
-  HD once it has (macOS Base System again goes back to the recovery).
+- **OpenCore's menu at each restart.** The installer restarts the VM three times, and Venera's OpenCore follows it by
+  itself: the first time straight into the installer (no menu), then with Macintosh HD chosen in its menu (seen in a
+  whole install, 2026-11-19). Nothing to pick. (KVM-Opencore's OpenCore 1.0.0 started on macOS Base System each time,
+  which went back to the recovery.)
 - **Setup Assistant can stop on its last screen.** Without a graphics driver macOS draws in software, and the last
   step into the desktop can sit there for good. If it hasn't moved in a few minutes, restart the VM from the Proxmox
   page (Reboot, or Stop and Start): the account is already made, and macOS starts at the login window. The desktop is
