@@ -1310,6 +1310,7 @@ static void engine_tick(void) {
             pump(&sessions[i]);
         }
     }
+    enc_tick();
 }
 static void engine_uuid_gone(const uint8_t *uuid) {
     session *s = find_session(uuid);
@@ -1928,6 +1929,7 @@ static void run_queue(void) {
 static int replay(int argc, char **argv) {
     shm = mmap(NULL, VV_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);   // page-aligned, as the real one
     out.msg = rp_msg, out.fill = rp_fill, out.pull = rp_pull;
+    enc_cfr_now = 1;
     for (int i = 0; i < argc; i++) {
         FILE *f = fopen(argv[i], "rb");
         if (!f) {

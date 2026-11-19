@@ -66,6 +66,7 @@ typedef struct {
     int64_t sent;
     uint64_t cfr_req;                    // an ecfr waiting for the frames before it
     int cfr_wait;
+    int64_t cfr_at;                      // when its answer may go (enc_answer_cfr)
 } encsession;
 static encsession encs[MAX_ENC];
 static int enc_h264, enc_hevc;           // what the GPU's driver encodes (found when the device opens)
@@ -80,6 +81,16 @@ static encsession *find_enc(const uint8_t *uuid) {
 }
 
 static void enc_answer_frame(encsession *s, enc_frame *f, uint32_t inf);
+static void enc_answer_cfr(encsession *s);
+// Now and then (the daemon's loop, every 50 ms at most): CompleteFrames answers whose wait is over.
+static void enc_tick(void) {
+    for (int i = 0; i < MAX_ENC; i++) {
+        if (encs[i].used && encs[i].cfr_wait) {
+            enc_answer_cfr(&encs[i]);
+        }
+    }
+}
+
 static void enc_close(encsession *s) {
     avcodec_free_context(&s->c);
     av_buffer_unref(&s->frames);
@@ -539,8 +550,26 @@ static void enc_answer_frame(encsession *s, enc_frame *f, uint32_t inf) {
     free(r.p);
 }
 
+// The answer to CompleteFrames, once every frame before it is out, and 20 ms later (engine_tick comes back for it). The
+// guest's encoder service hands each Eemt's frame to the app on a queue of its own, and an answer that came right
+// behind the last Eemt sometimes reached the app first: CompleteFrames returned a frame short, which an AVFoundation
+// export drops (about 1 run in 20 at 1080p; 0 in 100 with the wait).
+#define ENC_CFR_WAIT_NS 20000000LL
+static int64_t enc_now_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000000000LL + t.tv_nsec;
+}
+static int enc_cfr_now;   // the replay: no loop comes back, so no wait
 static void enc_answer_cfr(encsession *s) {
     if (s->cfr_wait && !s->nq) {
+        if (!s->cfr_at && !enc_cfr_now) {
+            s->cfr_at = enc_now_ns() + ENC_CFR_WAIT_NS;
+        }
+        if (!enc_cfr_now && enc_now_ns() < s->cfr_at) {
+            return;
+        }
+        s->cfr_at = 0;
         buf r = {0};
         msg_header(&r, "ecfr", 4, s->uuid, s->cfr_req);
         field_s32(&r, "err", 0);
@@ -854,6 +883,7 @@ static int enc_msg(const msg *m, const char *t, const struct vv_surf *surfs, int
     } else if (!strcmp(t, "ecfr")) {
         s->cfr_req = m->req;
         s->cfr_wait = 1;
+        s->cfr_at = 0;
         enc_collect(s);   // answers when the frames before it are out
         return 1;
     } else if (!strcmp(t, "einv")) {
