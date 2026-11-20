@@ -2148,3 +2148,11 @@ TRIM, Upgrade without a USB disk, Retina modes, a faster first boot (a warm-up a
   released and patched services ran the same (one failed attempt, then ready), with the snapshot moved aside too. Not
   shipped (each synchronous frame would drain and replay a GOP: thumbnails and Quick Look decode that way). Next time
   it happens: verbose (SIGUSR1) dumps the messages in the service's state directory; tools/pvhost replays them.
+  Caught again 2026-11-20 on VM 109, a second user's first login (Setup Assistant on screen): the aerials extension's
+  first decode ("Handling frame during still", a synchronous VTDecompressionSessionDecodeFrame) never returned: its
+  thread waited on VideoToolbox's send lock, held by the paravirtualization queue's thread inside VeneraVideo's
+  method 3. FigVideoQueue: 0 frames enqueued, all along; venera-videod meanwhile took 28,653 frames (162 a second) for
+  that session. No "failed to create decoded pixel buffer" this time. RunningBoard suspended the extension 60 s after
+  its launch (its launch assertion ran out with nothing shown), so the screen stayed black; killing the extension
+  brought the background back (a still, the extension not relaunched). Earlier the same day the first user's first
+  frame took 28 s: the wallpaper shows only when its first frame beats that 60 s.
