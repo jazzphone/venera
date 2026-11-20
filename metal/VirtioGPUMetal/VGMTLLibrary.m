@@ -1359,7 +1359,7 @@ static VGMTLFunction *vg_library_read(VGMTLLibrary *lib, NSData *blob, NSString 
         static dispatch_once_t once;
         dispatch_once(&once, ^{
             cache = [NSCache new];
-            cache.countLimit = 1024;
+            cache.countLimit = 4096;   // Core Image's two ci_stdlib libraries alone have 792 modules
         });
         NSMutableDictionary *info = [cache objectForKey:blob];
         NSString *ll = info[@"ll"];
@@ -1721,7 +1721,7 @@ static void vg_library_add_module(id<MTLDevice> device, NSString *ll, BOOL noVis
 
 // A metallib's function table (MTLB: the header's function list, each entry's NAME and its bitcode's place, OFFT's
 // third offset into the bitcode section): name -> its bitcode wrapper, nothing converted. Nil when the file isn't
-// one, or any entry doesn't check out (then the whole library is read as before). entriesOnly: only vertex, fragment
+// one, or any entry doesn't check out, or it names no module (then the whole library is read as before). entriesOnly: only vertex, fragment
 // and kernel functions (TYPE 0-2), as the old reading listed a library loaded without its visible functions (Core
 // Image's: it asks for every name a library lists).
 static NSDictionary<NSString *, NSData *> *vg_metallib_table(NSData *lib, BOOL entriesOnly, NSArray **all) {
@@ -1801,7 +1801,10 @@ static NSDictionary<NSString *, NSData *> *vg_metallib_table(NSData *lib, BOOL e
     if (all) {
         *all = blobs.allValues;
     }
-    return t.count ? t : nil;
+    // A library that lists nothing to ask for by name (Core Image's ci_stdlib under entriesOnly: functions without
+    // entry points, read only as a dynamic library's modules) is still read lazily: it was read whole at each load,
+    // 0.8 s for each icon iconservicesagent drew (its Core Image context is dropped between icons).
+    return t.count || blobs.count ? t : nil;
 }
 
 id<MTLLibrary> vg_new_library(id<MTLDevice> device, NSData *lib, NSError **error) {
