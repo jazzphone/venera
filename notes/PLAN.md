@@ -2037,3 +2037,41 @@ blob flips flush the whole screen to QEMU, and Screen Sharing captures the same 
   choice 3's model and identity (which now defaults to the VM's model). Choices 3/5/6 offer to shut a running VM down.
   A new VM's screen size sets the desktop too. Tested on VM 108 (snapshot, rolled back): 1920x1080 Metal desktop.
   Released as v0.1.8 (pre-release); nothing inside macOS changed.
+
+## Round 22 (2026-11-19): before 0.1.9
+
+The owner's list (1-7, then 9 and 10): checks on GitHub, a warning before Proxmox updates replace tested packages,
+TRIM, Upgrade without a USB disk, Retina modes, a faster first boot (a warm-up and faster translation), AMD hosts
+(experimental), and an install with nobody at the keyboard.
+
+- **GitHub checks** (.github/workflows/checks.yml): every script parses (macOS's in its bash 3.2) and passes
+  ShellCheck's errors (it found three), vm/test.sh with OpenCorePkg's pinned zip, and the guest agent's protocol on
+  macOS. vm/test.sh's older config is optional (the sample stands in).
+- **The apt hook** (packaging/host/apt-check, /etc/apt/apt.conf.d/80venera): before apt installs, it names each
+  TESTED package changing version and how to check and go back; warns only. Container test 28/28.
+- **TRIM on thin storage**: discard=on and OpenCore's SetApfsTrimTimeout -1 (asked for a new VM on thin storage,
+  startup setting 7). VM 108 (local-lvm): 100% -> 43.7% allocated at the next boot.
+- **Upgrade through the agent**: guest-file-write in 4 MB pieces through mon_cmd (PVE routes guest-* to QGA), checked
+  by SHA-256; the USB disk only for an agent that can't. The restart is checked by boot time (the installer
+  restarts the agent and one restart request went nowhere).
+- **Retina and 4K**: framebuffer 0.6.0 (modes to 3840x2160, HiRes flag from 2560 wide, VRAM for the largest mode with
+  a 1920x1200 fallback), install.sh's display override for QEMU's display (0x4914/0x1234, scale-resolutions). The
+  first try came up black: WindowServer's display surfaces at 16-33 MB couldn't get contiguous RAM
+  (VidMemory allocPhysical). Accelerator 0.7.0 keeps one spare contiguous block from its start (36.9 MB), shared
+  by allocations that can't get their own (nothing reads that memory). 1280x800 and 1920x1080 Retina on VM 108: the
+  host gets 2560x1600 and 3840x2160 frames.
+- **First boot**: the translator patch (packaging/translator/0001: fc_fold.rs, fold.py in Rust, by a subagent) and
+  the warm-up (warm.txt: 79 sets WindowServer asked for, names and numbers only; background translation on the
+  other cores). Cold start on VM 108 (caches cleared, same apps, 5 min): WindowServer waited 117 s -> 56 s. One set
+  (fixed_frag_lph_cpf) still took 21 s with the background busy: the next lever, with the translator's own time.
+- **AMD hosts**: Haswell-noTSX with vendor GenuineIntel in place of -cpu host (no OpenCore patches), asked first. That
+  model booted VM 108 to Venera's Metal desktop on the Intel host; no AMD host to try.
+- **Nobody at the keyboard**: install-venera auto (finds the empty disk, erases it, startosinstall with Venera), the
+  VM script types it into the recovery's Terminal through QMP send-key (Control-F2, Utilities, Terminal; the screen's
+  mean brightness and stillness say the recovery is up; the disk's first writes say the command ran), waits for the
+  agent and runs Finish; --answers FILE (vm/answers.example) answers every question. VM 111 end to end on node 2:
+  ~38 min to Venera's agent, Finish, Setup Assistant.
+- **Found on the way: HEIF hung Setup Assistant.** VM 111's Setup Assistant stayed black (no window, on the basic
+  display too): its main thread waited on CMPhoto decoding a HEIF image, whose tiles (dtil, dsts) venera-videod
+  answered "no error" with no picture. Now "unsupported", and the guest decodes in software; Setup Assistant came up.
+  The hosts had logged 308 such requests in 5 days (VM 107 too).
