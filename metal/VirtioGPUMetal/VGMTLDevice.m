@@ -550,7 +550,7 @@ static char kVGTwinKey;
 // "function=compute_average_luma": MTLIOAccelDevice's own version returned nil without an error).
 - (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d
                                                                error:(NSError **)error {
-    return vg_new_compute_pipeline(self, d.computeFunction, error);
+    return vg_new_compute_pipeline_sd(self, d.computeFunction, d.stageInputDescriptor, error);
 }
 // Completion-handler forms, answered synchronously (the base class's would not reach our pipelines either).
 - (void)newComputePipelineStateWithFunction:(id<MTLFunction>)f
@@ -570,7 +570,7 @@ static char kVGTwinKey;
                                       options:(MTLPipelineOption)o
                             completionHandler:(MTLNewComputePipelineStateWithReflectionCompletionHandler)handler {
     NSError *e = nil;
-    id<MTLComputePipelineState> p = vg_new_compute_pipeline(self, d.computeFunction, &e);
+    id<MTLComputePipelineState> p = vg_new_compute_pipeline_sd(self, d.computeFunction, d.stageInputDescriptor, &e);
     handler(p, nil, e);
 }
 - (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d
@@ -591,7 +591,7 @@ static char kVGTwinKey;
                                                              options:(MTLPipelineOption)o
                                                           reflection:(MTLAutoreleasedComputePipelineReflection *)r
                                                                error:(NSError **)error {
-    id<MTLComputePipelineState> p = vg_new_compute_pipeline(self, d.computeFunction, error);
+    id<MTLComputePipelineState> p = vg_new_compute_pipeline_sd(self, d.computeFunction, d.stageInputDescriptor, error);
     if (r) {
         *r = p ? vg_compute_reflection(d.computeFunction) : nil;
     }

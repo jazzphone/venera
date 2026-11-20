@@ -1,0 +1,94 @@
+diff --git a/translator/translator/src/passes/mod.rs b/translator/translator/src/passes/mod.rs
+index 3bfc0cc..bfe1ebb 100644
+--- a/translator/translator/src/passes/mod.rs
++++ b/translator/translator/src/passes/mod.rs
+@@ -39,6 +39,8 @@ pub enum StageInFormat {
+     UInt3,
+     UInt4,
+     Half2,
++    /// Three halves in six bytes (VFX's blend kernels for AvatarKit's Memoji read them at an 8-byte stride).
++    Half3,
+     Half4,
+     UChar4Normalized,
+ }
+@@ -47,6 +49,7 @@ impl StageInFormat {
+     pub fn bytes(self) -> u32 {
+         match self {
+             Self::Float | Self::Int | Self::UInt | Self::Half2 | Self::UChar4Normalized => 4,
++            Self::Half3 => 6,
+             Self::Float2 | Self::Int2 | Self::UInt2 | Self::Half4 => 8,
+             Self::Float3 | Self::Int3 | Self::UInt3 => 12,
+             Self::Float4 | Self::Int4 | Self::UInt4 => 16,
+diff --git a/translator/translator/src/passes/resources/collapse.rs b/translator/translator/src/passes/resources/collapse.rs
+index d9df8b7..4f8852d 100644
+--- a/translator/translator/src/passes/resources/collapse.rs
++++ b/translator/translator/src/passes/resources/collapse.rs
+@@ -2471,7 +2471,8 @@ fn load_stage_in_attribute(
+     let offset_words = ctx.const_uint(attribute.offset / 4);
+     let first = emit(ctx, loads, Op::IAdd, uint_ty, vec![Operand::IdRef(scaled), Operand::IdRef(offset_words)]);
+ 
+-    let word_count = attribute.format.bytes() / 4;
++    // the words the element spans (a half3's six bytes are read as two)
++    let word_count = attribute.format.bytes().div_ceil(4);
+     let ptr_ty = ctx.ty_ptr(StorageClass::StorageBuffer, uint_ty);
+     let zero = ctx.const_uint(0);
+     let mut words = Vec::new();
+@@ -2523,7 +2524,7 @@ fn load_stage_in_attribute(
+                 }
+             }
+         }
+-        F::Half2 | F::Half4 => {
++        F::Half2 | F::Half3 | F::Half4 => {
+             let v2 = ctx.ty_vecf(2);
+             let ext = ctx.glsl();
+             for w in &words {
+@@ -2536,6 +2537,10 @@ fn load_stage_in_attribute(
+                     components.push(emit(ctx, loads, Op::CompositeExtract, float_ty, vec![Operand::IdRef(pair), Operand::LiteralBit32(lane)]));
+                 }
+             }
++            // a half3's second word holds its third half and two bytes past the attribute: those aren't a lane
++            if attribute.format == F::Half3 {
++                components.truncate(3);
++            }
+         }
+         F::UChar4Normalized => {
+             let v4 = ctx.ty_vecf(4);
+diff --git a/translator/wrapper/src/lib.rs b/translator/wrapper/src/lib.rs
+index 98cbde9..12748d3 100644
+--- a/translator/wrapper/src/lib.rs
++++ b/translator/wrapper/src/lib.rs
+@@ -70,7 +70,7 @@ pub extern "C" fn nvmtl_translate_set_kernel_stage_in(words: *const u32, count:
+     for i in 0..na as usize {
+         let Some(&[attribute, buffer_index, offset, fmt]) = take(4) else { return 0 };
+         let format = match fmt {
+-            9 => F::UChar4Normalized, 25 => F::Half2, 27 => F::Half4,
++            9 => F::UChar4Normalized, 25 => F::Half2, 26 => F::Half3, 27 => F::Half4,
+             28 => F::Float, 29 => F::Float2, 30 => F::Float3, 31 => F::Float4,
+             32 => F::Int, 33 => F::Int2, 34 => F::Int3, 35 => F::Int4,
+             36 => F::UInt, 37 => F::UInt2, 38 => F::UInt3, 39 => F::UInt4,
+@@ -1068,11 +1068,24 @@ mod stage_in_tests {
+         assert!(apply_tg(Default::default()).kernel_stage_in.is_empty(), "count 0 clears it");
+     }
+ 
++    #[test]
++    fn a_half3_attribute_is_accepted_and_spans_two_words() {
++        // VFX's blend kernels (AvatarKit's Memoji): one Half3 attribute in buffer 1 at an 8-byte stride
++        let words = [1u32, 0, 1, 0, 26, 1, 1, 8, 5, 1];
++        assert_eq!(nvmtl_translate_set_kernel_stage_in(words.as_ptr(), words.len() as u32), 1);
++        let o = apply_tg(Default::default());
++        let (attribute, layout) = o.kernel_stage_in.attribute(0).expect("attribute 0 is described");
++        assert_eq!(attribute.format, metal2vulkan::passes::StageInFormat::Half3);
++        assert_eq!(attribute.format.bytes().div_ceil(4), 2);
++        assert_eq!(layout.stride, 8);
++        assert_eq!(nvmtl_translate_set_kernel_stage_in(std::ptr::null(), 0), 1);
++    }
++
+     #[test]
+     fn a_truncated_or_unsupported_stage_input_layout_is_refused_and_leaves_nothing_set() {
+         let truncated = [1u32, 0, 1, 0];
+         assert_eq!(nvmtl_translate_set_kernel_stage_in(truncated.as_ptr(), 4), 0);
+-        let unsupported_format = [1u32, 0, 1, 0, 26, 0];
++        let unsupported_format = [1u32, 0, 1, 0, 53, 0];
+         assert_eq!(nvmtl_translate_set_kernel_stage_in(unsupported_format.as_ptr(), 6), 0);
+         let indexed_step = [1u32, 0, 1, 0, 30, 1, 1, 12, 7, 1];
+         assert_eq!(nvmtl_translate_set_kernel_stage_in(indexed_step.as_ptr(), 10), 0);

@@ -453,7 +453,10 @@ VkDescriptorSet vg_write_set(VGMTLCommandBuffer *cmd, VkDescriptorSetLayout dsl,
     BOOL _dynamic;          // ThreadsDynamic: the 48-byte region block at _pushOffset; otherwise Workgroups
     uint32_t _pushOffset;
     uint32_t _maxThreads;
-    BOOL _noop;             // a kernel reading [[stage_in]] (not supported yet): dispatches do nothing (see below)
+    BOOL _noop;             // a [[stage_in]] kernel with no layout it can read: dispatches do nothing (see below)
+    NSData *_stageIn;       // its stage-input layout, as the translator takes it (nil: none)
+    uint32_t _stageInSlot;  // the buffer slot the translator gave the [[stage_in]] parameter
+    uint32_t _stageInBuffer;   // the application's buffer it reads (the layout's buffer index)
     NSMutableDictionary<NSString *, VGComputeVariant *> *_variants;   // threadgroup-length key -> variant
     NSObject *_lock;
     id<MTLDevice> _dev;
@@ -488,7 +491,10 @@ VkDescriptorSet vg_write_set(VGMTLCommandBuffer *cmd, VkDescriptorSetLayout dsl,
             return v;
         }
         uint64_t t0 = mach_absolute_time();
+        void vg_translate_set_stage_in(const uint32_t *words, uint32_t count);
+        vg_translate_set_stage_in(_stageIn.bytes, (uint32_t)(_stageIn.length / 4));
         NSData *spv = vg_translate(_ll, "kernel", _fc, tg, kVGMaxThreadgroupSlots, error);
+        vg_translate_set_stage_in(NULL, 0);
         if (!spv) {
             return nil;
         }
@@ -562,7 +568,51 @@ VkDescriptorSet vg_write_set(VGMTLCommandBuffer *cmd, VkDescriptorSetLayout dsl,
 }
 @end
 
+// A compute pipeline's stage-input layout in the words nvmtl_translate_set_kernel_stage_in reads (NullMoth's
+// nvmtl_stage_in_words): attributes (index, buffer, offset, format), then the layouts of the buffers they name (buffer,
+// stride, step function, rate). Venera's kernels read one buffer for their [[stage_in]]: *buffer is it, or the reason.
+static NSString *vg_stage_in_words(MTLStageInputOutputDescriptor *sd, NSMutableData *words, uint32_t *buffer) {
+    uint32_t a[1 + 16 * 4 + 1 + 31 * 4], n = 1, na = 0, b = UINT32_MAX;
+    for (NSUInteger i = 0; i < 16; i++) {
+        MTLAttributeDescriptor *at = [sd.attributes objectAtIndexedSubscript:i];
+        if (at.format == MTLAttributeFormatInvalid) {
+            continue;
+        }
+        if (at.bufferIndex >= 31) {
+            return [NSString stringWithFormat:@"stage-in attribute %lu uses buffer %lu", (unsigned long)i, (unsigned long)at.bufferIndex];
+        }
+        if (b != UINT32_MAX && b != at.bufferIndex) {
+            return @"stage-in attributes in more than one buffer";
+        }
+        b = (uint32_t)at.bufferIndex;
+        a[n++] = (uint32_t)i;
+        a[n++] = b;
+        a[n++] = (uint32_t)at.offset;
+        a[n++] = (uint32_t)at.format;
+        na++;
+    }
+    if (!na) {
+        return @"a stage-input descriptor with no attributes";
+    }
+    a[0] = na;
+    MTLBufferLayoutDescriptor *ly = [sd.layouts objectAtIndexedSubscript:b];
+    a[n++] = 1;
+    a[n++] = b;
+    a[n++] = (uint32_t)ly.stride;
+    a[n++] = (uint32_t)ly.stepFunction;
+    a[n++] = (uint32_t)ly.stepRate;
+    [words appendBytes:a length:n * sizeof(a[0])];
+    *buffer = b;
+    return nil;
+}
+
+id<MTLComputePipelineState> vg_new_compute_pipeline_sd(id<MTLDevice> device, id<MTLFunction> function,
+                                                      MTLStageInputOutputDescriptor *stageIn, NSError **error);
 id<MTLComputePipelineState> vg_new_compute_pipeline(id<MTLDevice> device, id<MTLFunction> function, NSError **error) {
+    return vg_new_compute_pipeline_sd(device, function, nil, error);
+}
+id<MTLComputePipelineState> vg_new_compute_pipeline_sd(id<MTLDevice> device, id<MTLFunction> function,
+                                                      MTLStageInputOutputDescriptor *stageIn, NSError **error) {
     if (error) {
         *error = nil;
     }
@@ -602,23 +652,42 @@ id<MTLComputePipelineState> vg_new_compute_pipeline(id<MTLDevice> device, id<MTL
                       [mx unsignedIntValue]);
             }
         }
-        BOOL stageIn = NO;
+        BOOL stageInBound = NO;
+        uint32_t stageInSlot = 0;
         for (NSDictionary *b in refl[@"bindings"]) {
             NSString *kind = b[@"kind"];
             if ([kind isEqual:@"KernelStageInput"]) {
-                stageIn = YES;
+                stageInBound = YES;
+                stageInSlot = [b[@"metal_index"] unsignedIntValue];
             } else if (p && ![@[ @"Buffer", @"ThreadgroupBuffer", @"Texture", @"StorageImage", @"Sampler", @"StaticSampler" ] containsObject:kind]) {
                 why = [NSString stringWithFormat:@"binding kind %@ not supported yet", kind];
                 p = nil;
             }
         }
-        // A kernel reading [[stage_in]] (setStageInRegion:, a stage-input descriptor): not supported yet. Refusing it
-        // crashed Setup Assistant at its Memoji step: VFX (AvatarKit's stickers) doesn't check for a nil pipeline and
-        // divides by the nil pipeline's thread width (SIGFPE). So it gets a pipeline whose dispatches do nothing: the
-        // stickers come out empty, and the app goes on.
-        if (p && stageIn) {
-            p->_noop = YES;
-            vglog("pipeline %s: [[stage_in]] isn't supported yet: its dispatches do nothing", function.name.UTF8String);
+        // A kernel reading [[stage_in]]: translated with the pipeline's stage-input layout, it reads its attributes
+        // from the application's buffer (the layout's), which each dispatch puts in the slot the translator gave the
+        // parameter. Without a layout it can read (none, or attributes in more than one buffer) it gets a pipeline
+        // whose dispatches do nothing rather than none: VFX (AvatarKit's Memoji stickers in Setup Assistant)
+        // dispatches on the pipeline without checking it and divided by a nil one's thread width (SIGFPE).
+        if (p && stageInBound) {
+            NSMutableData *words = [NSMutableData data];
+            uint32_t buffer = 0;
+            NSString *bad = stageIn ? vg_stage_in_words(stageIn, words, &buffer) : @"no stage-input descriptor";
+            if (bad) {
+                p->_noop = YES;
+                vglog("pipeline %s: [[stage_in]] with %s: its dispatches do nothing", function.name.UTF8String, bad.UTF8String);
+            } else {
+                p->_stageIn = words;
+                p->_stageInSlot = stageInSlot;
+                p->_stageInBuffer = buffer;
+                NSMutableString *w = [NSMutableString string];
+                for (NSUInteger i = 0; i < words.length / 4; i++) {
+                    [w appendFormat:@"%s%u", i ? " " : "", ((const uint32_t *)words.bytes)[i]];
+                }
+                vglog("pipeline %s: [[stage_in]] from buffer %u (slot %u), layout [%s], index buffer %lu type %lu",
+                      function.name.UTF8String, buffer, stageInSlot, w.UTF8String, (unsigned long)stageIn.indexBufferIndex,
+                      (unsigned long)stageIn.indexType);
+            }
         }
     }
     if (!p) {
@@ -641,6 +710,7 @@ id<MTLComputePipelineState> vg_new_compute_pipeline(id<MTLDevice> device, id<MTL
 @public
     dispatch_queue_t _serial;
     dispatch_queue_t _userCompletion;
+    VGMTLCommandBuffer *_lastCommitted;   // for completing in commit order (see commit)
 }
 @property(readonly) id<MTLDevice> device;
 @property(copy, atomic) NSString *label;
@@ -823,8 +893,22 @@ VkBuffer vg_vkbuffer(id<MTLBuffer> b) {
         [_owner fail:why ?: @"no command buffer"];
         return;
     }
-    // One descriptor set for every region: the same resources.
+    // One descriptor set for every region: the same resources. A [[stage_in]] kernel reads the application's buffer
+    // (its layout's) from the slot the translator gave the parameter.
+    VkBuffer keepBuf = VK_NULL_HANDLE;
+    VkDeviceSize keepOff = 0;
+    BOOL moved = _pso->_stageIn && _pso->_stageInSlot < kVGMaxBufferSlots && _pso->_stageInBuffer < kVGMaxBufferSlots;
+    if (moved) {
+        keepBuf = _t.buf[_pso->_stageInSlot];
+        keepOff = _t.off[_pso->_stageInSlot];
+        _t.buf[_pso->_stageInSlot] = _t.buf[_pso->_stageInBuffer];
+        _t.off[_pso->_stageInSlot] = _t.off[_pso->_stageInBuffer];
+    }
     VkDescriptorSet set = vg_write_set(_owner, v->dsl, v->bindings, v->nbindings, &_t, _pso->_name);
+    if (moved) {
+        _t.buf[_pso->_stageInSlot] = keepBuf;
+        _t.off[_pso->_stageInSlot] = keepOff;
+    }
     if (!set) {
         return;
     }
@@ -1055,6 +1139,7 @@ static BOOL vg_dirty_rect(VGMTLCommandBuffer *c, VGMTLTexture *t, int32_t r[4]);
         _handlers = [NSMutableArray array];
         _scheduledHandlers = [NSMutableArray array];
         _done = dispatch_group_create();
+        _statusSet = dispatch_group_create();
         _fenced = dispatch_group_create();
         _status = MTLCommandBufferStatusNotEnqueued;
         _surfacesWritten = [NSMutableSet set];
@@ -1439,6 +1524,7 @@ static void vg_surface_debug(VGMTLTexture *t) {
         _signals = nil;
     }
     _status = status;
+    dispatch_group_leave(_statusSet);
     NSArray *handlers;
     @synchronized(self) {
         handlers = [_handlers copy];
@@ -1473,6 +1559,19 @@ static void vg_surface_debug(VGMTLTexture *t) {
     [self enqueue];
     _status = MTLCommandBufferStatusCommitted;
     dispatch_group_enter(_done);
+    dispatch_group_enter(_statusSet);
+    // Command buffers of a queue complete in commit order: when one's completed handler runs, every earlier one says
+    // Completed (or Error). Without a completion queue ours finish on a concurrent queue, and VFX (AvatarKit's Memoji,
+    // OpenSubdiv) saw its dependency command buffer still Scheduled from a later one's handler, called it failed, and
+    // drew no Memoji. Each one's completion waits for the one before it to have its status (not its handlers, which may
+    // wait for a later command buffer).
+    if ([(NSObject *)self.commandQueue isKindOfClass:[VGMTLCommandQueue class]]) {
+        VGMTLCommandQueue *cq = (VGMTLCommandQueue *)self.commandQueue;
+        @synchronized(cq) {
+            _prev = cq->_lastCommitted;
+            cq->_lastCommitted = self;
+        }
+    }
     dispatch_group_enter(_fenced);
     _fencedEntered = YES;
     _submitted = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
@@ -1636,6 +1735,11 @@ static void vg_surface_debug(VGMTLTexture *t) {
     // In order on the queue's serial queue when the caller named a completion queue; otherwise as before (a handler
     // that waits for a later command buffer of the same queue must not deadlock behind it).
     dispatch_async(q && q->_userCompletion ? q->_serial : dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+        VGMTLCommandBuffer *prev = self->_prev;
+        self->_prev = nil;
+        if (prev) {
+            dispatch_group_wait(prev->_statusSet, DISPATCH_TIME_FOREVER);
+        }
         [self finishWith:end fence:fence];
         dispatch_group_leave(self->_done);
     });

@@ -106,8 +106,52 @@ static VkFormat vg_vertex_format(MTLVertexFormat f) {
     case MTLVertexFormatShort2: return VK_FORMAT_R16G16_SINT;
     case MTLVertexFormatShort2Normalized: return VK_FORMAT_R16G16_SNORM;
     case MTLVertexFormatUShort2Normalized: return VK_FORMAT_R16G16_UNORM;
+    // the rest of Metal's vertex formats (Memoji's SceneKit-style shaders read half3: 0.1.9); a format the GPU can't
+    // fetch is refused at the pipeline (vg_vertex_format_ok)
+    case MTLVertexFormatHalf: return VK_FORMAT_R16_SFLOAT;
+    case MTLVertexFormatHalf3: return VK_FORMAT_R16G16B16_SFLOAT;
+    case MTLVertexFormatInt3: return VK_FORMAT_R32G32B32_SINT;
+    case MTLVertexFormatUInt3: return VK_FORMAT_R32G32B32_UINT;
+    case MTLVertexFormatUChar: return VK_FORMAT_R8_UINT;
+    case MTLVertexFormatUChar2: return VK_FORMAT_R8G8_UINT;
+    case MTLVertexFormatUChar3: return VK_FORMAT_R8G8B8_UINT;
+    case MTLVertexFormatChar: return VK_FORMAT_R8_SINT;
+    case MTLVertexFormatChar2: return VK_FORMAT_R8G8_SINT;
+    case MTLVertexFormatChar3: return VK_FORMAT_R8G8B8_SINT;
+    case MTLVertexFormatChar4: return VK_FORMAT_R8G8B8A8_SINT;
+    case MTLVertexFormatUCharNormalized: return VK_FORMAT_R8_UNORM;
+    case MTLVertexFormatUChar2Normalized: return VK_FORMAT_R8G8_UNORM;
+    case MTLVertexFormatUChar3Normalized: return VK_FORMAT_R8G8B8_UNORM;
+    case MTLVertexFormatCharNormalized: return VK_FORMAT_R8_SNORM;
+    case MTLVertexFormatChar2Normalized: return VK_FORMAT_R8G8_SNORM;
+    case MTLVertexFormatChar3Normalized: return VK_FORMAT_R8G8B8_SNORM;
+    case MTLVertexFormatShort: return VK_FORMAT_R16_SINT;
+    case MTLVertexFormatShort3: return VK_FORMAT_R16G16B16_SINT;
+    case MTLVertexFormatShort4: return VK_FORMAT_R16G16B16A16_SINT;
+    case MTLVertexFormatUShort: return VK_FORMAT_R16_UINT;
+    case MTLVertexFormatUShort2: return VK_FORMAT_R16G16_UINT;
+    case MTLVertexFormatUShort3: return VK_FORMAT_R16G16B16_UINT;
+    case MTLVertexFormatUShort4: return VK_FORMAT_R16G16B16A16_UINT;
+    case MTLVertexFormatShortNormalized: return VK_FORMAT_R16_SNORM;
+    case MTLVertexFormatShort3Normalized: return VK_FORMAT_R16G16B16_SNORM;
+    case MTLVertexFormatShort4Normalized: return VK_FORMAT_R16G16B16A16_SNORM;
+    case MTLVertexFormatUShortNormalized: return VK_FORMAT_R16_UNORM;
+    case MTLVertexFormatUShort3Normalized: return VK_FORMAT_R16G16B16_UNORM;
+    case MTLVertexFormatUShort4Normalized: return VK_FORMAT_R16G16B16A16_UNORM;
+    case MTLVertexFormatInt1010102Normalized: return VK_FORMAT_A2B10G10R10_SNORM_PACK32;
+    case MTLVertexFormatUInt1010102Normalized: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    case MTLVertexFormatFloatRG11B10: return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+    case MTLVertexFormatFloatRGB9E5: return VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
     default: return VK_FORMAT_UNDEFINED;
     }
+}
+
+// the GPU fetches it as a vertex attribute (Venus passes the host's answer; 3-component 8- and 16-bit formats are the
+// ones some GPUs lack)
+static BOOL vg_vertex_format_ok(VkFormat f) {
+    VkFormatProperties fp = {0};
+    gVk.vkGetPhysicalDeviceFormatProperties(gVk.physical, f, &fp);
+    return (fp.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) != 0;
 }
 
 static VkBlendFactor vg_blend_factor(MTLBlendFactor f) {
@@ -372,8 +416,9 @@ id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRende
                 continue;
             }
             VkFormat f = vg_vertex_format(ad.format);
-            if (!f || ad.bufferIndex >= kVGMaxBufferSlots) {
-                why = [NSString stringWithFormat:@"vertex attribute %u: format %lu not supported yet", a, (unsigned long)ad.format];
+            if (!f || ad.bufferIndex >= kVGMaxBufferSlots || !vg_vertex_format_ok(f)) {
+                why = [NSString stringWithFormat:@"vertex attribute %u: format %lu not supported %s", a, (unsigned long)ad.format,
+                       f ? "by this GPU as a vertex format" : "yet"];
                 p = nil;
                 break;
             }
@@ -389,7 +434,9 @@ id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRende
             // element, which is a per-vertex binding with stride 0 in Vulkan.
             BOOL constant = ld.stepFunction == MTLVertexStepFunctionConstant;
             if (!constant && ld.stepFunction != MTLVertexStepFunctionPerVertex && ld.stepFunction != MTLVertexStepFunctionPerInstance) {
-                why = @"vertex step functions other than per vertex, per instance and constant aren't supported yet";
+                why = [NSString stringWithFormat:@"vertex buffer %u: step function %lu (only per vertex, per instance and constant "
+                                                 @"are supported yet), stride %lu, rate %lu", b, (unsigned long)ld.stepFunction,
+                                                 (unsigned long)ld.stride, (unsigned long)ld.stepRate];
                 p = nil;
                 break;
             }

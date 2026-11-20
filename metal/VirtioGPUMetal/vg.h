@@ -153,6 +153,9 @@ id<MTLBuffer> vg_new_buffer(id<MTLDevice> device, NSUInteger length, MTLResource
 id<MTLCommandQueue> vg_new_queue(id<MTLDevice> device);
 id<MTLLibrary> vg_new_library(id<MTLDevice> device, NSData *metallib, NSError **error);
 id<MTLComputePipelineState> vg_new_compute_pipeline(id<MTLDevice> device, id<MTLFunction> function, NSError **error);
+// the same, with a compute pipeline descriptor's stage-input layout (nil: none)
+id<MTLComputePipelineState> vg_new_compute_pipeline_sd(id<MTLDevice> device, id<MTLFunction> function,
+                                                      MTLStageInputOutputDescriptor *stageIn, NSError **error);
 
 // What VGMTLLibrary.m's functions carry for the pipeline code.
 @interface NSObject (VGFunction)

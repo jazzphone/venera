@@ -154,7 +154,8 @@ typedef int (*xl_spec_apply_fn)(const uint8_t *, size_t, const uint8_t *, size_t
 static xl_spec_fn pTranslateSpec;
 static xl_spec_apply_fn pSpecApply;
 static void (*pTranslateFree)(uint8_t *, size_t);
-static void (*pSetSamples)(uint32_t);   // nvmtl_translate_set_raster_sample_count (5d)
+static void (*pSetSamples)(uint32_t);
+static uint32_t (*pSetStageIn)(const uint32_t *, uint32_t);   // nvmtl_translate_set_kernel_stage_in (optional)   // nvmtl_translate_set_raster_sample_count (5d)
 static void (*pSetTgLengths)(const uint32_t *, uint32_t);
 
 static BOOL vg_translator_ready(void) {
@@ -177,6 +178,7 @@ static BOOL vg_translator_ready(void) {
         pReflectFC = (xl_fc_fn)dlsym(h, "nvmtl_reflect_fc");
         pSetTgLengths = dlsym(h, "nvmtl_translate_set_threadgroup_lengths");
         pSetSamples = dlsym(h, "nvmtl_translate_set_raster_sample_count");   // optional
+        pSetStageIn = dlsym(h, "nvmtl_translate_set_kernel_stage_in");       // optional
         pTranslateSpec = (xl_spec_fn)dlsym(h, "nvmtl_translate_spec");   // optional
         pSpecApply = (xl_spec_apply_fn)dlsym(h, "nvmtl_spec_apply");
         void (*setCaps)(uint32_t) = dlsym(h, "nvmtl_translate_set_caps");
@@ -218,10 +220,24 @@ static void vg_fc_unpack(NSDictionary<NSNumber *, NSData *> *fc, vg_fc_args *a) 
 // it (air.get_num_samples, ANGLE's) translate differently, so it is part of every cache key when it isn't 1.
 static __thread uint32_t gSamples;
 void vg_translate_set_samples(uint32_t n) { gSamples = n > 1 ? n : 0; }
+// A compute pipeline's [[stage_in]] layout (MTLStageInputOutputDescriptor, as nvmtl_translate_set_kernel_stage_in
+// reads it: the attributes' buffer, offset and format, the layouts' stride, step and rate) for the next translations
+// on this thread: the kernel then reads its stage-in attributes from the application's buffer by that layout. Part of
+// every cache key while set.
+static __thread uint32_t gStageIn[1 + 16 * 4 + 1 + 31 * 4], gStageInCount;
+void vg_translate_set_stage_in(const uint32_t *words, uint32_t count) {
+    gStageInCount = words && count <= sizeof(gStageIn) / sizeof(gStageIn[0]) ? count : 0;
+    if (gStageInCount) {
+        memcpy(gStageIn, words, count * sizeof(uint32_t));
+    }
+}
 
 static NSString *vg_translate_key(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc,
                                   const uint32_t *tg, uint32_t tgCount) {
     NSMutableString *k = [NSMutableString stringWithFormat:@"%p:%lx:%lu:%s", ll, (unsigned long)ll.hash, (unsigned long)ll.length, stage];
+    for (uint32_t i = 0; i < gStageInCount; i++) {
+        [k appendFormat:@"%s%x", i ? "," : "|stagein=", gStageIn[i]];
+    }
     if (gSamples) {
         [k appendFormat:@"|samples=%u", gSamples];
     }
@@ -292,6 +308,10 @@ static NSString *vg_disk_key(const char *kind, NSString *ll, const char *stage, 
     }
     for (uint32_t i = 0; tg && i < tgCount; i++) {
         CC_SHA256_Update(&c, &tg[i], 4);
+    }
+    if (gStageInCount) {
+        CC_SHA256_Update(&c, "stagein", 8);
+        CC_SHA256_Update(&c, gStageIn, gStageInCount * 4);
     }
     if (gSamples) {
         CC_SHA256_Update(&c, "samples", 8);
@@ -934,8 +954,22 @@ static NSData *vg_translate_uncached(NSString *ll, const char *stage, NSDictiona
     if (pSetSamples) {
         pSetSamples(gSamples ? gSamples : 1);
     }
+    if (gStageInCount) {
+        if (!pSetStageIn || !pSetStageIn(gStageIn, gStageInCount)) {
+            pSetTgLengths(NULL, 0);
+            if (error) {
+                NSMutableString *w = [NSMutableString string];
+                for (uint32_t i = 0; i < gStageInCount; i++) {
+                    [w appendFormat:@"%s%u", i ? " " : "", gStageIn[i]];
+                }
+                *error = pSetStageIn ? [NSString stringWithFormat:@"the translator refused the stage-input layout [%@] (attributes: index buffer offset format; layouts: buffer stride step rate)", w]
+                                     : @"the translator can't take a stage-input layout";
+            }
+            return nil;
+        }
+    }
     int r;
-    if (fc.count && pTranslateSpec && pSpecApply && vg_fc_spec_on()) {
+    if (fc.count && pTranslateSpec && pSpecApply && vg_fc_spec_on() && !gStageInCount) {
         NSString *why = nil;
         NSData *spv = vg_spec_translate(ll, stage, fc, tgLengths, tgCount, &why);
         if (spv) {
@@ -956,6 +990,9 @@ static NSData *vg_translate_uncached(NSString *ll, const char *stage, NSDictiona
         r = pTranslate(ll.UTF8String, stage, &out, &len, err, sizeof(err));
     }
     pSetTgLengths(NULL, 0);
+    if (gStageInCount && pSetStageIn) {
+        pSetStageIn(NULL, 0);
+    }
     if (r || !out) {
         if (error) {
             *error = [NSString stringWithFormat:@"translation failed: %s", err];
