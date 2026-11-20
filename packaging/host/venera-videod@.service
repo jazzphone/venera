@@ -59,7 +59,10 @@ SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources @mount @swap @reboot @module @raw-io @debug @cpu-emulation @obsolete
 SystemCallErrorNumber=EPERM
 UMask=0077
-MemoryMax=2G
+# Each open decoder holds its frames in GPU memory charged to this service: a 4K 10-bit HEVC stream ~1 GB (its DPB and
+# 16 spare frames, extra_hw_frames, ~26 MB each). 2G was reached by two (AVAssetImageGenerator opens up to four; ten
+# readers in a row were OOM-killed every run), and the service restarted mid-decode. 6G keeps five or so; more swap.
+MemoryMax=6G
 TasksMax=64
 LimitNOFILE=1024
 
