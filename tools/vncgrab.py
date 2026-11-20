@@ -3,6 +3,9 @@
 # back by egl-headless), frame by frame, for seeing what a gesture leaves on the screen. Runs on the Proxmox host; no
 # Python packages (VNC's DES challenge goes through openssl).
 #   vncgrab.py VMID SECONDS OUTDIR        frames as OUTDIR/NNNN-MS.ppm (MS: milliseconds since the start)
+#   VNCGRAB_CURSOR=1 vncgrab.py ...       also the cursor as the console gets it (VNC's rich cursor: its pixels, and
+#                                         the 1-bit mask QEMU makes from its alpha) as OUTDIR/cursor-NNN-MS.ppm, the
+#                                         masked-out pixels drawn magenta
 # It connects as Proxmox's console does: `qm vncproxy` with a one-time ticket in LC_PVE_TICKET, which becomes the VNC
 # password for that connection.
 import os, secrets, struct, subprocess, sys, time
@@ -47,7 +50,12 @@ rd(16)
 rd(struct.unpack('>I', rd(4))[0])   # name
 # 32-bit little-endian BGRX, raw encoding only
 wr(struct.pack('>BxxxBBBBHHHBBBxxx', 0, 32, 24, 0, 1, 255, 255, 255, 16, 8, 0))
-wr(struct.pack('>BxH i', 2, 1, 0))
+CURSOR = os.environ.get('VNCGRAB_CURSOR') == '1'
+if CURSOR:
+    wr(struct.pack('>BxH ii', 2, 2, 0, -239))
+else:
+    wr(struct.pack('>BxH i', 2, 1, 0))
+nc = 0
 fb = bytearray(W * H * 4)
 wr(struct.pack('>BBHHHH', 3, 0, 0, 0, W, H))
 t0 = time.time()
@@ -58,6 +66,20 @@ while time.time() - t0 < secs:
     rd(1)
     for _ in range(struct.unpack('>H', rd(2))[0]):
         x, y, rw, rh, enc = struct.unpack('>HHHHi', rd(12))
+        if enc == -239:   # rich cursor: pixels (BGRX), then a 1-bit mask a row at a time; x, y the hot spot
+            cpx = rd(rw * rh * 4)
+            mask = rd((rw + 7) // 8 * rh)
+            img = bytearray(rw * rh * 3)
+            for j in range(rh):
+                for i in range(rw):
+                    on = mask[j * ((rw + 7) // 8) + i // 8] >> (7 - i % 8) & 1
+                    q = (j * rw + i) * 4
+                    img[(j * rw + i) * 3:(j * rw + i) * 3 + 3] = bytes([cpx[q + 2], cpx[q + 1], cpx[q]]) if on else b'\xff\x00\xff'
+            with open(f'{out}/cursor-{nc:03d}-{int((time.time() - t0) * 1000):05d}.ppm', 'wb') as f:
+                f.write(b'P6 %d %d 255\n' % (rw, rh) + img)
+            print(f'cursor {nc}: {rw}x{rh}, hot spot {x},{y}')
+            nc += 1
+            continue
         if enc != 0:
             sys.exit(f'unexpected encoding {enc}')
         data = rd(rw * rh * 4)

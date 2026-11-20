@@ -560,6 +560,16 @@ IOReturn VirtioGPUFramebuffer::setCursorImage(void *cursorImage) {
             bzero(&cursorPixels_[y * kVGPUCursorSize + w], (kVGPUCursorSize - w) * 4);
         }
     }
+    // macOS hands the image over with premultiplied alpha; the device (QEMU) takes straight alpha, and its VNC cursor
+    // (Proxmox's console) shows a partly transparent pixel as a solid one, so the anti-aliased rim of a colored cursor
+    // (the spinning wait cursor) came out as a dark, ragged ring. Each partly transparent pixel gets its color back.
+    for (uint32_t i = 0; i < kVGPUCursorSize * kVGPUCursorSize; i++) {
+        const uint32_t px = cursorPixels_[i], a = px >> 24;
+        if (a && a < 255) {
+            uint32_t r = ((px >> 16) & 0xff) * 255 / a, g = ((px >> 8) & 0xff) * 255 / a, b = (px & 0xff) * 255 / a;
+            cursorPixels_[i] = (a << 24) | ((r > 255 ? 255 : r) << 16) | ((g > 255 ? 255 : g) << 8) | (b > 255 ? 255 : b);
+        }
+    }
     cursorHotX_ = info.cursorHotSpotX;
     cursorHotY_ = info.cursorHotSpotY;
     cursorReady_ = call(kVGPUSetCursor, cursorPixels_, (void *)(uintptr_t)cursorHotX_,
