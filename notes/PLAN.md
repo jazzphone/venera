@@ -2101,3 +2101,7 @@ TRIM, Upgrade without a USB disk, Retina modes, a faster first boot (a warm-up a
   before: every request refused), kern.hv_vmm_present still 0. VM 110: Upgrade, PerfPowerServices 1.3 s of CPU, then
   idle. Not run: a whole unattended install without applesmc (it needs Apple's license agreed to). Lilu and VirtualSMC
   run on the macOS versions they know (Tahoe): a major macOS upgrade waits for a Venera release (docs/INSTALL.md).
+  VM 107 (the owner's OK): Upgrade with the SMC change; HA started it again on the other node (proxmox1). Its older
+  guest agent couldn't take the package, and the USB fallback copied the kit's Venera Tools CD, whose package was
+  yesterday's release: the kexts and Metal driver stayed old. The USB disk is now made from the package being installed
+  (6th commit of the day); a second Upgrade put framebuffer 0.6.2, accelerator 0.7.0 and the new Metal driver on it.

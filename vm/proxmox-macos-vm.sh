@@ -969,7 +969,9 @@ upgrade_vm() {   # a VM with Venera: this release's host half on every node, the
 }
 usb_upgrade_disk() {   # the guest package on a USB disk in the running VM, mounted by macOS: sets img and mnt
   mkdir -p /root/venera; img=/root/venera/venera-upgrade-$VMID.iso
-  venera_disk "$img"
+  # made from the package being installed, not the kit's Tools CD: a kit whose package was replaced (a fix, a build)
+  # put the CD's older package on VM 107 (2026-11-20)
+  if command -v genisoimage >/dev/null; then TOOLS="" venera_disk "$img"; else venera_disk "$img"; fi
   while :; do   # loginwindow turns the disk away (and ejects it) while the screen is locked or nobody is logged in
     case $(screen_state) in
       locked) ask k "macOS's screen is locked, and it won't take a USB disk then: unlock it (the VM's console or Screen Sharing), then press Enter" ;;
