@@ -2075,3 +2075,11 @@ TRIM, Upgrade without a USB disk, Retina modes, a faster first boot (a warm-up a
   display too): its main thread waited on CMPhoto decoding a HEIF image, whose tiles (dtil, dsts) venera-videod
   answered "no error" with no picture. Now "unsupported", and the guest decodes in software; Setup Assistant came up.
   The hosts had logged 308 such requests in 5 days (VM 107 too).
+- **A new VM's Setup Assistant (VM 110, the owner's, installed with install-venera)** crashed at the account step and
+  macOS restarted: SIGFPE in VFX's RGMTLComputeCommandEncoderDispatchOnGrid1D (AvatarKit's Memoji stickers). VFX's
+  copy/blend kernels read [[stage_in]], which the driver refused, and VFX dispatched on the nil pipeline. Fixed in
+  steps: compute stage-in from the pipeline's layout (nvmtl_translate_set_kernel_stage_in), half3 in the translator
+  (packaging/translator/0002), the rest of Metal's vertex formats, command buffers of a queue completing in commit
+  order (VFX read its OpenSubdiv dependency as still Scheduled), and **Metal tessellation** (de1958c: NullMoth's
+  design ported, VGMTLTess.c; every buffer carries a device address). tools/mtltess passes on VM 108; the owner saw
+  the Memoji draw in VM 110's Setup Assistant.
