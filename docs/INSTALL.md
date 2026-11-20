@@ -332,6 +332,12 @@ pool, `/Library/GPUBundles/Venera/cache` (under 256 MB), which every process rea
 once for the whole machine, not once per app: a new app, or Safari's GPU process after an update, starts with what
 WindowServer and the Dock already translated.
 
+Most of that first wait was one shader: Core Animation's uber shader, which WindowServer asks for in a few dozen sets
+of function constants, one after another. The driver carries the list of those sets (`warm.txt` in its Resources:
+the function's name and the constants' values, nothing of Apple's shaders), and the first time WindowServer asks for
+that function it translates the other listed sets in the background on the VM's other cores (`VGMTL_NOWARM=1` turns
+it off for a process), so most of WindowServer's later requests find them ready.
+
 ## Uninstall
 
 ```bash

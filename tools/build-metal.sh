@@ -12,6 +12,8 @@ cp metal/VirtioGPUMetal/Info.plist $B/Contents/Info.plist
 cp mesa/out/libvulkan_virtio.dylib $B/Contents/Resources/
 # NV's metal2vulkan wrapper (LGPL-3.0-or-later), built for x86_64 by tools/build-translator.sh
 cp build/translator/libnvmtl_translate.dylib $B/Contents/Resources/
+# the warm-up's list (VGMTLLibrary.m): function names and constant values, no shader of Apple's
+[[ -f metal/VirtioGPUMetal/warm.txt ]] && cp metal/VirtioGPUMetal/warm.txt $B/Contents/Resources/
 cp ${NVSRC:-$HOME/src/vendor-src/nvidia-macos-driver}/translator/LICENSE $B/Contents/Resources/libnvmtl_translate.LICENSE
 for d in $B/Contents/Resources/*.dylib; do codesign -f -s - $d 2>/dev/null; done
 codesign -f -s - $B 2>/dev/null

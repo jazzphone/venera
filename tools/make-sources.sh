@@ -5,7 +5,8 @@
 #   upstream/OpenCore-*-RELEASE.zip      acidanthera's OpenCorePkg release (BSD-3)
 #   upstream/mesa-*.tar.xz               Mesa's release tarball (MIT); mesa/patches is in Venera's source
 #   upstream/ffmpeg-*.tar.xz (+ .asc)    FFmpeg's release tarball and its signature (LGPL-2.1)
-#   upstream/translator-COMMIT.tar.gz    NullMoth's translator/ (LGPL-3.0-or-later) at the pinned commit, its licenses
+#   upstream/translator-COMMIT.tar.gz    NullMoth's translator/ (LGPL-3.0-or-later) at the pinned commit, its licenses (as upstream has it:
+#                                        Venera's changes are packaging/translator/*.patch in venera-VERSION.tar.gz)
 #   upstream/cargo-home.tar.gz           the Rust crates the translator and -Z build-std use (CARGO_HOME, offline)
 #   upstream/python-wheels/              meson, ninja and the rest at mesa/requirements.txt's versions
 #   SHA256SUMS, README.txt
@@ -47,7 +48,7 @@ To build it again without the network, on a Mac with Xcode, Homebrew's Rust ($TR
   cp ../upstream/ffmpeg-* ~/src/vendor-src/ffmpeg/
   tar -xzf ../upstream/translator-$TRANSLATOR_COMMIT.tar.gz -C ~/src/vendor-src
   tar -xzf ../upstream/cargo-home.tar.gz -C ~/src/vendor-src/cargo-home
-  CARGO_OFFLINE=1 tools/build-translator.sh
+  CARGO_OFFLINE=1 tools/build-translator.sh   # applies packaging/translator/*.patch to a copy of the translator
   MESA_TARBALL=../upstream/mesa-$MESA_VERSION.tar.xz PIP_WHEELS=../upstream/python-wheels mesa/build-mesa.sh
   packaging/make-dist.sh
 (The Debian image the host half builds in is $DEBIAN_IMAGE; docker save it next to this if that must be offline too.)

@@ -1,0 +1,873 @@
+Venera's change to NullMoth's metal2vulkan translator (LGPL-3.0-or-later, packaging/UPSTREAM's TRANSLATOR_COMMIT):
+fold a function-constant-specialized AIR text before it is translated. Literal comparisons (at the type's width),
+boolean operations on literals, the branches they decide, blocks nothing reaches, phi entries from removed edges,
+single-entry phis and functions nothing reachable calls are folded away in the new translator/translator/src/fc_fold.rs,
+called from specialize_air_function_constants once constants were supplied. tools/build-translator.sh applies this
+patch (patch -p1, from the root of the translator checkout) to a copy of the checkout and builds the copy.
+
+diff --git a/translator/translator/src/fc_air_specialize.rs b/translator/translator/src/fc_air_specialize.rs
+index cc18287..5bbe202 100644
+--- a/translator/translator/src/fc_air_specialize.rs
++++ b/translator/translator/src/fc_air_specialize.rs
+@@ -8,7 +8,17 @@ pub fn specialize_air_function_constants<'a>(
+     let specialized = specialize_air_function_constants_unfolded(air_ll, values)?;
+     // Fields a static initializer copies from the constants just supplied are folded too, so the branches they decide
+     // are gone before translation instead of after it (crate::meta::fold_static_init_struct_fields).
+-    Ok(match crate::meta::fold_static_init_struct_fields(&specialized) {
++    let specialized = match crate::meta::fold_static_init_struct_fields(&specialized) {
++        Some(folded) => Cow::Owned(folded),
++        None => specialized,
++    };
++    // What the constants decide is folded before translation too: literal comparisons, the branches they settle, the
++    // blocks, phi entries and functions that leaves unreachable (crate::fc_fold). The unfolded text stands when the
++    // pass finds nothing or cannot read the text.
++    if values.is_empty() {
++        return Ok(specialized);
++    }
++    Ok(match crate::fc_fold::fold_specialized_air(&specialized) {
+         Some(folded) => Cow::Owned(folded),
+         None => specialized,
+     })
+diff --git a/translator/translator/src/fc_fold.rs b/translator/translator/src/fc_fold.rs
+new file mode 100644
+index 0000000..8c6cc2c
+--- /dev/null
++++ b/translator/translator/src/fc_fold.rs
+@@ -0,0 +1,825 @@
++//! Folds a function-constant-specialized AIR text before it is translated: comparisons and boolean operations on
++//! literals, the branches they decide, blocks nothing reaches, phi entries from edges that are gone, phis left with
++//! one entry, and functions nothing reachable calls. A specialized uber shader is mostly code its constants switch
++//! off, and translating that code only to drop it afterward is most of the time; the same computation comes out.
++//!
++//! The text is parsed by hand (no regex crate), one line at a time, the way the specializer writes and LLVM prints
++//! it. A function with anything this does not know how to read (a quoted name, `invoke`, `blockaddress`, a phi it
++//! cannot parse) is left as it is, and so is the whole text when a function is cut off: the caller then translates
++//! the unfolded text.
++use std::borrow::Cow;
++use std::collections::{HashMap, HashSet};
++
++/// Rounds of folding a function: a branch folded in one round makes a comparison in the next one literal.
++const MAX_ROUNDS: usize = 8;
++
++/// The folded text, or `None` when there is nothing to fold or the text is not one this can read.
++pub(crate) fn fold_specialized_air(ll: &str) -> Option<String> {
++    if ll.contains('\r') {
++        return None;
++    }
++    let lines: Vec<&str> = ll.split('\n').collect();
++
++    // functions: `define ...` to the first line that is exactly `}`
++    let mut spans = Vec::new();
++    let mut i = 0;
++    while i < lines.len() {
++        if lines[i].starts_with("define ") {
++            let mut j = i + 1;
++            while j < lines.len() && lines[j] != "}" {
++                j += 1;
++            }
++            if j >= lines.len() {
++                return None;
++            }
++            spans.push((i, j));
++            i = j + 1;
++        } else {
++            i += 1;
++        }
++    }
++    if spans.is_empty() {
++        return None;
++    }
++
++    let mut changed = false;
++    let mut new: Vec<Cow<str>> = Vec::with_capacity(lines.len());
++    let mut defs: Vec<(String, usize, usize)> = Vec::new(); // name, first and last line in `new`
++    let mut last = 0;
++    for &(s, e) in &spans {
++        new.extend(lines[last..s].iter().map(|l| Cow::Borrowed(*l)));
++        let start = new.len();
++        new.push(Cow::Borrowed(lines[s]));
++        match fold_function(lines[s], &lines[s + 1..e]) {
++            Some(body) => {
++                changed = true;
++                new.extend(body);
++            }
++            None => new.extend(lines[s + 1..e].iter().map(|l| Cow::Borrowed(*l))),
++        }
++        new.push(Cow::Borrowed("}"));
++        defs.push((function_name(lines[s])?, start, new.len() - 1));
++        last = e + 1;
++    }
++    new.extend(lines[last..].iter().map(|l| Cow::Borrowed(*l)));
++
++    // Functions nothing reachable calls. The roots are the functions named outside function bodies (metadata,
++    // globals, aliases) and those in an `air.` section. When no function is named outside the bodies the entry
++    // points are not known (no metadata), so every function stays.
++    let mut dead_lines = vec![false; new.len()];
++    let mut inside = vec![false; new.len()];
++    for (_, a, b) in &defs {
++        inside[*a..=*b].iter_mut().for_each(|x| *x = true);
++    }
++    let mut outside_refs = HashSet::new();
++    for (idx, line) in new.iter().enumerate() {
++        if !inside[idx] {
++            collect_global_refs(line, &mut outside_refs);
++        }
++    }
++    let index: HashMap<&str, usize> = defs
++        .iter()
++        .enumerate()
++        .map(|(n, (name, _, _))| (name.as_str(), n))
++        .collect();
++    let mut live = vec![false; defs.len()];
++    let mut todo = Vec::new();
++    let mut named = false;
++    for (n, (name, _, _)) in defs.iter().enumerate() {
++        // a function in an `air.` section is run by the translator without being called (the static initializer)
++        let in_air_section = lines[spans[n].0].contains("section \"air.");
++        let referenced = outside_refs.contains(name.as_str());
++        named |= referenced;
++        if in_air_section || referenced {
++            live[n] = true;
++            todo.push(n);
++        }
++    }
++    if named {
++        while let Some(n) = todo.pop() {
++            let (_, a, b) = &defs[n];
++            let mut refs = HashSet::new();
++            for line in &new[*a..=*b] {
++                collect_global_refs(line, &mut refs);
++            }
++            for r in refs {
++                if let Some(&m) = index.get(r.as_str()) {
++                    if !live[m] {
++                        live[m] = true;
++                        todo.push(m);
++                    }
++                }
++            }
++        }
++        for (n, (_, a, b)) in defs.iter().enumerate() {
++            if !live[n] {
++                changed = true;
++                dead_lines[*a..=*b].iter_mut().for_each(|x| *x = true);
++            }
++        }
++    }
++    if !changed {
++        return None;
++    }
++    let kept: Vec<&str> = new
++        .iter()
++        .zip(&dead_lines)
++        .filter(|(_, dead)| !**dead)
++        .map(|(l, _)| l.as_ref())
++        .collect();
++    Some(kept.join("\n"))
++}
++
++fn is_ident(b: u8) -> bool {
++    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'$' | b'-')
++}
++
++fn ident_len(s: &str) -> usize {
++    s.bytes().take_while(|b| is_ident(*b)).count()
++}
++
++/// The first `@name(` of a define line, a quoted name with its quotes.
++fn function_name(define: &str) -> Option<String> {
++    let mut from = 0;
++    while let Some(at) = define[from..].find('@') {
++        let start = from + at + 1;
++        let len = global_name_len(&define[start..]);
++        if len > 0 && define[start + len..].starts_with('(') {
++            return Some(define[start..start + len].to_string());
++        }
++        from = start;
++    }
++    None
++}
++
++/// The length of the name after an `@`: an identifier or a quoted string (the quotes count).
++fn global_name_len(s: &str) -> usize {
++    if let Some(rest) = s.strip_prefix('"') {
++        return match rest.find('"') {
++            Some(end) if end > 0 => end + 2,
++            _ => 0,
++        };
++    }
++    ident_len(s)
++}
++
++fn collect_global_refs(line: &str, out: &mut HashSet<String>) {
++    let mut from = 0;
++    while let Some(at) = line[from..].find('@') {
++        let start = from + at + 1;
++        let len = global_name_len(&line[start..]);
++        if len > 0 {
++            out.insert(line[start..start + len].to_string());
++        }
++        from = start + len;
++    }
++}
++
++struct Block<'a> {
++    name: String, // `%label`, or `%N` for an unlabeled entry
++    lines: Vec<Cow<'a, str>>,
++}
++
++/// A line's label (`name:` at its start), without the colon.
++fn label_of(line: &str) -> Option<&str> {
++    let n = ident_len(line);
++    (n > 0 && line[n..].starts_with(':')).then(|| &line[..n])
++}
++
++/// The number LLVM gives an unlabeled entry block: after the function's unnamed arguments.
++fn entry_number(define: &str) -> u64 {
++    let params = match (define.find('('), define.rfind(')')) {
++        (Some(a), Some(b)) if a < b => &define[a..b],
++        _ => "",
++    };
++    let mut highest: Option<u64> = None;
++    let mut from = 0;
++    while let Some(at) = params[from..].find('%') {
++        let start = from + at + 1;
++        let digits = params[start..]
++            .bytes()
++            .take_while(u8::is_ascii_digit)
++            .count();
++        let after = params[start + digits..].bytes().next();
++        if digits > 0 && !after.is_some_and(is_ident) {
++            if let Ok(n) = params[start..start + digits].parse::<u64>() {
++                highest = Some(highest.map_or(n, |h| h.max(n)));
++            }
++        }
++        from = start;
++    }
++    highest.map_or(0, |h| h + 1)
++}
++
++/// The register a line defines and what it is defined as: `%x = rhs`.
++fn split_def(line: &str) -> Option<(&str, &str)> {
++    let t = line.trim_start();
++    let rest = t.strip_prefix('%')?;
++    let n = ident_len(rest);
++    if n == 0 {
++        return None;
++    }
++    let rhs = rest[n..].strip_prefix(" = ")?;
++    Some((&t[..n + 1], rhs))
++}
++
++/// `A, B` with no other whitespace.
++fn two_operands(s: &str) -> Option<(&str, &str)> {
++    let (a, b) = s.split_once(", ")?;
++    let plain = |x: &str| !x.is_empty() && !x.contains(char::is_whitespace);
++    (plain(a) && plain(b)).then_some((a, b))
++}
++
++/// An i1 value: a literal or a register already known.
++fn bool_of(tok: &str, consts: &HashMap<String, bool>) -> Option<bool> {
++    match tok {
++        "true" | "1" => Some(true),
++        "false" | "0" => Some(false),
++        _ if tok.starts_with('%') => consts.get(tok).copied(),
++        _ => None,
++    }
++}
++
++/// An integer operand of a comparison: a decimal literal, `true`/`false`, or an i1 register already known.
++fn int_of(tok: &str, consts: &HashMap<String, bool>) -> Option<i128> {
++    match tok {
++        "true" => Some(1),
++        "false" => Some(0),
++        _ if tok.starts_with('%') => consts.get(tok).map(|b| *b as i128),
++        _ => {
++            let digits = tok.strip_prefix('-').unwrap_or(tok);
++            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
++                return None;
++            }
++            tok.parse::<i128>().ok()
++        }
++    }
++}
++
++/// `icmp PRED iN A, B` on literals, compared at the type's width: i8 255 is -1.
++fn fold_icmp(rest: &str, consts: &HashMap<String, bool>) -> Option<bool> {
++    let (pred, rest) = rest.split_once(' ')?;
++    let (ty, operands) = rest.split_once(' ')?;
++    let bits: u32 = ty.strip_prefix('i')?.parse().ok()?;
++    if !(1..=64).contains(&bits) {
++        return None;
++    }
++    let (x, y) = two_operands(operands)?;
++    let mask = (1i128 << bits) - 1;
++    let (a, b) = (int_of(x, consts)? & mask, int_of(y, consts)? & mask);
++    let signed = |v: i128| {
++        if v >> (bits - 1) != 0 {
++            v - (1i128 << bits)
++        } else {
++            v
++        }
++    };
++    Some(match pred {
++        "eq" => a == b,
++        "ne" => a != b,
++        "ugt" => a > b,
++        "uge" => a >= b,
++        "ult" => a < b,
++        "ule" => a <= b,
++        "sgt" => signed(a) > signed(b),
++        "sge" => signed(a) >= signed(b),
++        "slt" => signed(a) < signed(b),
++        "sle" => signed(a) <= signed(b),
++        _ => return None,
++    })
++}
++
++/// The i1 a definition is, when its operands are known enough.
++fn fold_def(rhs: &str, consts: &HashMap<String, bool>) -> Option<bool> {
++    if let Some(rest) = rhs.strip_prefix("icmp ") {
++        return fold_icmp(rest, consts);
++    }
++    for op in ["and", "or", "xor"] {
++        let Some(rest) = rhs.strip_prefix(op).and_then(|r| r.strip_prefix(" i1 ")) else {
++            continue;
++        };
++        let (x, y) = two_operands(rest)?;
++        let (a, b) = (bool_of(x, consts), bool_of(y, consts));
++        return match (op, a, b) {
++            ("and", Some(a), Some(b)) => Some(a & b),
++            ("or", Some(a), Some(b)) => Some(a | b),
++            ("xor", Some(a), Some(b)) => Some(a ^ b),
++            ("and", Some(false), _) | ("and", _, Some(false)) => Some(false),
++            ("or", Some(true), _) | ("or", _, Some(true)) => Some(true),
++            _ => None,
++        };
++    }
++    if let Some(rest) = rhs.strip_prefix("select i1 ") {
++        let mut parts = rest.split(", i1 ");
++        let (cond, yes, no) = (parts.next()?, parts.next()?, parts.next()?);
++        if parts.next().is_some() {
++            return None;
++        }
++        let plain = |x: &str| !x.is_empty() && !x.contains(char::is_whitespace);
++        if !(plain(cond) && plain(yes) && plain(no)) {
++            return None;
++        }
++        let chosen = if bool_of(cond, consts)? { yes } else { no };
++        return bool_of(chosen, consts);
++    }
++    None
++}
++
++/// `br i1 C, label %A, label %B` with C known: `br label %A` (or %B), the line's trailing text kept.
++fn fold_branch(line: &str, consts: &HashMap<String, bool>) -> Option<String> {
++    let t = line.trim_start();
++    let indent = &line[..line.len() - t.len()];
++    let rest = t.strip_prefix("br i1 ")?;
++    let (cond, rest) = rest.split_once(", label ")?;
++    if cond.is_empty() || cond.contains(char::is_whitespace) {
++        return None;
++    }
++    let value = bool_of(cond, consts)?;
++    let (yes, rest) = rest.split_once(", label ")?;
++    if !yes.starts_with('%') || yes.len() < 2 || yes.contains(char::is_whitespace) {
++        return None;
++    }
++    let end = rest
++        .find(|c: char| c.is_whitespace() || c == ',')
++        .unwrap_or(rest.len());
++    let (no, tail) = rest.split_at(end);
++    if !no.starts_with('%') || no.len() < 2 {
++        return None;
++    }
++    Some(format!(
++        "{indent}br label {}{tail}",
++        if value { yes } else { no }
++    ))
++}
++
++/// The blocks a block can go to: every `label %x` from its last branch-like line to its end (a switch spans lines).
++fn successors(lines: &[Cow<str>]) -> Vec<String> {
++    let terminator = lines.iter().rposition(|l| {
++        let t = l.trim_start();
++        ["br", "switch", "indirectbr", "callbr", "invoke"]
++            .iter()
++            .any(|kw| {
++                t.strip_prefix(kw)
++                    .is_some_and(|r| !r.bytes().next().is_some_and(is_ident))
++            })
++    });
++    let mut out = Vec::new();
++    for line in terminator.map_or(&[][..], |k| &lines[k..]) {
++        let mut from = 0;
++        while let Some(at) = line[from..].find("label %") {
++            let start = from + at + 6;
++            let n = ident_len(&line[start + 1..]);
++            if n > 0 {
++                out.push(line[start..start + 1 + n].to_string());
++            }
++            from = start + 1;
++        }
++    }
++    out
++}
++
++struct Phi<'a> {
++    head: &'a str, // everything before the first entry: `  %x = phi float`
++    entries: Vec<(&'a str, &'a str)>, // value, predecessor
++    tail: &'a str, // after the last entry, such as `, !dbg !4`
++}
++
++fn parse_phi(line: &str) -> Option<(&str, Phi<'_>)> {
++    let (name, rhs) = split_def(line)?;
++    rhs.strip_prefix("phi ")?;
++    let first = line.find(" [ ")?;
++    let head = &line[..first];
++    let mut rest = &line[first + 1..];
++    let mut entries = Vec::new();
++    loop {
++        rest = rest.strip_prefix("[ ")?;
++        // the value runs to the first `, %pred ]` (it may hold commas)
++        let mut from = 0;
++        let (cut, pred_len) = loop {
++            let at = from + rest[from..].find(", %")?;
++            let n = ident_len(&rest[at + 3..]);
++            if n > 0 && rest[at + 3 + n..].starts_with(" ]") {
++                break (at, n);
++            }
++            from = at + 1;
++        };
++        entries.push((&rest[..cut], &rest[cut + 2..cut + 3 + pred_len]));
++        rest = &rest[cut + 3 + pred_len + 2..];
++        match rest.strip_prefix(", ") {
++            Some(next) if next.starts_with("[ ") => rest = next,
++            _ => break,
++        }
++    }
++    Some((
++        name,
++        Phi {
++            head,
++            entries,
++            tail: rest,
++        },
++    ))
++}
++
++/// Registers of `map` in a line, replaced by what they map to.
++fn substitute(line: &str, map: &HashMap<String, String>) -> Option<String> {
++    let mut out: Option<String> = None;
++    let mut copied = 0;
++    let mut from = 0;
++    while let Some(at) = line[from..].find('%') {
++        let start = from + at;
++        let n = ident_len(&line[start + 1..]);
++        from = start + 1 + n;
++        if n == 0 {
++            continue;
++        }
++        if let Some(value) = map.get(&line[start..start + 1 + n]) {
++            let o = out.get_or_insert_with(|| String::with_capacity(line.len()));
++            o.push_str(&line[copied..start]);
++            o.push_str(value);
++            copied = from;
++        }
++    }
++    out.map(|mut o| {
++        o.push_str(&line[copied..]);
++        o
++    })
++}
++
++/// A function's body folded, or `None` when it has nothing to fold (or is not one this reads).
++fn fold_function<'a>(define: &str, body: &[&'a str]) -> Option<Vec<Cow<'a, str>>> {
++    // Quoted type names (`%"struct.X"`) are common in a body; a quoted register or label is not read here.
++    let unreadable = |l: &str| {
++        let t = l.trim_start();
++        l.starts_with('"')
++            || t.starts_with("%\"")
++            || l.contains("label %\"")
++            || l.contains("blockaddress")
++            || l.contains("indirectbr")
++            || l.contains(" invoke ")
++            || l.contains("callbr ")
++            || l.contains("landingpad")
++    };
++    if define.contains("%\"") || body.iter().any(|l| unreadable(l)) {
++        return None;
++    }
++    let mut blocks: Vec<Block> = Vec::new();
++    let mut cur = Block {
++        name: format!("%{}", entry_number(define)),
++        lines: Vec::new(),
++    };
++    for &l in body {
++        if let Some(label) = label_of(l) {
++            blocks.push(std::mem::replace(
++                &mut cur,
++                Block {
++                    name: format!("%{label}"),
++                    lines: vec![Cow::Borrowed(l)],
++                },
++            ));
++        } else {
++            cur.lines.push(Cow::Borrowed(l));
++        }
++    }
++    blocks.push(cur);
++    if blocks[0].lines.iter().all(|l| l.trim().is_empty()) {
++        blocks.remove(0);
++    }
++    if blocks.is_empty() {
++        return None;
++    }
++
++    let mut any = false;
++    for _ in 0..MAX_ROUNDS {
++        let mut changed = false;
++
++        // registers that are literals, in order
++        let mut consts: HashMap<String, bool> = HashMap::new();
++        for b in &blocks {
++            for l in &b.lines {
++                if let Some((dst, rhs)) = split_def(l) {
++                    if let Some(v) = fold_def(rhs, &consts) {
++                        consts.insert(dst.to_string(), v);
++                    }
++                }
++            }
++        }
++        // branches they decide
++        for b in &mut blocks {
++            for l in &mut b.lines {
++                if let Some(folded) = fold_branch(l, &consts) {
++                    *l = Cow::Owned(folded);
++                    changed = true;
++                }
++            }
++        }
++
++        // blocks nothing reaches
++        let succ: Vec<Vec<String>> = blocks.iter().map(|b| successors(&b.lines)).collect();
++        let by_name: HashMap<&str, usize> = blocks
++            .iter()
++            .enumerate()
++            .map(|(i, b)| (b.name.as_str(), i))
++            .collect();
++        let mut seen = vec![false; blocks.len()];
++        let mut todo = vec![0usize];
++        seen[0] = true;
++        while let Some(n) = todo.pop() {
++            for s in &succ[n] {
++                if let Some(&m) = by_name.get(s.as_str()) {
++                    if !seen[m] {
++                        seen[m] = true;
++                        todo.push(m);
++                    }
++                }
++            }
++        }
++        // predecessors among the blocks that stay
++        let mut preds: HashMap<String, HashSet<&str>> = HashMap::with_capacity(blocks.len());
++        for (i, b) in blocks.iter().enumerate() {
++            if seen[i] {
++                preds.entry(b.name.clone()).or_default();
++            }
++        }
++        for (i, b) in blocks.iter().enumerate() {
++            if !seen[i] {
++                continue;
++            }
++            for s in &succ[i] {
++                if let Some(set) = preds.get_mut(s.as_str()) {
++                    set.insert(b.name.as_str());
++                }
++            }
++        }
++        // phi entries from blocks that are no longer predecessors, as a list of rewrites to make
++        let mut rewrites: Vec<(usize, usize, String)> = Vec::new();
++        for (i, b) in blocks.iter().enumerate() {
++            if !seen[i] {
++                continue;
++            }
++            let have = &preds[b.name.as_str()];
++            for (k, l) in b.lines.iter().enumerate() {
++                if !l.contains("phi ") {
++                    continue;
++                }
++                let Some((_, phi)) = parse_phi(l) else {
++                    continue;
++                };
++                let keep: Vec<_> = phi
++                    .entries
++                    .iter()
++                    .filter(|(_, p)| have.contains(p))
++                    .collect();
++                if keep.is_empty() {
++                    return None;
++                }
++                if keep.len() != phi.entries.len() {
++                    let list: Vec<String> =
++                        keep.iter().map(|(v, p)| format!("[ {v}, {p} ]")).collect();
++                    rewrites.push((
++                        i,
++                        k,
++                        format!("{} {}{}", phi.head, list.join(", "), phi.tail),
++                    ));
++                }
++            }
++        }
++        if seen.iter().any(|s| !s) {
++            changed = true;
++        }
++        let mut idx = 0;
++        blocks.retain(|_| {
++            idx += 1;
++            seen[idx - 1]
++        });
++        // rewrites were indexed before the removal
++        let mut remap = vec![0usize; seen.len()];
++        let mut next = 0;
++        for (i, s) in seen.iter().enumerate() {
++            remap[i] = next;
++            if *s {
++                next += 1;
++            }
++        }
++        for (i, k, text) in rewrites {
++            blocks[remap[i]].lines[k] = Cow::Owned(text);
++            changed = true;
++        }
++
++        // a phi left with one entry is that value
++        let mut subst: HashMap<String, String> = HashMap::new();
++        for b in &mut blocks {
++            let mut keep = Vec::with_capacity(b.lines.len());
++            for l in b.lines.drain(..) {
++                let single = if l.contains("phi ") {
++                    parse_phi(&l).and_then(|(name, phi)| {
++                        (phi.entries.len() == 1
++                            && phi.tail.trim().is_empty()
++                            && phi.entries[0].0 != name)
++                            .then(|| (name.to_string(), phi.entries[0].0.to_string()))
++                    })
++                } else {
++                    None
++                };
++                match single {
++                    Some((name, value)) => {
++                        subst.insert(name, value);
++                    }
++                    None => keep.push(l),
++                }
++            }
++            b.lines = keep;
++        }
++        if !subst.is_empty() {
++            changed = true;
++            // chains: a phi's value may itself be one going away
++            let mut resolved = HashMap::with_capacity(subst.len());
++            for (k, v) in &subst {
++                let mut v = v;
++                let mut steps = 0;
++                while let Some(next) = subst.get(v) {
++                    v = next;
++                    steps += 1;
++                    if steps > subst.len() {
++                        return None;
++                    }
++                }
++                resolved.insert(k.clone(), v.clone());
++            }
++            for b in &mut blocks {
++                for l in &mut b.lines {
++                    if let Some(s) = substitute(l, &resolved) {
++                        *l = Cow::Owned(s);
++                    }
++                }
++            }
++        }
++        any |= changed;
++        if !changed {
++            break;
++        }
++    }
++    if !any {
++        return None;
++    }
++    Some(blocks.into_iter().flat_map(|b| b.lines).collect())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// A module whose function `@main` is an entry point (named in metadata), with `body` between its braces.
++    fn module(args: &str, body: &str) -> String {
++        format!(
++            "define void @main({args}) {{\n{body}}}\n!air.vertex = !{{!0}}\n!0 = !{{ptr @main}}\n"
++        )
++    }
++
++    #[test]
++    fn i8_255_is_minus_one() {
++        let ll = module(
++            "i1 %x",
++            "entry:\n  %c = icmp eq i8 255, -1\n  br i1 %c, label %a, label %b\na:\n  ret void\nb:\n  ret void\n",
++        );
++        let out = fold_specialized_air(&ll).expect("folds");
++        assert!(out.contains("br label %a"), "{out}");
++        assert!(!out.contains("b:\n"), "{out}");
++
++        // signed and unsigned at the width: -1 is below 0 signed, above it unsigned
++        for (pred, to_a) in [
++            ("slt", true),
++            ("sgt", false),
++            ("ugt", true),
++            ("ult", false),
++            ("sle", true),
++            ("uge", true),
++        ] {
++            let ll = module(
++                "i1 %x",
++                &format!("entry:\n  %c = icmp {pred} i8 255, 0\n  br i1 %c, label %a, label %b\na:\n  ret void\nb:\n  ret void\n"),
++            );
++            let out = fold_specialized_air(&ll).expect("folds");
++            let want = if to_a { "br label %a" } else { "br label %b" };
++            assert!(out.contains(want), "{pred}: {out}");
++        }
++        // an i1 true is -1 signed
++        let ll = module(
++            "i1 %x",
++            "entry:\n  %c = icmp slt i1 true, false\n  br i1 %c, label %a, label %b\na:\n  ret void\nb:\n  ret void\n",
++        );
++        assert!(fold_specialized_air(&ll).unwrap().contains("br label %a"));
++    }
++
++    #[test]
++    fn unlabeled_entry_block_is_numbered_after_the_unnamed_arguments() {
++        // the entry is %2: a phi entry from it must stay, so the phi folds to its value
++        let ll = module(
++            "i32 %0, i32 %1",
++            "  %c = icmp eq i32 1, 1\n  br i1 %c, label %b, label %a\na:\n  br label %b\nb:\n  %p = phi i32 [ 7, %2 ], [ 9, %a ]\n  call void @use(i32 %p)\n  ret void\n",
++        );
++        let out = fold_specialized_air(&ll).expect("folds");
++        assert!(!out.contains("phi"), "{out}");
++        assert!(out.contains("call void @use(i32 7)"), "{out}");
++        assert!(!out.contains("a:\n"), "{out}");
++
++        // no unnamed arguments: the entry is %0
++        let ll = "define void @main(i32 %x) {\n  br i1 true, label %b, label %a\na:\n  br label %b\nb:\n  %p = phi i32 [ 7, %0 ], [ 9, %a ]\n  ret void\n}\n!0 = !{ptr @main}\n";
++        let out = fold_specialized_air(ll).expect("folds");
++        assert!(!out.contains("phi") && !out.contains("[ 9"), "{out}");
++    }
++
++    #[test]
++    fn a_phi_loses_the_entry_of_a_removed_predecessor() {
++        let ll = module(
++            "i1 %x",
++            "entry:\n  br i1 true, label %a, label %b\na:\n  br i1 %x, label %m, label %n\nb:\n  br label %m\nn:\n  br label %m\nm:\n  %p = phi i32 [ 1, %a ], [ 2, %b ], [ 3, %n ]\n  call void @use(i32 %p)\n  ret void\n",
++        );
++        let out = fold_specialized_air(&ll).expect("folds");
++        assert!(out.contains("%p = phi i32 [ 1, %a ], [ 3, %n ]"), "{out}");
++        assert!(!out.contains("%b"), "{out}");
++    }
++
++    #[test]
++    fn a_chain_of_single_entry_phis_is_its_value() {
++        let ll = module(
++            "i1 %x",
++            "entry:\n  br label %a\na:\n  %p = phi i32 [ 5, %entry ]\n  br label %b\nb:\n  %q = phi i32 [ %p, %a ]\n  br label %c\nc:\n  %r = phi i32 [ %q, %b ]\n  call void @use(i32 %r, i32 %q)\n  ret void\n",
++        );
++        let out = fold_specialized_air(&ll).expect("folds");
++        assert!(!out.contains("phi"), "{out}");
++        assert!(out.contains("call void @use(i32 5, i32 5)"), "{out}");
++    }
++
++    #[test]
++    fn a_function_nothing_reaches_goes_and_one_in_metadata_stays() {
++        let ll = "define void @main() {\nentry:\n  call void @helper()\n  ret void\n}\n\
++define void @helper() {\n  ret void\n}\n\
++define void @dead() {\n  call void @deadhelper()\n  ret void\n}\n\
++define void @deadhelper() {\n  ret void\n}\n\
++define void @second() {\n  ret void\n}\n\
++define internal void @init() section \"air.static_init\" {\n  ret void\n}\n\
++declare void @ext()\n!air.vertex = !{!0}\n!air.fragment = !{!1}\n!0 = !{ptr @main}\n!1 = !{ptr @second}\n";
++        let out = fold_specialized_air(ll).expect("removes");
++        for kept in ["@main()", "@helper()", "@second()"] {
++            assert!(
++                out.contains(&format!("define void {kept}")),
++                "{kept}: {out}"
++            );
++        }
++        assert!(
++            !out.contains("@dead") && !out.contains("@deadhelper"),
++            "{out}"
++        );
++        assert!(out.contains("declare void @ext()"), "{out}");
++        assert!(
++            out.contains("@init()"),
++            "the static initializer is run without a call: {out}"
++        );
++        // a function a global's initializer names stays too, and so does what it calls: nothing is left to remove
++        let ll = ll.replace(
++            "!0 = !{ptr @main}",
++            "!0 = !{ptr @main}\n@table = global ptr @dead",
++        );
++        assert_eq!(fold_specialized_air(&ll), None);
++    }
++
++    #[test]
++    fn nothing_to_fold_comes_back_unchanged() {
++        let ll = module(
++            "i1 %x, i32 %y",
++            "entry:\n  %c = icmp eq i32 %y, 1\n  br i1 %c, label %a, label %b\na:\n  br label %m\nb:\n  br label %m\nm:\n  %p = phi i32 [ 1, %a ], [ 2, %b ]\n  call void @use(i32 %p)\n  ret void\n",
++        );
++        assert_eq!(fold_specialized_air(&ll), None);
++        // no functions at all, and a function cut off, are left alone
++        assert_eq!(fold_specialized_air("@g = global i32 0\n"), None);
++        assert_eq!(
++            fold_specialized_air("define void @f() {\n  ret void\n"),
++            None
++        );
++    }
++
++    #[test]
++    fn boolean_operations_and_selects_on_literals_decide_branches() {
++        let ll = module(
++            "i1 %x",
++            "entry:\n  %a = icmp eq i32 3, 3\n  %b = and i1 %x, false\n  %c = or i1 %a, %x\n  %d = select i1 %c, i1 %b, i1 true\n  br i1 %d, label %p, label %q\np:\n  ret void\nq:\n  ret void\n",
++        );
++        // %c is true, so %d is %b, which is false: q
++        let out = fold_specialized_air(&ll).expect("folds");
++        assert!(out.contains("br label %q"), "{out}");
++        assert!(!out.contains("p:\n"), "{out}");
++    }
++
++    #[test]
++    fn a_branch_keeps_its_trailing_metadata_and_a_function_with_a_quoted_name_is_left_alone() {
++        let ll = module(
++            "i1 %x",
++            "entry:\n  br i1 false, label %a, label %b, !llvm.loop !3\na:\n  ret void\nb:\n  ret void\n",
++        );
++        assert!(fold_specialized_air(&ll)
++            .unwrap()
++            .contains("br label %b, !llvm.loop !3"));
++        let ll = module("i1 %x", "entry:\n  br i1 true, label %\"a b\", label %b\n\"a b\":\n  ret void\nb:\n  ret void\n");
++        assert_eq!(fold_specialized_air(&ll), None);
++    }
++}
+diff --git a/translator/translator/src/lib.rs b/translator/translator/src/lib.rs
+index 807b298..396caf7 100644
+--- a/translator/translator/src/lib.rs
++++ b/translator/translator/src/lib.rs
+@@ -11,6 +11,7 @@ mod emit_sidecar;
+ mod emitted_effects;
+ pub mod env_vars;
+ mod fc_air_specialize;
++mod fc_fold;
+ mod fc_specialize;
+ pub(crate) mod float16;
+ pub mod fxhash;

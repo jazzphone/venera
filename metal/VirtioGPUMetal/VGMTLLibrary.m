@@ -408,6 +408,202 @@ NSData *vg_translate(NSString *ll, const char *stage, NSDictionary<NSNumber *, N
     }
     return spv ? vg_spirv_ieee(spv) : nil;
 }
+// ---- the warm-up (0.1.9) -------------------------------------------------------------------------------------------
+// A fresh macOS's WindowServer asks for Core Animation's uber fragment shader in ~46 sets of function constants in its
+// first minutes, one after another, ~2 s each in a VM. The bundle carries the sets WindowServer asked for on a fresh
+// install (Resources/warm.txt: the function's name, the stage, the sample count and the constants' values: numbers,
+// nothing of Apple's shaders). The first time a process asks for one of those functions, the other listed sets are
+// translated in the background on the VM's other cores, from that process's own copy of the function, so its next
+// requests find them in the cache. A request for a set already being translated waits for it instead of translating
+// it again. The warmrecord flag (/Library/GPUBundles/VirtioGPUMetal-warmrecord) writes the sets a process asks for to
+// its cache folder (warm-record.txt), which is how the list is made.
+static __thread int gWarming;   // a warm-up translation: it starts no warm-up of its own
+// the shader's entry point: !air.<stage> = !{!N}, and !N = !{ptr @NAME, ...} (a function's text also holds its module's
+// other functions, a static constructor first)
+static NSString *vg_ll_entry(NSString *ll, const char *stage) {
+    NSRange r = [ll rangeOfString:[NSString stringWithFormat:@"\n!air.%s = !{!", stage]];
+    if (r.location != NSNotFound) {
+        NSUInteger i = NSMaxRange(r), j = i;
+        while (j < ll.length && isdigit([ll characterAtIndex:j])) j++;
+        if (j > i) {
+            NSString *node = [NSString stringWithFormat:@"\n!%@ = ", [ll substringWithRange:NSMakeRange(i, j - i)]];
+            NSRange n = [ll rangeOfString:node];
+            NSRange at = n.location == NSNotFound ? n : [ll rangeOfString:@"@" options:0 range:NSMakeRange(NSMaxRange(n), MIN(ll.length - NSMaxRange(n), 400))];
+            if (at.location != NSNotFound) {
+                NSUInteger e = at.location + 1;
+                while (e < ll.length && !strchr(" ,()\n", [ll characterAtIndex:e])) e++;
+                if (e > at.location + 1) {
+                    return [ll substringWithRange:NSMakeRange(at.location + 1, e - at.location - 1)];
+                }
+            }
+        }
+    }
+    return nil;
+}
+static NSString *vg_ll_name(NSString *ll) {
+    NSRange d = [ll rangeOfString:@"define "];
+    if (d.location == NSNotFound) {
+        return @"?";
+    }
+    NSRange at = [ll rangeOfString:@"@" options:0 range:NSMakeRange(d.location, MIN(ll.length - d.location, 4096))];
+    if (at.location == NSNotFound) {
+        return @"?";
+    }
+    NSRange par = [ll rangeOfString:@"(" options:0 range:NSMakeRange(at.location, MIN(ll.length - at.location, 512))];
+    return par.location == NSNotFound ? @"?" : [ll substringWithRange:NSMakeRange(at.location + 1, par.location - at.location - 1)];
+}
+static NSString *vg_fc_line(NSDictionary<NSNumber *, NSData *> *fc) {   // "idx:hex idx:hex ..." in index order
+    NSMutableString *line = [NSMutableString string];
+    for (NSNumber *i in [fc.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+        const uint8_t *b = fc[i].bytes;
+        [line appendFormat:@"%s%@:", line.length ? " " : "", i];
+        for (NSUInteger k = 0; k < fc[i].length; k++) [line appendFormat:@"%02x", b[k]];
+    }
+    return line;
+}
+static NSDictionary<NSNumber *, NSData *> *vg_fc_parse(NSArray<NSString *> *parts) {
+    NSMutableDictionary<NSNumber *, NSData *> *fc = [NSMutableDictionary dictionary];
+    for (NSString *p in parts) {
+        NSArray<NSString *> *kv = [p componentsSeparatedByString:@":"];
+        if (kv.count != 2 || kv[1].length % 2) {
+            return nil;
+        }
+        NSMutableData *d = [NSMutableData dataWithLength:kv[1].length / 2];
+        uint8_t *b = d.mutableBytes;
+        for (NSUInteger k = 0; k < d.length; k++) {
+            unsigned v = 0;
+            if (sscanf([kv[1] substringWithRange:NSMakeRange(2 * k, 2)].UTF8String, "%02x", &v) != 1) {
+                return nil;
+            }
+            b[k] = (uint8_t)v;
+        }
+        fc[@(kv[0].intValue)] = d;
+    }
+    return fc;
+}
+static void vg_warm_record(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc) {
+    static int on = -1;
+    if (on < 0) {
+        BOOL vg_debug_flag(const char *name);
+        on = vg_debug_flag("warmrecord") && vg_disk_dir();
+    }
+    if (!on || !fc.count) {
+        return;
+    }
+    NSString *path = [[vg_disk_dir() stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"warm-record.txt"];
+    NSString *name = vg_ll_entry(ll, stage) ?: vg_ll_name(ll);
+    NSString *line = [NSString stringWithFormat:@"%@ %s %u %@\n", name, stage, gSamples ? gSamples : 1, vg_fc_line(fc)];
+    @synchronized([NSFileManager class]) {
+        NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (!h) {
+            [[NSFileManager defaultManager] createFileAtPath:path contents:nil attributes:nil];
+            h = [NSFileHandle fileHandleForWritingAtPath:path];
+        }
+        [h seekToEndOfFile];
+        [h writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        [h closeFile];
+    }
+}
+// the list: "name stage" -> its sets, each @[samples, fc]
+static NSDictionary<NSString *, NSArray *> *vg_warm_list(void) {
+    static NSDictionary *list;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSMutableDictionary *m = [NSMutableDictionary dictionary];
+        NSString *path = [[NSBundle bundleForClass:NSClassFromString(@"VGMTLDevice")] pathForResource:@"warm" ofType:@"txt"];
+        NSString *text = path ? [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:NULL] : nil;
+        for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
+            NSArray<NSString *> *w = [line componentsSeparatedByString:@" "];
+            if (w.count < 4 || [line hasPrefix:@"#"]) {
+                continue;
+            }
+            NSDictionary *fc = vg_fc_parse([w subarrayWithRange:NSMakeRange(3, w.count - 3)]);
+            if (!fc.count) {
+                continue;
+            }
+            NSString *k = [NSString stringWithFormat:@"%@ %@", w[0], w[1]];
+            if (!m[k]) {
+                m[k] = [NSMutableArray array];
+            }
+            [m[k] addObject:@[ @(w[2].intValue), fc ]];
+        }
+        list = m;
+        if (m.count) {
+            vglog("warm-up: %lu functions listed", (unsigned long)m.count);
+        }
+    });
+    return list;
+}
+static NSMutableDictionary<NSString *, dispatch_group_t> *gWarmInflight;
+static NSData *vg_translate_flagged(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc,
+                                    const uint32_t *tgLengths, uint32_t tgCount, NSString **error);
+static void vg_warm_start(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc) {
+    if (gWarming || !fc.count || getenv("VGMTL_NOWARM")) {
+        return;
+    }
+    NSString *name = vg_ll_entry(ll, stage) ?: vg_ll_name(ll);
+    NSArray *sets = vg_warm_list()[[NSString stringWithFormat:@"%@ %s", name, stage]];
+    if (!sets.count) {
+        return;
+    }
+    static NSMutableSet *started;
+    static dispatch_queue_t q;
+    static dispatch_semaphore_t slots;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        started = [NSMutableSet set];
+        gWarmInflight = [NSMutableDictionary dictionary];
+        q = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
+        long n = sysconf(_SC_NPROCESSORS_ONLN) - 1;
+        slots = dispatch_semaphore_create(n < 1 ? 1 : n > 4 ? 4 : n);   // the other cores, at most 4
+    });
+    NSString *mark = [NSString stringWithFormat:@"%p %s", (__bridge void *)ll, stage];
+    @synchronized(started) {
+        if ([started containsObject:mark]) {
+            return;
+        }
+        [started addObject:mark];
+    }
+    vglog("warm-up: %s %s, %lu sets in the background", name.UTF8String, stage, (unsigned long)sets.count);
+    NSString *stageName = @(stage);
+    for (NSArray *set in sets) {
+        uint32_t samples = [set[0] unsignedIntValue];
+        NSDictionary *fc2 = set[1];
+        if ([fc2 isEqualToDictionary:fc]) {
+            continue;
+        }
+        dispatch_async(q, ^{
+            dispatch_semaphore_wait(slots, DISPATCH_TIME_FOREVER);
+            gWarming = 1;
+            vg_translate_set_samples(samples);
+            const char *st = stageName.UTF8String;
+            NSString *key = vg_translate_key(ll, st, fc2, NULL, 0);
+            dispatch_group_t g = dispatch_group_create();
+            dispatch_group_enter(g);
+            BOOL mine = NO;
+            @synchronized(gWarmInflight) {
+                if (!gWarmInflight[key]) {
+                    gWarmInflight[key] = g;
+                    mine = YES;
+                }
+            }
+            if (mine) {
+                NSString *why = nil;
+                if (!vg_translate_flagged(ll, st, fc2, NULL, 0, &why)) {
+                    vglog("warm-up: a set failed: %s", why.UTF8String);
+                }
+                @synchronized(gWarmInflight) {
+                    [gWarmInflight removeObjectForKey:key];
+                }
+            }
+            dispatch_group_leave(g);
+            vg_translate_set_samples(0);
+            gWarming = 0;
+            dispatch_semaphore_signal(slots);
+        });
+    }
+}
+
 static NSData *vg_translate_flagged(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc,
                                     const uint32_t *tgLengths, uint32_t tgCount, NSString **error) {
     static NSMutableDictionary<NSString *, NSData *> *cache;
@@ -420,8 +616,28 @@ static NSData *vg_translate_flagged(NSString *ll, const char *stage, NSDictionar
             return hit;
         }
     }
+    // a set the warm-up is translating: wait for it, then take it from the cache
+    dispatch_group_t inflight = nil;
+    if (!gWarming && gWarmInflight) {
+        @synchronized(gWarmInflight) {
+            inflight = gWarmInflight[key];
+        }
+    }
+    if (inflight) {
+        dispatch_group_wait(inflight, DISPATCH_TIME_FOREVER);
+        @synchronized(cache) {
+            NSData *hit = cache[key];
+            if (hit) {
+                return hit;
+            }
+        }
+    }
     NSString *dkey = vg_disk_dir() ? vg_disk_key("spirv", ll, stage, fc, tgLengths, tgCount) : nil;
     NSData *spv = dkey ? vg_disk_get(dkey) : nil;
+    if (!spv && !gWarming) {
+        vg_warm_record(ll, stage, fc);
+        vg_warm_start(ll, stage, fc);
+    }
     if (spv) {
         vg_perf(VG_PERF_DISK_HIT, spv.length, 0);
     } else {

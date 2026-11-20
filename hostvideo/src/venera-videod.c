@@ -76,6 +76,7 @@ static void logf_(const char *fmt, ...) {
 #define kVTPropertyNotSupportedErr (-12900)
 #define kVTCouldNotFindVideoDecoderErr (-12906)
 #define kVTVideoDecoderBadDataErr (-12909)
+#define kVTVideoDecoderUnsupportedDataFormatErr (-12910)
 #define kVTVideoDecoderMalfunctionErr (-12911)
 #define kVTInvalidSessionErr (-12903)
 #define kVTDecodeFrame_DoNotOutputFrame (1u << 1)
@@ -1268,6 +1269,17 @@ static void engine_msg(const uint8_t *p, size_t n, const struct vv_surf *surfs, 
         reply_err(&m, 0);
     } else if (!strcmp(t, "-dec")) {
         free_session(s);
+    } else if (!strcmp(t, "dtil") || !strcmp(t, "dsts")) {
+        // A HEIF image's tiles (dtil) and their status (dsts): not decoded here. "No error" with no picture left the
+        // guest's image decoder (CMPhoto) waiting forever, as Setup Assistant did on a fresh VM (its first screen is a
+        // HEIF image); unsupported makes it decode in software instead.
+        static int told;
+        if (!told++) {
+            LOG("%s: HEIF tile decoding isn't done here: unsupported (the guest decodes in software)", safe_type(t));
+        }
+        if (m.flags & 1) {
+            reply_err(&m, kVTVideoDecoderUnsupportedDataFormatErr);
+        }
     } else {
         static char seen[64][5];
         static int nseen;
