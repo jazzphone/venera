@@ -2127,3 +2127,11 @@ TRIM, Upgrade without a USB disk, Retina modes, a faster first boot (a warm-up a
   2.9 s, 2.2 MB of SPIR-V; a white screen meanwhile). The private seed was remade for the new translator from VM 111's
   pool after the full setup (1927 translations, the hello's included; tools/seed-pool.sh SEED_FROM), and the
   owner's kits on both nodes carry it (not a release: make-dist ships a seed only with VENERA_PRIVATE_SEED=1).
+
+### 0.1.9 (2026-11-20)
+
+- Everything since 0.1.8 (round 22, Setup Assistant's Memoji and "hello", VirtualSMC, the faster library reading, the
+  cursor). Released as v0.1.9 (pre-release, no seed in it). The owner's kits on both nodes are a private 0.1.9 with
+  the seed; VMs 107, 108 (snapshot venera-019-pre first), 110 and 111 upgraded, each on the same Metal driver,
+  framebuffer 0.6.2 and VirtualSMC. Upgrades run on both nodes at once lost their place twice (VM 108 after the copy,
+  VM 107 after the USB disk; the package was in, no restart): run one Upgrade at a time; reruns finished both.
