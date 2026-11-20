@@ -2105,3 +2105,11 @@ TRIM, Upgrade without a USB disk, Retina modes, a faster first boot (a warm-up a
   guest agent couldn't take the package, and the USB fallback copied the kit's Venera Tools CD, whose package was
   yesterday's release: the kexts and Metal driver stayed old. The USB disk is now made from the package being installed
   (6th commit of the day); a second Upgrade put framebuffer 0.6.2, accelerator 0.7.0 and the new Metal driver on it.
+- **The Memoji menu's beach ball (VM 110)**: the pose picker sat at a full core for ~30 s on each open. A sample:
+  newDefaultLibraryWithBundle -> vg_new_library, converting every module of VFX's default.metallib to IR text
+  (vg_air_to_text, vg_entry_of): 585 modules, ~1.2 s per load, and AvatarKit loads it again for each renderer. A
+  metallib's function table (MTLB: NAME, TYPE, OFFT's bitcode offset; the list size leaves out its 4-byte count) now
+  lists the functions and each module is converted when first asked for; a library loaded without its visible
+  functions (Core Image's) lists TYPE 0-2 only, as before, and dynamic-library linking still gets every module. VFX's
+  library: 1.17 s -> 0.02 s. VM 111, two boots each way (the eagerlib flag file brings back the old reading): no
+  missing functions either way, the desktop on Metal; mtlcube, mtlalign, mtltess pass.

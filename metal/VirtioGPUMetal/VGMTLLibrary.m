@@ -1242,8 +1242,16 @@ static NSError *vg_lib_error(NSString *what) {
 
 @interface VGMTLLibrary : NSObject <MTLLibrary> {
 @public
-    NSDictionary<NSString *, VGMTLFunction *> *_functions;
-    NSArray<NSString *> *_modules;   // every module's IR text, entry points or not (a dynamic library's exports)
+    NSMutableDictionary<NSString *, VGMTLFunction *> *_functions;
+    NSArray<NSString *> *_modules;   // every module's IR text, entry points or not (a dynamic library's exports):
+                                     // read through vg_library_modules, which converts what is still pending
+    // A metallib's functions not converted yet (0.1.9): name (its function table's) -> its bitcode. Converting a
+    // module to IR text costs; AvatarKit's VFX library has 585 and its processes asked for a few dozen, so the
+    // Memoji pickers spent ~30 s of CPU at every start converting them all. Each is converted when first asked for.
+    NSMutableDictionary<NSString *, NSData *> *_pending;
+    NSArray<NSData *> *_blobs;       // every module of the metallib (listed or not), for vg_library_modules
+    NSMutableSet<NSValue *> *_read;  // the ones converted
+    BOOL _noVisible;
     NSArray *_dylibs;                // VGMTLDynamicLibrary given when this library was compiled (5d)
     NSData *_raw;                    // the metallib
 }
@@ -1293,23 +1301,103 @@ static BOOL vg_entry_of(NSString *ll, NSString **name, NSString **stage) {
     return NO;
 }
 
+static void vg_library_add_module(id<MTLDevice> device, NSString *ll, BOOL noVisible, NSMutableDictionary *fns);
+static VGMTLFunction *vg_function_by_cxx_name(NSDictionary<NSString *, VGMTLFunction *> *fns, NSString *name);
+static VGMTLFunction *vg_library_read(VGMTLLibrary *lib, NSData *blob, NSString *key, NSString *name);
+// The pending module named `name` (or, for a name in a namespace, one whose table name starts with its C++ symbol),
+// converted and its functions added; then the function. Under the library's lock.
+static VGMTLFunction *vg_library_function(VGMTLLibrary *lib, NSString *name) {
+    @synchronized(lib) {
+        VGMTLFunction *f = lib->_functions[name] ?: vg_function_by_cxx_name(lib->_functions, name);
+        if (f || !lib->_pending.count) {
+            return f;
+        }
+        NSString *key = lib->_pending[name] ? name : nil;
+        if (!key && [name containsString:@"::"]) {
+            NSArray *parts = [name componentsSeparatedByString:@"::"];
+            NSMutableString *prefix = [NSMutableString stringWithString:@"_ZN"];
+            for (NSString *p in parts) {
+                [prefix appendFormat:@"%lu%@", (unsigned long)p.length, p];
+            }
+            for (NSString *k in lib->_pending) {
+                if ([k hasPrefix:prefix]) {
+                    key = k;
+                    break;
+                }
+            }
+        }
+        if (!key) {
+            return nil;
+        }
+        return vg_library_read(lib, lib->_pending[key], key, name);
+    }
+}
+// A pending module converted and its functions added; then the function `name`. Under the library's lock.
+static VGMTLFunction *vg_library_read(VGMTLLibrary *lib, NSData *blob, NSString *key, NSString *name) {
+    @synchronized(lib) {
+        for (NSString *k in [lib->_pending allKeysForObject:blob]) {   // the module's other names
+            [lib->_pending removeObjectForKey:k];
+        }
+        [lib->_read addObject:[NSValue valueWithNonretainedObject:blob]];
+        NSString *ll = vg_air_to_text(blob);
+        if (!ll) {
+            vglog("library: %s's module couldn't be read", key.UTF8String);
+            return nil;
+        }
+        NSMutableDictionary *fns = [NSMutableDictionary dictionary];
+        vg_library_add_module(lib.device, ll, lib->_noVisible, fns);
+        if (key && fns.count == 1 && !fns[key]) {
+            fns[key] = fns.allValues.firstObject;   // the table's name for the module's entry (a quoted symbol's)
+        }
+        for (NSString *k in fns) {
+            VGMTLFunction *nf = fns[k];
+            nf->_lib = lib;
+            if (!lib->_functions[k]) {
+                lib->_functions[k] = nf;
+            }
+        }
+        lib->_modules = [(lib->_modules ?: @[]) arrayByAddingObject:ll];
+        return name ? (lib->_functions[name] ?: vg_function_by_cxx_name(lib->_functions, name)) : nil;
+    }
+}
+// Every module's text, the ones not read yet converted now (a dynamic library's exports, a library's externs).
+static NSArray<NSString *> *vg_library_modules(VGMTLLibrary *lib) {
+    @synchronized(lib) {
+        for (NSData *blob in lib->_blobs) {
+            if (![lib->_read containsObject:[NSValue valueWithNonretainedObject:blob]]) {
+                vg_library_read(lib, blob, nil, nil);
+            }
+        }
+        return lib->_modules ?: @[];
+    }
+}
+
 @implementation VGMTLLibrary
 @synthesize device = _device, label = _label;
 - (instancetype)initWithDevice:(id<MTLDevice>)device functions:(NSDictionary *)functions {
     if ((self = [super init])) {
         _device = device;
-        _functions = [functions copy];
+        _functions = [functions mutableCopy];
         for (VGMTLFunction *f in _functions.allValues) {
             f->_lib = self;
         }
     }
     return self;
 }
-- (NSArray<NSString *> *)functionNames { return _functions.allKeys; }
+- (NSArray<NSString *> *)functionNames {
+    @synchronized(self) {
+        if (!_pending.count) {
+            return _functions.allKeys;
+        }
+        NSMutableSet *names = [NSMutableSet setWithArray:_functions.allKeys];
+        [names addObjectsFromArray:_pending.allKeys];
+        return names.allObjects;
+    }
+}
 - (NSData *)vgRaw { return _raw; }
 - (VGMTLLibrary *)vgSelf { return self; }
 // What the library calls and doesn't define, linked from dynamic libraries (Core Image asks).
-- (NSArray<NSString *> *)externFunctionNames { return vg_undefined_externs(_modules ?: @[]).allObjects; }
+- (NSArray<NSString *> *)externFunctionNames { return vg_undefined_externs(vg_library_modules(self)).allObjects; }
 // A name in a namespace ("Clear::clear_vertex", Maps) is the entry's C++ symbol: _ZN5Clear12clear_vertexE...
 static VGMTLFunction *vg_function_by_cxx_name(NSDictionary<NSString *, VGMTLFunction *> *fns, NSString *name) {
     NSArray *parts = [name componentsSeparatedByString:@"::"];
@@ -1331,7 +1419,7 @@ static VGMTLFunction *vg_function_by_cxx_name(NSDictionary<NSString *, VGMTLFunc
 - (MTLLibraryType)type { return MTLLibraryTypeExecutable; }
 - (NSString *)installName { return nil; }
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name {
-    VGMTLFunction *f = _functions[name] ?: vg_function_by_cxx_name(_functions, name);
+    VGMTLFunction *f = vg_library_function(self, name);
     if (!f) {
         vglog("library: no function %s", name.UTF8String);
     }
@@ -1343,7 +1431,7 @@ static VGMTLFunction *vg_function_by_cxx_name(NSDictionary<NSString *, VGMTLFunc
     if (error) {
         *error = nil;
     }
-    VGMTLFunction *f = _functions[name];
+    VGMTLFunction *f = vg_library_function(self, name);
     if (!f) {
         vglog("library: no function %s", name.UTF8String);
         if (error) {
@@ -1568,9 +1656,129 @@ static NSArray<NSString *> *vg_visible_of(NSString *ll) {
     return out;
 }
 
+// A module's functions: its entry point, or its visible / stitchable functions (5d: SwiftUI's shader effects, Core
+// Image's kernels), functions of the library too, for stitching and linking.
+static void vg_library_add_module(id<MTLDevice> device, NSString *ll, BOOL noVisible, NSMutableDictionary *fns) {
+    NSString *name = nil, *stage = nil;
+    if (vg_entry_of(ll, &name, &stage)) {
+        fns[name] = [[VGMTLFunction alloc] initWithDevice:device name:name stage:stage ll:ll];
+    } else if (!noVisible) {
+        NSArray *vis = vg_visible_of(ll);
+        if (!vis.count) {
+            vis = vg_exported_defs(ll);   // Apple's stitched output: the stitched function, no visible metadata
+        }
+        for (NSString *v in vis) {
+            fns[v] = [[VGMTLFunction alloc] initWithDevice:device name:v stage:@"visible" ll:ll];
+        }
+    }
+}
+
+// A metallib's function table (MTLB: the header's function list, each entry's NAME and its bitcode's place, OFFT's
+// third offset into the bitcode section): name -> its bitcode wrapper, nothing converted. Nil when the file isn't
+// one, or any entry doesn't check out (then the whole library is read as before). entriesOnly: only vertex, fragment
+// and kernel functions (TYPE 0-2), as the old reading listed a library loaded without its visible functions (Core
+// Image's: it asks for every name a library lists).
+static NSDictionary<NSString *, NSData *> *vg_metallib_table(NSData *lib, BOOL entriesOnly, NSArray **all) {
+    const uint8_t *b = lib.bytes;
+    NSUInteger n = lib.length;
+    if (n < 0x5c || memcmp(b, "MTLB", 4)) {
+        return nil;
+    }
+    uint64_t listOff, listSize, bcOff, bcSize;
+    memcpy(&listOff, b + 0x18, 8);
+    memcpy(&listSize, b + 0x20, 8);
+    memcpy(&bcOff, b + 0x48, 8);
+    memcpy(&bcSize, b + 0x50, 8);
+    if (listOff + 4 + listSize > n || bcOff + bcSize > n) {   // the list's size leaves out its 4-byte count
+        return nil;
+    }
+    uint32_t count;
+    memcpy(&count, b + listOff, 4);
+    NSMutableDictionary *t = [NSMutableDictionary dictionary];
+    NSMutableDictionary<NSNumber *, NSData *> *blobs = [NSMutableDictionary dictionary];
+    uint64_t at = listOff + 4, end = listOff + 4 + listSize;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t esize;
+        if (at + 4 > end) {
+            return nil;
+        }
+        memcpy(&esize, b + at, 4);
+        uint64_t e = at + 4, eend = at + esize;
+        if (esize < 8 || eend > end) {
+            return nil;
+        }
+        NSString *name = nil;
+        uint64_t bc = UINT64_MAX;
+        int type = -1;
+        while (e + 4 <= eend && memcmp(b + e, "ENDT", 4)) {
+            uint16_t len;
+            if (e + 6 > eend) {
+                return nil;
+            }
+            memcpy(&len, b + e + 4, 2);
+            const uint8_t *v = b + e + 6;
+            if (e + 6 + len > eend) {
+                return nil;
+            }
+            if (!memcmp(b + e, "NAME", 4) && len) {
+                name = [[NSString alloc] initWithBytes:v length:strnlen((const char *)v, len) encoding:NSUTF8StringEncoding];
+            } else if (!memcmp(b + e, "TYPE", 4) && len >= 1) {
+                type = v[0];
+            } else if (!memcmp(b + e, "OFFT", 4) && len >= 24) {
+                memcpy(&bc, v + 16, 8);
+            }
+            e += 6 + len;
+        }
+        if (!name.length || bc == UINT64_MAX || bc + 20 > bcSize) {
+            return nil;
+        }
+        const uint8_t *w = b + bcOff + bc;
+        if (!(w[0] == 0xde && w[1] == 0xc0 && w[2] == 0x17 && w[3] == 0x0b)) {
+            return nil;   // not a bitcode wrapper there: read the library the old way
+        }
+        uint32_t woff, wsize;
+        memcpy(&woff, w + 8, 4);
+        memcpy(&wsize, w + 12, 4);
+        if (!wsize || bc + (uint64_t)woff + wsize > bcSize) {
+            return nil;
+        }
+        NSData *blob = blobs[@(bc)];   // one module per offset, whatever names point at it
+        if (!blob) {
+            blob = [lib subdataWithRange:NSMakeRange((NSUInteger)(bcOff + bc), woff + wsize)];
+            blobs[@(bc)] = blob;
+        }
+        if (!entriesOnly || (type >= 0 && type <= 2)) {
+            t[name] = blob;
+        }
+        at = eend;
+    }
+    if (all) {
+        *all = blobs.allValues;
+    }
+    return t.count ? t : nil;
+}
+
 id<MTLLibrary> vg_new_library(id<MTLDevice> device, NSData *lib, NSError **error) {
     if (error) {
         *error = nil;
+    }
+    NSArray *all = nil;
+    BOOL vg_debug_flag(const char *name);
+    static int eager = -1;   // VGMTL_EAGER_LIB or the eagerlib flag file: every module read at load, as before 0.1.9
+    if (eager < 0) {
+        eager = getenv("VGMTL_EAGER_LIB") || vg_debug_flag("eagerlib");
+    }
+    NSDictionary *table = eager ? nil : vg_metallib_table(lib, gNoVisible, &all);
+    if (table) {
+        VGMTLLibrary *l = [[VGMTLLibrary alloc] initWithDevice:device functions:@{}];
+        l->_pending = [table mutableCopy];
+        l->_blobs = all;
+        l->_read = [NSMutableSet set];
+        l->_noVisible = gNoVisible;
+        l->_raw = lib;
+        vglog("library: %lu bytes, %lu functions listed, each read when first asked for", (unsigned long)lib.length,
+              (unsigned long)table.count);
+        return l;
     }
     NSMutableDictionary *fns = [NSMutableDictionary dictionary];
     NSMutableArray<NSString *> *modules = [NSMutableArray array];
@@ -1592,20 +1800,7 @@ id<MTLLibrary> vg_new_library(id<MTLDevice> device, NSData *lib, NSError **error
         NSString *ll = vg_air_to_text([NSData dataWithBytes:b + i length:off + size]);
         if (ll) {
             [modules addObject:ll];
-        }
-        NSString *name = nil, *stage = nil;
-        if (ll && vg_entry_of(ll, &name, &stage)) {
-            fns[name] = [[VGMTLFunction alloc] initWithDevice:device name:name stage:stage ll:ll];
-        } else if (ll && !gNoVisible) {
-            // visible / stitchable functions (5d: SwiftUI's shader effects, Core Image's kernels): functions of the
-            // library too, for stitching and linking
-            NSArray *vis = vg_visible_of(ll);
-            if (!vis.count) {
-                vis = vg_exported_defs(ll);   // Apple's stitched output: the stitched function, no visible metadata
-            }
-            for (NSString *v in vis) {
-                fns[v] = [[VGMTLFunction alloc] initWithDevice:device name:v stage:@"visible" ll:ll];
-            }
+            vg_library_add_module(device, ll, gNoVisible, fns);
         }
         i += off + size - 1;
     }
@@ -1651,7 +1846,7 @@ id<MTLDynamicLibrary> vg_new_dynamic_library(id<MTLLibrary> lib, NSError **error
     VGMTLDynamicLibrary *d = [VGMTLDynamicLibrary new];
     d->_lib = (VGMTLLibrary *)lib;
     d->_installName = lib.installName;
-    vglog("dynamic library: %lu module(s)", (unsigned long)d->_lib->_modules.count);
+    vglog("dynamic library: %lu module(s)", (unsigned long)vg_library_modules(d->_lib).count);
     return d;
 }
 
@@ -1669,7 +1864,7 @@ static NSString *vg_linked_ll(VGMTLLibrary *lib, NSString *ll, NSString *name) {
     NSMutableArray *mods = [NSMutableArray array];
     for (id d in lib->_dylibs) {
         if ([d isKindOfClass:[VGMTLDynamicLibrary class]]) {
-            [mods addObjectsFromArray:((VGMTLDynamicLibrary *)d)->_lib->_modules ?: @[]];
+            [mods addObjectsFromArray:vg_library_modules(((VGMTLDynamicLibrary *)d)->_lib)];
         }
     }
     if (!mods.count) {

@@ -375,6 +375,8 @@ Files in `/Library/GPUBundles` the Metal driver reads (root only; delete them to
 - `VirtioGPUMetal-perf`: log where WindowServer's frames spend their time every 5 s (to
   `/var/tmp/VirtioGPUMetal.log` and the system log; WindowServer notices the file within 5 s).
 - `VirtioGPUMetal-gputime`: with it, GPU timings too (costs a little). Read when a process starts.
+- `VirtioGPUMetal-eagerlib`: read every shader of a Metal library when it loads, as before 0.1.9 (the driver reads
+  one when an app first asks for it). Read when a process starts.
 
 The accelerator flips at most once per 12 ms by default (`vgpuflipms=N` boot-arg, 0 = no limit).
 
