@@ -2182,3 +2182,13 @@ TRIM, Upgrade without a USB disk, Retina modes, a faster first boot (a warm-up a
   row, each replaying the GOP, and past 64 suppressed frames the replays' output piled up as 4K frames. Replaced by a
   per-packet AV_CODEC_FLAG_LOW_DELAY and an FFmpeg patch (hostvideo/patches/0001: HEVC hands a frame out at its
   frame end, decode order), no drain.
+- **0.1.10 released (2026-11-20, v0.1.10 on f28a5e7, a full release, Latest).** The moving wallpaper's first frame
+  (VideoToolbox's reply wait corrected in-process, VeneraVideo 0.2.2, videod's Apple-style synchronous answer with an
+  FFmpeg low-delay patch), every function constant to the translator (black video stills and login-screen
+  background; the installer redoes old black copies once), the login window on the GPU and its list's pictures
+  (integer regroupings of a surface plane), Dock badge numbers (buffer textures one level), Core Image libraries read
+  lazily (icons 13x faster), the host service's MemoryMax 2G -> 6G, Finish waiting for macOS's restart, the Tools CD
+  kept in the VM. VMs 108, 109 and 107 upgraded one at a time from the private kit (each Upgrade run as its own
+  systemd unit: one started from an SSH session died with it); 107's agent couldn't take the package, the USB disk
+  did. VM 108 lost its mouse after its restart: two tablets (Proxmox's and the args'), fixed with --tablet 0 and in
+  Upgrade since (004fb03, after the release).
