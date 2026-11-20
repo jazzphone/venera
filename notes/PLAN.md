@@ -2115,3 +2115,11 @@ TRIM, Upgrade without a USB disk, Retina modes, a faster first boot (a warm-up a
   missing functions either way, the desktop on Metal; mtlcube, mtlalign, mtltess pass.
   Then 618f087: converted modules kept per process (AvatarKit loads the library ~170 times a minute). The owner: no
   beach ball, a slight pause left (the Memoji are 3D, tessellated and subdivided; each picker is its own process).
+- **Setup Assistant's last screen hung (VM 110)**: "Update Mac Automatically" spun for good. The closing "hello"
+  animation (SetupAssistantSupportUI's textFragment) couldn't get its text pipeline: the translator typed the Segment
+  buffer, whose pointer the shader keeps in a Context struct and a helper reads back (segments[i], segments[0].start),
+  as one Segment instead of an array of them, and the run-time element index became a member index. The faildump
+  flag file (5b9e889) saved the shader; translate_native reproduced it on the Mac; packaging/translator/0003 (a
+  subagent's, reviewed): such a buffer is a runtime array of its record (body_buf_dynamic_record_element_type), with a
+  hand-written test. The crate's tests: 2402 pass, the same 85 fail as before (an old spirv-val, short corpora). VM 111:
+  the hello pipeline builds, a boot refuses no shader (2 in the hour before), mtlcube/align/tess pass.

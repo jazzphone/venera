@@ -1,0 +1,263 @@
+Venera's change to NullMoth's metal2vulkan translator (LGPL-3.0-or-later, packaging/UPSTREAM's TRANSLATOR_COMMIT):
+a buffer of records whose address the shader keeps in a local struct and reads back in a helper is an array of those
+records. Setup Assistant's "hello" fragment (textFragment) stores its buffer pointers in a Context struct; a helper
+loads the Segment buffer's pointer back out of it, reads segments[i] and, through element 0, a member of segments[0].
+The pointer reaches the entry's buffer only after its field is forwarded, so the parameter was untyped, and with the
+buffer's air.struct_type_info declared, stage-input lowering took the declared struct alone for the whole buffer: the
+run-time element index became a struct member index ("owned InBoundsAccessChain violates its access-chain contract").
+An untyped buffer with a declared struct layout that the body indexes by a run-time element index, all such accesses
+naming one record type of the declared size, is now a runtime array of that record, as it already was when that record
+was the only element type the body named (the new body_buf_dynamic_record_element_type in
+translator/translator/src/passes/resources/discovery.rs, used in translator/translator/src/passes/stage_input/mod.rs;
+test native_record_buffer_read_back_from_a_context_field_is_an_array_of_records). tools/build-translator.sh applies
+this patch (patch -p1, from the root of the translator checkout) after 0001 and 0002.
+
+diff -ruN a/translator/translator/src/native/tests/buffers.rs b/translator/translator/src/native/tests/buffers.rs
+--- a/translator/translator/src/native/tests/buffers.rs	2026-11-15 12:34:54
++++ b/translator/translator/src/native/tests/buffers.rs	2026-11-20 08:31:18
+@@ -14564,3 +14564,136 @@
+     );
+     tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+ }
++
++#[test]
++fn native_record_buffer_read_back_from_a_context_field_is_an_array_of_records() {
++    // The entry keeps its buffer pointers in a local context struct and a helper reads one back, then reads record
++    // `idx[0]` of it and, through element 0, a member of record 0. With the buffer's struct_type_info declared, the
++    // declared struct alone was taken for the whole buffer, and the run-time element index became a struct member index.
++    let ll = r#"
++target triple = "air64-apple-macosx14.0.0"
++%Seg = type { <4 x float>, <4 x float>, <2 x float>, [8 x i8] }
++%Ctx = type { ptr addrspace(1), ptr addrspace(1) }
++
++define <4 x float> @frag(<4 x float> %position, ptr addrspace(1) "air-buffer-no-alias" %segs, ptr addrspace(1) "air-buffer-no-alias" %idx) {
++entry:
++  %ctx = alloca %Ctx, align 8
++  %segs_field = getelementptr inbounds %Ctx, ptr %ctx, i64 0, i32 0
++  store ptr addrspace(1) %segs, ptr %segs_field, align 8
++  %idx_field = getelementptr inbounds %Ctx, ptr %ctx, i64 0, i32 1
++  store ptr addrspace(1) %idx, ptr %idx_field, align 8
++  %r = call fastcc <4 x float> @read_record(ptr addrspace(1) %idx, ptr %ctx)
++  ret <4 x float> %r
++}
++
++define internal fastcc <4 x float> @read_record(ptr addrspace(1) %ix, ptr %ctx) {
++entry:
++  %field = getelementptr inbounds %Ctx, ptr %ctx, i64 0, i32 0
++  %records = load ptr addrspace(1), ptr %field, align 8
++  %i32 = load i32, ptr addrspace(1) %ix, align 4
++  %i = sext i32 %i32 to i64
++  %record = getelementptr inbounds %Seg, ptr addrspace(1) %records, i64 %i
++  %sum = call fastcc <4 x float> @sum_record(ptr addrspace(1) %record)
++  %first_a = getelementptr inbounds %Seg, ptr addrspace(1) %records, i64 0, i32 0
++  %a0 = load <4 x float>, ptr addrspace(1) %first_a, align 16
++  %r = fadd fast <4 x float> %sum, %a0
++  ret <4 x float> %r
++}
++
++define internal fastcc <4 x float> @sum_record(ptr addrspace(1) %record) {
++entry:
++  %a = load <4 x float>, ptr addrspace(1) %record, align 16
++  %b_field = getelementptr inbounds %Seg, ptr addrspace(1) %record, i64 0, i32 1
++  %b = load <4 x float>, ptr addrspace(1) %b_field, align 16
++  %r = fadd fast <4 x float> %a, %b
++  ret <4 x float> %r
++}
++
++!air.fragment = !{!0}
++!0 = !{ptr @frag, !1, !3}
++!1 = !{!2}
++!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
++!3 = !{!4, !5, !7}
++!4 = !{i32 0, !"air.position", !"air.center", !"air.no_perspective", !"air.arg_type_name", !"float4", !"air.arg_name", !"position"}
++!5 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.struct_type_info", !6, !"air.arg_type_size", i32 48, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"Seg", !"air.arg_name", !"segs"}
++!6 = !{i32 0, i32 16, i32 0, !"float4", !"a", i32 16, i32 16, i32 0, !"float4", !"b", i32 32, i32 8, i32 0, !"float2", !"c"}
++!7 = !{i32 2, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"int", !"air.arg_name", !"idx"}
++"#;
++    let tmp = std::env::temp_dir().join(format!(
++        "metal2vulkan_context_field_record_array_{}",
++        std::process::id()
++    ));
++    let _ = std::fs::create_dir_all(&tmp);
++    let spv = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
++    let asm = disassemble(&spv).expect("disassemble");
++    let module = load_bytes(&spv).expect("load spv");
++    let definition = |id: Word| {
++        module
++            .types_global_values
++            .iter()
++            .find(|instruction| instruction.result_id == Some(id))
++            .unwrap_or_else(|| panic!("%{id} is defined: {asm}"))
++    };
++    let operand_id = |instruction: &Instruction, index: usize| match instruction.operands.get(index) {
++        Some(Operand::IdRef(id)) => *id,
++        other => panic!("operand {index} of {instruction:?} is {other:?}: {asm}"),
++    };
++    let records = module
++        .annotations
++        .iter()
++        .find(|instruction| {
++            instruction.class.opcode == Op::Decorate
++                && instruction.operands.get(1) == Some(&Operand::Decoration(Decoration::Binding))
++                && instruction.operands.get(2) == Some(&Operand::LiteralBit32(0))
++        })
++        .map(|instruction| operand_id(instruction, 0))
++        .expect("the record buffer has binding 0");
++    let block = operand_id(definition(definition(records).result_type.unwrap()), 1);
++    let block = definition(block);
++    assert_eq!(block.class.opcode, Op::TypeStruct, "{asm}");
++    assert_eq!(block.operands.len(), 1, "the block wraps one runtime array: {asm}");
++    let array = operand_id(block, 0);
++    assert_eq!(
++        definition(array).class.opcode,
++        Op::TypeRuntimeArray,
++        "the record buffer is an array of records: {asm}"
++    );
++    assert!(
++        module.annotations.iter().any(|instruction| {
++            instruction.class.opcode == Op::Decorate
++                && instruction.operands.first() == Some(&Operand::IdRef(array))
++                && instruction.operands.get(1) == Some(&Operand::Decoration(Decoration::ArrayStride))
++                && instruction.operands.get(2) == Some(&Operand::LiteralBit32(48))
++        }),
++        "a record is 48 bytes apart: {asm}"
++    );
++    let constants = module
++        .types_global_values
++        .iter()
++        .filter(|instruction| instruction.class.opcode == Op::Constant)
++        .filter_map(|instruction| instruction.result_id)
++        .collect::<HashSet<_>>();
++    assert!(
++        module
++            .all_inst_iter()
++            .filter(|instruction| matches!(
++                instruction.class.opcode,
++                Op::AccessChain | Op::InBoundsAccessChain
++            ))
++            .filter(|instruction| instruction.operands.first() == Some(&Operand::IdRef(records)))
++            .any(|instruction| {
++                instruction.operands.len() >= 3
++                    && matches!(instruction.operands[1], Operand::IdRef(wrapper) if constants.contains(&wrapper))
++                    && matches!(instruction.operands[2], Operand::IdRef(element) if !constants.contains(&element))
++            }),
++        "the run-time index steps to its record: {asm}"
++    );
++    if std::process::Command::new("spirv-val")
++        .arg("--version")
++        .output()
++        .is_ok()
++    {
++        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
++    }
++    let _ = std::fs::remove_dir_all(tmp);
++}
+diff -ruN a/translator/translator/src/passes/resources/discovery.rs b/translator/translator/src/passes/resources/discovery.rs
+--- a/translator/translator/src/passes/resources/discovery.rs	2026-11-15 12:34:54
++++ b/translator/translator/src/passes/resources/discovery.rs	2026-11-20 08:29:18
+@@ -405,6 +405,57 @@
+     elements.next().is_none().then_some(element)
+ }
+ 
++/// The record type of an untyped buffer the body steps through by a run-time element index: the one pointee of the
++/// single-index access chains on it whose index is not a constant (`getelementptr %Record, ptr %buffer, i64 %i` reaches
++/// the entry as such a chain once the buffer's address is forwarded out of a local object's field, as from a context
++/// struct of buffer pointers a helper reads). The buffer is then an array of that record, whatever member paths the
++/// body also reads through element 0 (`getelementptr %Record, ptr %buffer, i64 0, i32 0` arrives as the one-index chain
++/// `0` to the member, so it names a member's type, not a second element type). None unless every such chain names the
++/// same aggregate.
++pub(in crate::passes) fn body_buf_dynamic_record_element_type(
++    ctx: &Ctx,
++    func: &Function,
++    pid: Word,
++) -> Option<Word> {
++    let defs = type_defs(&ctx.module);
++    let aliases = buffer_pointer_aliases(func, pid);
++    let mut element = None;
++    for instruction in func.blocks.iter().flat_map(|block| &block.instructions) {
++        if !matches!(
++            instruction.class.opcode,
++            Op::AccessChain
++                | Op::InBoundsAccessChain
++                | Op::PtrAccessChain
++                | Op::InBoundsPtrAccessChain
++        ) || !instruction
++            .operands
++            .first()
++            .is_some_and(|operand| matches!(operand, Operand::IdRef(id) if aliases.contains(id)))
++        {
++            continue;
++        }
++        let [_, Operand::IdRef(index)] = instruction.operands.as_slice() else {
++            continue;
++        };
++        if const_int_literal(&defs, *index).is_some() {
++            continue;
++        }
++        let pointee = instruction
++            .result_type
++            .and_then(|ty| ptr_pointee(&defs, ty))?;
++        if !defs.get(&pointee).is_some_and(|definition| {
++            matches!(definition.class.opcode, Op::TypeStruct | Op::TypeArray)
++        }) {
++            return None;
++        }
++        if element.is_some_and(|known| known != pointee) {
++            return None;
++        }
++        element = Some(pointee);
++    }
++    element
++}
++
+ pub(in crate::passes) fn body_buf_flat_scalar_element_type(
+     ctx: &Ctx,
+     func: &Function,
+diff -ruN a/translator/translator/src/passes/stage_input/mod.rs b/translator/translator/src/passes/stage_input/mod.rs
+--- a/translator/translator/src/passes/stage_input/mod.rs	2026-11-15 12:34:54
++++ b/translator/translator/src/passes/stage_input/mod.rs	2026-11-20 08:32:04
+@@ -1255,6 +1255,44 @@
+                                 elem_ty: st,
+                             },
+                         )
++                    } else if let Some(elem) = pointee_is_scalar
++                        .then(|| {
++                            body_buf_dynamic_record_element_type(
++                                ctx,
++                                &ctx.module.functions[entry_idx],
++                                *pid,
++                            )
++                        })
++                        .flatten()
++                        .filter(|elem| {
++                            layout_ty_size_align(ctx, *elem, &layout_defs).0
++                                == layout_ty_size_align(ctx, st, &layout_defs).0
++                        })
++                    {
++                        // An untyped buffer of records the body indexes at run time and also reads through element 0
++                        // (the pointer came out of a local object's field, so no typed GEP on the parameter named
++                        // its element type): an array of that record, as a lone element type would make it. The
++                        // declared struct alone is one record, and a run-time element index has nowhere to go in it.
++                        let already_has_wrapper_member0 = access_chains_include_wrapper_member0(
++                            &defs,
++                            &ctx.module.functions[entry_idx],
++                            *pid,
++                        );
++                        let rta = ctx.ty_runtime_array(elem);
++                        let block = ctx.module.fresh_id();
++                        ctx.new_globals.push(type_inst(
++                            Op::TypeStruct,
++                            block,
++                            vec![Operand::IdRef(rta)],
++                        ));
++                        (
++                            block,
++                            BufWrap::Collapsed {
++                                block_ty: block,
++                                prepend_member0: !already_has_wrapper_member0,
++                                typed_aliases: vec![],
++                            },
++                        )
+                     } else {
+                         (
+                             st,
