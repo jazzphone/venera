@@ -383,6 +383,9 @@ Files in `/Library/GPUBundles` the Metal driver reads (root only; delete them to
 - `VirtioGPUMetal-faildump`: save the text of each shader the translator can't take, to the process's cache folder
   (`faildump/NAME-STAGE.ll`, beside `spirv/`), to try the translator on. Its lines name the processes it's for, or
   it's empty for every process.
+- `VirtioGPUMetal-shaderdump`: the functions it names (one a line) saved as each process translates them, to
+  `/var/tmp/VirtioGPUMetal-shaderdump/NAME-STAGE.ll`, `.fc` (the function constants) and `.spv`, to try the translator
+  on. A process with `VGMTL_NODISKCACHE=1` translates what its cache would have answered.
 - `VirtioGPUMetal-novtfix`: leave VideoToolbox's reply wait as Apple ships it. Since 0.1.10 the driver corrects it in
   each process it loads into (Intel VideoToolbox turns a 10 s timeout into a 32-bit count of nanoseconds, which
   overflows), so a synchronous video decode gets its frame before the call returns, as on a Mac: the moving

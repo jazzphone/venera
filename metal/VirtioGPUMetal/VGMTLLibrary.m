@@ -196,15 +196,21 @@ static BOOL vg_translator_ready(void) {
 }
 
 // Function constants as the translator's _fc entry points take them: parallel index / size / payload arrays.
+// Up to 64 constants were passed until 0.1.10, the rest dropped in no particular order (a dictionary's): a shader
+// with more came out with whichever 64 made it. VideoToolbox's Metal transfer (VTMTSComputeFunction) has 242, among
+// them the ones that turn its textures on: it bound none and wrote nothing, so AVAssetImageGenerator's stills were
+// black (and with them the login screen's copy of a moving wallpaper).
+enum { kVgMaxFC = 1024 };
 typedef struct {
     size_t n;
-    uint32_t idx[64], sz[64];
-    const uint8_t *pay[64];
+    uint32_t idx[kVgMaxFC], sz[kVgMaxFC];
+    const uint8_t *pay[kVgMaxFC];
 } vg_fc_args;
 static void vg_fc_unpack(NSDictionary<NSNumber *, NSData *> *fc, vg_fc_args *a) {
     a->n = 0;
     for (NSNumber *k in fc) {
-        if (a->n == 64) {
+        if (a->n == kVgMaxFC) {
+            vglog("function constants: %lu, only the first %d passed", (unsigned long)fc.count, kVgMaxFC);
             break;
         }
         a->idx[a->n] = k.unsignedIntValue;
@@ -460,6 +466,12 @@ static NSString *vg_ll_entry(NSString *ll, const char *stage) {
     }
     return nil;
 }
+// [[texture(EXPR)]] or [[function_constant(FC)]] on an argument: its location index is a global the static
+// initializer computes, or the argument exists only when a constant is true (see vg_spec_translate)
+static BOOL vg_fc_decided_args(NSString *ll) {
+    return [ll containsString:@"!\"air.location_index\", ptr"] || [ll containsString:@"!\"air.function_constant\", !"];
+}
+
 static NSString *vg_ll_name(NSString *ll) {
     NSRange d = [ll rangeOfString:@"define "];
     if (d.location == NSNotFound) {
@@ -652,7 +664,9 @@ static NSData *vg_translate_flagged(NSString *ll, const char *stage, NSDictionar
             }
         }
     }
-    NSString *dkey = vg_disk_dir() ? vg_disk_key("spirv", ll, stage, fc, tgLengths, tgCount) : nil;
+    // more than 64 constants: translated before 0.1.10 with only 64 of them (vg_fc_unpack), so a key of its own and
+    // they are made again; every other cached translation, the seed's too, still counts
+    NSString *dkey = vg_disk_dir() ? vg_disk_key(fc.count > 64 ? "spirv-fc" : "spirv", ll, stage, fc, tgLengths, tgCount) : nil;
     NSData *spv = dkey ? vg_disk_get(dkey) : nil;
     if (!spv && !gWarming) {
         vg_warm_record(ll, stage, fc);
@@ -747,6 +761,16 @@ static NSData *vg_spec_entry(NSString *ll, const char *stage, const uint32_t *tg
 // threadgroup lengths must be set on this thread already. nil and why when it can't.
 static NSData *vg_spec_translate(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc,
                                  const uint32_t *tgLengths, uint32_t tgCount, NSString **why) {
+    // Arguments whose index or presence the constants decide ([[texture(EXPR), function_constant(FC)]]: a location
+    // index read from a global the static initializer computes from the constants, or an argument that exists only
+    // when a constant is true) can't be bound by a translation made before the values are known: it finds no such
+    // texture and drops what uses it. VideoToolbox's Metal transfer (VTMTSComputeFunction) is one: its output came
+    // out empty, so AVAssetImageGenerator's stills were black (and the login screen's copy of a moving wallpaper).
+    // A translation per set of values, with the constants folded first, binds them.
+    if (vg_fc_decided_args(ll)) {
+        *why = @"argument indices or presence decided by function constants";
+        return nil;
+    }
     NSData *entry = vg_spec_entry(ll, stage, tgLengths, tgCount, why);
     const uint32_t *hdr = entry.bytes;
     if (!entry || entry.length < 8 || hdr[0] != 0x31435053u || entry.length < 8 + (size_t)hdr[1]) {
@@ -939,6 +963,39 @@ static void vg_fc_check(NSString *ll, const char *stage, NSDictionary<NSNumber *
     vglog("fccheck   one module only: %s", [onlyB componentsJoinedByString:@"; "].UTF8String);
 }
 
+// the shaderdump flag file: functions named in it (one a line) saved as translated, to
+// /var/tmp/VirtioGPUMetal-shaderdump/NAME-STAGE.ll, .fc (each function constant: index, then its bytes in hex) and
+// .spv (a process that can write there). With VGMTL_NODISKCACHE=1 a process translates (and dumps) what its cache
+// would have answered.
+static void vg_shaderdump(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc, NSData *spv) {
+    NSString *list = [NSString stringWithContentsOfFile:@"/Library/GPUBundles/VirtioGPUMetal-shaderdump"
+                                               encoding:NSUTF8StringEncoding error:NULL];
+    NSString *fname = nil;
+    for (NSString *n in [list componentsSeparatedByString:@"\n"]) {   // a module defining @NAME( (helpers may come first)
+        if (n.length && [ll containsString:[NSString stringWithFormat:@"@%@(", n]]) {
+            fname = n;
+        }
+    }
+    if (fname) {
+        NSString *dir = @"/private/var/tmp/VirtioGPUMetal-shaderdump";
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        NSString *base = [NSString stringWithFormat:@"%@/%@-%s", dir, fname, stage];
+        [ll writeToFile:[base stringByAppendingString:@".ll"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        NSMutableString *f = [NSMutableString string];
+        for (NSNumber *k in [fc.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+            NSData *v = fc[k];
+            [f appendFormat:@"%@", k];
+            for (NSUInteger i = 0; i < v.length; i++) {
+                [f appendFormat:@" %02x", ((const uint8_t *)v.bytes)[i]];
+            }
+            [f appendString:@"\n"];
+        }
+        [f writeToFile:[base stringByAppendingString:@".fc"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        [spv writeToFile:[base stringByAppendingString:@".spv"] atomically:YES];
+        vglog("shaderdump: %s", base.UTF8String);
+    }
+}
+
 static NSData *vg_translate_uncached(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc,
                                      const uint32_t *tgLengths, uint32_t tgCount, NSString **error) {
     if (!vg_translator_ready()) {
@@ -974,6 +1031,7 @@ static NSData *vg_translate_uncached(NSString *ll, const char *stage, NSDictiona
         NSData *spv = vg_spec_translate(ll, stage, fc, tgLengths, tgCount, &why);
         if (spv) {
             pSetTgLengths(NULL, 0);
+            vg_shaderdump(ll, stage, fc, spv);
             return spv;
         }
         static int logged;
@@ -1015,6 +1073,7 @@ static NSData *vg_translate_uncached(NSString *ll, const char *stage, NSDictiona
     }
     NSData *spv = [NSData dataWithBytes:out length:len];
     pTranslateFree(out, len);
+    vg_shaderdump(ll, stage, fc, spv);
     return spv;
 }
 
@@ -1022,7 +1081,7 @@ static NSDictionary *vg_reflect_uncached(NSString *ll, const char *stage, NSDict
                                          NSString **error, NSData **jsonOut);
 
 NSDictionary *vg_reflect(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc, NSString **error) {
-    NSString *dkey = vg_disk_dir() ? vg_disk_key("reflect", ll, stage, fc, NULL, 0) : nil;
+    NSString *dkey = vg_disk_dir() ? vg_disk_key(fc.count > 64 ? "reflect-fc" : "reflect", ll, stage, fc, NULL, 0) : nil;
     NSData *json = dkey ? vg_disk_get(dkey) : nil;
     if (json) {
         NSDictionary *d = [NSJSONSerialization JSONObjectWithData:json options:0 error:nil];
