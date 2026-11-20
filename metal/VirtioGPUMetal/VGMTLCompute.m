@@ -464,8 +464,11 @@ VkDescriptorSet vg_write_set(VGMTLCommandBuffer *cmd, VkDescriptorSetLayout dsl,
 @implementation VGMTLComputePipelineState
 @synthesize label = _label;
 - (id<MTLDevice>)device { return _dev; }
-- (NSUInteger)maxTotalThreadsPerThreadgroup { return _maxThreads; }
-- (NSUInteger)threadExecutionWidth { return 32; }   // Metal's simdgroup width, which the translator keeps
+// Callers divide by these (VFX's RGMTLComputeCommandEncoderDispatchOnGrid1D rounds the thread count to a multiple of
+// the width: a 0 there killed Setup Assistant at its Memoji step with SIGFPE), so neither is ever 0, and the width
+// never exceeds the limit.
+- (NSUInteger)maxTotalThreadsPerThreadgroup { return _maxThreads ? _maxThreads : 1024; }
+- (NSUInteger)threadExecutionWidth { return _maxThreads && _maxThreads < 32 ? _maxThreads : 32; }   // Metal's simdgroup width, which the translator keeps
 - (NSUInteger)staticThreadgroupMemoryLength { return 0; }
 - (BOOL)supportIndirectCommandBuffers { return NO; }
 - (MTLResourceID)gpuResourceID { return (MTLResourceID){0}; }
@@ -592,7 +595,11 @@ id<MTLComputePipelineState> vg_new_compute_pipeline(id<MTLDevice> device, id<MTL
         }
         id mx = refl[@"max_work_group_size"];
         if (p) {
-            p->_maxThreads = [mx isKindOfClass:[NSNumber class]] ? MIN([mx unsignedIntValue], 1024u) : 1024u;
+            p->_maxThreads = [mx isKindOfClass:[NSNumber class]] && [mx unsignedIntValue] ? MIN([mx unsignedIntValue], 1024u) : 1024u;
+            if ([mx isKindOfClass:[NSNumber class]] && [mx unsignedIntValue] < 32) {
+                vglog("compute pipeline %s: max_work_group_size %u (0 = unknown: 1024)", p->_name ? p->_name.UTF8String : "?",
+                      [mx unsignedIntValue]);
+            }
         }
         for (NSDictionary *b in refl[@"bindings"]) {
             NSString *kind = b[@"kind"];
