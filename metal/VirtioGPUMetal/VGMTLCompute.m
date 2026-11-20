@@ -453,6 +453,7 @@ VkDescriptorSet vg_write_set(VGMTLCommandBuffer *cmd, VkDescriptorSetLayout dsl,
     BOOL _dynamic;          // ThreadsDynamic: the 48-byte region block at _pushOffset; otherwise Workgroups
     uint32_t _pushOffset;
     uint32_t _maxThreads;
+    BOOL _noop;             // a kernel reading [[stage_in]] (not supported yet): dispatches do nothing (see below)
     NSMutableDictionary<NSString *, VGComputeVariant *> *_variants;   // threadgroup-length key -> variant
     NSObject *_lock;
     id<MTLDevice> _dev;
@@ -601,12 +602,23 @@ id<MTLComputePipelineState> vg_new_compute_pipeline(id<MTLDevice> device, id<MTL
                       [mx unsignedIntValue]);
             }
         }
+        BOOL stageIn = NO;
         for (NSDictionary *b in refl[@"bindings"]) {
             NSString *kind = b[@"kind"];
-            if (p && ![@[ @"Buffer", @"ThreadgroupBuffer", @"Texture", @"StorageImage", @"Sampler", @"StaticSampler" ] containsObject:kind]) {
+            if ([kind isEqual:@"KernelStageInput"]) {
+                stageIn = YES;
+            } else if (p && ![@[ @"Buffer", @"ThreadgroupBuffer", @"Texture", @"StorageImage", @"Sampler", @"StaticSampler" ] containsObject:kind]) {
                 why = [NSString stringWithFormat:@"binding kind %@ not supported yet", kind];
                 p = nil;
             }
+        }
+        // A kernel reading [[stage_in]] (setStageInRegion:, a stage-input descriptor): not supported yet. Refusing it
+        // crashed Setup Assistant at its Memoji step: VFX (AvatarKit's stickers) doesn't check for a nil pipeline and
+        // divides by the nil pipeline's thread width (SIGFPE). So it gets a pipeline whose dispatches do nothing: the
+        // stickers come out empty, and the app goes on.
+        if (p && stageIn) {
+            p->_noop = YES;
+            vglog("pipeline %s: [[stage_in]] isn't supported yet: its dispatches do nothing", function.name.UTF8String);
         }
     }
     if (!p) {
@@ -779,6 +791,9 @@ VkBuffer vg_vkbuffer(id<MTLBuffer> b) {
 - (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u { }
 - (void)useResources:(const id<MTLResource> __unsafe_unretained[])r count:(NSUInteger)n usage:(MTLResourceUsage)u { }
 - (void)memoryBarrierWithScope:(MTLBarrierScope)scope { }   // every dispatch is followed by a full barrier
+// [[stage_in]] kernels do nothing yet (their pipeline says why): their region is accepted
+- (void)setStageInRegion:(MTLRegion)region { }
+- (void)setStageInRegionWithIndirectBuffer:(id<MTLBuffer>)buffer indirectBufferOffset:(NSUInteger)offset { }
 - (void)memoryBarrierWithResources:(const id<MTLResource> __unsafe_unretained[])r count:(NSUInteger)n { }
 
 // The translator's KernelDispatch::plan, here: per dimension the full groups, then the tail as one smaller group.
@@ -789,6 +804,9 @@ VkBuffer vg_vkbuffer(id<MTLBuffer> b) {
     if (!_pso) {
         [_owner fail:@"dispatch without a compute pipeline"];
         return;
+    }
+    if (_pso->_noop) {
+        return;   // a [[stage_in]] kernel (see its pipeline)
     }
     uint32_t grid[3] = {(uint32_t)threads.width, (uint32_t)threads.height, (uint32_t)threads.depth};
     uint32_t nominal[3] = {(uint32_t)tptg.width, (uint32_t)tptg.height, (uint32_t)tptg.depth};
