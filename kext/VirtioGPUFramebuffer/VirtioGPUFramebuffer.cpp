@@ -560,15 +560,37 @@ IOReturn VirtioGPUFramebuffer::setCursorImage(void *cursorImage) {
             bzero(&cursorPixels_[y * kVGPUCursorSize + w], (kVGPUCursorSize - w) * 4);
         }
     }
-    // macOS hands the image over with premultiplied alpha; the device (QEMU) takes straight alpha, and its VNC cursor
-    // (Proxmox's console) shows a partly transparent pixel as a solid one, so the anti-aliased rim of a colored cursor
-    // (the spinning wait cursor) came out as a dark, ragged ring. Each partly transparent pixel gets its color back.
+    // macOS hands the image over with premultiplied alpha; the device (QEMU) takes straight alpha. QEMU's VNC cursor
+    // (Proxmox's console) has no alpha, only a mask: a pixel is drawn solid from half opacity up, and hidden below it.
+    // So each partly transparent pixel gets its color back (premultiplied, the anti-aliased rim of the spinning wait
+    // cursor came out as a dark, ragged ring), and the cursor's drop shadow (black, partly transparent) stays under half
+    // opacity: where it was over half, the console drew it as solid black specks under the cursor. A client with
+    // alpha (SPICE) still draws the shadow, its darkest part a little lighter.
+    // Proxmox's console (noVNC 1.x) also reads a VNC cursor's red and blue the wrong way round (its rich-cursor decoder
+    // takes BGRX while it asks QEMU for RGBX), so the wait cursor's orange came out light blue: red and blue are sent
+    // swapped, which that console shows right. The boot argument -vgpucursorrgb keeps them as they are, for a viewer
+    // that reads them right.
+    static int swapRB = -1;
+    if (swapRB < 0) {
+        bool keep = false;
+        PE_parse_boot_argn("-vgpucursorrgb", &keep, sizeof(keep));
+        swapRB = keep ? 0 : 1;
+    }
     for (uint32_t i = 0; i < kVGPUCursorSize * kVGPUCursorSize; i++) {
-        const uint32_t px = cursorPixels_[i], a = px >> 24;
+        const uint32_t px = cursorPixels_[i];
+        uint32_t a = px >> 24, r = (px >> 16) & 0xff, g = (px >> 8) & 0xff, b = px & 0xff;
         if (a && a < 255) {
-            uint32_t r = ((px >> 16) & 0xff) * 255 / a, g = ((px >> 8) & 0xff) * 255 / a, b = (px & 0xff) * 255 / a;
-            cursorPixels_[i] = (a << 24) | ((r > 255 ? 255 : r) << 16) | ((g > 255 ? 255 : g) << 8) | (b > 255 ? 255 : b);
+            r = r * 255 / a;
+            g = g * 255 / a;
+            b = b * 255 / a;
+            r = r > 255 ? 255 : r;
+            g = g > 255 ? 255 : g;
+            b = b > 255 ? 255 : b;
+            if (a >= 128 && r < 48 && g < 48 && b < 48) {
+                a = 127;   // shadow
+            }
         }
+        cursorPixels_[i] = swapRB ? (a << 24) | (b << 16) | (g << 8) | r : (a << 24) | (r << 16) | (g << 8) | b;
     }
     cursorHotX_ = info.cursorHotSpotX;
     cursorHotY_ = info.cursorHotSpotY;
