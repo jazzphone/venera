@@ -997,6 +997,20 @@ static NSData *vg_translate_uncached(NSString *ll, const char *stage, NSDictiona
         if (error) {
             *error = [NSString stringWithFormat:@"translation failed: %s", err];
         }
+        // the faildump flag file: the text of each function that fails, to try the translator on (its cache folder,
+        // beside spirv/: faildump/NAME-STAGE.ll)
+        static int faildump = -1;
+        if (faildump < 0) {
+            BOOL vg_debug_flag(const char *name);
+            faildump = vg_debug_flag("faildump") && vg_disk_dir();
+        }
+        if (faildump) {
+            NSString *dir = [[vg_disk_dir() stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"faildump"];
+            [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+            NSString *path = [NSString stringWithFormat:@"%@/%@-%s.ll", dir, vg_ll_name(ll), stage];
+            [ll writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            vglog("faildump: %s", path.UTF8String);
+        }
         return nil;
     }
     NSData *spv = [NSData dataWithBytes:out length:len];
