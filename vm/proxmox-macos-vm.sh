@@ -582,6 +582,12 @@ backup_conf() { mkdir -p /root/macos-vm-backup; cp "/etc/pve/qemu-server/$VMID.c
 stop_vm() {   # shuts the VM down (from macOS, as the Apple menu does) and waits; HA's VMs through HA
   qm status "$VMID" | grep -q stopped && return 0
   echo "== shutting VM $VMID down"
+  # through the guest agent when it answers: macOS at Setup Assistant (and while it starts up) doesn't act on the
+  # power button Proxmox's shutdown presses, and the wait ran its full 10 minutes (2026-11-20)
+  if qm guest cmd "$VMID" ping >/dev/null 2>&1; then
+    qm guest exec "$VMID" --timeout 10 -- /sbin/shutdown -h now >/dev/null 2>&1 || true
+    local w; for w in $(seq 1 24); do qm status "$VMID" 2>/dev/null | grep -q stopped && return 0; sleep 5; done
+  fi
   qm shutdown "$VMID" --timeout 300 >/dev/null 2>&1 || true
   local i; for i in $(seq 1 120); do qm status "$VMID" 2>/dev/null | grep -q stopped && return 0; sleep 5; done
   die "VM $VMID didn't shut down in 10 minutes: shut it down from macOS, then run this again"
@@ -853,7 +859,10 @@ auto_install() {   # the VM (running or not) has its recovery and the Venera Too
   echo "   it started: the disk is erased and macOS's installer is on its way"
   t0=$(date +%s)
   while :; do   # the guest agent comes with Venera, at macOS's first startup
-    if qm guest cmd "$VMID" ping >/dev/null 2>&1 && [ -n "$(guest 'cat "/Library/Application Support/Venera/VERSION" 2>/dev/null')" ]; then break; fi
+    # Venera's version file, and macOS started again after Venera's install (it writes the file first, then restarts
+    # macOS: Finish began during that restart, found no Venera and asked a booting macOS to shut down, 2026-11-20)
+    if qm guest cmd "$VMID" ping >/dev/null 2>&1 &&
+       [ "$(guest 'V="/Library/Application Support/Venera"; [ -s "$V/VERSION" ] && [ -f "$V/install.log" ] && [ "$(sysctl -n kern.boottime | sed -E "s/^[^0-9]*([0-9]+).*/\1/")" -gt "$(stat -f %m "$V/install.log")" ] && echo up')" = up ]; then break; fi
     mins=$((($(date +%s) - t0) / 60))
     if [ $((mins / 5)) != $last ]; then
       last=$((mins / 5)); w=$(disk_writes)
