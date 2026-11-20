@@ -1,5 +1,5 @@
 #!/bin/zsh
-# User-space tools for the VM (x86_64): build/vgputest, build/vkprobe, build/vkexec, build/acceltest, build/llvmprobe, build/mtlprobe, build/mtlcompute, build/mtlrender, build/mtllat, build/blobtest, build/dragtest, build/modetest (tools/pngdiff.m runs on the Mac: build it by hand) (+ metallibs)
+# User-space tools for the VM (x86_64): build/vgputest, build/vkprobe, build/vkexec, build/acceltest, build/llvmprobe, build/mtlprobe, build/mtlcompute, build/mtlrender, build/mtltess, build/mtllat, build/blobtest, build/dragtest, build/modetest (tools/pngdiff.m runs on the Mac: build it by hand) (+ metallibs)
 set -euo pipefail
 cd "${0:A:h}/.."
 mkdir -p build
@@ -22,6 +22,7 @@ $CC -fobjc-arc -framework Foundation -framework Metal tools/mtlsource.m -o build
 $CC -fobjc-arc -framework Foundation -framework Metal tools/mtlatlas.m -o build/mtlatlas
 $CC -fobjc-arc -framework Foundation -framework Metal tools/mtlpath.m -o build/mtlpath
 $CC -fobjc-arc -framework Foundation -framework Metal tools/mtlptr.m -o build/mtlptr
+$CC -fobjc-arc -framework Foundation -framework Metal tools/mtltess.m -o build/mtltess
 $CC -fobjc-arc -framework Foundation -framework CoreGraphics tools/wininfo.m -o build/wininfo
 $CC -fobjc-arc -Wno-deprecated-declarations -framework Foundation -framework Metal -framework CoreImage tools/citest.m -o build/citest
 $CC -fobjc-arc -framework Foundation -framework Metal -framework QuartzCore -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers tools/carender.m -o build/carender

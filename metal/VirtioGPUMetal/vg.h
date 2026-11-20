@@ -63,7 +63,7 @@ void vg_trace_sync(const char *after);
     X(vkCmdSetStencilReference) X(vkCmdSetDepthBiasEnable) X(vkCmdSetRasterizerDiscardEnable)                     \
     X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetDepthBoundsTestEnable) X(vkDeviceWaitIdle)                         \
     X(vkCreateQueryPool) X(vkResetDescriptorPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults) \
-    X(vkCmdBlitImage) X(vkEnumerateDeviceExtensionProperties)
+    X(vkCmdBlitImage) X(vkEnumerateDeviceExtensionProperties) X(vkGetBufferDeviceAddress) X(vkCmdDrawIndirect)
 
 #define VG_DECLARE(name) PFN_##name name;
 struct vg_vulkan {
@@ -79,6 +79,9 @@ struct vg_vulkan {
     BOOL formatlessStorage;    // shaderStorageImageRead/WriteWithoutFormat: typeless storage textures
     BOOL calibrated;           // VK_EXT_calibrated_timestamps enabled
     BOOL feedbackLoop;         // VK_EXT_attachment_feedback_loop_layout enabled (framebuffer fetch mode 4)
+    // Metal tessellation (VGMTLTess.c) needs all four: the stages, 64-bit integers and device addresses in shaders,
+    // and buffers made with addresses (bufferAddresses: bufferDeviceAddress, unless VirtioGPUMetal-nobda says no).
+    BOOL tessellation, int64, deviceAddress, bufferAddresses;
     VkCommandPool pool;
     pthread_mutex_t lock;      // the queue and the command pool
     VG_VK_FUNCS(VG_DECLARE)
@@ -101,8 +104,13 @@ typedef struct {
     VkDeviceSize size;
     uint32_t subChunk;       // 0: its own memory; else 1 + the chunk it was cut from (5d)
     uint32_t subClass, subOffset;
+    BOOL addressable;           // made with VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT (gVk.bufferAddresses)
+    VkDeviceAddress address;    // its device address once asked for (vg_buffer_address), 0 before
 } vg_buffer;
 int vg_buffer_create(VkDeviceSize size, vg_buffer *out);
+// The buffer's device address (the first call asks Venus, a round trip; the answer stays with the buffer, through the
+// staging pool too), 0 when it has none.
+VkDeviceAddress vg_buffer_address(vg_buffer *b);
 void vg_buffer_destroy(vg_buffer *b);
 // The virtio-gpu blob resource behind a mapped allocation (Mesa's vn_macos_device_memory_res_id), 0 if none (5c).
 uint32_t vg_memory_res_id(VkDeviceMemory memory);

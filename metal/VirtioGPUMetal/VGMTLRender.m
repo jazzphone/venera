@@ -14,8 +14,13 @@
 //   read into a texel fetch of a sampled image at the fragment's position; before a draw with such a pipeline the
 //   encoder ends rendering, copies the color attachments to scratch images, resumes rendering (load) and binds the
 //   copies at set 3 (NV's "fetch copy"). A [[color(n)]] the pass has no attachment for reads a zeroed scratch image.
+// - Tessellation (5d, NullMoth's design, VGMTLTess.c): a post-tessellation vertex function is the evaluation stage, with
+//   a generated vertex and control stage in front of it; the control stage pulls the per-control-point and per-patch
+//   data from the vertex buffers by device address (a push-constant block), and drawPatches is a patch-list draw.
 #import "objects.h"
+#import <objc/runtime.h>
 #include "nvmtl_fetch_copy.h"
+#include "VGMTLTess.h"
 
 // Which [[color(n)]] inputs a fragment module declares (OpDecorate Binding 192+n) and which it reads: a variable some
 // OpLoad, OpAccessChain, OpCopyObject or OpFunctionCall uses (5c). Core Animation's specialized shaders can keep the
@@ -213,6 +218,11 @@ enum { kVGMaxColor = 8 };
     VkPipelineColorBlendAttachmentState _blend[kVGMaxColor];
     VkPipeline _pipelines[12];   // points, lines, triangles; the same with depth clamped (MTLDepthClipModeClamp); then all
                                  // six for attachments in the feedback loop layout (5d)
+    // Tessellation (5d): _vs is then the evaluation stage, _tvs and _tcs the generated vertex and control stages; the
+    // control stage pulls from Metal vertex buffers _tessVb[0.._tessNvb) (vg_tess_push.vb in that order).
+    BOOL _tess;
+    uint32_t _tessN, _tessCpidx, _tessNvb, _tessVb[VG_TESS_NVB];
+    VkShaderModule _tvs, _tcs;
     id<MTLDevice> _dev;
 }
 @property(readonly) id<MTLDevice> device;
@@ -247,13 +257,24 @@ enum { kVGMaxColor = 8 };
         }
         static const VkPrimitiveTopology kTopology[3] = {VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST,
                                                          VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
-        VkPipelineShaderStageCreateInfo stages[2] = {
-            {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, _vs, "main", NULL},
-            {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, _fs, "main", NULL}};
+        // a tessellation pipeline: the evaluation stage where the vertex stage is, the generated two after the fragment
+        VkPipelineShaderStageCreateInfo stages[4] = {
+            {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
+             _tess ? VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT : VK_SHADER_STAGE_VERTEX_BIT, _vs, "main", NULL},
+            {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, _fs, "main", NULL},
+            {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, _tvs, "main", NULL},
+            {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, _tcs, "main",
+             NULL}};
+        if (_tess && !_fs) {   // no fragment stage: the generated two move up
+            stages[1] = stages[2];
+            stages[2] = stages[3];
+        }
         VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, NULL, 0,
                                                    _nvbind, _vbind, _nvattr, _vattr};
         VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0,
-                                                     kTopology[cls], VK_FALSE};
+                                                     _tess ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST : kTopology[cls], VK_FALSE};
+        // one control point per patch: the generated vertex stage only passes the patch's position on (VGMTLTess.c)
+        VkPipelineTessellationStateCreateInfo ts = {VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO, NULL, 0, 1};
         VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, NULL, 0, 1, NULL, 1, NULL};
         VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
         rs.polygonMode = VK_POLYGON_MODE_FILL;
@@ -278,10 +299,11 @@ enum { kVGMaxColor = 8 };
         VkPipelineRenderingCreateInfo ri = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, _ncolor, _color,
                                             _depthFormat, _stencilFormat};
         VkGraphicsPipelineCreateInfo gci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &ri};
-        gci.stageCount = _fs ? 2 : 1;
+        gci.stageCount = (_fs ? 2 : 1) + (_tess ? 2 : 0);
         gci.pStages = stages;
         gci.pVertexInputState = &vi;
         gci.pInputAssemblyState = &ia;
+        gci.pTessellationState = _tess ? &ts : NULL;
         gci.pViewportState = &vp;
         gci.pRasterizationState = &rs;
         gci.pMultisampleState = &ms;
@@ -319,6 +341,90 @@ static VkShaderModule vg_module(NSData *spv) {
     VkShaderModule m = VK_NULL_HANDLE;
     gVk.vkCreateShaderModule(gVk.device, &ci, NULL, &m);
     return m;
+}
+
+// A post-tessellation vertex function's pipeline (5d, VGMTLTess.c; NullMoth's NVMTLDevice.m reads the descriptor the same
+// way): checks what the device and the descriptor need, reads the reflected control-point count and [[instance_id]]
+// Location, describes the vertex descriptor and builds the stages. Returns the evaluation module (vs with the
+// descriptor's spacing and vertex order) and the generated vertex and control modules, or nil with why.
+static NSData *vg_tess_pipeline(VGMTLRenderPipelineState *p, MTLRenderPipelineDescriptor *d, NSObject *vf, NSData *vs,
+                                uint32_t patchType, uint32_t cps, NSData **tvs, NSData **tcs, NSString **why) {
+    if (!gVk.tessellation || !gVk.int64 || !gVk.bufferAddresses) {
+        *why = [NSString stringWithFormat:@"tessellation: this device lacks %s",
+                                          !gVk.tessellation ? "tessellationShader" : !gVk.int64 ? "shaderInt64"
+                                          : gVk.deviceAddress ? "buffers with device addresses (VirtioGPUMetal-nobda)"
+                                                              : "bufferDeviceAddress"];
+        return nil;
+    }
+    if (d.tessellationFactorFormat != MTLTessellationFactorFormatHalf) {
+        *why = [NSString stringWithFormat:@"tessellation: factor format %lu (only Half is carried)",
+                                          (unsigned long)d.tessellationFactorFormat];
+        return nil;
+    }
+    NSString *rerr = nil;
+    NSDictionary *tr = vg_reflect([vf vgLL], "vertex", [vf vgFC], &rerr)[@"tessellation"];
+    if (![tr isKindOfClass:[NSDictionary class]]) {
+        tr = nil;
+    }
+    NSNumber *rn = [tr[@"control_point_count"] isKindOfClass:[NSNumber class]] ? tr[@"control_point_count"] : nil;
+    NSDictionary *ri = [tr[@"instance_id"] isKindOfClass:[NSDictionary class]] ? tr[@"instance_id"] : nil;
+    NSNumber *rl = [ri[@"location"] isKindOfClass:[NSNumber class]] ? ri[@"location"] : nil;
+    uint32_t n = rn.unsignedIntValue ? rn.unsignedIntValue : cps;
+    if (rn.unsignedIntValue && cps && rn.unsignedIntValue != cps) {
+        *why = [NSString stringWithFormat:@"tessellation: %@ reflects %u control points and its module reads %u",
+                                          ((id<MTLFunction>)vf).name, rn.unsignedIntValue, cps];
+        return nil;
+    }
+    if (!n || n > 32) {
+        *why = [NSString stringWithFormat:@"tessellation: %@ has no control-point count in 1..32 (%u)", ((id<MTLFunction>)vf).name, n];
+        return nil;
+    }
+    if (!tr) {
+        vglog("tessellation: %s has no reflection (%s): its instance_id Location is inferred from the interface",
+              ((id<MTLFunction>)vf).name.UTF8String, rerr.UTF8String ?: "-");
+    }
+    float maxf = (float)d.maxTessellationFactor;
+    maxf = MIN(MAX(maxf, 1.0f), MIN(64.0f, (float)gVk.props.limits.maxTessellationGenerationLevel));
+    vg_tess_desc td = {patchType, n, (uint32_t)d.tessellationPartitionMode, (uint32_t)d.tessellationOutputWindingOrder,
+                       (uint32_t)d.tessellationFactorStepFunction, d.tessellationFactorScaleEnabled ? 1u : 0u,
+                       (uint32_t)d.tessellationControlPointIndexType, maxf, rl ? rl.intValue : -1};
+    // the vertex descriptor as the control stage reads it (attribute n at Location n)
+    vg_tess_input vin;
+    memset(&vin, 0, sizeof(vin));
+    MTLVertexDescriptor *vd = d.vertexDescriptor;
+    for (uint32_t a = 0; a < VG_TESS_NATTR && vd; a++) {
+        MTLVertexAttributeDescriptor *ad = vd.attributes[a];
+        if (ad.format == MTLVertexFormatInvalid) {
+            continue;
+        }
+        if (ad.bufferIndex >= VG_TESS_NATTR) {
+            *why = [NSString stringWithFormat:@"tessellation: vertex attribute %u reads buffer %lu", a, (unsigned long)ad.bufferIndex];
+            return nil;
+        }
+        vin.attr[vin.nattr++] = (typeof(vin.attr[0])){a, (uint32_t)ad.bufferIndex, (uint32_t)ad.format, (uint32_t)ad.offset};
+        MTLVertexBufferLayoutDescriptor *ld = vd.layouts[ad.bufferIndex];
+        vin.layout[ad.bufferIndex].stride = ld.stride > UINT32_MAX ? VG_TESS_STRIDE_DYNAMIC : (uint32_t)ld.stride;
+        vin.layout[ad.bufferIndex].step = (uint32_t)ld.stepFunction;
+        vin.layout[ad.bufferIndex].rate = (uint32_t)ld.stepRate;
+    }
+    vg_tess_modules m;
+    char reason[256] = "";
+    if (vg_tess_build(vs.bytes, vs.length / 4, &td, &vin, &m, reason, sizeof(reason))) {
+        *why = [NSString stringWithFormat:@"tessellation: %s", reason];
+        return nil;
+    }
+    p->_tess = YES;
+    p->_tessN = n;
+    p->_tessCpidx = td.cpidx;
+    p->_tessNvb = m.nvb;
+    memcpy(p->_tessVb, m.vbmap, sizeof(p->_tessVb));
+    *tvs = [NSData dataWithBytesNoCopy:m.vs length:m.vsWords * 4 freeWhenDone:YES];
+    *tcs = [NSData dataWithBytesNoCopy:m.tcs length:m.tcsWords * 4 freeWhenDone:YES];
+    vglog("tessellation: %s: %s patch, %u control points, partition %u, winding %u, factor step %u, scale %u, "
+          "control-point index %u, max %.0f, %u vertex buffer(s) pulled, patch_id at Location %d, instance_id Location %d",
+          ((id<MTLFunction>)vf).name.UTF8String, patchType == 2 ? "quad" : "triangle", n, td.partition, td.winding, td.stepfn,
+          td.scale_en, td.cpidx, (double)td.maxf, m.nvb, (int)m.pidloc, (int)td.inst_loc);
+    return [NSData dataWithBytesNoCopy:m.tese length:m.teseWords * 4 freeWhenDone:YES];
 }
 
 static BOOL vg_passlog(void);
@@ -369,6 +475,11 @@ id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRende
         if (fs) {
             fs = vg_spirv_retarget_set(fs, 1);
         }
+        uint32_t tessType = 0, tessCps = 0;
+        NSData *tvs = nil, *tcs = nil;
+        if (vs && vg_spirv_tess_info(vs.bytes, vs.length, &tessType, &tessCps)) {
+            vs = vg_tess_pipeline(p, d, vf, vs, tessType, tessCps, &tvs, &tcs, &why);
+        }
         if (!vs || (ff && !fs)) {
             p = nil;
         } else if (vg_spirv_has_push_constants(vs) || (fs && vg_spirv_has_push_constants(fs))) {
@@ -392,23 +503,38 @@ id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRende
             }
             p->_vs = vg_module(vs);
             p->_fs = fs ? vg_module(fs) : VK_NULL_HANDLE;
-            p->_dsl[0] = vg_set_layout(p->_vb, p->_nvb, VK_SHADER_STAGE_VERTEX_BIT);
+            if (p->_tess) {
+                p->_tvs = vg_module(tvs);
+                p->_tcs = vg_module(tcs);
+            }
+            // set 0 is the vertex function's: the evaluation stage's in a tessellation pipeline (the generated stages
+            // bind nothing)
+            p->_dsl[0] = vg_set_layout(p->_vb, p->_nvb,
+                                       p->_tess ? VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT : VK_SHADER_STAGE_VERTEX_BIT);
             p->_dsl[1] = vg_set_layout(p->_fb, p->_nfb, VK_SHADER_STAGE_FRAGMENT_BIT);
             p->_dsl[2] = gEmptyLayout;
             p->_dsl[3] = gFetchLayout;
+            // Render stages have no push constants of their own (refused above); a tessellation pipeline's control
+            // stage reads vg_tess_push from offset 0.
+            VkPushConstantRange tessRange = {VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, 0, VG_TESS_PC_BYTES};
             VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, p->_fetchDeclared ? 4 : 2,
-                                               p->_dsl, 0, NULL};
+                                               p->_dsl, p->_tess ? 1 : 0, p->_tess ? &tessRange : NULL};
             vg_trace_sync("shader modules + set layouts");
             gVk.vkCreatePipelineLayout(gVk.device, &plci, NULL, &p->_layout);
             vg_trace_sync("pipeline layout");
-            vglog("render pipeline %s: translated in %.1f ms (%lu + %lu bytes of SPIR-V, %d + %d bindings%s)",
+            vglog("render pipeline %s: translated in %.1f ms (%lu + %lu bytes of SPIR-V, %d + %d bindings%s%s)",
                   p->_name.UTF8String, (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e6, (unsigned long)vs.length,
-                  (unsigned long)fs.length, p->_nvb, p->_nfb, p->_fetchMask ? ", framebuffer fetch by copies" : "");
+                  (unsigned long)fs.length, p->_nvb, p->_nfb, p->_fetchMask ? ", framebuffer fetch by copies" : "",
+                  p->_tess ? ", tessellation" : "");
+            if (p->_tess && (!p->_vs || !p->_tvs || !p->_tcs)) {
+                why = @"tessellation: vkCreateShaderModule failed for a stage";
+                p = nil;
+            }
         }
     }
     if (p) {
-        // Vertex input from the vertex descriptor.
-        MTLVertexDescriptor *vd = d.vertexDescriptor;
+        // Vertex input from the vertex descriptor (none in a tessellation pipeline: its control stage pulls it).
+        MTLVertexDescriptor *vd = p->_tess ? nil : d.vertexDescriptor;
         BOOL used[kVGMaxBufferSlots] = {NO};
         for (uint32_t a = 0; a < 31 && vd; a++) {
             MTLVertexAttributeDescriptor *ad = vd.attributes[a];
@@ -561,6 +687,14 @@ id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRende
     uint32_t _dbgDraws, _dbgRefused, _dbgSplits;
     NSMutableArray *_dbgUniforms;   // (name, stage, VkBuffer, offset) of each draw's buffer 0, copied out at endEncoding
     NSMutableString *_dbgSeq;
+    // Tessellation (5d): the buffer object behind each vertex slot (nil for setVertexBytes, whose memory is the command
+    // buffer's arena), for its device address; the factor buffer and scale; a patch draw in progress (prepareDraw).
+    __unsafe_unretained VGMTLBuffer *_vobj[kVGMaxBufferSlots];
+    id<MTLBuffer> _tfb;
+    NSUInteger _tfbOff, _tfbStride;
+    float _tfScale;
+    BOOL _tfScaleSet;
+    BOOL _tessDraw;
     // What this encoder last put into the command buffer (5c round 4): a draw sends state only when it changes. Vulkan
     // keeps dynamic state, the bound pipeline, sets and vertex buffers across render pass instances (the fetch
     // copies' end/resume), so this stays valid for the whole encoder.
@@ -625,7 +759,15 @@ static void vg_set_sampler(VGMTLCommandBuffer *cmd, vg_stage_bindings *t, id<MTL
         [_owner->_keep addObject:state];
     }
 }
-- (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i { vg_set_buffer(_owner, &_vt, b, o, i); }
+static void vg_track_vertex(VGRenderEncoder *e, id<MTLBuffer> b, NSUInteger i) {
+    if (i < kVGMaxBufferSlots) {
+        e->_vobj[i] = [(NSObject *)b isKindOfClass:[VGMTLBuffer class]] ? (VGMTLBuffer *)b : nil;
+    }
+}
+- (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {
+    vg_set_buffer(_owner, &_vt, b, o, i);
+    vg_track_vertex(self, b, i);
+}
 - (void)setFragmentBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i { vg_set_buffer(_owner, &_ft, b, o, i); }
 - (void)setVertexBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i {
     if (i < kVGMaxBufferSlots) {
@@ -640,6 +782,7 @@ static void vg_set_sampler(VGMTLCommandBuffer *cmd, vg_stage_bindings *t, id<MTL
 - (void)setVertexBuffers:(const id<MTLBuffer> __unsafe_unretained[])b offsets:(const NSUInteger[])o withRange:(NSRange)r {
     for (NSUInteger k = 0; k < r.length; k++) {
         vg_set_buffer(_owner, &_vt, b[k], o[k], r.location + k);
+        vg_track_vertex(self, b[k], r.location + k);
     }
 }
 - (void)setFragmentBuffers:(const id<MTLBuffer> __unsafe_unretained[])b offsets:(const NSUInteger[])o withRange:(NSRange)r {
@@ -647,7 +790,10 @@ static void vg_set_sampler(VGMTLCommandBuffer *cmd, vg_stage_bindings *t, id<MTL
         vg_set_buffer(_owner, &_ft, b[k], o[k], r.location + k);
     }
 }
-- (void)setVertexBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i { vg_set_bytes(_owner, &_vt, p, n, i); }
+- (void)setVertexBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {
+    vg_set_bytes(_owner, &_vt, p, n, i);
+    vg_track_vertex(self, nil, i);
+}
 - (void)setFragmentBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i { vg_set_bytes(_owner, &_ft, p, n, i); }
 - (void)setVertexTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { vg_set_texture(_owner, &_vt, t, i); }
 - (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { vg_set_texture(_owner, &_ft, t, i); }
@@ -844,7 +990,18 @@ static BOOL vg_passlog(void) {
         [_owner fail:_open ? @"draw without a render pipeline" : @"draw after endEncoding"];
         return NO;
     }
+    if (_pso->_tess != _tessDraw) {   // Metal's rule: a tessellation pipeline draws patches, and only it does
+        static int said;
+        if (said++ < 8) {
+            vglog("render: %s on %s, which %s a post-tessellation vertex function: NOT drawn",
+                  _tessDraw ? "a patch draw" : "a primitive draw", _pso->_name.UTF8String, _pso->_tess ? "has" : "has no");
+        }
+        return NO;
+    }
     int cls = type == MTLPrimitiveTypePoint ? 0 : (type == MTLPrimitiveTypeLine || type == MTLPrimitiveTypeLineStrip) ? 1 : 2;
+    if (_tessDraw) {
+        cls = 2;   // one patch-list pipeline, made in the triangles' slot
+    }
     NSString *why = nil;
     // An attachment the fragment stage also has bound as a texture (5d): RenderBox, without framebuffer reads, blends
     // by reading its own color target as texture(4) (and its coverage as texture(5)) right after a render-target
@@ -934,8 +1091,9 @@ static BOOL vg_passlog(void) {
         [MTLPrimitiveTypeLineStrip] = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP,
         [MTLPrimitiveTypeTriangle] = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
         [MTLPrimitiveTypeTriangleStrip] = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP};
-    int topo = (int)kTopo[type <= MTLPrimitiveTypeTriangleStrip ? type : MTLPrimitiveTypeTriangle];
-    int restart = type == MTLPrimitiveTypeLineStrip || type == MTLPrimitiveTypeTriangleStrip;
+    int topo = _tessDraw ? (int)VK_PRIMITIVE_TOPOLOGY_PATCH_LIST
+                         : (int)kTopo[type <= MTLPrimitiveTypeTriangleStrip ? type : MTLPrimitiveTypeTriangle];
+    int restart = !_tessDraw && (type == MTLPrimitiveTypeLineStrip || type == MTLPrimitiveTypeTriangleStrip);
     if (VG_CHANGED(_last.topo != topo)) {
         gVk.vkCmdSetPrimitiveTopology(cb, (VkPrimitiveTopology)topo);
         _last.topo = topo;
@@ -1395,6 +1553,204 @@ static BOOL vg_can_feedback(VGMTLTexture *t, const char *why) {
                   indexBuffer:(id<MTLBuffer>)ib indexBufferOffset:(NSUInteger)off {
     [self drawIndexedPrimitives:type indexCount:count indexType:itype indexBuffer:ib indexBufferOffset:off
                   instanceCount:1 baseVertex:0 baseInstance:0];
+}
+
+// ---- tessellation (5d) ---------------------------------------------------------------------------------------------
+// After NullMoth's NVMTLObjects.m (setTessellationFactorBuffer..., nvmtlTessAddress, nvmtlPatches, drawPatches...,
+// drawIndexedPatches...; PolyForm Noncommercial 1.0.0, Copyright (c) 2026 NullMoth Systems): the checks and the draw are
+// theirs, the device addresses come from vg_buffer_address.
+
+- (void)setTessellationFactorBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset instanceStride:(NSUInteger)instanceStride {
+    if (buffer && ![(NSObject *)buffer isKindOfClass:[VGMTLBuffer class]]) {
+        vglog("setTessellationFactorBuffer: not our buffer (%s): ignored", object_getClassName(buffer));
+        buffer = nil;
+    }
+    if (buffer) {
+        [_owner->_keep addObject:buffer];
+    }
+    _tfb = buffer;
+    _tfbOff = offset;
+    _tfbStride = instanceStride;
+}
+- (void)setTessellationFactorScale:(float)scale {
+    _tfScale = scale;
+    _tfScaleSet = YES;
+}
+// The device address of buf + off (0 and YES for no buffer). NO, logged, when it isn't ours, the offset is outside it,
+// it has no address, or the address isn't aligned.
+- (BOOL)vgTessAddress:(id<MTLBuffer>)buf offset:(NSUInteger)off align:(uint64_t)al what:(const char *)what out:(uint64_t *)out {
+    *out = 0;
+    if (!buf) {
+        return YES;
+    }
+    if (![(NSObject *)buf isKindOfClass:[VGMTLBuffer class]]) {
+        vglog("tessellation draw: the %s is not our buffer (%s): NOT drawn", what, object_getClassName(buf));
+        return NO;
+    }
+    VGMTLBuffer *vb = (VGMTLBuffer *)buf;
+    if (off >= vb->_length) {
+        vglog("tessellation draw: %s offset %lu is outside its %lu bytes: NOT drawn", what, (unsigned long)off,
+              (unsigned long)vb->_length);
+        return NO;
+    }
+    vg_vkbuffer(buf);   // a no-copy buffer's CPU contents, now
+    [_owner->_keep addObject:buf];
+    uint64_t a = vg_buffer_address(&vb->_b);
+    if (!a) {
+        vglog("tessellation draw: the %s has no device address: NOT drawn", what);
+        return NO;
+    }
+    a += off;
+    if (a & (al - 1)) {
+        vglog("tessellation draw: the %s at offset %lu is not %llu-byte aligned: NOT drawn", what, (unsigned long)off,
+              (unsigned long long)al);
+        return NO;
+    }
+    *out = a;
+    return YES;
+}
+// The device address of what vertex slot i has bound (a buffer, or setVertexBytes' arena), 0 if nothing or no address.
+- (uint64_t)vgVertexAddress:(NSUInteger)i {
+    VkBuffer b = _vt.buf[i];
+    if (!b) {
+        return 0;
+    }
+    uint64_t a = 0;
+    if (_vobj[i] && _vobj[i]->_b.buffer == b) {
+        a = vg_buffer_address(&_vobj[i]->_b);
+    } else {
+        for (int k = 0; k < _owner->_narena && !a; k++) {
+            if (_owner->_arena[k].buffer == b) {
+                a = vg_buffer_address(&_owner->_arena[k]);
+            }
+        }
+    }
+    return a ? a + _vt.off[i] : 0;
+}
+- (void)vgPatches:(NSUInteger)n start:(NSUInteger)start count:(NSUInteger)count pib:(id<MTLBuffer>)pib pibOff:(NSUInteger)pibOff
+             cpib:(id<MTLBuffer>)cpib cpibOff:(NSUInteger)cpibOff indexed:(BOOL)indexed instances:(NSUInteger)instances
+             base:(NSUInteger)base indirect:(id<MTLBuffer>)ind indOff:(NSUInteger)indOff {
+    if (vg_passlog()) {
+        [_dbgSeq appendFormat:@"{patches%s n%lu s%lu c%lu i%lu%s}", indexed ? " idx" : "", (unsigned long)n, (unsigned long)start,
+                              (unsigned long)count, (unsigned long)instances, ind ? " indirect" : ""];
+    }
+    if (!_open || !_pso) {
+        [_owner fail:_open ? @"patch draw without a render pipeline" : @"patch draw after endEncoding"];
+        return;
+    }
+    static int said;
+    const BOOL tell = said < 16;
+    if (!_pso->_tess) {
+        if (tell) {
+            said++;
+            vglog("tessellation draw: %s has no post-tessellation vertex function: NOT drawn", _pso->_name.UTF8String);
+        }
+        return;
+    }
+    if (!ind && (!count || !instances)) {
+        return;
+    }
+    const char *refuse = NULL;
+    if (n != _pso->_tessN) {
+        refuse = "the draw's control points per patch differ from the function's";
+    } else if (!_tfb) {
+        refuse = "no tessellation factor buffer is set";
+    } else if (indexed != (_pso->_tessCpidx != 0)) {
+        refuse = indexed ? "an indexed draw on a pipeline with no control-point index type"
+                         : "a non-indexed draw on a pipeline with a control-point index type";
+    } else if (indexed && !cpib) {
+        refuse = "drawIndexedPatches with no control-point index buffer";
+    } else if (_tfbStride & 3) {
+        refuse = "the factor buffer's instance stride is not a multiple of 4";
+    } else if (ind && (indOff & 3)) {
+        refuse = "the indirect buffer offset is not a multiple of 4";
+    }
+    if (refuse) {
+        if (tell) {
+            said++;
+            vglog("tessellation draw: %s (%s, %lu control points, the function takes %u): NOT drawn", refuse,
+                  _pso->_name.UTF8String, (unsigned long)n, _pso->_tessN);
+        }
+        return;
+    }
+    vg_tess_push pc;
+    memset(&pc, 0, sizeof(pc));
+    if (![self vgTessAddress:_tfb offset:_tfbOff align:4 what:"tessellation factor buffer" out:&pc.fac] ||
+        ![self vgTessAddress:pib offset:pibOff align:4 what:"patch index buffer" out:&pc.pix] ||
+        ![self vgTessAddress:cpib offset:cpibOff align:(_pso->_tessCpidx == 1 ? 2 : 4) what:"control-point index buffer"
+                         out:&pc.cpx]) {
+        return;
+    }
+    for (uint32_t k = 0; k < _pso->_tessNvb && k < VG_TESS_NVB; k++) {
+        uint32_t i = _pso->_tessVb[k];
+        pc.vb[k] = i < kVGMaxBufferSlots ? [self vgVertexAddress:i] : 0;
+        if (!pc.vb[k] || (pc.vb[k] & 3)) {
+            if (tell) {
+                said++;
+                vglog("tessellation draw: vertex buffer %u, which %s pulls from, is %s: NOT drawn", i, _pso->_name.UTF8String,
+                      !pc.vb[k] ? (_vt.buf[i] ? "a buffer without a device address" : "not bound")
+                                : "bound at an offset that is not 4-byte aligned");
+            }
+            return;
+        }
+    }
+    pc.istride = (uint32_t)_tfbStride;
+    pc.scale = _tfScaleSet ? _tfScale : 1.0f;
+    VkBuffer indBuf = ind ? vg_vkbuffer(ind) : VK_NULL_HANDLE;
+    if (ind && !indBuf) {
+        vglog("tessellation draw: the indirect buffer is not our buffer: NOT drawn");
+        return;
+    }
+    _tessDraw = YES;
+    BOOL ok = [self prepareDraw:MTLPrimitiveTypeTriangle];
+    _tessDraw = NO;
+    if (!ok) {
+        return;
+    }
+    VkCommandBuffer cb = _owner->_cb;
+    gVk.vkCmdPushConstants(cb, _pso->_layout, VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, 0, sizeof(pc), &pc);
+    if (ind) {
+        // MTLDrawPatchIndirectArguments (patchCount, instanceCount, patchStart, baseInstance) is VkDrawIndirectCommand
+        [_owner->_keep addObject:ind];
+        gVk.vkCmdDrawIndirect(cb, indBuf, indOff, 1, 0);
+    } else {
+        gVk.vkCmdDraw(cb, (uint32_t)count, (uint32_t)instances, (uint32_t)start, (uint32_t)base);
+    }
+    static int told;
+    if (!told++) {
+        vglog("tessellation: first patch draw in this process (%s, %s)", _pso->_name.UTF8String, ind ? "indirect" : "direct");
+    }
+}
+- (void)drawPatches:(NSUInteger)n patchStart:(NSUInteger)start patchCount:(NSUInteger)count patchIndexBuffer:(id<MTLBuffer>)pib
+    patchIndexBufferOffset:(NSUInteger)pibOff instanceCount:(NSUInteger)instances baseInstance:(NSUInteger)base {
+    [self vgPatches:n start:start count:count pib:pib pibOff:pibOff cpib:nil cpibOff:0 indexed:NO instances:instances base:base
+           indirect:nil indOff:0];
+}
+- (void)drawPatches:(NSUInteger)n patchIndexBuffer:(id<MTLBuffer>)pib patchIndexBufferOffset:(NSUInteger)pibOff
+      indirectBuffer:(id<MTLBuffer>)ind indirectBufferOffset:(NSUInteger)indOff {
+    if (!ind) {
+        vglog("drawPatches:indirectBuffer: nil");
+        return;
+    }
+    [self vgPatches:n start:0 count:0 pib:pib pibOff:pibOff cpib:nil cpibOff:0 indexed:NO instances:0 base:0 indirect:ind
+             indOff:indOff];
+}
+- (void)drawIndexedPatches:(NSUInteger)n patchStart:(NSUInteger)start patchCount:(NSUInteger)count
+          patchIndexBuffer:(id<MTLBuffer>)pib patchIndexBufferOffset:(NSUInteger)pibOff
+   controlPointIndexBuffer:(id<MTLBuffer>)cpib controlPointIndexBufferOffset:(NSUInteger)cpibOff
+             instanceCount:(NSUInteger)instances baseInstance:(NSUInteger)base {
+    [self vgPatches:n start:start count:count pib:pib pibOff:pibOff cpib:cpib cpibOff:cpibOff indexed:YES instances:instances
+               base:base indirect:nil indOff:0];
+}
+- (void)drawIndexedPatches:(NSUInteger)n patchIndexBuffer:(id<MTLBuffer>)pib patchIndexBufferOffset:(NSUInteger)pibOff
+    controlPointIndexBuffer:(id<MTLBuffer>)cpib controlPointIndexBufferOffset:(NSUInteger)cpibOff
+             indirectBuffer:(id<MTLBuffer>)ind indirectBufferOffset:(NSUInteger)indOff {
+    if (!ind) {
+        vglog("drawIndexedPatches:indirectBuffer: nil");
+        return;
+    }
+    [self vgPatches:n start:0 count:0 pib:pib pibOff:pibOff cpib:cpib cpibOff:cpibOff indexed:YES instances:0 base:0
+           indirect:ind indOff:indOff];
 }
 
 static float vg_half(uint16_t h) {

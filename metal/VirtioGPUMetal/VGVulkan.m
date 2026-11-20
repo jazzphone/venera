@@ -134,6 +134,9 @@ static int vg_vulkan_init_locked(void) {
     f2.features.robustBufferAccess = VK_FALSE;
     f13.robustImageAccess = VK_FALSE;
     gVk.formatlessStorage = f2.features.shaderStorageImageReadWithoutFormat && f2.features.shaderStorageImageWriteWithoutFormat;
+    gVk.tessellation = f2.features.tessellationShader;
+    gVk.int64 = f2.features.shaderInt64;
+    gVk.deviceAddress = f12.bufferDeviceAddress;
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, gVk.queueFamily, 1, &prio};
     // VK_EXT_calibrated_timestamps (5c round 4): GPU timestamps on the guest's clock, to split completion latency.
@@ -206,6 +209,14 @@ static int vg_vulkan_init_locked(void) {
         vglog("vulkan: vkCreateCommandPool %d", r);
         return -1;
     }
+    // Buffers are made with device addresses when the device has them (Metal tessellation's control stage reads the
+    // factor and vertex buffers through them); the flag file VirtioGPUMetal-nobda makes them as before.
+    gVk.bufferAddresses = gVk.deviceAddress && gVk.vkGetBufferDeviceAddress &&
+                          access("/Library/GPUBundles/VirtioGPUMetal-nobda", F_OK) != 0;
+    vglog("vulkan: tessellationShader %s, shaderInt64 %s, bufferDeviceAddress %s (buffers %s device addresses): "
+          "Metal tessellation %s",
+          gVk.tessellation ? "on" : "ABSENT", gVk.int64 ? "on" : "ABSENT", gVk.deviceAddress ? "on" : "ABSENT",
+          gVk.bufferAddresses ? "carry" : "have no", gVk.tessellation && gVk.int64 && gVk.bufferAddresses ? "available" : "UNAVAILABLE");
     vglog("vulkan: %s (vendor %04x device %04x, API %u.%u.%u), queue family %u, host memory type %u", gVk.props.deviceName,
           gVk.props.vendorID, gVk.props.deviceID, VK_VERSION_MAJOR(gVk.props.apiVersion),
           VK_VERSION_MINOR(gVk.props.apiVersion), VK_VERSION_PATCH(gVk.props.apiVersion), gVk.queueFamily,
@@ -267,7 +278,10 @@ static void vg_sub_push(uint32_t cls, vg_slot s) {
 static BOOL vg_sub_get(uint32_t cls, vg_slot *out) {
     pthread_mutex_lock(&gSubLock);
     if (!gNFree[cls]) {
-        VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, kVgSubChunk, gVk.hostMemoryType};
+        // a chunk's buffers all have addresses or none do (gVk.bufferAddresses is decided once, at init)
+        VkMemoryAllocateFlagsInfo fi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, NULL, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0};
+        VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, gVk.bufferAddresses ? &fi : NULL, kVgSubChunk,
+                                    gVk.hostMemoryType};
         VkDeviceMemory m = VK_NULL_HANDLE;
         void *map = NULL;
         if (gVk.vkAllocateMemory(gVk.device, &mai, NULL, &m) != VK_SUCCESS) {
@@ -306,6 +320,9 @@ int vg_buffer_create(VkDeviceSize size, vg_buffer *out) {
                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
                 VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+    if (gVk.bufferAddresses) {
+        bci.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    }
     bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     VkResult r = gVk.vkCreateBuffer(gVk.device, &bci, NULL, &out->buffer);
     if (r != VK_SUCCESS) {
@@ -331,6 +348,7 @@ int vg_buffer_create(VkDeviceSize size, vg_buffer *out) {
                 out->subChunk = s.chunk + 1;
                 out->subClass = cls;
                 out->subOffset = s.off;
+                out->addressable = gVk.bufferAddresses;
                 return 0;
             }
             pthread_mutex_lock(&gSubLock);
@@ -338,7 +356,9 @@ int vg_buffer_create(VkDeviceSize size, vg_buffer *out) {
             pthread_mutex_unlock(&gSubLock);
         }
     }
-    VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, gVk.hostMemoryType};
+    VkMemoryAllocateFlagsInfo fi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, NULL, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0};
+    VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, gVk.bufferAddresses ? &fi : NULL, req.size,
+                                gVk.hostMemoryType};
     r = gVk.vkAllocateMemory(gVk.device, &mai, NULL, &out->memory);
     if (r == VK_SUCCESS) {
         r = gVk.vkBindBufferMemory(gVk.device, out->buffer, out->memory, 0);
@@ -352,7 +372,19 @@ int vg_buffer_create(VkDeviceSize size, vg_buffer *out) {
         return -1;
     }
     out->size = size;
+    out->addressable = gVk.bufferAddresses;
     return 0;
+}
+
+VkDeviceAddress vg_buffer_address(vg_buffer *b) {
+    if (!b->buffer || !b->addressable || !gVk.vkGetBufferDeviceAddress) {
+        return 0;
+    }
+    if (!b->address) {
+        VkBufferDeviceAddressInfo ai = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, NULL, b->buffer};
+        b->address = gVk.vkGetBufferDeviceAddress(gVk.device, &ai);
+    }
+    return b->address;
 }
 
 void vg_buffer_destroy(vg_buffer *b) {

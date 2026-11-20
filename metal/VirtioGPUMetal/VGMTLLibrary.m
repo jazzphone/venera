@@ -1076,6 +1076,9 @@ static NSSet<NSString *> *vg_undefined_externs(NSArray<NSString *> *modules);
     NSString *_stage;   // "kernel" | "vertex" | "fragment"
     NSDictionary<NSNumber *, NSData *> *_fc;   // function-constant values (newFunctionWithName:constantValues:)
     NSString *_specName;   // MTLFunctionDescriptor.specializedName: the name a linking caller refers to it by
+    BOOL _patchRead;       // _patchType / _patchCount read from the IR (5d)
+    MTLPatchType _patchType;
+    NSInteger _patchCount;
 }
 @property(readonly) id<MTLDevice> device;
 @property(readonly) NSString *name;
@@ -1100,6 +1103,78 @@ static NSSet<NSString *> *vg_undefined_externs(NSArray<NSString *> *modules);
     return [_stage isEqualToString:@"vertex"]     ? MTLFunctionTypeVertex
            : [_stage isEqualToString:@"fragment"] ? MTLFunctionTypeFragment
                                                   : MTLFunctionTypeKernel;
+}
+// A post-tessellation vertex function's patch (5d): its entry node (!air.vertex = !{!N}, !N = !{ptr @f, !out, !in, ...})
+// names a node !{!"air.patch", !"quad" | !"triangle", !"air.patch_control_point", i32 COUNT}. Apps (SceneKit) ask
+// these to decide whether a pipeline is tessellated; Metal answers MTLPatchTypeNone and -1 for any other function.
+static void vg_ll_patch(NSString *ll, MTLPatchType *type, NSInteger *count) {
+    *type = MTLPatchTypeNone;
+    *count = -1;
+    NSRange r = [ll rangeOfString:@"\n!air.vertex = !{!"];
+    if (r.location == NSNotFound) {
+        return;
+    }
+    NSScanner *sc = [NSScanner scannerWithString:[ll substringFromIndex:NSMaxRange(r)]];
+    NSInteger entry = -1;
+    if (![sc scanInteger:&entry]) {
+        return;
+    }
+    NSRange def = [ll rangeOfString:[NSString stringWithFormat:@"\n!%ld = ", (long)entry]];
+    if (def.location == NSNotFound) {
+        return;
+    }
+    NSString *line = [ll substringWithRange:[ll lineRangeForRange:NSMakeRange(def.location + 1, 1)]];
+    NSScanner *refs = [NSScanner scannerWithString:line];
+    [refs scanUpToString:@"{" intoString:NULL];
+    while (!refs.atEnd) {
+        [refs scanUpToString:@"!" intoString:NULL];
+        if (![refs scanString:@"!" intoString:NULL]) {
+            break;
+        }
+        NSInteger ref = -1;
+        if (![refs scanInteger:&ref]) {
+            continue;
+        }
+        NSRange rd = [ll rangeOfString:[NSString stringWithFormat:@"\n!%ld = ", (long)ref]];
+        if (rd.location == NSNotFound) {
+            continue;
+        }
+        NSString *node = [ll substringWithRange:[ll lineRangeForRange:NSMakeRange(rd.location + 1, 1)]];
+        if ([node rangeOfString:@"!\"air.patch\""].location == NSNotFound) {
+            continue;
+        }
+        *type = [node rangeOfString:@"!\"quad\""].location != NSNotFound       ? MTLPatchTypeQuad
+                : [node rangeOfString:@"!\"triangle\""].location != NSNotFound ? MTLPatchTypeTriangle
+                                                                                : MTLPatchTypeNone;
+        NSRange cp = [node rangeOfString:@"!\"air.patch_control_point\", i32 "];
+        NSInteger k = 0;
+        if (cp.location != NSNotFound &&
+            [[NSScanner scannerWithString:[node substringFromIndex:NSMaxRange(cp)]] scanInteger:&k] && k > 0) {
+            *count = *type == MTLPatchTypeNone ? -1 : k;
+        }
+        return;
+    }
+}
+- (void)vgReadPatch {
+    @synchronized(self) {
+        if (!_patchRead) {
+            if ([_stage isEqualToString:@"vertex"]) {
+                vg_ll_patch(_ll, &_patchType, &_patchCount);
+            } else {
+                _patchType = MTLPatchTypeNone;
+                _patchCount = -1;
+            }
+            _patchRead = YES;
+        }
+    }
+}
+- (MTLPatchType)patchType {
+    [self vgReadPatch];
+    return _patchType;
+}
+- (NSInteger)patchControlPointCount {
+    [self vgReadPatch];
+    return _patchCount;
 }
 // Core Image's reflection of a visible function (VGMTLReflection.m)
 - (NSArray *)arguments { return (vg_ci_entry(self) ?: vg_ci_stitch_entry(self))[@"args"]; }
