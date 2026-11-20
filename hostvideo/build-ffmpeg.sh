@@ -3,9 +3,13 @@
 # H.264, HEVC, AV1 and VP9 decoders and H.264 and HEVC encoders with VA-API, shared libraries under out/ffmpeg.
 #   docker run --rm --platform linux/amd64 -v ~/src:/src venera-hostvideo-build /src/macos-virtio-gpu/hostvideo/build-ffmpeg.sh
 set -e
-SRC=/src/vendor-src/ffmpeg/ffmpeg-7.1.1
+UPSTREAM=/src/vendor-src/ffmpeg/ffmpeg-7.1.1
 OUT=/src/macos-virtio-gpu/hostvideo/out/ffmpeg
 B=/tmp/ffbuild
+# Venera's patches (hostvideo/patches/*.patch, LGPL like FFmpeg) on a copy of the release's source
+SRC=/tmp/ffsrc
+rm -rf $SRC && cp -R $UPSTREAM $SRC
+for p in /src/macos-virtio-gpu/hostvideo/patches/*.patch; do patch -s -d $SRC -p1 <"$p"; done
 mkdir -p $B && cd $B
 $SRC/configure --prefix=$OUT --enable-shared --disable-static --disable-programs --disable-doc --disable-debug \
   --disable-everything --disable-autodetect --enable-vaapi --enable-libdrm \

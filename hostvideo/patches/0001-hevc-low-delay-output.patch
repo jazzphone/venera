@@ -1,0 +1,20 @@
+--- a/libavcodec/hevc/hevcdec.c	2026-11-20 14:16:56
++++ b/libavcodec/hevc/hevcdec.c	2026-11-20 14:16:56
+@@ -3446,6 +3446,17 @@
+     av_log(s->avctx, AV_LOG_DEBUG, "Decoded frame with POC %zu/%d.\n",
+            l - s->layers, s->poc);
+ 
++    /* Venera: with AV_CODEC_FLAG_LOW_DELAY set for a packet, its frame (and any held back before it) is handed out
++     * as soon as it is decoded, in decode order, as Apple's decoders do for a synchronous decode without temporal
++     * processing. The frames stay in the DPB as references. */
++    if (s->avctx->flags & AV_CODEC_FLAG_LOW_DELAY) {
++        const HEVCSPS *const sps = s->ps.pps_list[s->sh.pps_id]->sps;
++        ret = ff_hevc_output_frames(s, s->layers_active_decode, s->layers_active_output, 0,
++                                    sps->temporal_layer[sps->max_sub_layers - 1].max_dec_pic_buffering, 0);
++        if (ret < 0)
++            return ret;
++    }
++
+     return 0;
+ }
+ 

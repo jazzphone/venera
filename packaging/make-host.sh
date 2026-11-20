@@ -50,8 +50,9 @@ chmod 755 $D/install-host.sh $D/apt-check $D/proxmox-macos-vm.sh $D/bin/*
 FF=${FFSRC:-$HOME/src/vendor-src/ffmpeg/ffmpeg-7.1.1}
 cp $FF/COPYING.LGPLv2.1 $D/licenses/FFmpeg-LGPL-2.1.txt
 cat >$D/licenses/FFmpeg-SOURCE.txt <<TXT
-The libraries in lib/ are FFmpeg 7.1.1 (https://ffmpeg.org/releases/ffmpeg-7.1.1.tar.xz), unmodified, built as
-shared LGPL libraries (no --enable-gpl, no --enable-nonfree) by hostvideo/build-ffmpeg.sh in Venera's repository:
+The libraries in lib/ are FFmpeg 7.1.1 (https://ffmpeg.org/releases/ffmpeg-7.1.1.tar.xz) with Venera's patches
+(hostvideo/patches/*.patch in Venera's repository and its sources archive, under the same LGPL), built as shared LGPL
+libraries (no --enable-gpl, no --enable-nonfree) by hostvideo/build-ffmpeg.sh in Venera's repository:
 $(sed -n '/configure/,/extra-ldflags/p' hostvideo/build-ffmpeg.sh)
 TXT
 (cd $D && find bin lib opencore $([[ -d guest ]] && echo guest) -type f -exec shasum -a 256 {} + >SHA256SUMS)

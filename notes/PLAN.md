@@ -2172,3 +2172,13 @@ TRIM, Upgrade without a USB disk, Retina modes, a faster first boot (a warm-up a
   hold, and the host can answer as Apple's does. Not built yet: the patch (in-process from the Metal plugin, or
   system-wide), the kext told which senders wait properly, and videod's synchronous path (decode order: FFmpeg's
   HEVC holds frames for reordering).
+  Built the same day (20aebfc): VGMTLVTFix.m, VeneraVideo 0.2.2's marker client, videod's Apple-style answer. VM 108's
+  test tool: 7 of 8 frames in their call; VM 109's wallpaper (a new login): its player layer ready in 1.3 s. But
+  the login screen stayed black: the background there is a copy WallpaperAgent exports to /var/db/Wallpapers/UUID
+  from the extension's VideoPlayer snapshot, and AVAssetImageGenerator's stills were black on Venera before any of
+  this (also with the fix off): VideoToolbox's Metal transfer (VTMTSComputeFunction) reads a 3840-wide x420 plane as
+  a 960-wide RGBA16Unorm texture (the same 7680-byte rows) and the driver refused the texture. And videod's first
+  synchronous path (drain + replay per frame) was OOM-killed under the generator: dozens of synchronous frames in a
+  row, each replaying the GOP, and past 64 suppressed frames the replays' output piled up as 4K frames. Replaced by a
+  per-packet AV_CODEC_FLAG_LOW_DELAY and an FFmpeg patch (hostvideo/patches/0001: HEVC hands a frame out at its
+  frame end, decode order), no drain.
