@@ -1339,13 +1339,45 @@ static VGMTLFunction *vg_library_read(VGMTLLibrary *lib, NSData *blob, NSString 
             [lib->_pending removeObjectForKey:k];
         }
         [lib->_read addObject:[NSValue valueWithNonretainedObject:blob]];
-        NSString *ll = vg_air_to_text(blob);
+        // A module's text and functions, kept for the process by its bytes: AvatarKit loads VFX's library again for
+        // each renderer (170 loads a minute in the Memoji menu), and each load asked for the same few dozen modules.
+        static NSCache<NSData *, NSMutableDictionary *> *cache;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            cache = [NSCache new];
+            cache.countLimit = 1024;
+        });
+        NSMutableDictionary *info = [cache objectForKey:blob];
+        NSString *ll = info[@"ll"];
         if (!ll) {
-            vglog("library: %s's module couldn't be read", key.UTF8String);
-            return nil;
+            ll = vg_air_to_text(blob);
+            if (!ll) {
+                vglog("library: %s's module couldn't be read", key.UTF8String);
+                return nil;
+            }
+            info = [NSMutableDictionary dictionaryWithObject:ll forKey:@"ll"];
+            [cache setObject:info forKey:blob];
         }
+        NSString *specKey = lib->_noVisible ? @"entries" : @"functions";
         NSMutableDictionary *fns = [NSMutableDictionary dictionary];
-        vg_library_add_module(lib.device, ll, lib->_noVisible, fns);
+        NSArray<NSArray<NSString *> *> *spec;
+        @synchronized(info) {
+            spec = info[specKey];
+        }
+        if (spec) {
+            for (NSArray<NSString *> *e in spec) {   // name, stage
+                fns[e[0]] = [[VGMTLFunction alloc] initWithDevice:lib.device name:e[0] stage:e[1] ll:ll];
+            }
+        } else {
+            vg_library_add_module(lib.device, ll, lib->_noVisible, fns);
+            NSMutableArray *made = [NSMutableArray array];
+            for (NSString *k in fns) {
+                [made addObject:@[ k, ((VGMTLFunction *)fns[k])->_stage ]];
+            }
+            @synchronized(info) {
+                info[specKey] = made;
+            }
+        }
         if (key && fns.count == 1 && !fns[key]) {
             fns[key] = fns.allValues.firstObject;   // the table's name for the module's entry (a quoted symbol's)
         }
