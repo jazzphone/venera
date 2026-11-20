@@ -1,0 +1,178 @@
+diff --git a/hostvideo/src/venera-videod.c b/hostvideo/src/venera-videod.c
+index 716d85e..d2448fa 100644
+--- a/hostvideo/src/venera-videod.c
++++ b/hostvideo/src/venera-videod.c
+@@ -79,6 +79,7 @@ static void logf_(const char *fmt, ...) {
+ #define kVTVideoDecoderUnsupportedDataFormatErr (-12910)
+ #define kVTVideoDecoderMalfunctionErr (-12911)
+ #define kVTInvalidSessionErr (-12903)
++#define kVTDecodeFrame_EnableAsynchronousDecompression (1u << 0)
+ #define kVTDecodeFrame_DoNotOutputFrame (1u << 1)
+ #define kVTDecodeInfo_Asynchronous (1u << 0)
+ #define kVTDecodeInfo_FrameDropped (1u << 1)
+@@ -245,6 +246,7 @@ typedef struct frame_out {
+     uint32_t surf;       // the guest's buffer, once it answered
+     uint8_t uui[16];
+     int answered;
++    int sync;      // a synchronous decode's frame: its Demt says so (inf 0), and the dfrm is answered after it
+     struct timespec asked;   // when the Dbuf went out: an answer that never comes drops the frame (pump_stale)
+     struct frame_out *next;
+ } frame_out;
+@@ -263,6 +265,8 @@ typedef struct {
+     int npending;
+     int finishing;   // a dfin waits for the queue to empty
+     uint64_t fin_req;
++    int fin_dfrm;    // ... or a synchronous dfrm's (see on_dfrm): answered as a dfrm when its frame is out
++    frame_out *spare;   // an output buffer asked for ahead, for a synchronous decode (see on_dfrm)
+     // A dfin (VTDecompressionSessionFinishDelayedFrames) must put out every frame the decoder holds and keep its
+     // references, as Apple's decoders do; FFmpeg can only drain to the end and start over. So the packets since the
+     // last key frame are kept, and after a drain they go through the decoder again with their output thrown away.
+@@ -295,6 +299,8 @@ static session *find_session(const uint8_t *uuid) {
+     return NULL;
+ }
+ static void free_session(session *s) {
++    free(s->spare);
++    s->spare = NULL;
+     for (int i = 0; i < s->nsaved; i++) {
+         av_packet_free(&s->saved[i]);
+     }
+@@ -449,7 +455,10 @@ static void send_pba(session *s) {
+ 
+ static void send_demt(session *s, frame_out *f, uint32_t inf) {
+     buf m = {0};
+-    msg_header(&m, "Demt", 2, s->uuid, ++host_req);
++    // a synchronous decode's frame as a plain message, as an encoded frame is (vv_encode.h's Eemt): VeneraVideo holds
++    // that call's send until its answer and keeps a request (flags 2) behind the answer, so the frame came after the
++    // call returned; a plain message keeps its place, before the answer
++    msg_header(&m, "Demt", f->sync ? 0 : 2, s->uuid, ++host_req);
+     field_s64(&m, "frm", f->frm);
+     field_s32(&m, "err", f->err);
+     field_u32(&m, "inf", inf);
+@@ -632,6 +641,25 @@ static int download(frame_out *f) {
+ 
+ // Move this session's output along: frames off the GPU into slots, ask for buffers, fill the answered ones and emit
+ // them in order, and finish a dfin when done.
++// An output buffer asked for ahead of a synchronous decode (see on_dfrm): the guest answers a Dbuf only between its
++// calls, as VeneraVideo holds a call's send until its answer.
++static void ask_spare(session *s) {
++    if (s->spare || !s->c) {
++        return;
++    }
++    frame_out *e = calloc(1, sizeof(*e));
++    e->slot = -1;
++    e->frm = s->max_frm + 1;
++    e->dbuf_req = ++host_req;
++    clock_gettime(CLOCK_MONOTONIC, &e->asked);
++    s->spare = e;
++    buf m = {0};
++    msg_header(&m, "Dbuf", 2, s->uuid, e->dbuf_req);
++    field_s64(&m, "frm", e->frm);
++    out.msg(&m);
++    free(m.p);
++}
++
+ static void pump(session *s) {
+     for (frame_out *f = s->head; f; f = f->next) {
+         if (f->f && !f->err && download(f) < 0) {
+@@ -669,7 +697,7 @@ static void pump(session *s) {
+             }
+             out.fill(f->surf, f->slot, f->w, f->h, f->stride, f->bps);
+             f->slot = -1;   // the guest frees it (VV_G_SLOTDONE)
+-            send_demt(s, f, kVTDecodeInfo_Asynchronous);
++            send_demt(s, f, f->sync ? 0 : kVTDecodeInfo_Asynchronous);
+         }
+         s->head = f->next;
+         if (!s->head) {
+@@ -690,12 +718,20 @@ static void pump(session *s) {
+             s->pending_fo[i] = NULL;
+         }
+         s->npending = 0;
++        int was_dfrm = s->fin_dfrm;
+         buf r = {0};
+-        msg_header(&r, "dfin", 4, s->uuid, s->fin_req);
++        msg_header(&r, was_dfrm ? "dfrm" : "dfin", 4, s->uuid, s->fin_req);
+         field_s32(&r, "err", 0);
++        if (was_dfrm) {
++            field_u32(&r, "inf", 0);   // the frame went out before the answer: not asynchronous
++        }
+         out.msg(&r);
+         free(r.p);
+         s->finishing = 0;
++        s->fin_dfrm = 0;
++        if (was_dfrm) {
++            ask_spare(s);   // for the next one, asked now that the guest's call has returned and it can answer
++        }
+         if (!s->c) {   // a dsta since the dfin took the decoder away and did not get another
+             return;
+         }
+@@ -760,6 +796,7 @@ static void collect(session *s) {
+                 if (s->pending_fo[i]) {   // its buffer was asked for already: carry that over
+                     frame_out *e = s->pending_fo[i];
+                     f->dbuf_req = e->dbuf_req, f->answered = e->answered, f->surf = e->surf, f->err = e->err;
++                    f->sync = e->sync;
+                     f->asked = e->asked;
+                     memcpy(f->uui, e->uui, 16);
+                     free(e);
+@@ -1020,9 +1057,25 @@ static void on_dfrm(session *s, const msg *m) {
+         send_demt(s, &f, kVTDecodeInfo_Asynchronous);
+         return;
+     }
++    // A synchronous decode (no EnableAsynchronousDecompression): VideoToolbox's caller has its frame when the call
++    // returns, as Apple's decoders give it. Answered with Asynchronous, the frame came after the call, and a caller that
++    // reads it right away found none: the moving wallpaper's still frame ("VideoPlayerLayer failed to create decoded
++    // pixel buffer"), so a new VM's wallpaper went black and Setup Assistant's last screen waited for it. Apple's host
++    // (VTParavirtualizationHost, fed this exchange by tools/pvhost) answers such a dfrm with the frame itself: Dbuf,
++    // then Demt with inf 0. The guest can't answer a Dbuf inside the call here (VeneraVideo holds the call's send until
++    // its answer: the Dbuf waited 2 s and the frame failed), so the buffer is one asked for ahead (ask_spare). The
++    // decoder is drained (FFmpeg holds frames back for reordering), the frames go out, the dfrm is answered after
++    // them, and the packets since the last key frame go through again with their output thrown away so the frames
++    // after keep their references, as after a dfin. With no spare buffer ready it is answered as before.
++    int sync = !(dfl & kVTDecodeFrame_EnableAsynchronousDecompression) && !(dfl & kVTDecodeFrame_DoNotOutputFrame) &&
++               !s->finishing && s->spare && s->spare->answered && !s->spare->err;
+     if (s->npending < 256) {
+         frame_out *e = NULL;
+-        if (!(dfl & kVTDecodeFrame_DoNotOutputFrame)) {
++        if (sync) {
++            e = s->spare;
++            s->spare = NULL;
++            e->frm = frm, e->sync = 1;
++        } else if (!(dfl & kVTDecodeFrame_DoNotOutputFrame)) {
+             e = calloc(1, sizeof(*e));
+             e->frm = frm, e->slot = -1;
+             e->dbuf_req = ++host_req;
+@@ -1037,6 +1090,17 @@ static void on_dfrm(session *s, const msg *m) {
+         s->pending_dfl[s->npending] = dfl;
+         s->pending_fo[s->npending++] = e;
+     }
++    if (sync) {
++        free(r.p);
++        VLOG("frame %lld: synchronous: drained, the frame out, then the answer", (long long)frm);
++        avcodec_send_packet(s->c, NULL);
++        collect(s);
++        s->finishing = 1;
++        s->fin_dfrm = 1;
++        s->fin_req = m->req;
++        pump(s);
++        return;
++    }
+     field_s32(&r, "err", 0);
+     field_u32(&r, "inf", kVTDecodeInfo_Asynchronous);
+     out.msg(&r);
+@@ -1092,6 +1156,9 @@ static void engine_msg(const uint8_t *p, size_t n, const struct vv_surf *surfs,
+             for (int i = 0; i < s->npending && !hit; i++) {
+                 hit = s->pending_fo[i] && s->pending_fo[i]->dbuf_req == m.req ? s->pending_fo[i] : NULL;
+             }
++            if (!hit && s->spare && s->spare->dbuf_req == m.req) {
++                hit = s->spare;
++            }
+             if (hit) {
+                 frame_out *f = hit;
+                 size_t un = 0;
+@@ -1216,6 +1283,7 @@ static void engine_msg(const uint8_t *p, size_t n, const struct vv_surf *surfs,
+             }
+             send_pba(s);
+             reply_err(&m, 0);
++            ask_spare(s);
+         }
+     } else if (!strcmp(t, "dsup")) {
+         buf r = {0};

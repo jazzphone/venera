@@ -2135,3 +2135,16 @@ TRIM, Upgrade without a USB disk, Retina modes, a faster first boot (a warm-up a
   the seed; VMs 107, 108 (snapshot venera-019-pre first), 110 and 111 upgraded, each on the same Metal driver,
   framebuffer 0.6.2 and VirtualSMC. Upgrades run on both nodes at once lost their place twice (VM 108 after the copy,
   VM 107 after the USB disk; the package was in, no restart): run one Upgrade at a time; reruns finished both.
+- **A new VM's black wallpaper (VM 109, 0.1.9's one-line setup), not fixed.** At first login the aerial wallpaper
+  never drew and Setup Assistant's last screen waited for it: WallpaperAerialsExtension logged "VideoPlayerLayer
+  failed to create decoded pixel buffer" ~1000 times a second, 0 frames enqueued, while venera-videod decoded the whole
+  4K 10-bit movie again and again (2 GB, 1.4 GB of it swapped). Stopping VM 109's video service let it through (the
+  guest decoded in software). Found on the way: a synchronous decode is answered Asynchronous at once, where Apple's
+  host (tools/pvhost fed the guest's own messages) sends Dbuf then Demt with inf 0 and no early answer; VeneraVideo
+  holds such a send and queues host requests behind its answer, so a Dbuf waits 2 s. An experiment (a spare buffer
+  asked ahead, drain + replay, Demt as a plain message) is notes/sync-decode-experiment.patch: synchronous frames then
+  come with their buffers and inf 0, though still just after the call. The wallpaper also opens a tile session
+  (dsts), refused since the HEIF fix. But the failure could not be brought back once the wallpaper had a snapshot:
+  released and patched services ran the same (one failed attempt, then ready), with the snapshot moved aside too. Not
+  shipped (each synchronous frame would drain and replay a GOP: thumbnails and Quick Look decode that way). Next time
+  it happens: verbose (SIGUSR1) dumps the messages in the service's state directory; tools/pvhost replays them.
