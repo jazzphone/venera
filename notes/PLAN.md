@@ -2113,3 +2113,5 @@ TRIM, Upgrade without a USB disk, Retina modes, a faster first boot (a warm-up a
   functions (Core Image's) lists TYPE 0-2 only, as before, and dynamic-library linking still gets every module. VFX's
   library: 1.17 s -> 0.02 s. VM 111, two boots each way (the eagerlib flag file brings back the old reading): no
   missing functions either way, the desktop on Metal; mtlcube, mtlalign, mtltess pass.
+  Then 618f087: converted modules kept per process (AvatarKit loads the library ~170 times a minute). The owner: no
+  beach ball, a slight pause left (the Memoji are 3D, tessellated and subdivided; each picker is its own process).
