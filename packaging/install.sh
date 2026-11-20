@@ -586,6 +586,21 @@ run chmod 644 /Library/LaunchDaemons/local.venera.watch.plist
 [ $DRY = 1 ] || launchctl bootout system/local.venera.watch 2>/dev/null
 run launchctl bootstrap system /Library/LaunchDaemons/local.venera.watch.plist
 say "Metal driver: kept in $K; $SYSVOL; watcher local.venera.watch running"
+# The login screen's copy of each user's wallpaper (/var/db/Wallpapers/UUID, WallpaperAgent's export): one made from a
+# moving wallpaper before 0.1.10 is black (the driver passed only 64 of VideoToolbox's function constants, and its
+# stills came out empty), and macOS keeps it while the wallpaper doesn't change. Moved aside once, so each user's next
+# login exports it again; macOS makes one when there is none.
+if [ ! -e "$V/wallpaper-exports-redone" ] && [ -d /var/db/Wallpapers ]; then
+  moved=0
+  for d in /var/db/Wallpapers/*/; do
+    [ -f "$d/Metadata.plist" ] || continue
+    plutil -p "$d/Metadata.plist" 2>/dev/null | grep -q 'com.apple.wallpaper.choice.aerials' || continue
+    run mkdir -p "$V/old-wallpaper-exports"
+    run mv "${d%/}" "$V/old-wallpaper-exports/$(basename "$d")-$(date +%Y%m%d%H%M%S)" && moved=$((moved + 1))
+  done
+  run touch "$V/wallpaper-exports-redone"
+  [ $moved = 0 ] || say "login screen: $moved moving wallpaper's copy set aside (made again at its user's next login)"
+fi
 
 # ---- 5. the Venera app ---------------------------------------------------------------------------------------------
 CUID=$(stat -f %u /dev/console)
