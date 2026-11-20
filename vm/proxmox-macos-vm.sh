@@ -1252,7 +1252,12 @@ for r in json.load(sys.stdin):
   fi
   [ -n "$OCSRC" ] || die "Venera's OpenCore image isn't beside this script (the host package's opencore/ folder)"
   OCIMG=$ISO/OpenCore-$NAME.img REC=$ISO/Tahoe-recovery.img
-  [ ! -f "$OCIMG" ] || die "$OCIMG is there already (another VM's?): pick another name, or remove it"
+  OC_LEFT=0
+  if [ -f "$OCIMG" ]; then   # a VM by this name had one: replaced only when no VM (a snapshot included) names it now
+    grep -qsF "OpenCore-$NAME.img" /etc/pve/nodes/*/qemu-server/*.conf &&
+      die "$OCIMG is there already, and a VM uses it: pick another name"
+    OC_LEFT=1
+  fi
   BOOTARGS="keepsyms=1" CSR=""
   if [ $VENERA = 1 ]; then
     BOOTARGS="keepsyms=1 amfi_get_out_of_my_way=1"
@@ -1307,6 +1312,7 @@ if [ $MODE = create ]; then
     echo "    (imported, at least $DISK GB; it must be an Intel (x86) macOS; Venera is made for macOS 26 Tahoe)"
   elif [ -n "$BYO_INST" ]; then echo "  - OpenCore $OCVER (Venera's own image, from this package), and your installer $BYO_INST to install from"
   else echo "  - OpenCore $OCVER (Venera's own image, from this package) and macOS Tahoe's recovery from Apple, into $ISO"; fi
+  [ "${OC_LEFT:-0}" = 1 ] && echo "    (OpenCore-$NAME.img there is left from a VM since removed: replaced)"
   echo "  - VM $VMID '$NAME': $CORES cores${PCORES:+ on the performance cores ($PCORES)}, $MEM MB, $DISK GB on $STORAGE$([ $TRIM = on ] && echo ", TRIM on")"
   echo "    (the OpenCore$([ -n "$BYO_DISK" ] || echo " and $([ -n "$BYO_INST" ] && echo installer || echo recovery)") image$([ -n "$BYO_DISK" ] || echo s) imported as small disks there too)"
   echo "  - network: $BRIDGE${VLAN:+, VLAN $VLAN}; starts with the host"
