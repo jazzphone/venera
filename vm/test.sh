@@ -12,13 +12,14 @@ fail=0
 check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fail=1; fi; }
 W=$(mktemp -d)
 
-OSK='osk="ourhardworkbythesewordsguardedpleasedontsteal(c)AppleComputerInc"'
+OSK='osk="the(c)key"'   # a stand-in for the SMC key older VMs' args carry
 NEW="-smbios type=2 -device qemu-xhci -cpu host,vendor=GenuineIntel,+invtsc,+hypervisor,kvm=on,vmware-cpuid-freq=on -device isa-applesmc,$OSK"
 A=$(venera_args "$NEW" 1)
 check "the address width goes into -cpu host" '[[ $A == *" -cpu host,host-phys-bits-limit=40,vendor=GenuineIntel,+invtsc,"* ]]'
 check "Venus's three globals and the sound device" '[[ $A == *"-global virtio-vga-gl.venus=on -global virtio-vga-gl.blob=on -global virtio-vga-gl.hostmem=2G -audiodev spice,id=vsnd -device usb-audio,audiodev=vsnd" ]]'
 check "the rest kept as it was" '[[ $A == "-smbios type=2 -device qemu-xhci -cpu host,"*"-device isa-applesmc,$OSK -global"* ]]'
 check "a second pass adds nothing" '[ "$(venera_args "$A" 1)" = "$A" ]'
+check "QEMU's applesmc out of the args (its quoted key too), the rest kept" '[ "$(no_applesmc "$NEW -global x=1")" = "-smbios type=2 -device qemu-xhci -cpu host,vendor=GenuineIntel,+invtsc,+hypervisor,kvm=on,vmware-cpuid-freq=on -global x=1" ] && [ "$(no_applesmc "-device isa-applesmc -cpu host")" = "-cpu host" ] && [ "$(no_applesmc "-cpu host")" = "-cpu host" ]'
 check "no sound device when not asked" '[[ $(venera_args "$NEW" 0) != *usb-audio* ]]'
 V107="-smbios type=2 -cpu host,host-phys-bits-limit=40,vendor=GenuineIntel -global virtio-vga-gl.venus=on -global virtio-vga-gl.blob=on -global virtio-vga-gl.hostmem=2G -audiodev spice,id=vsnd -device usb-audio,audiodev=vsnd -chardev socket,path=/run/venera-video-107.sock,id=vvideo"
 check "a VM that has it all is left alone" '[ "$(venera_args "$V107" 1)" = "$V107" ]'
@@ -63,7 +64,7 @@ c = plistlib.load(open(sys.argv[1], "rb")); what = sys.argv[2]; G = "7C436110-AB
 nv, gen, add = c["NVRAM"], c["PlatformInfo"]["Generic"], [k["BundlePath"] for k in c["Kernel"]["Add"]]
 s = plistlib.load(open(sys.argv[3], "rb"))
 if what == "create":
-    ok = (add == ["VeneraHide.kext"] and gen["SystemUUID"] != "00000000-0000-0000-0000-000000000000"
+    ok = (add == ["Lilu.kext", "VirtualSMC.kext", "VeneraHide.kext"] and gen["SystemUUID"] != "00000000-0000-0000-0000-000000000000"
           and c["UEFI"]["Output"]["Resolution"] == "1920x1080@32" and c["Misc"]["Boot"]["Timeout"] == 5
           and nv["Add"][G]["boot-args"] == "keepsyms=1 amfi_get_out_of_my_way=1"
           and nv["Add"][G]["csr-active-config"] == bytes.fromhex("03020000")
@@ -78,7 +79,7 @@ PY
 }
 cp "$CFG" "$W/c.plist"
 NEWUUID=1 OC_RES=1920x1080 OC_TIMEOUT=5 OC_ARGS="keepsyms=1 amfi_get_out_of_my_way=1" OC_CSR=03020000 MODEL=iMac20,1 SERIAL="" MLB="" ROM="" oc_config "$W/c.plist" >"$W/oc.log"
-check "a new VM's OpenCore: VeneraHide alone, its own UUID, the screen, SIP 0x203, AMFI, the model" 'ok_plist "$W/c.plist" create "$CFG"'
+check "a new VM's OpenCore: Lilu, VirtualSMC and VeneraHide, its own UUID, the screen, SIP 0x203, AMFI, the model" 'ok_plist "$W/c.plist" create "$CFG"'
 cp "$W/c.plist" "$W/c1.plist"
 OC_RES=1920x1080 OC_TIMEOUT=5 OC_ARGS="keepsyms=1 amfi_get_out_of_my_way=1" OC_CSR=03020000 MODEL=iMac20,1 SERIAL="" MLB="" ROM="" oc_config "$W/c.plist" >/dev/null
 check "OpenCore edited twice is the same" 'python3 -c "import plistlib,sys; sys.exit(plistlib.load(open(\"$W/c.plist\",\"rb\")) != plistlib.load(open(\"$W/c1.plist\",\"rb\")))"'
@@ -115,10 +116,23 @@ cp "$CFG" "$W/moved.plist"; oc_transplant "$W/old.plist" "$W/moved.plist" >/dev/
 check "an older VM moved to Venera's OpenCore: its kexts, boot-args, identity and screen kept, the old extras gone" 'python3 -c "
 import plistlib, sys
 c = plistlib.load(open(\"$W/moved.plist\", \"rb\")); add = [k[\"BundlePath\"] for k in c[\"Kernel\"][\"Add\"]]
-sys.exit(not (add == [\"VeneraHide.kext\", \"VirtioGPU.kext\", \"VeneraVideo.kext\"]
+sys.exit(not (add == [\"Lilu.kext\", \"VirtualSMC.kext\", \"VeneraHide.kext\", \"VirtioGPU.kext\", \"VeneraVideo.kext\"]
     and c[\"NVRAM\"][\"Add\"][\"7C436110-AB2A-4BBB-A880-FE41995C9F82\"][\"boot-args\"] == \"keepsyms=1 vgpuaccel=4\"
     and c[\"PlatformInfo\"][\"Generic\"][\"SystemSerialNumber\"] == \"C02OWNSERIAL\" and c[\"UEFI\"][\"Output\"][\"Resolution\"] == \"1280x800@32\"
     and c[\"Misc\"][\"Boot\"][\"PickerMode\"] == \"Builtin\" and not c[\"UEFI\"][\"Drivers\"][1][\"Path\"].startswith(\"OpenCanopy\")))"'
+# an older Venera VM's config (VeneraHide and Venera's kexts, no VirtualSMC) gets Lilu and VirtualSMC first, once
+python3 - "$CFG" "$W/smc.plist" <<'PY'
+import plistlib, sys
+c = plistlib.load(open(sys.argv[1], "rb"))
+c["Kernel"]["Add"] = [k for k in c["Kernel"]["Add"] if k["BundlePath"] == "VeneraHide.kext"]
+c["Kernel"]["Add"].append(dict(c["Kernel"]["Add"][0], BundlePath="VirtioGPU.kext", ExecutablePath="Contents/MacOS/VirtioGPU"))
+plistlib.dump(c, open(sys.argv[2], "wb"))
+PY
+oc_smc_merge "$CFG" "$W/smc.plist" >/dev/null; oc_smc_merge "$CFG" "$W/smc.plist" >/dev/null
+check "an older Venera VM's OpenCore gets Lilu and VirtualSMC first, once" 'python3 -c "
+import plistlib, sys
+add = [k[\"BundlePath\"] for k in plistlib.load(open(\"$W/smc.plist\", \"rb\"))[\"Kernel\"][\"Add\"]]
+sys.exit(add != [\"Lilu.kext\", \"VirtualSMC.kext\", \"VeneraHide.kext\", \"VirtioGPU.kext\"])"'
 # a generated Mac identity (macserial beside the script, in opencore/, as the host package has it)
 if [ -n "$MACSERIAL" ]; then
   mlb_ok() {   # a 17-character MLB's checksum (macserial's FORMAT.md)

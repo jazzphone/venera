@@ -27,6 +27,8 @@ fetch() {   # fetch FILE URL SHA256: the cached copy (downloaded once), checked
 git archive --format=tar.gz --prefix=venera-$VERSION/ -o $D/venera-$VERSION.tar.gz HEAD
 [[ -z $(git status --porcelain --untracked-files=no) ]] || echo "make-sources: uncommitted changes aren't in venera-$VERSION.tar.gz (it is HEAD)" >&2
 fetch $V/opencore/OpenCore-$OPENCORE_VERSION-RELEASE.zip $OPENCORE_URL $OPENCORE_SHA256
+fetch $V/lilu/Lilu-$LILU_VERSION-RELEASE.zip $LILU_URL $LILU_SHA256
+fetch $V/virtualsmc/VirtualSMC-$VIRTUALSMC_VERSION-RELEASE.zip $VIRTUALSMC_URL $VIRTUALSMC_SHA256
 fetch $V/mesa-tarball/mesa-$MESA_VERSION.tar.xz $MESA_URL $MESA_SHA256
 fetch $V/ffmpeg/ffmpeg-$FFMPEG_VERSION.tar.xz $FFMPEG_URL $FFMPEG_SHA256
 [[ -f $V/ffmpeg/ffmpeg-$FFMPEG_VERSION.tar.xz.asc ]] && cp $V/ffmpeg/ffmpeg-$FFMPEG_VERSION.tar.xz.asc $D/upstream/
@@ -43,8 +45,10 @@ and each upstream one against packaging/UPSTREAM inside venera-$VERSION.tar.gz.
 
 To build it again without the network, on a Mac with Xcode, Homebrew's Rust ($TRANSLATOR_RUSTC) and Docker:
   tar -xzf venera-$VERSION.tar.gz && cd venera-$VERSION
-  mkdir -p ~/src/vendor-src/opencore ~/src/vendor-src/mesa-tarball ~/src/vendor-src/ffmpeg ~/src/vendor-src/cargo-home
+  mkdir -p ~/src/vendor-src/opencore ~/src/vendor-src/lilu ~/src/vendor-src/virtualsmc ~/src/vendor-src/mesa-tarball ~/src/vendor-src/ffmpeg ~/src/vendor-src/cargo-home
   cp ../upstream/OpenCore-*-RELEASE.zip ~/src/vendor-src/opencore/
+  cp ../upstream/Lilu-*-RELEASE.zip ~/src/vendor-src/lilu/
+  cp ../upstream/VirtualSMC-*-RELEASE.zip ~/src/vendor-src/virtualsmc/
   cp ../upstream/ffmpeg-* ~/src/vendor-src/ffmpeg/
   tar -xzf ../upstream/translator-$TRANSLATOR_COMMIT.tar.gz -C ~/src/vendor-src
   tar -xzf ../upstream/cargo-home.tar.gz -C ~/src/vendor-src/cargo-home

@@ -4,27 +4,38 @@
 #                                                 imports it; and its .sha256
 # From acidanthera's OpenCorePkg release (BSD-3; checksum-pinned below, kept in ~/src/vendor-src/opencore and in the
 # release mirror), with config.py's settings over its Sample.plist, Venera's SSDT-VENERA.dsl (compiled with iasl)
-# and VeneraHide.kext. OpenCore's own ocvalidate checks the config. No KVM-Opencore, no Lilu.
+# and VeneraHide.kext, and acidanthera's Lilu and VirtualSMC (BSD-3, checksum-pinned the same way: a full SMC; QEMU's
+# applesmc can't list its keys, and PerfPowerServices spun a core for good trying). OpenCore's own ocvalidate checks
+# the config. No KVM-Opencore.
 set -euo pipefail
 cd "${0:A:h}/../.."
 . packaging/UPSTREAM   # the version, address and checksum of OpenCorePkg, and the Debian image
 OCVER=$OPENCORE_VERSION OCSHA=$OPENCORE_SHA256 DEBIAN=$DEBIAN_IMAGE
-OCZIP=${VENERA_VENDOR_SRC:-$HOME/src/vendor-src}/opencore/OpenCore-$OCVER-RELEASE.zip
+VS=${VENERA_VENDOR_SRC:-$HOME/src/vendor-src}
+OCZIP=$VS/opencore/OpenCore-$OCVER-RELEASE.zip
+LILUZIP=$VS/lilu/Lilu-$LILU_VERSION-RELEASE.zip
+VSMCZIP=$VS/virtualsmc/VirtualSMC-$VIRTUALSMC_VERSION-RELEASE.zip
 [[ -d build/VeneraHide.kext ]] || { echo "no build/VeneraHide.kext: run tools/build.sh"; exit 1; }
 if [[ ! -f $OCZIP ]]; then
   mkdir -p ${OCZIP:h}
   curl -fsSL -o $OCZIP $OPENCORE_URL
 fi
 echo "$OCSHA  $OCZIP" | shasum -a 256 -c --quiet || { echo "$OCZIP doesn't match its checksum"; exit 1; }
+for z in "$LILUZIP $LILU_URL $LILU_SHA256" "$VSMCZIP $VIRTUALSMC_URL $VIRTUALSMC_SHA256"; do
+  set -- ${=z}
+  [[ -f $1 ]] || { mkdir -p ${1:h}; curl -fsSL -o $1 $2; }
+  echo "$3  $1" | shasum -a 256 -c --quiet || { echo "$1 doesn't match its checksum"; exit 1; }
+done
 # a fresh work folder each run (Docker Desktop's file sharing can show a just-deleted folder's old contents)
 B=build/opencore-work-$$
 OUT=build/opencore
 rm -rf $B && mkdir -p $B/oc $B/EFI/BOOT $B/EFI/OC/ACPI $B/EFI/OC/Drivers $B/EFI/OC/Kexts
 (cd $B/oc && unzip -q $OCZIP)
+mkdir -p $B/lilu $B/vsmc && (cd $B/lilu && unzip -q $LILUZIP) && (cd $B/vsmc && unzip -q $VSMCZIP)
 cp $B/oc/X64/EFI/BOOT/BOOTx64.efi $B/EFI/BOOT/
 cp $B/oc/X64/EFI/OC/OpenCore.efi $B/EFI/OC/
 for d in OpenRuntime OpenHfsPlus OpenPartitionDxe ResetNvramEntry; do cp $B/oc/X64/EFI/OC/Drivers/$d.efi $B/EFI/OC/Drivers/; done
-cp -R build/VeneraHide.kext $B/EFI/OC/Kexts/
+cp -R build/VeneraHide.kext $B/lilu/Lilu.kext $B/vsmc/Kexts/VirtualSMC.kext $B/EFI/OC/Kexts/
 cp vm/opencore/SSDT-VENERA.dsl $B/
 python3 vm/opencore/config.py $B/oc/Docs/Sample.plist $B/EFI/OC/config.plist
 IMG=OpenCore-Venera-$OCVER.img
@@ -45,7 +56,7 @@ docker run --rm --platform linux/amd64 -v "$PWD/$B:/b" $DEBIAN sh -ec '
   END=$(sgdisk -i 1 '$IMG' | sed -n "s/^Last sector: \([0-9]*\).*/\1/p")
   mformat -i '$IMG'@@1M -T $((END - 2048 + 1)) -F -N 56454E52 -v OPENCORE ::   # the FAT ends where the partition does
   mcopy -i '$IMG'@@1M -s -m EFI ::
-  mdir -i '$IMG'@@1M -/ ::EFI | grep -c -E "efi|aml|plist|VeneraHide"
+  mdir -i '$IMG'@@1M -/ ::EFI | grep -c -E "efi|aml|plist|VeneraHide|Lilu|VirtualSMC"
   sgdisk -v '$IMG' | grep -q "No problems found" && sgdisk -p '$IMG' | grep -q "EF00  EFI" || { sgdisk -p '$IMG'; echo "the partition table is wrong"; exit 1; } '
 rm -rf $OUT && mkdir -p $OUT && mv $B/$IMG $OUT/ && rm -rf $B
 (cd $OUT && shasum -a 256 $IMG | tee $IMG.sha256)

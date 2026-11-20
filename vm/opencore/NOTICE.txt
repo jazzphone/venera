@@ -6,5 +6,8 @@ Venera's OpenCore image (OpenCore-Venera-VERSION.img), made by vm/opencore/build
 - config.plist: OpenCorePkg's Docs/Sample.plist with Venera's settings (vm/opencore/config.py)
 - ACPI/SSDT-VENERA.aml: Venera's own (vm/opencore/SSDT-VENERA.dsl)
 - Kexts/VeneraHide.kext: Venera's own (kext/VeneraHide), under Venera's license
+- Kexts/Lilu.kext and Kexts/VirtualSMC.kext: from acidanthera's Lilu and VirtualSMC releases of the versions in
+  packaging/UPSTREAM, unmodified. BSD-3-Clause (licenses/Lilu-BSD-3.txt, licenses/VirtualSMC-BSD-3.txt);
+  https://github.com/acidanthera/Lilu, https://github.com/acidanthera/VirtualSMC
 
 The VM script also carries macrecovery.py from OpenCorePkg (BSD-3-Clause), unmodified.

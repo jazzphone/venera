@@ -375,6 +375,62 @@ update_opencore() {   # the VM stopped, OCIMG its OpenCore disk
   umount "$w/src"; rm -rf "$w"
 }
 
+# A full SMC (0.1.9): Venera's OpenCore image carries acidanthera's Lilu and VirtualSMC. QEMU's applesmc has only the
+# keys macOS needs to boot and can't list them; PerfPowerServices asks for every key by index at its start and spun a
+# core for good. A VM on Venera's older image gets the two kexts at its Upgrade.
+oc_kexts_running() {   # the running VM's OpenCore disk: its kexts, one per line (read-only; nothing if it can't tell)
+  local vol img loop m start i; vol=$(disk_of ide2); [ -n "$vol" ] || return 0
+  img=$(pvesm path "$vol" 2>/dev/null) && [ -e "$img" ] || return 0
+  loop=$(losetup -frP --show "$img" 2>/dev/null) || return 0
+  m=$(mktemp -d)
+  for i in $(seq 1 30); do [ -b "${loop}p1" ] && break; udevadm settle 2>/dev/null || sleep 0.1; done
+  start=$(partx -g -o START -n 1 "$loop" 2>/dev/null || true)
+  if { [ -b "${loop}p1" ] && mount -o ro "${loop}p1" "$m" 2>/dev/null; } ||
+     { [ -n "$start" ] && mount -o ro,offset=$((start * 512)) "$loop" "$m" 2>/dev/null; }; then
+    ls "$m/EFI/OC/Kexts" 2>/dev/null
+    umount "$m"
+  fi
+  rmdir "$m"; losetup -d "$loop"
+}
+# VirtualSMC steps aside when Apple's AppleSMC is already attached to another SMC device, and QEMU's applesmc is one
+# (an ACPI device AppleSMC matches first): with VirtualSMC in OpenCore, QEMU's goes. VirtualSMC carries the OSK keys
+# macOS decrypts its own apps with, which QEMU's device was there for.
+no_applesmc() { sed -E 's/ ?-device isa-applesmc(,[^ "]*("[^"]*")?[^ ]*)?//; s/^ +//' <<<"$1"; }   # args without QEMU's SMC
+smc_plan() {   # the running VM: SMC_KEXTS=1 when its OpenCore (Venera's) needs Lilu and VirtualSMC from this package,
+               # SMC_ARGS=1 when QEMU's applesmc then goes from its args
+  SMC_KEXTS=0 SMC_ARGS=0
+  local k a; k=$(oc_kexts_running); a=$(qm config "$VMID" | sed -n 's/^args: //p')
+  [ -n "$OCSRC" ] && grep -qx VeneraHide.kext <<<"$k" && ! grep -qx VirtualSMC.kext <<<"$k" && SMC_KEXTS=1
+  if [[ $a == *isa-applesmc* ]] && { [ $SMC_KEXTS = 1 ] || grep -qx VirtualSMC.kext <<<"$k"; }; then SMC_ARGS=1; fi
+}
+smc_args_off() {   # the VM stopped: QEMU's applesmc out of its args
+  local a; a=$(qm config "$VMID" | sed -n 's/^args: //p')
+  [[ $a == *isa-applesmc* ]] || return 0
+  qm set "$VMID" --args "$(no_applesmc "$a")" >/dev/null && echo "   QEMU's applesmc out of the VM's args (VirtualSMC is its SMC now)"
+}
+oc_smc_merge() {   # SRC-config DST-config: SRC's Lilu and VirtualSMC entries first in DST's Kernel/Add (once)
+  python3 - "$1" "$2" <<'PY'
+import plistlib, sys
+src = plistlib.load(open(sys.argv[1], "rb")); dst = plistlib.load(open(sys.argv[2], "rb"))
+names = ("Lilu.kext", "VirtualSMC.kext")
+ours = [k for k in src["Kernel"]["Add"] if k.get("BundlePath") in names]
+dst["Kernel"]["Add"] = ours + [k for k in dst["Kernel"]["Add"] if k.get("BundlePath") not in names]
+plistlib.dump(dst, open(sys.argv[2], "wb"))
+print("   OpenCore: " + ", ".join(k["BundlePath"] for k in dst["Kernel"]["Add"]))
+PY
+}
+oc_add_smc() {   # the VM stopped, OCIMG its OpenCore disk: Lilu and VirtualSMC from this package's image, first in Kernel/Add
+  local w; w=$(mktemp -d)
+  mount -o ro,loop,offset=$((2048 * 512)) "$OCSRC" "$w"   # its EFI partition starts at sector 2048 (build.sh)
+  [ -d "$w/EFI/OC/Kexts/VirtualSMC.kext" ] || { umount "$w"; rmdir "$w"; warn "this package's OpenCore image has no VirtualSMC"; return 1; }
+  oc_mount
+  rm -rf "$MNT/EFI/OC/Kexts/Lilu.kext" "$MNT/EFI/OC/Kexts/VirtualSMC.kext"
+  cp -R "$w/EFI/OC/Kexts/Lilu.kext" "$w/EFI/OC/Kexts/VirtualSMC.kext" "$MNT/EFI/OC/Kexts/"
+  oc_smc_merge "$w/EFI/OC/config.plist" "$MNT/EFI/OC/config.plist"
+  oc_umount
+  umount "$w"; rmdir "$w"
+}
+
 apply_identity() {   # an existing VM's OpenCore disk: the Mac identity only
   oc_mount
   MODEL=$MODEL SERIAL=$SERIAL MLB=$MLB ROM=$ROM oc_config "$MNT/EFI/OC/config.plist"
@@ -870,6 +926,7 @@ upgrade_vm() {   # a VM with Venera: this release's host half on every node, the
   grep -qx authroot-off <<<"$st" && ! grep -qx nosysvol <<<"$st" && webgl=1
   user=$(tail -1 <<<"$st"); [ "$user" = root ] && user=""
   case " $(qm config "$VMID" | sed -n 's/^args: //p') " in *"/run/venera-video-$VMID.sock"*) HASDEV=1 ;; esac
+  smc_plan
   echo "  macOS has Venera $cur: hardware video $([ $video = 1 ] && echo on || echo off), the Venera app $([ $app = 1 ] && echo on || echo off), the guest agent $([ $agent = 1 ] && echo on || echo off), Safari WebGL (the system-volume copy) $([ $webgl = 1 ] && echo on || echo off)"
   if [ $HASDEV = 1 ]; then
     [ -n "$HOSTKIT" ] || die "VM $VMID has hardware video but Venera's host half isn't beside this script"
@@ -877,7 +934,14 @@ upgrade_vm() {   # a VM with Venera: this release's host half on every node, the
   fi
   echo; echo "== The plan"
   [ $HASDEV = 1 ] && echo "  - the host half: install-host.sh --vm $VMID here${nodes[*]:+ and on ${nodes[*]}} (running VMs keep their video connections)"
-  echo "  - in macOS: $(basename "$GPKG") through the guest agent, with the same choices, then a restart"
+  if [ $SMC_KEXTS = 1 ] || [ $SMC_ARGS = 1 ]; then
+    echo "  - in macOS: $(basename "$GPKG") through the guest agent, with the same choices"
+    [ $SMC_KEXTS = 1 ] && echo "  - OpenCore: acidanthera's Lilu and VirtualSMC added, the OpenCore disk saved to /root first"
+    echo "  - the VM's SMC: VirtualSMC in place of QEMU's applesmc (with QEMU's alone, macOS's power logger can spin a CPU"
+    echo "    core for good), so the restart is a shut-down and a start"
+  else
+    echo "  - in macOS: $(basename "$GPKG") through the guest agent, with the same choices, then a restart"
+  fi
   echo "    (an older guest agent that can't take it: from a USB disk, while someone is logged in with the screen unlocked)"
   [ -z "$user" ] || echo "    ($user is logged in: the restart closes their apps, and anything unsaved is lost)"
   yes_no "Go ahead?" || die "nothing changed"
@@ -920,6 +984,24 @@ usb_upgrade_disk() {   # the guest package on a USB disk in the running VM, moun
   if [ -z "$mnt" ]; then usb_disk del; rm -f "$img"; die "macOS didn't mount the USB disk in 2 minutes (did its screen lock?): nothing installed"; fi
 }
 upgrade_restart() {   # after upgrade_vm: macOS restarted, and what runs once it's back
+  if [ "${SMC_KEXTS:-0}" = 1 ] || [ "${SMC_ARGS:-0}" = 1 ]; then
+    stop_vm
+    local smc_ok=1
+    if [ "${SMC_KEXTS:-0}" = 1 ]; then
+      OCVOL=$(disk_of ide2); OCIMG=$(pvesm path "$OCVOL")
+      [[ $OCIMG == /dev/* ]] && lvchange -ay "$OCIMG"
+      BK=/root/opencore-$NAME-$(date +%Y%m%d-%H%M%S).img; dd if="$OCIMG" of="$BK" bs=1M status=none
+      echo "== OpenCore: Lilu and VirtualSMC (the old disk saved as $BK)"
+      oc_add_smc || { smc_ok=0; warn "OpenCore wasn't changed (Venera's OpenCore, choice 5, brings them too): QEMU's applesmc stays"; }
+    fi
+    [ $smc_ok = 1 ] && smc_args_off
+    echo "== starting VM $VMID"
+    qm start "$VMID" >/dev/null
+    sleep 30
+    local n; for n in $(seq 1 60); do qm guest cmd "$VMID" ping >/dev/null 2>&1 && break; sleep 5; done
+    upgrade_status
+    return
+  fi
   echo "== restarting macOS"
   # the installer can restart the guest agent just then, and the request goes nowhere: by macOS's boot time, a restart
   # that didn't happen is asked for again
@@ -934,8 +1016,11 @@ upgrade_restart() {   # after upgrade_vm: macOS restarted, and what runs once it
     if [ $try = 3 ]; then warn "macOS didn't restart: restart it yourself (Apple menu > Restart) to finish the upgrade"
     else echo "   macOS hasn't restarted yet: asking again"; fi
   done
+  upgrade_status
+}
+upgrade_status() {   # what runs in macOS after the upgrade's restart
   sleep 20
-  st=$(guest 'V="/Library/Application Support/Venera"; echo "Venera $(cat "$V/VERSION")"; kextstat 2>/dev/null | grep -o "VeneraVideo ([0-9.]*)"; ioreg -rc VirtioGPUAccel -d1 2>/dev/null | sed -n "s/.*\"VirtioGPUArmState\" = \"\(.*\)\"/desktop: \1/p"')
+  st=$(guest 'V="/Library/Application Support/Venera"; echo "Venera $(cat "$V/VERSION")"; kextstat 2>/dev/null | grep -o "VeneraVideo ([0-9.]*)"; kextstat 2>/dev/null | grep -o "VirtualSMC ([0-9.]*)"; ioreg -rc VirtioGPUAccel -d1 2>/dev/null | sed -n "s/.*\"VirtioGPUArmState\" = \"\(.*\)\"/desktop: \1/p"')
   if [ -n "$st" ]; then sed 's/^/   /' <<<"$st"; else warn "macOS's guest agent hasn't answered since the restart: check the VM's console"; fi
   echo "== Done. In macOS, the Venera app (Applications) shows what runs."
 }
@@ -1020,11 +1105,15 @@ if [ -n "$EXIST" ]; then
     echo "  - VM $VMID's OpenCore disk ($OCVOL): OpenCore $OCVER, Venera's config and VeneraHide in place of the old EFI"
     echo "    folder; kept: Venera's kexts and their entries, boot-args and SIP, the Mac identity, the screen size"
     echo "  - the old disk saved first, to /root"
+    [[ $(qm config "$VMID" | sed -n 's/^args: //p') == *isa-applesmc* ]] &&
+      echo "  - QEMU's applesmc out of the VM's args: the image's VirtualSMC is its SMC"
     yes_no "Go ahead?" || die "nothing changed"
     [[ $OCIMG == /dev/* ]] && lvchange -ay "$OCIMG"
     BK=/root/opencore-$NAME-$(date +%Y%m%d-%H%M%S).img; dd if="$OCIMG" of="$BK" bs=1M status=none
     update_opencore
-    echo "== Done (the previous OpenCore disk is saved as $BK; dd it back to undo). Start VM $VMID."; exit 0
+    smc_args_off
+    echo "== Done (the previous OpenCore disk is saved as $BK; dd it back to undo, and put QEMU's applesmc back in the"
+    echo "   VM's args). Start VM $VMID."; exit 0
   fi
 else
   MODE=create
@@ -1104,9 +1193,6 @@ for r in json.load(sys.stdin):
       INSTALL=1
     fi
   fi
-  # Apple's SMC key, the same for every Mac (published by the open-source macOS VM projects). The OpenCore image has no
-  # VirtualSMC, so without it macOS can't decrypt WindowServer and boot stalls at "busy timeout ... AppleACPICPU".
-  OSK="ourhardworkbythesewordsguardedpleasedontsteal(c)AppleComputerInc"
   [ -n "$OCSRC" ] || die "Venera's OpenCore image isn't beside this script (the host package's opencore/ folder)"
   OCIMG=$ISO/OpenCore-$NAME.img REC=$ISO/Tahoe-recovery.img
   [ ! -f "$OCIMG" ] || die "$OCIMG is there already (another VM's?): pick another name, or remove it"
@@ -1167,7 +1253,7 @@ if [ $MODE = create ]; then
   echo "  - VM $VMID '$NAME': $CORES cores${PCORES:+ on the performance cores ($PCORES)}, $MEM MB, $DISK GB on $STORAGE$([ $TRIM = on ] && echo ", TRIM on")"
   echo "    (the OpenCore$([ -n "$BYO_DISK" ] || echo " and $([ -n "$BYO_INST" ] && echo installer || echo recovery)") image$([ -n "$BYO_DISK" ] || echo s) imported as small disks there too)"
   echo "  - network: $BRIDGE${VLAN:+, VLAN $VLAN}; starts with the host"
-  echo "  - SMC: QEMU applesmc with Apple's SMC key; CPU: $CPU_SAYS; OpenCore with VeneraHide, $RES"
+  echo "  - SMC: VirtualSMC (in OpenCore); CPU: $CPU_SAYS; OpenCore with Lilu, VirtualSMC and VeneraHide, $RES"
   if [ $VENERA = 1 ]; then
     echo "  - Venera: display virtio-gl with Venus, host-phys-bits-limit=40; in OpenCore SIP 0x$([ $WEBGL = 1 ] && echo A03 || echo 203)"
     echo "    and amfi_get_out_of_my_way=1$([ $WEBGL = 1 ] && echo " (authenticated root off, for Safari WebGL)")"
@@ -1228,7 +1314,7 @@ fi
 echo "== VM $VMID"
 # One tablet: the args' own on the XHCI. Proxmox's (--tablet 1, on the EHCI) beside it made two, and QEMU sends the
 # console's mouse to one of them; on VM 107 it went to Proxmox's, which macOS had stopped reading, and the mouse died.
-ARGS="-smbios type=2 -device qemu-xhci -device usb-kbd -device usb-tablet -global nec-usb-xhci.msi=off -global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off $CPU_ARG -device isa-applesmc,osk=\"$OSK\""
+ARGS="-smbios type=2 -device qemu-xhci -device usb-kbd -device usb-tablet -global nec-usb-xhci.msi=off -global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off $CPU_ARG"   # the SMC: VirtualSMC, in OpenCore
 VGA=vmware
 if [ $VENERA = 1 ]; then VGA=virtio-gl,clipboard=vnc; ARGS=$(screen_args "$(venera_args "$ARGS" $AUDIO)" "$RES")
 elif [ $AUDIO = 1 ]; then ARGS="$ARGS -audiodev spice,id=vsnd -device usb-audio,audiodev=vsnd"; fi

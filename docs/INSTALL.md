@@ -380,6 +380,11 @@ The accelerator flips at most once per 12 ms by default (`vgpuflipms=N` boot-arg
 
 ## Known limits
 
+- **A major macOS upgrade needs a Venera release that knows it first**: the VM's SMC is acidanthera's VirtualSMC
+  (through Lilu), and it runs only on the macOS versions its release knows (Tahoe in Lilu 1.7.2 and VirtualSMC 1.3.8).
+  On a newer macOS it stays off, and with no SMC macOS can't start its apps. Upgrade Venera before the macOS upgrade
+  (Venera's kexts need that too); to try a newer macOS anyway, add `-lilubeta -vsmcbeta` to the boot-args.
+
 - **A VM needs a sound device for YouTube and other streaming sites**: Safari's streaming playback (Media Source
   Extensions) won't start without a default audio output, and keeps retrying (CoreAudio logs `-66680 ...
   Default-Output`). macOS has no driver for QEMU's Intel HDA, but drives USB audio itself: add

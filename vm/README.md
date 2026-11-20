@@ -41,7 +41,7 @@ it:
   in one pass, with no restart to change SIP first;
 - downloads macOS Tahoe's recovery from Apple with OpenCorePkg's `macrecovery.py` (carried in the package, checked
   against Apple's chunklist), unless you brought your own macOS. That is the only download;
-- creates a q35 / OVMF VM: the host's own CPU with `host-phys-bits-limit=40`, QEMU's `applesmc` with the SMC key, the
+- creates a q35 / OVMF VM: the host's own CPU with `host-phys-bits-limit=40` (the SMC is VirtualSMC, in OpenCore), the
   `virtio-gl` display with Venus (blob resources, a 2 GB host memory window), a USB sound device (YouTube needs one),
   vmxnet3, a virtio disk (with TRIM on thin storage, asked: local-lvm, ZFS, Ceph or a disk file take freed space back;
   thick LVM and iSCSI can't, and a TRIM over iSCSI crawls), USB keyboard and tablet, and the guest agent's virtio port;
@@ -89,12 +89,16 @@ onto an 18 GB disk image made with Disk Utility, and copy the image to the ISO s
 ### Venera's OpenCore
 
 `vm/opencore/build.sh` makes it at release time from acidanthera's OpenCorePkg release (1.0.8 now, BSD-3; the version
-and checksum are in `packaging/UPSTREAM`) with three things of Venera's own: the config (`config.py`: OpenCore's
+and checksum are in `packaging/UPSTREAM`) with three things of Venera's own and two of acidanthera's: the config (`config.py`: OpenCore's
 `Sample.plist` with what a QEMU q35 VM needs), one ACPI table (`SSDT-VENERA.dsl`: an EC device, the USB power
 properties, the CPU's power-management plugin type) and **VeneraHide.kext**, which keeps `kern.hv_vmm_present` from
-everything in macOS but software update, so the Apple Account sign-in doesn't turn the VM away. OpenCore's
-`ocvalidate` checks the config, and the same sources always make the same image. There is no Lilu, no VMHide and
-nothing from thenickdude's KVM-Opencore (which older VMs used: its last release, v21, has OpenCore 1.0.0 from 2024).
+everything in macOS but software update, so the Apple Account sign-in doesn't turn the VM away; and acidanthera's
+**Lilu** and **VirtualSMC** (BSD-3, pinned with their checksums in `packaging/UPSTREAM`), the VM's SMC. QEMU's own
+`applesmc` holds only the keys macOS needs to boot and can't list them: macOS's power logger (`PerfPowerServices`)
+asks for every key by index when it starts, and spun a CPU core for good on it. VirtualSMC answers (65 keys listed
+in 3 ms), and carries the OSK keys macOS decrypts its own apps with; it steps aside when another SMC is in use, so
+Venera's VMs have no `applesmc` in their `args:`. OpenCore's `ocvalidate` checks the config, and the same sources
+always make the same image. There is no VMHide and nothing from thenickdude's KVM-Opencore (which older VMs used: its last release, v21, has OpenCore 1.0.0 from 2024).
 The menu is OpenCore's text one, 5 seconds, and lists only macOS volumes.
 
 **The Mac identity** (the model, serial, board serial and Wi-Fi MAC address OpenCore gives macOS), for the model you
@@ -163,12 +167,15 @@ Run it again with the VM's name:
      window, or in use; an older agent that can't take it gets a USB disk plugged into the running VM instead, which
      macOS mounts only while someone is logged in with the screen unlocked), installed through the guest agent with the
      choices macOS has now (hardware video, the Venera app, the system-volume copy for Safari WebGL);
-   - the disk unplugged, then macOS restarted. Whoever is logged in loses unsaved work: the plan says who that is.
+   - the disk unplugged, then macOS restarted. Whoever is logged in loses unsaved work: the plan says who that is;
+   - a VM on Venera's OpenCore from before 0.1.9: Lilu and VirtualSMC added to its OpenCore disk (saved to `/root`
+     first) and QEMU's `applesmc` taken out of its `args:`, so the restart is a shut-down and a start.
 5. **OpenCore**: moves the VM (stopped) to Venera's OpenCore image from this package: its EFI folder and config are
    replaced, and what was the VM's own is carried over (Venera's kexts and their entries, boot-args and SIP, the Mac
-   identity, the screen size, the menu's timeout). What the old image brought that Venera doesn't need goes (Lilu,
-   VMHide, WhateverGreen, AppleALC, the Broadcom Bluetooth kexts, OpenCanopy). The old OpenCore disk is saved to
-   `/root` first; writing it back undoes the change.
+   identity, the screen size, the menu's timeout). What the old image brought that Venera doesn't need goes (its
+   own Lilu and VirtualSMC, VMHide, WhateverGreen, AppleALC, the Broadcom Bluetooth kexts, OpenCanopy), and QEMU's
+   `applesmc` leaves the VM's `args:` (the image's VirtualSMC is its SMC). The old OpenCore disk is saved to `/root`
+   first; writing it back (and putting `applesmc` back in `args:`) undoes the change.
 6. **Startup settings**, the ones people change most, without editing `config.plist`:
    - **Screen size**: the size macOS's desktop starts at, up to 1920x1200 (QEMU's display reports it to Venera's
      framebuffer, as `-global virtio-vga-gl.xres/yres` in the VM's `args:`), and OpenCore's menu's and Recovery's;
@@ -205,5 +212,4 @@ were developed in. The comments at the top say what each piece is for and
 what broke without it. `vm/test.sh` tests its pieces that need no Proxmox host: the args, a cluster node's address,
 Venera's OpenCore config and the script's edits to it, and moving an older VM's config (KVM-Opencore's) onto it.
 
-**License:** this folder is MIT (`vm/LICENSE`, the earlier project's license), not Venera's PolyForm Noncommercial. It contains
-Apple's SMC key (the `OSK` string QEMU's `applesmc` needs), as every open-source macOS VM project publishes it.
+**License:** this folder is MIT (`vm/LICENSE`, the earlier project's license), not Venera's PolyForm Noncommercial.

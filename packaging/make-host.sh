@@ -31,6 +31,8 @@ cp vm/proxmox-macos-vm.sh vm/macrecovery.py $D/
 ls build/opencore/OpenCore-Venera-*.img >/dev/null 2>&1 || vm/opencore/build.sh >/dev/null
 mkdir -p $D/opencore && cp build/opencore/OpenCore-Venera-*.img $D/opencore/
 cp vm/opencore/OpenCorePkg-LICENSE.txt $D/licenses/OpenCorePkg-BSD-3.txt
+cp vm/opencore/Lilu-LICENSE.txt $D/licenses/Lilu-BSD-3.txt
+cp vm/opencore/VirtualSMC-LICENSE.txt $D/licenses/VirtualSMC-BSD-3.txt
 cp vm/opencore/NOTICE.txt $D/opencore/
 # OpenCorePkg's macserial (Linux), from the same pinned release: the VM script generates a Mac identity with it (a
 # serial and board serial that match each other and the model)

@@ -2083,3 +2083,21 @@ TRIM, Upgrade without a USB disk, Retina modes, a faster first boot (a warm-up a
   order (VFX read its OpenSubdiv dependency as still Scheduled), and **Metal tessellation** (de1958c: NullMoth's
   design ported, VGMTLTess.c; every buffer carries a device address). tools/mtltess passes on VM 108; the owner saw
   the Memoji draw in VM 110's Setup Assistant.
+- **The Memoji editor, the wait cursor (VM 110)**: the Memoji editor and pose picker are app extensions inside
+  AvatarUI.framework, not inside an .app, so the default list turned them away (58107a1: .appex gets the device);
+  with a device they showed two gaps: cube textures (d928652; tools/mtlcube) and compute buffers at offsets Intel's
+  Vulkan can't take, AvatarKit's 16-bit blend-shape indices at 2 mod 4 (copied through aligned scratch memory;
+  tools/mtlalign). The wait cursor in Proxmox's console: premultiplied rims (8d0b9bd), noVNC 1.7 reading the rich
+  cursor's red and blue swapped, and the drop shadow drawn solid by QEMU's 1-bit mask (framebuffer 0.6.2, 8df678e).
+  The owner saw both right.
+- **A full SMC**: VM 110's PerfPowerServices held a core for 8.5 h (501 CPU minutes), stuck in its first
+  PLSMCMetricsAgent getAllKeys: QEMU's applesmc has 6 keys and no key-by-index command, and each refused request is a
+  trip through the emulated port. Venera's OpenCore now carries acidanthera's Lilu 1.7.2 and VirtualSMC 1.3.8
+  (BSD-3, pinned in packaging/UPSTREAM; ocvalidate clean). VirtualSMC steps aside when AppleSMC is already attached
+  to another SMC device, and QEMU's applesmc is an ACPI device it attaches to first: so QEMU's applesmc leaves the
+  args (VirtualSMC carries the OSK keys). New VMs have none; Upgrade adds the kexts to a VM on Venera's older image and
+  takes applesmc out (a shut-down and a start instead of a restart, the OpenCore disk saved first); choice 5 does both.
+  VM 111: Upgrade end to end, three boots and Recovery without applesmc, 65 keys listed in 2.8 ms (tools/smckeys;
+  before: every request refused), kern.hv_vmm_present still 0. VM 110: Upgrade, PerfPowerServices 1.3 s of CPU, then
+  idle. Not run: a whole unattended install without applesmc (it needs Apple's license agreed to). Lilu and VirtualSMC
+  run on the macOS versions they know (Tahoe): a major macOS upgrade waits for a Venera release (docs/INSTALL.md).

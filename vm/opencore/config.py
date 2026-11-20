@@ -36,10 +36,17 @@ c['Booter']['Quirks']['SetupVirtualMap'] = False
 # Device properties: none (the sample's are for real Macs' audio and graphics)
 c['DeviceProperties']['Add'] = {}
 
-# Kernel: VeneraHide (the VM hidden from kern.hv_vmm_present: Apple Account sign-in); Venera's installer adds its
-# own kexts later. The CPU reported as a Skylake-SP Xeon (an iMac Pro's) whatever the host's, and its power
-# management faked: macOS knows neither the newer Intel CPUs a host may have, nor a VM's.
-add = [{'Arch': 'x86_64', 'BundlePath': 'VeneraHide.kext', 'Comment': 'Venera: the VM hidden from kern.hv_vmm_present',
+# Kernel: Lilu and VirtualSMC (a full SMC: QEMU's applesmc has only the keys macOS needs to boot and can't list them,
+# and PerfPowerServices asked it for every key by index, spinning a core for good), then VeneraHide (the VM hidden
+# from kern.hv_vmm_present: Apple Account sign-in); Venera's installer adds its own kexts later. The CPU reported as
+# a Skylake-SP Xeon (an iMac Pro's) whatever the host's, and its power management faked: macOS knows neither the newer
+# Intel CPUs a host may have, nor a VM's.
+def kext(name, comment):
+    return {'Arch': 'x86_64', 'BundlePath': name + '.kext', 'Comment': comment, 'Enabled': True,
+            'ExecutablePath': 'Contents/MacOS/' + name, 'MaxKernel': '', 'MinKernel': '', 'PlistPath': 'Contents/Info.plist'}
+add = [kext('Lilu', "acidanthera's Lilu (VirtualSMC needs it)"),
+       kext('VirtualSMC', "acidanthera's VirtualSMC: a full SMC for macOS")]
+add += [{'Arch': 'x86_64', 'BundlePath': 'VeneraHide.kext', 'Comment': 'Venera: the VM hidden from kern.hv_vmm_present',
         'Enabled': True, 'ExecutablePath': 'Contents/MacOS/VeneraHide', 'MaxKernel': '', 'MinKernel': '',
         'PlistPath': 'Contents/Info.plist'}]
 c['Kernel']['Add'] = add
