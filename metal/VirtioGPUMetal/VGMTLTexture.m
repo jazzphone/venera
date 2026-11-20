@@ -1490,6 +1490,19 @@ static VGMTLTexture *vg_surface_root_image(id<MTLDevice> device, MTLTextureDescr
     return (VGMTLTexture *)vg_new_texture(device, rd);
 }
 
+static BOOL vg_format_is_integer(MTLPixelFormat pf) {
+    switch (pf) {
+    case MTLPixelFormatR8Uint: case MTLPixelFormatR8Sint: case MTLPixelFormatR16Uint: case MTLPixelFormatR16Sint:
+    case MTLPixelFormatRG8Uint: case MTLPixelFormatRG8Sint: case MTLPixelFormatR32Uint: case MTLPixelFormatR32Sint:
+    case MTLPixelFormatRG16Uint: case MTLPixelFormatRG16Sint: case MTLPixelFormatRGBA8Uint: case MTLPixelFormatRGBA8Sint:
+    case MTLPixelFormatRGB10A2Uint: case MTLPixelFormatRG32Uint: case MTLPixelFormatRG32Sint: case MTLPixelFormatRGBA16Uint:
+    case MTLPixelFormatRGBA16Sint: case MTLPixelFormatRGBA32Uint: case MTLPixelFormatRGBA32Sint:
+        return YES;
+    default:
+        return NO;
+    }
+}
+
 id<MTLTexture> vg_new_surface_texture(id<MTLDevice> device, MTLTextureDescriptor *d, IOSurfaceRef surface, NSUInteger plane) {
     const vg_format *f = vg_format_of(d.pixelFormat);
     if (!surface || !f || (f->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT) || d.textureType != MTLTextureType2D ||
@@ -1500,7 +1513,14 @@ id<MTLTexture> vg_new_surface_texture(id<MTLDevice> device, MTLTextureDescriptor
     }
     size_t bpr = IOSurfaceGetBytesPerRowOfPlane(surface, plane);
     size_t sw = IOSurfaceGetWidthOfPlane(surface, plane), sh = IOSurfaceGetHeightOfPlane(surface, plane);
-    if (d.width > sw || d.height > sh || bpr % f->bytes || IOSurfaceGetBytesPerElementOfPlane(surface, plane) != f->bytes) {
+    // A plane's rows in its own elements, or regrouped into bigger integer ones: VideoToolbox's Metal transfer
+    // (VTMTSComputeFunction) reads a 512-wide BGRA plane as a 128-wide RGBA32Uint texture (the same 2048-byte rows)
+    // to convert a user's picture for the login screen's list of users; refused, the conversion failed and no picture
+    // showed. Integer texels carry the bits as they are; a regrouping into normalized or float texels stays refused
+    // (VideoToolbox then copies on the CPU: its 10-bit copy into RGBA16Unorm texels came out wrong here).
+    size_t eb = IOSurfaceGetBytesPerElementOfPlane(surface, plane);
+    BOOL fits = eb == f->bytes ? d.width <= sw : (vg_format_is_integer(d.pixelFormat) && eb && d.width * f->bytes <= sw * eb);
+    if (!fits || d.height > sh || bpr % f->bytes) {
         vglog("surface texture: %lux%lu format %lu doesn't fit surface %zux%zu, %zu bytes per row, %zu per element",
               (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.pixelFormat, sw, sh, bpr,
               IOSurfaceGetBytesPerElementOfPlane(surface, plane));
