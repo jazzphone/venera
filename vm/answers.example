@@ -1,0 +1,52 @@
+# proxmox-macos-vm.sh --answers FILE: every question answered from this file, for a VM made with nobody at the
+# keyboard. KEY=value, one per line; # starts a comment; quotes are optional. A key left out takes the question's
+# default (the value in brackets when the script asks); "Go ahead?" is yes.
+#
+#   ./proxmox-macos-vm.sh --answers my-vm.answers
+#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/jazzphone/venera/main/get-venera.sh)" -- --answers /root/my-vm.answers
+#
+# With INSTALL=y it goes on to install macOS Tahoe with Venera by itself (about an hour) and runs Finish, so the VM
+# ends at Setup Assistant, drawn by the host's GPU. That needs MACOS_LICENSE=agree: macOS installs under Apple's
+# license (https://www.apple.com/legal/sla/), and agreeing to it is yours to do.
+
+# ---- the VM ----------------------------------------------------------------------------------------------------------
+NAME=macos                # the VM's name (an existing VM's name runs WHAT below instead)
+VENERA=y                  # set it up for Venera (Metal and OpenGL on the host's GPU)
+VIDEO=y                   # hardware video (an Intel host GPU)
+WEBGL=n                   # Safari WebGL (turns off SIP's authenticated root too)
+AUDIO=y                   # a USB sound device (YouTube needs one)
+STORAGE=local-lvm         # storage for the VM's disks
+TRIM=y                    # on thin storage: give the space macOS frees back
+NODES=                    # cluster nodes to set up too, for HA ("all", or names: pve2 pve3)
+ISOSTORE=local            # storage for the OpenCore image and Apple's recovery (~2.5 GB)
+BRIDGE=vmbr0
+VLAN=                     # empty for none
+#VMID=120                 # left out: the next free number
+CORES=4
+MEM=8192                  # MB; Venera needs 8192 or more
+DISK=64                   # GB
+RES=1280x800              # the screen size (up to 3840x2400; 2560x1600 is Retina's "looks like 1280x800")
+SRC=1                     # where macOS comes from: 1 Apple's recovery (or a number from the script's list)
+#AMD=y                    # an AMD host: EXPERIMENTAL, untested (an Intel CPU model in the VM)
+
+# ---- the Mac identity ------------------------------------------------------------------------------------------------
+MODEL=iMac20,1            # a model macOS Tahoe supports
+IDWAY=g                   # g: generate one for this VM; m: your Mac's (SERIAL, MLB, ROM below); s: OpenCore's sample
+#SERIAL=C02XXXXXXXXX
+#MLB=C02XXXXXXXXXXXXXX
+#ROM=aa:bb:cc:dd:ee:ff
+#MODEL_FROM_SERIAL=y      # when your serial is another model's: make the VM that model
+
+# ---- macOS, installed by itself ---------------------------------------------------------------------------------------
+INSTALL=n                 # y: install macOS Tahoe with Venera now (typed into the recovery's Terminal), then Finish
+#MACOS_LICENSE=agree      # needed for INSTALL=y: you agree to Apple's macOS license
+APP=y                     # the Venera app in macOS
+MACOS_VOLUME=Macintosh HD # the macOS volume's name
+FINISH=y                  # Finish after the install (hardware video, the installer disks out, a restart)
+TAKE_OUT=y                # at Finish: take the recovery disk and the Venera Tools CD out
+
+# ---- an existing VM (NAME is one already) ----------------------------------------------------------------------------
+#WHAT=1                   # 1 Finish, 2 Ready for Venera, 3 the Mac identity, 4 Upgrade, 5 OpenCore, 6 startup settings,
+                          # 7 Install macOS (onto an empty disk)
+#SHUTDOWN=y               # shut a running VM down when the choice needs it stopped
+#START=y                  # start it again after the startup settings

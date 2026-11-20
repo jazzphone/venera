@@ -45,6 +45,7 @@ command. **[docs/SETUP.md](docs/SETUP.md) walks through it, screen by screen.**
 | | |
 |---|---|
 | Host | Proxmox VE 9 (tested: 9.2), or QEMU 9.2+ built with virglrenderer 1.0+ (Venus) on Linux |
+| Host CPU | Intel (tested); AMD **experimental, untested** (the VM gets an Intel CPU model, Haswell) |
 | Host GPU | a GPU with a Vulkan 1.3 driver that exports dma-bufs: Intel (tested: Iris Xe, Mesa ANV) or AMD (Mesa RADV, untested); hardware video needs an Intel GPU (VA-API) |
 | Guest | macOS Tahoe (tested: 26.7.3), x86_64, booted through OpenCore |
 
@@ -53,7 +54,7 @@ command. **[docs/SETUP.md](docs/SETUP.md) walks through it, screen by screen.**
 **Experimental, home-lab.** Tested on macOS Tahoe 26.7.3 (25G342) in Proxmox VE 9.2 (pve-qemu 11.1.3,
 virglrenderer 1.1.0) on an Intel Iris Xe host, in daily use there. Known limits:
 
-- One display, 1024x768 to 1920x1080; no HDR yet.
+- One display, 1024x768 to 4K, with Retina modes from 2560x1440 ("looks like" half that); no HDR.
 - Proxmox's noVNC console shows at most ~33 fps (QEMU's VNC refresh); the guest draws at 50-60. SPICE, or a display
   that isn't VNC, shows the rest.
 - A newer macOS than the tested one can fall back to the software desktop until Venera is tested on it: turn off

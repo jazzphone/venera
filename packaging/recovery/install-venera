@@ -8,6 +8,15 @@
 #     left no usable desktop).
 #
 #   "/Volumes/Venera Tools/install-venera" [install|remove] [VOLUME NAME]
+#   "/Volumes/Venera Tools/install-venera" auto --agree-to-license [--name NAME] [--disk diskN]
+#                                          [--no-video] [--no-app] [--no-agent] [--webgl]
+#
+# auto asks nothing (the VM script's unattended install types it): it finds the VM's empty disk (at least 30 GB, no
+# macOS on it, not Recovery's, OpenCore's or this CD; --disk names it when there are several), erases it as APFS
+# ("Macintosh HD", or --name), and installs macOS with Venera as above, the choices from the flags (hardware video,
+# the app and the guest agent on, Safari WebGL off). Apple's macOS license must be agreed to: --agree-to-license
+# (read it first: "$(ls -d /Install*.app)/Contents/Resources/startosinstall" --license). A disk with macOS on it is
+# never erased.
 #
 # On an installed macOS it changes nothing on the running Recovery: it unpacks the release onto that macOS's Data
 # volume (/Library/Application Support/Venera/release) with a one-time startup job, and macOS runs Venera's own
@@ -18,22 +27,72 @@ set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 ACTION=install
 VOL=""
-for a in "$@"; do
-  case $a in
-    install|remove) ACTION=$a ;;
-    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
-    *) VOL=$a ;;
+AUTO=0 AGREE=0 ANAME="Macintosh HD" ADISK="" VIDEO=1 APP=1 AGENT=1 WEBGL=0
+while [ $# -gt 0 ]; do
+  case $1 in
+    install|remove) ACTION=$1 ;;
+    auto) AUTO=1 ;;
+    --agree-to-license) AGREE=1 ;;
+    --name) ANAME=${2:-}; shift ;;
+    --disk) ADISK=${2:-}; shift ;;
+    --no-video) VIDEO=0 ;;
+    --no-app) APP=0 ;;
+    --no-agent) AGENT=0 ;;
+    --webgl) WEBGL=1 ;;
+    -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
+    *) VOL=$1 ;;
   esac
+  shift
 done
 say() { printf '%s\n' "$*"; }
 die() { printf 'install-venera: %s\n' "$*" >&2; exit 1; }
-yes_no() { local v; read -r -p "  $1 [${2:-y}]: " v; v=${v:-${2:-y}}; case $v in [Yy]*) return 0 ;; *) return 1 ;; esac; }
+yes_no() {
+  local v
+  if [ $AUTO = 1 ]; then v=${2:-y}; say "  $1 [$v] (auto)"; else read -r -p "  $1 [${2:-y}]: " v; v=${v:-${2:-y}}; fi
+  case $v in [Yy]*) return 0 ;; *) return 1 ;; esac
+}
 info() { diskutil info "$1" 2>/dev/null | awk -F': *' -v k="$2" '$1 ~ "^ *"k"$" {print $2; exit}'; }
 [ "$(id -u)" = 0 ] || die "run it as root (macOS Recovery's Terminal is)"
 R="$HERE/Recovery"
 TGZ=$(ls "$R"/Venera-[0-9]*.tar.gz 2>/dev/null | tail -1)
 [ -n "$TGZ" ] || die "no Venera release beside this command (Recovery/Venera-VERSION.tar.gz): is the Venera Tools CD mounted?"
 VER=$(basename "$TGZ" .tar.gz); VER=${VER#Venera-}
+
+# ---- auto: the VM's empty disk, erased as APFS ---------------------------------------------------------------------
+if [ $AUTO = 1 ]; then
+  [ $AGREE = 1 ] || die "auto installs macOS, whose license needs your agreement: add --agree-to-license (read it with: \"$(ls -d /Install*.app 2>/dev/null | head -1)/Contents/Resources/startosinstall\" --license)"
+  # the disks a macOS (or this Recovery, or OpenCore, or this CD) is on: never erased
+  USED=" "
+  for v in /Volumes/*; do
+    [ -d "$v" ] || continue
+    st=$(info "$v" "APFS Physical Store"); [ -n "$st" ] || st=$(info "$v" "Part of Whole")
+    st=$(echo "$st" | sed -E 's/^(disk[0-9]+).*/\1/')
+    case ${v#/Volumes/} in "macOS Base System"*|"Venera Tools"|OPENCORE|EFI) USED="$USED$st " ;; esac
+    [ -f "$v/System/Library/CoreServices/SystemVersion.plist" ] && USED="$USED$st "
+  done
+  [ -f /System/Library/CoreServices/SystemVersion.plist ] && st=$(info / "APFS Physical Store") && USED="$USED$(echo "$st" | sed -E 's/^(disk[0-9]+).*/\1/') "
+  CANDS=""
+  for d in $(diskutil list physical | awk '/^\/dev\/disk/ {sub("/dev/", "", $1); print $1}'); do
+    case "$USED" in *" $d "*) continue ;; esac
+    [ "$(info "$d" "Read-Only Media")" = Yes ] && continue
+    b=$(diskutil info -plist "$d" 2>/dev/null | plutil -extract TotalSize raw -o - - 2>/dev/null || echo 0)
+    [ "${b:-0}" -ge 30000000000 ] 2>/dev/null || continue
+    CANDS="$CANDS $d"
+  done
+  CANDS=${CANDS# }
+  if [ -n "$ADISK" ]; then
+    case " $CANDS " in *" $ADISK "*) ;; *) die "$ADISK isn't an empty disk of 30 GB or more (the empty ones: ${CANDS:-none})" ;; esac
+  else
+    case $CANDS in
+      "") die "no empty disk of 30 GB or more (one with macOS on it is never erased)" ;;
+      *" "*) die "more than one empty disk ($CANDS): name one with --disk" ;;
+      *) ADISK=$CANDS ;;
+    esac
+  fi
+  say "Erasing $ADISK ($(info "$ADISK" "Disk Size" | sed 's/ (.*//')) as APFS, \"$ANAME\""
+  diskutil eraseDisk APFS "$ANAME" GPT "$ADISK" || die "couldn't erase $ADISK"
+  VOL=$ANAME
+fi
 
 # ---- the volume ----------------------------------------------------------------------------------------------------
 # candidates: APFS volumes in /Volumes but Recovery's own, this CD, OpenCore's, an installer's, and an installed
@@ -70,7 +129,11 @@ fi
 INSTALLED=0
 [ -f "/Volumes/$VOL/System/Library/CoreServices/SystemVersion.plist" ] && INSTALLED=1
 
-choices() {   # the package's choices; sets VIDEO APP AGENT WEBGL (1 or 0)
+choices() {   # the package's choices; sets VIDEO APP AGENT WEBGL (1 or 0); auto: the flags'
+  if [ $AUTO = 1 ]; then
+    say "The choices: hardware video $VIDEO, the Venera app $APP, the guest agent $AGENT, Safari WebGL $WEBGL"
+    return 0
+  fi
   say "The choices (Enter keeps the one in brackets):"
   VIDEO=1; APP=1; AGENT=1; WEBGL=0
   yes_no "Hardware video (needs the host's half: install-host.sh, or the VM script's Finish)?" y || VIDEO=0
@@ -101,10 +164,13 @@ if [ $INSTALLED = 0 ]; then
   [ $WEBGL = 1 ] && PKGS+=(--installpackage "$R/Venera Choice webgl.pkg")
   PKGS+=(--installpackage "$R/Venera Stage.pkg")
   say ""
-  say "macOS's license comes first (space for the next page, q at its end)."
-  read -r -p "  Enter to read it: " _
-  "$SOI" --license | more
-  yes_no "Do you agree to it?" n || die "nothing changed (Reinstall macOS installs without Venera; run this again after)"
+  if [ $AUTO = 1 ]; then say "macOS's license: agreed to (--agree-to-license)"
+  else
+    say "macOS's license comes first (space for the next page, q at its end)."
+    read -r -p "  Enter to read it: " _
+    "$SOI" --license | more
+    yes_no "Do you agree to it?" n || die "nothing changed (Reinstall macOS installs without Venera; run this again after)"
+  fi
   yes_no "Install macOS onto \"$VOL\" now?" y || die "nothing changed"
   # --volume is the installer's own (not in its usage on every version); without it, it would pick Recovery's volume
   exec "$SOI" --agreetolicense --volume "/Volumes/$VOL" "${PKGS[@]}"

@@ -11,7 +11,8 @@ This guide is the short path. [vm/README.md](../vm/README.md) has everything the
 
 ## What you need
 
-- A **Proxmox VE 9** node with an **Intel GPU** (an iGPU: Iris Xe was tested). The script checks the GPU and says what
+- A **Proxmox VE 9** node with an **Intel CPU and GPU** (an iGPU: Iris Xe was tested; an AMD CPU is experimental and
+  untested, see [vm/README.md](../vm/README.md)). The script checks the GPU and says what
   it finds.
 - Internet access on the host and for the VM (Apple's recovery and macOS itself download during the install).
 - About 70 GB of storage for the VM.
@@ -26,6 +27,12 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/jazzphone/venera/main/ge
 
 It downloads the newest Venera release's host package into `/root/venera`, checks it, and starts the VM script. The
 script asks its questions, shows a plan, and changes nothing until you say **y** at "Go ahead?".
+
+**The quick way:** answer **y** to "Install macOS with Venera now, by itself" (and type `agree` to Apple's macOS
+license): the script then does steps 2, 3 and 5 below itself, typing into the recovery's Terminal through the VM's
+keyboard, and the VM ends at Setup Assistant (step 4) in about an hour. To answer every question from a file instead
+(the same VM again, or from a script), see [vm/answers.example](../vm/answers.example):
+`bash -c "$(curl -fsSL https://raw.githubusercontent.com/jazzphone/venera/main/get-venera.sh)" -- --answers my-vm.answers`.
 
 The questions (Enter keeps the answer in brackets):
 

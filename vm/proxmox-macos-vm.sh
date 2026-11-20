@@ -19,6 +19,7 @@
 #   the SMC key             - without it boot stops at "busy timeout ... AppleACPICPU" (WindowServer can't be decrypted)
 #   VeneraHide (OpenCore)   - without it the Apple Account sign-in sees a VM and fails ("Verification failed")
 #   -cpu host (+hypervisor) - hiding the hypervisor from the CPU stops the kernel; VeneraHide hides it from Apple's checks
+#                             (an AMD host, experimental: an Intel model, Haswell, in its place)
 #   TRIM only on thin storage - Disk Utility's erase TRIMs the whole disk, which shared iSCSI storage clears 2 MB at a
 #                             time; on thin storage (local-lvm, ZFS, Ceph, a file) TRIM gives freed space back
 #   the guest agent         - Venera's (a Customize choice, on by default) on the virtio agent port: clean shutdowns,
@@ -32,10 +33,53 @@
 #                             installer changes them first and finishes after a restart)
 #   the video device last   - added at Finish: without VeneraVideo.kext, macOS hangs on it and finds no OpenCore disk
 set -euo pipefail
-ask() { local v; read -r -p "  $2${3:+ [$3]}: " v; printf -v "$1" '%s' "${v:-${3:-}}"; }
-yes_no() { local v; read -r -p "  $1 [y/N]: " v; [[ $v =~ ^[Yy] ]]; }
-no_yes() { local v; read -r -p "  $1 [Y/n]: " v; ! [[ $v =~ ^[Nn] ]]; }
 die() { echo "STOP: $*"; exit 1; }
+# --answers FILE: the questions answered from FILE (KEY=value lines; vm/answers.example has every key), for a VM made
+# with nobody at the keyboard. A question FILE doesn't answer takes its default; "Go ahead?" is yes.
+declare -A ANS=(); ANSWERS=""
+load_answers() {
+  local line k v
+  [ -r "$1" ] || die "can't read the answers file $1"
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}
+    [[ $line =~ ^[[:space:]]*([A-Z][A-Z0-9_]*)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
+    k=${BASH_REMATCH[1]} v=${BASH_REMATCH[2]}
+    [[ $v == \#* ]] && v=""                                   # an empty value, then a comment
+    [[ $v == \"* || $v == \'* ]] || v=${v%%[[:space:]]#*}   # a comment after an unquoted value
+    v=${v%"${v##*[![:space:]]}"}
+    if [[ $v =~ ^\"(.*)\"$ ]] || [[ $v =~ ^\'(.*)\'$ ]]; then v=${BASH_REMATCH[1]}; fi
+    ANS[$k]=$v
+  done <"$1"
+  ANSWERS=$1
+}
+ask() {   # ask VAR QUESTION [DEFAULT]: VAR is also the answers file's key
+  local v
+  if [ -n "$ANSWERS" ]; then
+    if [ -n "${ANS[$1]+x}" ]; then v=${ANS[$1]}; else v=${3:-}; fi
+    echo "  $2: $v"
+  else read -r -p "  $2${3:+ [$3]}: " v; v=${v:-${3:-}}; fi
+  printf -v "$1" '%s' "$v"
+}
+# yes_no / no_yes QUESTION [KEY]: No / Yes unless answered. KEY is its key in an answers file (y or n); NODE:name
+# reads NODES there (the nodes to set up, or "all").
+answer() {   # answer DEFAULT QUESTION [KEY]: prints y or n
+  local d=$1 q=$2 k=${3:-} v
+  if [ -z "$ANSWERS" ]; then
+    read -r -p "  $q [$([ "$d" = y ] && echo Y/n || echo y/N)]: " v
+    case $v in [Yy]*) echo y ;; [Nn]*) echo n ;; *) echo "$d" ;; esac
+    return 0
+  fi
+  if [[ $k == NODE:* ]]; then
+    if [ -z "${ANS[NODES]+x}" ]; then v=$d
+    elif [ "${ANS[NODES]}" = all ] || [[ " ${ANS[NODES]} " == *" ${k#NODE:} "* ]]; then v=y; else v=n; fi
+  elif [ "$q" = "Go ahead?" ]; then v=y
+  elif [ -n "$k" ] && [ -n "${ANS[$k]+x}" ]; then case ${ANS[$k]} in [Yy1]* | on | true) v=y ;; *) v=n ;; esac
+  else v=$d; fi
+  echo "  $q $v" >&2
+  echo "$v"
+}
+yes_no() { [ "$(answer n "$1" "${2:-}")" = y ]; }
+no_yes() { [ "$(answer y "$1" "${2:-}")" = y ]; }
 warn() { echo "  ! $*"; }
 num() { [[ $1 =~ ^[0-9]+$ ]] || die "$2 is a number"; }
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -146,7 +190,8 @@ venera_args() {   # the VM's args line with Venera's pieces added (each only onc
   case " $a " in
     *host-phys-bits-limit=*) ;;
     *" -cpu host,"* | *" -cpu host ") a=$(sed -E 's/(^| )-cpu host(,| |$)/\1-cpu host,host-phys-bits-limit=40\2/' <<<"$a") ;;
-    *) echo "  ! the VM's -cpu isn't 'host': add host-phys-bits-limit=40 to it by hand" >&2 ;;
+    *host-phys-bits=on*) echo "  ! the VM's -cpu takes the host's address width: add host-phys-bits-limit=40 to it by hand" >&2 ;;
+    *) ;;   # a named CPU model (an AMD host's): QEMU gives it 40 address bits already
   esac
   for g in venus=on blob=on hostmem=2G; do
     case " $a " in *" -global virtio-vga-gl.${g%%=*}="*) ;; *) a="$a -global virtio-vga-gl.$g" ;; esac
@@ -348,7 +393,8 @@ for k, x in v.items(): print("%s=%s" % (k, shlex.quote(x)))
 PY
 }
 # The size macOS's desktop starts at is the one QEMU's display reports (its EDID's preferred mode: xres and yres,
-# 1280x800 when not given); VirtioGPUFramebuffer offers it among its modes, up to 1920x1200. OpenCore's resolution is
+# 1280x800 when not given); VirtioGPUFramebuffer offers it among its modes, up to 3840x2400 (Retina: 2560x1600 is
+# offered as "looks like 1280x800" at twice the pixels). OpenCore's resolution is
 # the menu's and Recovery's (and the basic display's, without Venera).
 screen_args() {   # the VM's args line $1 with the display's size $2 (WxH), as -global virtio-vga-gl.xres/yres
   local a w=${2%x*} h=${2#*x}
@@ -359,8 +405,8 @@ screen_args() {   # the VM's args line $1 with the display's size $2 (WxH), as -
 screen_size() {   # $1 WxH, $2 1 for a Venera VM: dies unless a size the VM can show
   [[ $1 =~ ^([0-9]{3,4})x([0-9]{3,4})$ ]] || die "a screen size is like 1280x800"
   [ "${BASH_REMATCH[1]}" -ge 640 ] && [ "${BASH_REMATCH[2]}" -ge 480 ] || die "the smallest screen is 640x480"
-  [ "$2" != 1 ] || { [ "${BASH_REMATCH[1]}" -le 1920 ] && [ "${BASH_REMATCH[2]}" -le 1200 ]; } ||
-    die "Venera's display goes up to 1920x1200"
+  [ "$2" != 1 ] || { [ "${BASH_REMATCH[1]}" -le 3840 ] && [ "${BASH_REMATCH[2]}" -le 2400 ]; } ||
+    die "Venera's display goes up to 3840x2400"
 }
 
 # The startup settings people change most, without editing config.plist: the screen size, verbose startup, the
@@ -389,7 +435,7 @@ startup_settings() {
   DO_ID=0
   while :; do
     echo; echo "  VM $VMID's startup settings (OpenCore's config.plist$([ $ven = 1 ] && echo " and the VM's display")):"
-    echo "    1  Screen size: $S$([ $ven = 1 ] && echo "   (macOS's desktop, up to 1920x1200; Recovery and OpenCore's menu too)")"
+    echo "    1  Screen size: $S$([ $ven = 1 ] && echo "   (macOS's desktop, up to 3840x2400, Retina from 2560x1440; Recovery and OpenCore's menu too)")"
     echo "    2  Verbose startup: $([ $V = 1 ] && echo on || echo off)   (-v: the kernel's messages instead of the Apple logo)"
     echo "    3  OpenCore's menu: $T s   (the time to pick another disk or Recovery)"
     echo "    4  Venera at startup: $([ $OFF = 1 ] && echo "off (-vgpuoff: the basic display)" || echo on)"
@@ -545,17 +591,17 @@ finish_vm() {   # macOS and Venera installed: hardware video, the installer disk
   gpu_scan
   if [ "$GPU_KIND" = intel ] && [ -n "$HOSTKIT" ]; then
     if [ -z "$st" ] || [[ $st == *"video choice"* ]]; then
-      no_yes "Hardware video (the host's Intel GPU decodes and encodes for the VM)?" && VIDEO=1
+      no_yes "Hardware video (the host's Intel GPU decodes and encodes for the VM)?" "VIDEO" && VIDEO=1
     else   # without VeneraVideo.kext the device hangs macOS's boot
       warn "Venera in macOS was installed without its video choice: install it again with it before turning this on"
-      yes_no "Hardware video anyway?" && VIDEO=1
+      yes_no "Hardware video anyway?" "VIDEO" && VIDEO=1
     fi
   elif [ "$GPU_KIND" = intel ]; then
     echo "  (hardware video: run this from the unpacked Venera-host folder; it carries the host's half)"
   fi
-  if [ $VIDEO = 1 ]; then for n in $(vm_other_nodes); do no_yes "Hardware video on $n too (HA may start the VM there)?" && nodes+=("$n"); done; fi
+  if [ $VIDEO = 1 ]; then for n in $(vm_other_nodes); do no_yes "Hardware video on $n too (HA may start the VM there)?" "NODE:$n" && nodes+=("$n"); done; fi
   for s in ide0 ide1; do
-    [ -n "$(disk_of $s)" ] && yes_no "Take out $s ($(disk_of $s): the macOS recovery or the Venera Tools CD)?" && drops+=("$s")
+    [ -n "$(disk_of $s)" ] && yes_no "Take out $s ($(disk_of $s): the macOS recovery or the Venera Tools CD)?" "TAKE_OUT" && drops+=("$s")
   done
   # Venera's agent answers on either port; the virtio one is ten times faster than the ISA serial port
   if [[ $st == *"guest agent"* ]] && ! qm config "$VMID" | grep -q '^agent:.*type=virtio'; then VIRTIO_AGENT=1; fi
@@ -598,9 +644,9 @@ ready_vm() {   # an existing macOS VM (stopped): the host's packages, the displa
   qm status "$VMID" | grep -q stopped || die "shut VM $VMID down first, then run this again"
   STORAGE=$(qm config "$VMID" | sed -n 's/^virtio0: \([^:]*\):.*/\1/p'); [ -n "$STORAGE" ] || STORAGE=local-lvm
   cur=$(qm config "$VMID" | sed -n 's/^args: //p')
-  case " $cur " in *usb-audio*) ;; *) no_yes "A sound device (USB audio; YouTube needs one)?" || AUDIO=0 ;; esac
+  case " $cur " in *usb-audio*) ;; *) no_yes "A sound device (USB audio; YouTube needs one)?" "AUDIO" || AUDIO=0 ;; esac
   new=$(venera_args "$cur" $AUDIO)
-  for n in $(vm_other_nodes); do no_yes "Set up $n too (HA may start the VM there)?" && nodes+=("$n"); done
+  for n in $(vm_other_nodes); do no_yes "Set up $n too (HA may start the VM there)?" "NODE:$n" && nodes+=("$n"); done
   echo; echo "== The plan"
   echo "  - here${nodes[*]:+ and on ${nodes[*]}}: install $(missing_pkgs $VENUS_PKGS genisoimage)(those missing), KVM ignore_msrs on"
   echo "  - VM $VMID: display virtio-gl (was $(qm config "$VMID" | sed -n 's/^vga: //p'))"
@@ -665,6 +711,136 @@ usb_disk() {   # usb_disk add IMAGE | del: the image as a USB drive in the runni
   hmp "device_del venera-upgdev" >/dev/null 2>&1 || true
 }
 
+# ---- macOS installed with nobody at the keyboard -------------------------------------------------------------------
+# The VM boots macOS's recovery (OpenCore starts it by itself); this waits until its window is up (the screen no
+# longer the black of the boot, and still), opens Terminal from the menu bar with the keyboard (Control-F2, Utilities,
+# Terminal: no mouse, any screen size), and types install-venera's auto command (Venera Tools CD): it erases the empty
+# disk and starts macOS's installer with Venera. The disk's first writes say the command ran; if none come, it tries
+# again. Then macOS installs (it restarts a few times, OpenCore follows it), Venera installs at its first startup, and
+# the guest agent answers at Setup Assistant: then Finish.
+KEYS_PL='use PVE::QemuServer::Monitor qw(mon_cmd); use Time::HiRes qw(usleep);
+my $vm = shift;
+my %sym = (" " => "spc", "-" => "minus", "=" => "equal", "/" => "slash", "." => "dot", "," => "comma", ";" => "semicolon",
+  "\x27" => "apostrophe", "\\" => "backslash", "\x60" => "grave_accent", "[" => "bracket_left", "]" => "bracket_right");
+my %sh = ("_" => "minus", "+" => "equal", "?" => "slash", ">" => "dot", "<" => "comma", ":" => "semicolon", "\"" => "apostrophe",
+  "|" => "backslash", "~" => "grave_accent", "{" => "bracket_left", "}" => "bracket_right", "!" => "1", "@" => "2", "#" => "3",
+  "\$" => "4", "%" => "5", "^" => "6", "&" => "7", "*" => "8", "(" => "9", ")" => "0");
+sub press { mon_cmd($vm, "send-key", keys => [map { { type => "qcode", data => $_ } } @_], "hold-time" => 40); usleep(60000); }
+for my $it (@ARGV) {
+  if ($it =~ /^sleep:([\d.]+)$/) { usleep($1 * 1e6); next; }
+  if ($it =~ /^text:(.*)$/s) {
+    for my $c (split //, $1) {
+      if ($c =~ /^[a-z0-9]$/) { press($c) } elsif ($c =~ /^[A-Z]$/) { press("shift", lc $c) }
+      elsif (exists $sym{$c}) { press($sym{$c}) } elsif (exists $sh{$c}) { press("shift", $sh{$c}) }
+      else { die "no key for $c\n" }
+    }
+    next;
+  }
+  press(split /-(?=.)/, $it);
+}'
+vm_keys() { perl -e "$KEYS_PL" "$VMID" "$@"; }   # vm_keys ctrl-f2 right "text:..." ret sleep:1
+disk_writes() {   # the VM's disk (virtio0): writes so far, and bytes written
+  perl -MPVE::QemuServer::Monitor=mon_cmd -e 'for (@{mon_cmd($ARGV[0], "query-blockstats")}) {
+    print "$_->{stats}{wr_operations} $_->{stats}{wr_bytes}\n" if ($_->{qdev} // "") =~ m{/virtio0/} }' "$VMID" 2>/dev/null | head -1
+}
+screen_now() {   # the screen: "MEAN CHANGED" (mean brightness 0-255; % of sampled pixels changed since the last call)
+  local f=/run/venera-screen-$VMID
+  perl -MPVE::QemuServer::Monitor=mon_cmd -e 'mon_cmd($ARGV[0], "screendump", filename => $ARGV[1], format => "ppm")' \
+    "$VMID" "$f.new.ppm" 2>/dev/null || { echo "0 100"; return 0; }
+  python3 -I - "$f.new.ppm" "$f.ppm" <<'PY'
+import os, sys
+def px(p):
+    d = open(p, "rb").read(); parts = d.split(b"\n", 3)   # QEMU writes P6, W H, 255, then the pixels
+    return parts[3][::48]                                 # every 16th pixel's first byte (gray enough)
+a = px(sys.argv[1])
+mean = sum(a) / max(len(a), 1)
+b = px(sys.argv[2]) if os.path.exists(sys.argv[2]) else b""
+changed = 100.0 if len(b) != len(a) else 100.0 * sum(1 for x, y in zip(a, b) if abs(x - y) > 8) / max(len(a), 1)
+print("%d %.1f" % (mean, changed))
+PY
+  mv "$f.new.ppm" "$f.ppm"
+}
+recovery_up() {   # waits (up to 8 minutes) for the recovery's window: not the boot's black, and still for 15 s
+  local i still=0 m c
+  rm -f "/run/venera-screen-$VMID.ppm"
+  for i in $(seq 1 96); do
+    sleep 5; read -r m c <<<"$(screen_now)"
+    if [ "${m:-0}" -ge 12 ] && [ "${c%.*}" -lt 1 ]; then still=$((still + 1)); else still=0; fi
+    [ $still -ge 3 ] && [ $i -ge 8 ] && return 0
+  done
+  return 1
+}
+auto_install() {   # the VM (running or not) has its recovery and the Venera Tools CD, and an empty disk
+  local cmd try w0 w i t0 mins last=-1
+  cmd="\"/Volumes/Venera Tools/install-venera\" auto --agree-to-license --name \"${MACOS_VOLUME:-Macintosh HD}\""
+  [ "${IVIDEO:-1}" = 1 ] || cmd="$cmd --no-video"
+  [ "${IAPP:-1}" = 1 ] || cmd="$cmd --no-app"
+  [ "${IWEBGL:-0}" = 1 ] && cmd="$cmd --webgl"
+  echo; echo "== Installing macOS Tahoe with Venera onto VM $VMID, with nobody at the keyboard"
+  echo "   (about an hour: macOS downloads several GB from Apple; watch it in the VM's Console if you like, without"
+  echo "   typing there until it reaches Setup Assistant)"
+  qm status "$VMID" | grep -q running || qm start "$VMID" >/dev/null
+  for try in 1 2 3; do
+    recovery_up || die "the recovery's window didn't come up in 8 minutes: open the VM's Console and do it by hand (vm/README.md)"
+    w0=$(disk_writes); w0=${w0%% *}
+    echo "   the recovery is up: Terminal, then install-venera auto (try $try)"
+    vm_keys esc sleep:0.5 ctrl-f2 sleep:0.7 right right right right sleep:0.5 down sleep:0.7 text:Terminal sleep:0.5 ret sleep:5
+    vm_keys "text:$cmd" ret
+    for i in $(seq 1 24); do
+      sleep 5; w=$(disk_writes); w=${w%% *}
+      [ "${w:-0}" -gt "${w0:-0}" ] && break
+    done
+    [ "${w:-0}" -gt "${w0:-0}" ] && break
+    [ $try = 3 ] && die "install-venera didn't start (no writes to the disk): open the VM's Console and run it by hand"
+    echo "   no writes to the disk yet: trying again"
+  done
+  echo "   it started: the disk is erased and macOS's installer is on its way"
+  t0=$(date +%s)
+  while :; do   # the guest agent comes with Venera, at macOS's first startup
+    if qm guest cmd "$VMID" ping >/dev/null 2>&1 && [ -n "$(guest 'cat "/Library/Application Support/Venera/VERSION" 2>/dev/null')" ]; then break; fi
+    mins=$((($(date +%s) - t0) / 60))
+    if [ $((mins / 5)) != $last ]; then
+      last=$((mins / 5)); w=$(disk_writes)
+      echo "   $mins min: $(awk '{printf "%.1f GB", $2 / 1e9}' <<<"${w:-0 0}") written to the disk"
+    fi
+    [ $mins -lt 180 ] || die "macOS hasn't come up with Venera's guest agent in 3 hours: look at the VM's Console"
+    sleep 20
+  done
+  echo "   macOS is installed, with Venera $(guest 'cat "/Library/Application Support/Venera/VERSION"') and its guest agent"
+}
+license_ok() {   # Apple's macOS license, agreed to by whoever runs this: MACOS_LICENSE=agree, or typed
+  local a=""
+  echo "  macOS installs under Apple's license (macOS Tahoe's: https://www.apple.com/legal/sla/)."
+  if [ -n "$ANSWERS" ]; then a=${ANS[MACOS_LICENSE]-}; echo "  macOS's license: ${a:-not agreed to (MACOS_LICENSE=agree)}"
+  else read -r -p "  Type agree to agree to it: " a; fi
+  [ "$a" = agree ]
+}
+finish_auto() {   # Finish right after an unattended install, with its own answers: video as chosen, installer disks out
+  ANSWERS=${ANSWERS:-auto}
+  ANS[VIDEO]=$IVIDEO; [ -n "${ANS[TAKE_OUT]+x}" ] || ANS[TAKE_OUT]=y
+  if [ "${ANS[FINISH]:-y}" = n ]; then echo "== Done (FINISH=n): run this again and choose Finish when you're ready."; return 0; fi
+  finish_vm
+  echo "   macOS is at Setup Assistant on the host's GPU: open the VM's Console to set it up."
+}
+install_choice() {   # choice 7: an existing VM with its recovery, the Venera Tools CD and an empty disk
+  [ -n "$(disk_of ide0)" ] || die "VM $VMID has no recovery disk (ide0) to install from"
+  [[ $(disk_of ide1) == *Venera-Tools* ]] || die "VM $VMID has no Venera Tools CD in ide1 (Ready for Venera, choice 2, adds it)"
+  qm config "$VMID" | grep -q '^agent:.*enabled=1' || qm config "$VMID" | grep -q '^agent: 1' ||
+    die "VM $VMID's guest agent option is off (Options > QEMU Guest Agent): the install is followed through it"
+  gpu_scan
+  IVIDEO=0; [ "$GPU_KIND" = intel ] && no_yes "Hardware video (the host's Intel GPU decodes and encodes for the VM)?" "VIDEO" && IVIDEO=1
+  IAPP=1; no_yes "The Venera app (tells you when something needs you)?" "APP" || IAPP=0
+  IWEBGL=0; yes_no "Safari WebGL (SIP's authenticated root off too)?" "WEBGL" && IWEBGL=1
+  ask MACOS_VOLUME "The macOS volume's name" "Macintosh HD"
+  license_ok || die "nothing changed (without agreeing to Apple's license, install macOS by hand: vm/README.md)"
+  echo; echo "== The plan"
+  echo "  - start VM $VMID into its recovery, open Terminal there with the keyboard, and run install-venera auto: it erases"
+  echo "    the empty disk (never one with macOS on it) and installs macOS Tahoe with Venera; about an hour"
+  echo "  - then Finish: $([ $IVIDEO = 1 ] && echo "hardware video, ")the installer disks out, a restart to Setup Assistant"
+  yes_no "Go ahead?" || die "nothing changed"
+  auto_install
+  finish_auto
+}
 screen_state() {   # open, locked or nobody: macOS mounts a new USB disk only while someone is logged in, unlocked
   guest 'ioreg -n Root -d1 -a | plutil -extract IOConsoleUsers json -o - - 2>/dev/null' | screen_says
 }
@@ -697,7 +873,7 @@ upgrade_vm() {   # a VM with Venera: this release's host half on every node, the
   echo "  macOS has Venera $cur: hardware video $([ $video = 1 ] && echo on || echo off), the Venera app $([ $app = 1 ] && echo on || echo off), the guest agent $([ $agent = 1 ] && echo on || echo off), Safari WebGL (the system-volume copy) $([ $webgl = 1 ] && echo on || echo off)"
   if [ $HASDEV = 1 ]; then
     [ -n "$HOSTKIT" ] || die "VM $VMID has hardware video but Venera's host half isn't beside this script"
-    for n in $(vm_other_nodes); do no_yes "The host half on $n too (HA may start the VM there)?" && nodes+=("$n"); done
+    for n in $(vm_other_nodes); do no_yes "The host half on $n too (HA may start the VM there)?" "NODE:$n" && nodes+=("$n"); done
   fi
   echo; echo "== The plan"
   [ $HASDEV = 1 ] && echo "  - the host half: install-host.sh --vm $VMID here${nodes[*]:+ and on ${nodes[*]}} (running VMs keep their video connections)"
@@ -745,9 +921,19 @@ usb_upgrade_disk() {   # the guest package on a USB disk in the running VM, moun
 }
 upgrade_restart() {   # after upgrade_vm: macOS restarted, and what runs once it's back
   echo "== restarting macOS"
-  qm guest exec "$VMID" --timeout 10 -- /sbin/shutdown -r now >/dev/null 2>&1 || true
-  sleep 30
-  for n in $(seq 1 60); do qm guest cmd "$VMID" ping >/dev/null 2>&1 && break; sleep 5; done
+  # the installer can restart the guest agent just then, and the request goes nowhere: by macOS's boot time, a restart
+  # that didn't happen is asked for again
+  local b0 b try
+  b0=$(guest 'sysctl -n kern.boottime | cut -d, -f1')
+  for try in 1 2 3; do
+    qm guest exec "$VMID" --timeout 10 -- /sbin/shutdown -r now >/dev/null 2>&1 || true
+    sleep 30
+    for n in $(seq 1 60); do qm guest cmd "$VMID" ping >/dev/null 2>&1 && break; sleep 5; done   # (qm agent ping misses)
+    b=$(guest 'sysctl -n kern.boottime | cut -d, -f1')
+    [ -n "$b" ] && [ "$b" != "$b0" ] && break
+    if [ $try = 3 ]; then warn "macOS didn't restart: restart it yourself (Apple menu > Restart) to finish the upgrade"
+    else echo "   macOS hasn't restarted yet: asking again"; fi
+  done
   sleep 20
   st=$(guest 'V="/Library/Application Support/Venera"; echo "Venera $(cat "$V/VERSION")"; kextstat 2>/dev/null | grep -o "VeneraVideo ([0-9.]*)"; ioreg -rc VirtioGPUAccel -d1 2>/dev/null | sed -n "s/.*\"VirtioGPUArmState\" = \"\(.*\)\"/desktop: \1/p"')
   if [ -n "$st" ]; then sed 's/^/   /' <<<"$st"; else warn "macOS's guest agent hasn't answered since the restart: check the VM's console"; fi
@@ -756,9 +942,28 @@ upgrade_restart() {   # after upgrade_vm: macOS restarted, and what runs once it
 
 # ---- the questions -------------------------------------------------------------------------------------------------
 [ -z "${MACOS_VM_TEST:-}" ] || return 0   # vm/test.sh sources the functions above
+while [ $# -gt 0 ]; do
+  case $1 in
+    --answers | -a) load_answers "${2:?--answers needs a file}"; shift 2 ;;
+    -h | --help) echo "usage: $0 [--answers FILE]   (vm/README.md; vm/answers.example has the keys)"; exit 0 ;;
+    *) die "unknown option $1 (--answers FILE)" ;;
+  esac
+done
 [ "$(id -u)" = 0 ] || die "run as root on the Proxmox host"
 command -v qm >/dev/null && command -v pvesm >/dev/null || die "this is for a Proxmox VE host (no qm / pvesm)"
-grep -q -m1 GenuineIntel /proc/cpuinfo || die "this makes macOS VMs for Intel CPUs (-cpu host as an Intel Mac); this host's CPU isn't Intel"
+# the VM's CPU: the host's own on an Intel host (an Intel Mac's); on an AMD host (EXPERIMENTAL, untested), an Intel
+# model KVM presents instead (Haswell, as macOS VMs on AMD Proxmox hosts commonly use: no kernel patches in OpenCore),
+# slower than the host's own, and with the host's AVX-512 and newer instructions hidden
+CPU_ARG="-cpu host,vendor=GenuineIntel,+invtsc,+hypervisor,kvm=on,vmware-cpuid-freq=on" CPU_SAYS="the host's own"
+if ! grep -q -m1 GenuineIntel /proc/cpuinfo; then
+  grep -q -m1 AuthenticAMD /proc/cpuinfo || die "this makes macOS VMs on Intel CPUs (and, experimentally, AMD ones); this host's CPU is neither"
+  warn "an AMD CPU: EXPERIMENTAL and UNTESTED (nobody has tried Venera on an AMD host yet). The VM gets an Intel CPU"
+  warn "model (Haswell, presented by KVM) instead of the host's own: slower, and an app that needs newer instructions may"
+  warn "not start. Please report what happens: https://github.com/jazzphone/venera/issues"
+  yes_no "Go on with an AMD CPU (experimental, untested)?" "AMD" || die "nothing changed"
+  CPU_ARG="-cpu Haswell-noTSX,vendor=GenuineIntel,+invtsc,+hypervisor,kvm=on,vmware-cpuid-freq=on,+pcid,+ssse3,+sse4.2,+popcnt,+avx,+avx2,+aes,+fma,+bmi1,+bmi2,+xsave,+xsaveopt,check"
+  CPU_SAYS="an Intel model (Haswell) on this AMD host: EXPERIMENTAL"
+fi
 [ -e /dev/kvm ] || die "no /dev/kvm: turn on VT-x in the host's firmware"
 
 echo; echo "== A macOS Tahoe VM on Proxmox, ready for Venera${VER:+ $VER}"
@@ -783,17 +988,19 @@ if [ -n "$EXIST" ]; then
   echo "    4  Upgrade Venera${VER:+ to $VER}: the host half on every node, then the guest package in macOS, and a restart"
   echo "    5  OpenCore ${OCVER:-?}: move the VM (stopped) to Venera's OpenCore, keeping its settings and identity"
   echo "    6  Startup settings: screen size, verbose startup, OpenCore's menu, Venera on or off, boot-args"
+  echo "    7  Install macOS: onto the VM's empty disk, with Venera, by itself (then Finish)"
   ask WHAT "Which" "1"
   case $WHAT in
     1) finish_vm; exit 0 ;;
     2) host_versions; [ "$GPU_KIND" != none ] || die "no GPU the host can render on: Venera needs one"; ready_vm; exit 0 ;;
     3) ;;
     4) upgrade_vm; upgrade_restart; exit 0 ;;
+    7) install_choice; exit 0 ;;
     5 | 6) ;;
     *) die "nothing changed" ;;
   esac
   if ! qm status "$VMID" | grep -q stopped; then
-    yes_no "VM $VMID is running: shut it down now (from macOS, as the Apple menu does)?" ||
+    yes_no "VM $VMID is running: shut it down now (from macOS, as the Apple menu does)?" "SHUTDOWN" ||
       die "shut VM $VMID down first (Proxmox's Shutdown, or Apple menu > Shut Down), then run this again"
     stop_vm
   fi
@@ -802,7 +1009,7 @@ if [ -n "$EXIST" ]; then
   if [ "$WHAT" = 6 ]; then
     startup_settings
     if [ $DO_ID = 0 ]; then
-      no_yes "Start VM $VMID now?" && qm start "$VMID" && echo "== VM $VMID is starting."
+      no_yes "Start VM $VMID now?" "START" && qm start "$VMID" && echo "== VM $VMID is starting."
       exit 0
     fi
   fi
@@ -823,22 +1030,22 @@ else
   MODE=create
   host_versions
   VENERA=0 VIDEO=0 WEBGL=0 AUDIO=1 NODES=()
-  if [ "$GPU_KIND" != none ]; then no_yes "Set it up for Venera (Metal and OpenGL on the host's GPU)?" && VENERA=1; fi
+  if [ "$GPU_KIND" != none ]; then no_yes "Set it up for Venera (Metal and OpenGL on the host's GPU)?" "VENERA" && VENERA=1; fi
   if [ $VENERA = 1 ]; then
-    [ "$GPU_KIND" = intel ] && no_yes "Hardware video (the host's Intel GPU decodes H.264, HEVC and VP9 and encodes H.264 and HEVC)?" && VIDEO=1
-    yes_no "Safari WebGL (SIP's authenticated root off too, so the driver can go on the system volume)?" && WEBGL=1
+    [ "$GPU_KIND" = intel ] && no_yes "Hardware video (the host's Intel GPU decodes H.264, HEVC and VP9 and encodes H.264 and HEVC)?" "VIDEO" && VIDEO=1
+    yes_no "Safari WebGL (SIP's authenticated root off too, so the driver can go on the system volume)?" "WEBGL" && WEBGL=1
   fi
-  no_yes "A sound device (USB audio over SPICE; YouTube needs one)?" || AUDIO=0
+  no_yes "A sound device (USB audio over SPICE; YouTube needs one)?" "AUDIO" || AUDIO=0
   echo; echo "  VM storage (its disks):"; pvesm status --content images | sed 's/^/    /'
   ask STORAGE "Storage for the VM's disks" "local-lvm"
   pvesm status --content images | awk 'NR>1{print $1}' | grep -qx "$STORAGE" || die "$STORAGE can't hold VM disks"
   TRIM=off
   if storage_thin "$STORAGE"; then
-    no_yes "TRIM: give the space macOS frees back to $STORAGE (it's thin storage)?" && TRIM=on
+    no_yes "TRIM: give the space macOS frees back to $STORAGE (it's thin storage)?" "TRIM" && TRIM=on
   else echo "  ($STORAGE is $(pvesm status | awk -v s="$STORAGE" '$1 == s {print $2}'): no TRIM, it can't take space back)"; fi
   if [ -n "$(other_nodes)" ]; then
     if storage_shared "$STORAGE"; then
-      for n in $(other_nodes); do no_yes "Set up node $n too (HA may start the VM there)?" && NODES+=("$n"); done
+      for n in $(other_nodes); do no_yes "Set up node $n too (HA may start the VM there)?" "NODE:$n" && NODES+=("$n"); done
     else echo "  ($STORAGE is this node's own: the VM stays here, the other nodes aren't set up)"; fi
   fi
   echo; echo "  ISO storage (the VM's OpenCore image and macOS's recovery from Apple go there, ~2.5 GB):"; pvesm status --content iso | sed 's/^/    /'
@@ -863,7 +1070,7 @@ for r in json.load(sys.stdin):
   ask MEM "Memory in MB" "8192"; num "$MEM" "memory"
   [ $VENERA = 0 ] || [ "$MEM" -ge 8192 ] || die "Venera needs 8192 MB or more"
   ask DISK "Disk in GB" "64"; num "$DISK" "the disk size"
-  ask RES "Screen size$([ $VENERA = 1 ] && echo " (up to 1920x1200)")" "1280x800"
+  ask RES "Screen size$([ $VENERA = 1 ] && echo " (up to 3840x2400; 2560x1600 for Retina)")" "1280x800"
   screen_size "$RES" $VENERA
   # where macOS comes from: Apple's recovery, or a disk or installer of your own in an ISO or import folder
   BYO_DISK="" BYO_INST="" SRCS=()
@@ -886,6 +1093,16 @@ for r in json.load(sys.stdin):
     elif [ "$SRC" != 1 ]; then die "no choice $SRC"; fi
   else
     echo "  (macOS from Apple's recovery: no disk or installer image of your own in an ISO storage's template/iso or import folder)"
+  fi
+  INSTALL=0
+  if [ $VENERA = 1 ] && [ -z "$BYO_DISK" ]; then
+    if yes_no "Install macOS with Venera now, by itself (about an hour, nobody at the keyboard)?" "INSTALL"; then
+      IVIDEO=$VIDEO IWEBGL=$WEBGL IAPP=1
+      no_yes "The Venera app (tells you when something needs you)?" "APP" || IAPP=0
+      ask MACOS_VOLUME "The macOS volume's name" "Macintosh HD"
+      license_ok || die "nothing changed (without agreeing to Apple's license, leave the install out: INSTALL=n)"
+      INSTALL=1
+    fi
   fi
   # Apple's SMC key, the same for every Mac (published by the open-source macOS VM projects). The OpenCore image has no
   # VirtualSMC, so without it macOS can't decrypt WindowServer and boot stalls at "busy timeout ... AppleACPICPU".
@@ -921,7 +1138,7 @@ m | M)
   SM=$(serial_model "$SERIAL")
   if [ -n "$SM" ] && [ "$SM" != "$MODEL" ]; then
     warn "that serial is for model $SM, not $MODEL"
-    if no_yes "Make the VM's model $SM (macOS Tahoe must support it)?"; then MODEL=$SM; fi
+    if no_yes "Make the VM's model $SM (macOS Tahoe must support it)?" "MODEL_FROM_SERIAL"; then MODEL=$SM; fi
   fi
   ask MLB "Board serial (MLB)"; MLB=${MLB^^}; [[ $MLB =~ ^[A-Z0-9]{13,17}$ ]] || die "that MLB doesn't look right (13-17 letters and digits)"
   ask ROM "Wi-Fi MAC address (aa:bb:cc:dd:ee:ff)"; ROM=${ROM,,}
@@ -950,7 +1167,7 @@ if [ $MODE = create ]; then
   echo "  - VM $VMID '$NAME': $CORES cores${PCORES:+ on the performance cores ($PCORES)}, $MEM MB, $DISK GB on $STORAGE$([ $TRIM = on ] && echo ", TRIM on")"
   echo "    (the OpenCore$([ -n "$BYO_DISK" ] || echo " and $([ -n "$BYO_INST" ] && echo installer || echo recovery)") image$([ -n "$BYO_DISK" ] || echo s) imported as small disks there too)"
   echo "  - network: $BRIDGE${VLAN:+, VLAN $VLAN}; starts with the host"
-  echo "  - SMC: QEMU applesmc with Apple's SMC key; CPU: the host's own; OpenCore with VeneraHide, $RES"
+  echo "  - SMC: QEMU applesmc with Apple's SMC key; CPU: $CPU_SAYS; OpenCore with VeneraHide, $RES"
   if [ $VENERA = 1 ]; then
     echo "  - Venera: display virtio-gl with Venus, host-phys-bits-limit=40; in OpenCore SIP 0x$([ $WEBGL = 1 ] && echo A03 || echo 203)"
     echo "    and amfi_get_out_of_my_way=1$([ $WEBGL = 1 ] && echo " (authenticated root off, for Safari WebGL)")"
@@ -961,6 +1178,7 @@ if [ $MODE = create ]; then
   fi
   [ $AUDIO = 1 ] && echo "  - a USB sound device (plays in Proxmox's SPICE console)"
   echo "  - a guest agent port (virtio) for Venera's guest agent"
+  [ $INSTALL = 1 ] && echo "  - then macOS Tahoe with Venera, installed by itself (the recovery's Terminal, typed through the VM's keyboard), and Finish"
 fi
 if [ -n "$SERIAL" ]; then echo "  - Mac identity$([ $GENERATED = 1 ] && echo " (generated)"): $MODEL, serial ${SERIAL:0:4}..., MAC $ROM"
 else echo "  - Mac identity: the sample one from OpenCore$([ $MODE = create ] && echo ", model $MODEL") (no iCloud until you add yours)"; fi
@@ -1010,7 +1228,7 @@ fi
 echo "== VM $VMID"
 # One tablet: the args' own on the XHCI. Proxmox's (--tablet 1, on the EHCI) beside it made two, and QEMU sends the
 # console's mouse to one of them; on VM 107 it went to Proxmox's, which macOS had stopped reading, and the mouse died.
-ARGS="-smbios type=2 -device qemu-xhci -device usb-kbd -device usb-tablet -global nec-usb-xhci.msi=off -global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off -cpu host,vendor=GenuineIntel,+invtsc,+hypervisor,kvm=on,vmware-cpuid-freq=on -device isa-applesmc,osk=\"$OSK\""
+ARGS="-smbios type=2 -device qemu-xhci -device usb-kbd -device usb-tablet -global nec-usb-xhci.msi=off -global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off $CPU_ARG -device isa-applesmc,osk=\"$OSK\""
 VGA=vmware
 if [ $VENERA = 1 ]; then VGA=virtio-gl,clipboard=vnc; ARGS=$(screen_args "$(venera_args "$ARGS" $AUDIO)" "$RES")
 elif [ $AUDIO = 1 ]; then ARGS="$ARGS -audiodev spice,id=vsnd -device usb-audio,audiodev=vsnd"; fi
@@ -1039,6 +1257,12 @@ else
   qm set "$VMID" --ide2 "$OCDISK,cache=unsafe" --ide0 "$RECDISK,cache=unsafe" --boot order=ide2 --args "$ARGS" >/dev/null
 fi
 [ $VENERA = 1 ] && attach_venera_disk
+if [ $INSTALL = 1 ]; then
+  [ -n "$TOOLS" ] || die "no Venera Tools CD was attached (it carries install-venera): install macOS by hand, below"
+  auto_install
+  finish_auto
+  exit 0
+fi
 
 if [ -n "$BYO_DISK" ]; then
   echo "== Done: VM $VMID ($NAME), on your macOS disk. Start it from the Proxmox web page and open its Console: OpenCore's"

@@ -9,6 +9,7 @@
 # questions and shows its plan before it changes anything. Run it again later for the script's other choices
 # (Finish, Upgrade, the Mac identity), or run /root/venera/Venera-host-VERSION/proxmox-macos-vm.sh directly.
 #
+#   bash -c "$(curl -fsSL .../get-venera.sh)" -- --answers /root/my-vm.answers   nobody at the keyboard (vm/answers.example)
 #   VENERA_VERSION=0.1.6   that release instead of the newest
 #   GH_TOKEN=...           a GitHub token, for a private copy of the repository (also pass it to curl above:
 #                          -H "Authorization: Bearer $GH_TOKEN")
@@ -65,4 +66,6 @@ echo "Starting $KIT/proxmox-macos-vm.sh"
 echo
 [ -n "${VENERA_NO_RUN:-}" ] && exit 0
 cd "$KIT"
-exec ./proxmox-macos-vm.sh </dev/tty
+# the script's own options pass through (--answers FILE: nobody at the keyboard, vm/answers.example); its questions
+# read the terminal even when this came in through a pipe, and need none with an answers file
+if { : </dev/tty; } 2>/dev/null; then exec ./proxmox-macos-vm.sh "$@" </dev/tty; else exec ./proxmox-macos-vm.sh "$@"; fi

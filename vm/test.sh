@@ -23,8 +23,10 @@ check "no sound device when not asked" '[[ $(venera_args "$NEW" 0) != *usb-audio
 V107="-smbios type=2 -cpu host,host-phys-bits-limit=40,vendor=GenuineIntel -global virtio-vga-gl.venus=on -global virtio-vga-gl.blob=on -global virtio-vga-gl.hostmem=2G -audiodev spice,id=vsnd -device usb-audio,audiodev=vsnd -chardev socket,path=/run/venera-video-107.sock,id=vvideo"
 check "a VM that has it all is left alone" '[ "$(venera_args "$V107" 1)" = "$V107" ]'
 check "-cpu host at the end of the line" '[ "$(venera_args "-smbios type=2 -cpu host" 0)" = "-smbios type=2 -cpu host,host-phys-bits-limit=40 -global virtio-vga-gl.venus=on -global virtio-vga-gl.blob=on -global virtio-vga-gl.hostmem=2G" ]'
-O=$(venera_args "-cpu Skylake-Client" 0 2>&1 >/dev/null)
-check "another -cpu is reported, not changed" '[[ $O == *"add host-phys-bits-limit=40 to it by hand"* ]] && [[ $(venera_args "-cpu Skylake-Client" 0 2>/dev/null) == "-cpu Skylake-Client -global"* ]]'
+O=$(venera_args "-cpu Skylake-Client,host-phys-bits=on" 0 2>&1 >/dev/null)
+check "a -cpu with the host's address width is reported, not changed" '[[ $O == *"add host-phys-bits-limit=40 to it by hand"* ]] && [[ $(venera_args "-cpu Skylake-Client,host-phys-bits=on" 0 2>/dev/null) == "-cpu Skylake-Client,host-phys-bits=on -global"* ]]'
+O=$(venera_args "-cpu Haswell-noTSX,vendor=GenuineIntel" 0 2>&1 >/dev/null)
+check "a named model (an AMD host's) is left as it is, quietly" '[ -z "$O" ] && [[ $(venera_args "-cpu Haswell-noTSX,vendor=GenuineIntel" 0) == "-cpu Haswell-noTSX,vendor=GenuineIntel -global"* ]]'
 
 X=$(choices_xml 1 0 1)
 check "the upgrade's choices are a property list Installer reads" 'python3 -c "import plistlib,sys; a=plistlib.loads(sys.argv[1].encode()); assert [(d[\"choiceIdentifier\"], d[\"attributeSetting\"], d[\"choiceAttribute\"]) for d in a] == [(\"video\",1,\"selected\"),(\"app\",0,\"selected\"),(\"webgl\",1,\"selected\"),(\"agent\",1,\"selected\")]" "$X"'
@@ -95,7 +97,7 @@ check "TRIM written and read back" '[ "$CUR_TRIM" = on ] && OC_TRIM=off oc_confi
 eval "$(oc_read "$W/s.plist")"
 check "startup settings read back as written" '[ "$CUR_RES" = 1440x900 ] && [ "$CUR_TIMEOUT" = 8 ] && [ "$CUR_ARGS" = "keepsyms=1 debug=0x100 amfi_get_out_of_my_way=1 vgpuaccel=4 -v" ] && [ -n "$CUR_MODEL" ]'
 check "the display's size into the args, once, the rest kept" '[ "$(screen_args "-cpu host -global virtio-vga-gl.xres=1280 -global virtio-vga-gl.yres=800 -global virtio-vga-gl.venus=on" 1920x1080)" = "-cpu host -global virtio-vga-gl.venus=on -global virtio-vga-gl.xres=1920 -global virtio-vga-gl.yres=1080" ] && [ "$(screen_args "-cpu host" 1440x900)" = "-cpu host -global virtio-vga-gl.xres=1440 -global virtio-vga-gl.yres=900" ]'
-check "screen sizes: up to 1920x1200 with Venera, larger without" '(screen_size 1920x1200 1) && ! (screen_size 2560x1440 1 >/dev/null) && (screen_size 2560x1440 0) && ! (screen_size 1920 1 >/dev/null) && ! (screen_size 320x200 0 >/dev/null)'
+check "screen sizes: up to 3840x2400 with Venera, larger without" '(screen_size 3840x2400 1) && ! (screen_size 5120x2880 1 >/dev/null) && (screen_size 5120x2880 0) && ! (screen_size 1920 1 >/dev/null) && ! (screen_size 320x200 0 >/dev/null)'
 
 # an older VM's config (with Venera's kexts and its own identity) moved onto Venera's
 python3 - "$OLDCFG" "$W/old.plist" <<'PY'
@@ -138,6 +140,13 @@ sys.exit(not (len(m) == 17 and all(ch in a for ch in m) and
 else
   echo "skip the generated identity (no macserial in opencore/ beside the script)"
 fi
+# the answers file: vm/answers.example as the script reads it (comments, a value with a space, empty values)
+load_answers "$(dirname "$0")/answers.example"
+check "answers.example reads as documented" '[ "${ANS[NAME]}" = macos ] && [ "${ANS[MACOS_VOLUME]}" = "Macintosh HD" ] && [ -z "${ANS[VLAN]}" ] && [ -n "${ANS[NODES]+x}" ] && [ -z "${ANS[NODES]}" ] && [ "${ANS[INSTALL]}" = n ] && [ -z "${ANS[VMID]+x}" ] && [ -z "${ANS[MACOS_LICENSE]+x}" ]'
+ask CORES "Cores" 2 >/dev/null
+check "an answered question takes the file's value, a missing key its default" '[ "$CORES" = 4 ] && { ask NOSUCHKEY "x" dflt >/dev/null; [ "$NOSUCHKEY" = dflt ]; }'
+check "yes/no from the file, nodes from NODES, and Go ahead is yes" '! no_yes "q" INSTALL 2>/dev/null && no_yes "q" VENERA 2>/dev/null && ! no_yes "q" NODE:pve2 2>/dev/null && yes_no "Go ahead?" 2>/dev/null'
+ANSWERS=""
 check "a package that isn't installed is missing" '[ "$(missing_pkgs bash no-such-package-here)" = "no-such-package-here " ]'
 rm -rf "$W" "$CFG"
 [ $fail = 0 ] && echo "all passed"

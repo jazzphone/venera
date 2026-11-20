@@ -15,7 +15,11 @@ a dry run.
 
 ## What it checks
 
-- an Intel CPU (the VM runs as an Intel Mac on `-cpu host`) and KVM;
+- an Intel CPU (the VM runs as an Intel Mac on `-cpu host`) and KVM. An AMD CPU is **experimental and untested**:
+  the VM gets an Intel CPU model KVM presents (Haswell-noTSX, vendor GenuineIntel), as macOS VMs on AMD Proxmox hosts
+  commonly do, with no kernel patches in OpenCore; slower than the host's own, and an app that needs newer instructions
+  may not start. The same model booted macOS with Venera's Metal desktop on the Intel test host; nobody has tried it on
+  an AMD host yet (the script asks first, and an answers file needs `AMD=y`);
 - the GPU: an Intel GPU gives Venera Metal, OpenGL and hardware video (decoding and encoding); an AMD GPU, Metal and OpenGL; with no GPU
   the host can render on (or one passed through to another VM), the VM gets a plain VMware display instead;
 - QEMU 9.2 or later and virglrenderer 1.0 or later (Proxmox VE 9);
@@ -107,6 +111,28 @@ choose (iMac20,1 by default, one macOS Tahoe supports):
 - **skip**: OpenCore's shared sample serial; never sign into iCloud with it.
 
 The script's third choice for an existing VM changes it later (to yours, for iCloud, or a generated one).
+
+### Nobody at the keyboard
+
+`proxmox-macos-vm.sh --answers FILE` takes every answer from FILE (`KEY=value` lines; [answers.example](answers.example)
+has every key, with the defaults), so a VM can be made by a script, or the same way again. Through the one-line setup:
+`bash -c "$(curl -fsSL .../get-venera.sh)" -- --answers FILE`.
+
+With `INSTALL=y` (and `MACOS_LICENSE=agree`: macOS installs under Apple's license, which is yours to agree to) it goes
+on to install macOS with nobody at the keyboard, about an hour:
+
+1. it starts the VM, which boots macOS Tahoe's recovery, and waits for the recovery's window (the screen no longer the
+   boot's black, and still);
+2. it opens Terminal from the menu bar with the VM's keyboard (Control-F2, Utilities, Terminal: no mouse, any screen
+   size) and types `install-venera auto` (from the Venera Tools CD): that erases the VM's empty disk (never one with
+   macOS on it) and starts macOS's installer with Venera added. The disk's first writes say the command ran; with none
+   in two minutes it tries again;
+3. macOS downloads and installs (the VM restarts a few times; OpenCore follows it), Venera installs at macOS's first
+   startup, and Venera's guest agent answers: then Finish runs (hardware video, the installer disks out, a restart).
+
+The VM ends at Setup Assistant, drawn by the host's GPU: the account is yours to make. The same install runs on a VM
+made without it: choice **7 Install macOS** (its recovery disk and the Venera Tools CD still in, its disk empty).
+Watching the console meanwhile is fine; typing there before Setup Assistant can get in its way.
 
 ## An existing VM
 
