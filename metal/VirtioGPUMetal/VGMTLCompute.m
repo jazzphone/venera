@@ -457,6 +457,7 @@ VkDescriptorSet vg_write_set(VGMTLCommandBuffer *cmd, VkDescriptorSetLayout dsl,
     NSData *_stageIn;       // its stage-input layout, as the translator takes it (nil: none)
     uint32_t _stageInSlot;  // the buffer slot the translator gave the [[stage_in]] parameter
     uint32_t _stageInBuffer;   // the application's buffer it reads (the layout's buffer index)
+    uint64_t _writes;       // the buffer slots the kernel writes (bit n: buffer(n))
     NSMutableDictionary<NSString *, VGComputeVariant *> *_variants;   // threadgroup-length key -> variant
     NSObject *_lock;
     id<MTLDevice> _dev;
@@ -659,6 +660,9 @@ id<MTLComputePipelineState> vg_new_compute_pipeline_sd(id<MTLDevice> device, id<
             if ([kind isEqual:@"KernelStageInput"]) {
                 stageInBound = YES;
                 stageInSlot = [b[@"metal_index"] unsignedIntValue];
+            } else if (p && [kind isEqual:@"Buffer"] && [b[@"metal_index"] unsignedIntValue] < 64 &&
+                       [@[ @"ReadWrite", @"WriteOnly", @"Storage" ] containsObject:b[@"access"] ?: @""]) {
+                p->_writes |= 1ull << [b[@"metal_index"] unsignedIntValue];
             } else if (p && ![@[ @"Buffer", @"ThreadgroupBuffer", @"Texture", @"StorageImage", @"Sampler", @"StaticSampler" ] containsObject:kind]) {
                 why = [NSString stringWithFormat:@"binding kind %@ not supported yet", kind];
                 p = nil;
@@ -793,6 +797,7 @@ VkBuffer vg_vkbuffer(id<MTLBuffer> b) {
 @public
     VGMTLComputePipelineState *_pso;
     vg_stage_bindings _t;
+    NSUInteger _len[kVGMaxBufferSlots];   // each bound buffer's length (for a misaligned offset's copy)
     uint32_t _tg[kVGMaxThreadgroupSlots];
 }
 @end
@@ -811,6 +816,7 @@ VkBuffer vg_vkbuffer(id<MTLBuffer> b) {
     }
     _t.buf[index] = vg_vkbuffer(buffer);
     _t.off[index] = offset;
+    _len[index] = buffer.length;
     if (buffer) {
         [_owner->_keep addObject:buffer];
     }
@@ -852,6 +858,7 @@ VkBuffer vg_vkbuffer(id<MTLBuffer> b) {
     if (![_owner upload:bytes length:length buffer:&_t.buf[index] offset:&_t.off[index]]) {
         [_owner fail:@"setBytes: no upload memory"];
     }
+    _len[index] = (NSUInteger)_t.off[index] + length;
 }
 - (void)setThreadgroupMemoryLength:(NSUInteger)length atIndex:(NSUInteger)index {
     if (index < kVGMaxThreadgroupSlots) {
@@ -904,7 +911,47 @@ VkBuffer vg_vkbuffer(id<MTLBuffer> b) {
         _t.buf[_pso->_stageInSlot] = _t.buf[_pso->_stageInBuffer];
         _t.off[_pso->_stageInSlot] = _t.off[_pso->_stageInBuffer];
     }
+    // A buffer bound at an offset the device can't take (Metal allows any multiple of the data's size: the Memoji's
+    // blend-shape kernels read 16-bit indices at offsets of 2 mod 4, and Intel's Vulkan wants 4) is copied, from its
+    // offset to its end, to scratch memory that is aligned, and bound there; one the kernel writes is copied back
+    // after the dispatch.
+    struct { uint32_t slot; VkBuffer buf, tmp; VkDeviceSize off, tmpOff, size; } fix[8];
+    int nfix = 0;
+    VkBuffer fixKeepBuf[8];
+    VkDeviceSize fixKeepOff[8];
+    for (int i = 0; i < v->nbindings && nfix < 8; i++) {
+        uint32_t b = v->bindings[i].binding;
+        VkDescriptorType type = v->bindings[i].type;
+        if ((type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) ||
+            b >= kVGMaxBufferSlots || !_t.buf[b]) {
+            continue;
+        }
+        VkDeviceSize al = type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ? gVk.props.limits.minUniformBufferOffsetAlignment
+                                                                    : gVk.props.limits.minStorageBufferOffsetAlignment;
+        NSUInteger len = moved && b == _pso->_stageInSlot ? _len[_pso->_stageInBuffer] : _len[b];
+        if (!al || !(_t.off[b] % al) || len <= _t.off[b] || len - _t.off[b] > (16u << 20)) {
+            continue;
+        }
+        VkDeviceSize size = len - _t.off[b], tmpOff = 0;
+        VkBuffer tmp = VK_NULL_HANDLE;
+        if (![_owner scratch:size buffer:&tmp offset:&tmpOff]) {
+            break;
+        }
+        fix[nfix].slot = b, fix[nfix].buf = _t.buf[b], fix[nfix].off = _t.off[b];
+        fix[nfix].tmp = tmp, fix[nfix].tmpOff = tmpOff, fix[nfix].size = size;
+        VkBufferCopy region = {_t.off[b], tmpOff, size};
+        gVk.vkCmdCopyBuffer(_owner->_cb, _t.buf[b], tmp, 1, &region);
+        fixKeepBuf[nfix] = _t.buf[b], fixKeepOff[nfix] = _t.off[b];
+        _t.buf[b] = tmp, _t.off[b] = tmpOff;
+        nfix++;
+    }
+    if (nfix) {
+        [_owner barrier];
+    }
     VkDescriptorSet set = vg_write_set(_owner, v->dsl, v->bindings, v->nbindings, &_t, _pso->_name);
+    for (int f = nfix - 1; f >= 0; f--) {
+        _t.buf[fix[f].slot] = fixKeepBuf[f], _t.off[fix[f].slot] = fixKeepOff[f];
+    }
     if (moved) {
         _t.buf[_pso->_stageInSlot] = keepBuf;
         _t.off[_pso->_stageInSlot] = keepOff;
@@ -957,6 +1004,17 @@ VkBuffer vg_vkbuffer(id<MTLBuffer> b) {
         gVk.vkCmdDispatch(_owner->_cb, count[0], count[1], count[2]);
     }
     [_owner barrier];
+    BOOL back = NO;
+    for (int f = 0; f < nfix; f++) {
+        if (fix[f].slot < 64 && (_pso->_writes >> fix[f].slot & 1)) {
+            VkBufferCopy region = {fix[f].tmpOff, fix[f].off, fix[f].size};
+            gVk.vkCmdCopyBuffer(_owner->_cb, fix[f].tmp, fix[f].buf, 1, &region);
+            back = YES;
+        }
+    }
+    if (back) {
+        [_owner barrier];
+    }
 }
 - (void)dispatchThreads:(MTLSize)threads threadsPerThreadgroup:(MTLSize)tptg {
     [self dispatchGrid:threads local:tptg];
@@ -1220,6 +1278,13 @@ static BOOL vg_dirty_rect(VGMTLCommandBuffer *c, VGMTLTexture *t, int32_t r[4]);
 }
 
 - (BOOL)upload:(const void *)bytes length:(NSUInteger)len buffer:(VkBuffer *)buf offset:(VkDeviceSize *)off {
+    if (![self scratch:len buffer:buf offset:off]) {
+        return NO;
+    }
+    memcpy((uint8_t *)_arena[_narena - 1].map + *off, bytes, len);
+    return YES;
+}
+- (BOOL)scratch:(NSUInteger)len buffer:(VkBuffer *)buf offset:(VkDeviceSize *)off {
     VkDeviceSize align = MAX(gVk.props.limits.minStorageBufferOffsetAlignment, gVk.props.limits.minUniformBufferOffsetAlignment);
     align = MAX(align, 16);
     VkDeviceSize at = (_arenaUsed + align - 1) & ~(align - 1);
@@ -1230,7 +1295,6 @@ static BOOL vg_dirty_rect(VGMTLCommandBuffer *c, VGMTLTexture *t, int32_t r[4]);
         _narena++;
         at = 0;
     }
-    memcpy((uint8_t *)_arena[_narena - 1].map + at, bytes, len);
     *buf = _arena[_narena - 1].buffer;
     *off = at;
     _arenaUsed = at + len;

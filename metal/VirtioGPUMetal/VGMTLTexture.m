@@ -623,7 +623,9 @@ BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
 - (NSUInteger)height { return _height; }
 - (NSUInteger)depth { return _depth; }
 - (NSUInteger)mipmapLevelCount { return _mips; }
-- (NSUInteger)arrayLength { return _layers; }
+- (NSUInteger)arrayLength {
+    return _type == MTLTextureTypeCube ? 1 : _type == MTLTextureTypeCubeArray ? _layers / 6 : _layers;
+}
 - (NSUInteger)sampleCount { return _parent ? MAX(_parent->_samples, 1) : MAX(_samples, 1); }
 - (MTLTextureUsage)usage { return _usage; }
 - (MTLStorageMode)storageMode { return _storage; }
@@ -768,6 +770,9 @@ id<MTLTexture> vg_new_texture(id<MTLDevice> device, MTLTextureDescriptor *d) {
     case MTLTextureType3D: itype = VK_IMAGE_TYPE_3D, vtype = VK_IMAGE_VIEW_TYPE_3D; break;
     case MTLTextureType2DMultisample: itype = VK_IMAGE_TYPE_2D, vtype = VK_IMAGE_VIEW_TYPE_2D; break;   // 5d
     case MTLTextureType2DMultisampleArray: itype = VK_IMAGE_TYPE_2D, vtype = VK_IMAGE_VIEW_TYPE_2D_ARRAY; break;
+    // A cube: six layers (+X -X +Y -Y +Z -Z, Metal's slice order and Vulkan's), seen as a cube (the Memoji's lighting)
+    case MTLTextureTypeCube: itype = VK_IMAGE_TYPE_2D, vtype = VK_IMAGE_VIEW_TYPE_CUBE; break;
+    case MTLTextureTypeCubeArray: itype = VK_IMAGE_TYPE_2D, vtype = VK_IMAGE_VIEW_TYPE_CUBE_ARRAY; break;
     default:
         vglog("texture: type %lu not supported yet", (unsigned long)d.textureType);
         return nil;
@@ -821,7 +826,10 @@ id<MTLTexture> vg_new_texture(id<MTLDevice> device, MTLTextureDescriptor *d) {
     t->_height = d.textureType == MTLTextureType1D || d.textureType == MTLTextureType1DArray ? 1 : MAX(d.height, 1);
     t->_depth = d.textureType == MTLTextureType3D ? MAX(d.depth, 1) : 1;
     t->_mips = MAX(d.mipmapLevelCount, 1);
-    t->_layers = d.textureType == MTLTextureType2DArray || d.textureType == MTLTextureType1DArray ? MAX(d.arrayLength, 1) : 1;
+    t->_layers = d.textureType == MTLTextureType2DArray || d.textureType == MTLTextureType1DArray ? MAX(d.arrayLength, 1)
+                 : d.textureType == MTLTextureTypeCube                                             ? 6
+                 : d.textureType == MTLTextureTypeCubeArray                                        ? 6 * MAX(d.arrayLength, 1)
+                                                                                                   : 1;
     t->_usage = d.usage;
     t->_storage = d.storageMode;
     VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -844,6 +852,9 @@ id<MTLTexture> vg_new_texture(id<MTLDevice> device, MTLTextureDescriptor *d) {
     ici.usage = usage;
     if (f->aspect == VK_IMAGE_ASPECT_COLOR_BIT) {
         ici.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;   // texture views may reinterpret the format (5b)
+    }
+    if (vtype == VK_IMAGE_VIEW_TYPE_CUBE || vtype == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) {
+        ici.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     }
     t->_imageUsage = usage;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -1154,7 +1165,13 @@ id<MTLTexture> vg_texture_view_swz(VGMTLTexture *p, MTLPixelFormat pf, MTLTextur
     case MTLTextureType3D: vtype = VK_IMAGE_VIEW_TYPE_3D; break;
     case MTLTextureType2DMultisample: vtype = VK_IMAGE_VIEW_TYPE_2D; break;
     case MTLTextureType2DMultisampleArray: vtype = VK_IMAGE_VIEW_TYPE_2D_ARRAY; break;
+    case MTLTextureTypeCube: vtype = slices.length == 6 ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_MAX_ENUM; break;
+    case MTLTextureTypeCubeArray: vtype = slices.length % 6 ? VK_IMAGE_VIEW_TYPE_MAX_ENUM : VK_IMAGE_VIEW_TYPE_CUBE_ARRAY; break;
     default: vtype = VK_IMAGE_VIEW_TYPE_MAX_ENUM; break;
+    }
+    BOOL cubeImage = p->_type == MTLTextureTypeCube || p->_type == MTLTextureTypeCubeArray;   // made cube-compatible
+    if ((vtype == VK_IMAGE_VIEW_TYPE_CUBE || vtype == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) && !cubeImage) {
+        vtype = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
     }
     if (!f || vtype == VK_IMAGE_VIEW_TYPE_MAX_ENUM || levels.location + levels.length > p->_mips ||
         slices.location + slices.length > p->_layers || !levels.length || !slices.length) {

@@ -190,6 +190,7 @@ BOOL vg_spirv_has_push_constants(NSData *spv);   // DescriptorSet 0 -> newSet (N
 - (void)barrier;
 - (VkDescriptorSet)allocSet:(VkDescriptorSetLayout)dsl;
 - (BOOL)upload:(const void *)bytes length:(NSUInteger)len buffer:(VkBuffer *)buf offset:(VkDeviceSize *)off;
+- (BOOL)scratch:(NSUInteger)len buffer:(VkBuffer *)buf offset:(VkDeviceSize *)off;   // like upload, nothing written
 @end
 
 @interface VGEncoder : NSObject {

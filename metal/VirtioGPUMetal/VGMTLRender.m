@@ -2044,8 +2044,9 @@ static VkAttachmentStoreOp vg_store(MTLStoreAction a) {
         [_keep addObject:t];
         // A level or slice (CoreDisplay renders its display pipe's LUTs into slices of a 1D array, 5b): a view of just
         // that level and slice to render into; surface syncing still goes by the texture itself.
+        // A cube's face is a slice too: a cube view can't be rendered into.
         VGMTLTexture *target = t;
-        if (c.level || c.slice) {
+        if (c.level || c.slice || t->_type == MTLTextureTypeCube || t->_type == MTLTextureTypeCubeArray) {
             MTLTextureType vt = t->_type == MTLTextureType1D || t->_type == MTLTextureType1DArray ? MTLTextureType1D
                                                                                                    : MTLTextureType2D;
             target = (VGMTLTexture *)vg_texture_view(t, t->_pixelFormat, vt, NSMakeRange(c.level, 1), NSMakeRange(c.slice, 1));
