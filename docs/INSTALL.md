@@ -300,10 +300,13 @@ until the device is gone (`--remove-vm` on the host, start the VM again, run the
 WindowServer (the desktop), every app (a process running from an `.app` bundle, an app extension (`.appex`, such as the
 Memoji editor), and the graphics process WebKit starts for Safari and other web views), and the background services that draw for the screen: `iconservicesagent`
 (every icon Finder, the Dock and open panels show), `CursorUIViewService`, `avconferenced` (video calls) and
-`mediaanalysisd` (the photo library's analysis). Other daemons don't, and neither do `loginwindow` and
-`SecurityAgent`, the processes that let you log in. Each process on the driver costs the host about 58 MB.
+`mediaanalysisd` (the photo library's analysis), and the login window's `loginwindow` and `SecurityAgent` (since
+0.1.10: they draw the login screen's user pictures and background). Other daemons don't. Each process on the driver
+costs the host about 58 MB.
 `/Library/GPUBundles/VirtioGPUMetal-allow.txt` changes that, one line each: a process name adds it, `-name` excludes
 it, `*` adds every process, `apps-off` turns the apps (and services) default off, `services-off` the services alone.
+If the login window ever misbehaves on the driver, `-loginwindow` and `-SecurityAgent` keep it off; from macOS's
+Recovery the file is `/Volumes/Data/Library/GPUBundles/VirtioGPUMetal-allow.txt` (the Data volume's name may differ).
 
 A Metal call the driver doesn't have yet is answered with nothing (an empty object or zero) rather than crashing the
 app, and logged: `status.sh` lists the ones of the last day by app, under "Metal calls the driver lacks". An app that

@@ -183,7 +183,12 @@ BOOL vg_windowserver_refused(void) {
 // was turned away on VM 107 in a day's use, and drew on the CPU instead: icons for Finder, the Dock and every open
 // panel (iconservicesagent: ~7 s of CPU for one new folder), the cursor's own views, video calls' effects and the
 // photo library's analysis. Each costs one Venus context on the host (~58 MB).
-static const char *const kServices[] = {"iconservicesagent", "CursorUIViewService", "avconferenced", "mediaanalysisd"};
+// The login window (loginwindow, SecurityAgent) is here since 0.1.10: Tahoe draws its user pictures and its wallpaper
+// snapshot through VFX, which has nothing to draw with without a device (no pictures, a black background). They were
+// kept off before for fear a driver fault would lock the user out; "-loginwindow" / "-SecurityAgent" in the list (it
+// can be written from Recovery, on the Data volume) keeps them off.
+static const char *const kServices[] = {"iconservicesagent", "CursorUIViewService", "avconferenced", "mediaanalysisd",
+                                        "loginwindow", "SecurityAgent"};
 
 static BOOL vg_process_allowed(mach_port_t port) {
     const char *me = getprogname();
@@ -216,10 +221,6 @@ static BOOL vg_process_allowed(mach_port_t port) {
     }
     if (!strncmp(me, "com.apple.WebKit.GPU", 20)) {
         return YES;
-    }
-    // Never by default: the processes that let you log in and unlock (a driver fault there would lock the user out).
-    if (!strcmp(me, "loginwindow") || !strcmp(me, "SecurityAgent")) {
-        return NO;
     }
     for (size_t i = 0; i < sizeof(kServices) / sizeof(kServices[0]); i++) {
         if (!strcmp(me, kServices[i])) {
