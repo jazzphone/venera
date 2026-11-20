@@ -24,6 +24,9 @@
 #define VV_MAGIC 0x56564431u   // 'VVD1'
 #define VV_VERSION 1
 #define VV_SHM_SIZE (256u << 20)
+// VV_G_MSG's arg2: the sending process's VideoToolbox waits for answers properly (VGMTLVTFix.m), so a synchronous
+// decode can be answered as Apple's host does (venera-videod's on_dfrm)
+#define VV_MSG_WAITS_PROPERLY 1u
 #define VV_G2H_OFF (64u << 10)
 #define VV_G2H_SIZE (32u << 20)
 #define VV_H2G_OFF (VV_G2H_OFF + VV_G2H_SIZE)
@@ -64,7 +67,7 @@ enum {
     VV_PAD = 0,   // filler to the ring's end
     // guest -> host
     VV_G_HELLO = 1,      // the guest driver started (arg0: guest_gen, arg1: VV_GF_*; 0.1.1's driver sends 0)
-    VV_G_MSG = 2,        // payload: arg0 vv_surf, then the message (arg1 bytes)
+    VV_G_MSG = 2,        // payload: arg0 vv_surf, then the message (arg1 bytes); arg2: VV_MSG_ flags
     VV_G_SLOTDONE = 3,   // arg0: the slot, arg1: 0 or an error (the surface was gone)
     VV_G_UUIDGONE = 4,   // payload: a 16-byte UUID whose process went away
     VV_G_PULLDONE = 5,   // arg0: the slot, arg1: 0 or an error, arg2: the IOSurface (a pull order done)

@@ -65,6 +65,7 @@ public:
 };
 
 #define LOG(fmt, ...) IOLog("VeneraVideo: " fmt "\n", ##__VA_ARGS__)
+static constexpr UInt32 kTypeWaitsProperly = 0x76776678;   // 'vwfx' (VGMTLVTFix.m)
 
 class AppleVideoToolboxParavirtualizationUserClient;
 
@@ -78,7 +79,12 @@ public:
 
     // for the user clients
     IOReturn sendMessage(AppleVideoToolboxParavirtualizationUserClient *c, const uint8_t *msg, uint32_t len,
-                         const uint32_t *surfaceIDs, unsigned n, task_t task);
+                         const uint32_t *surfaceIDs, unsigned n, task_t task, bool waitsProperly);
+    // Processes whose VideoToolbox waits for an answer properly (Venera's Metal driver corrected its reply wait,
+    // VGMTLVTFix.m, and holds a marker client of type kTypeWaitsProperly open): their synchronous decodes aren't held
+    // and are marked for the host.
+    void markTask(task_t t, bool on);
+    bool waitsProperly(task_t t);
     void uuidGone(const uint8_t *uuid);
     void addClient(AppleVideoToolboxParavirtualizationUserClient *c);
     void removeClient(AppleVideoToolboxParavirtualizationUserClient *c);
@@ -117,6 +123,7 @@ private:
     uint64_t useClock_ = 0;
     uint32_t hostGen_ = 0;
     uint64_t stats_[6] = {};   // messages out, messages in, fills, fill failures, dropped (no client), ring full
+    task_t properTasks_[kMaxClients] = {};
 };
 
 class AppleVideoToolboxParavirtualizationUserClient : public IOUserClient {
@@ -149,6 +156,7 @@ private:
     uint8_t uuids_[kMaxUUIDs][16] = {};
     unsigned nuuids_ = 0;
     bool closed_ = false;
+    bool marker_ = false;   // a kTypeWaitsProperly client: marks its task, nothing else
     // A request whose answer this process must have in hand before its send returns (see waitsForReply): its number,
     // and 0 waiting, 1 the answer queued, 2 the process has drained its queue since (VideoToolbox has it)
     bool waiting_ = false;
@@ -459,7 +467,7 @@ void AppleVideoToolboxParavirtualizationDriver::dropSurface(Surface *s) {
 
 IOReturn AppleVideoToolboxParavirtualizationDriver::sendMessage(AppleVideoToolboxParavirtualizationUserClient *c,
                                                                 const uint8_t *msg, uint32_t len, const uint32_t *ids,
-                                                                unsigned n, task_t task) {
+                                                                unsigned n, task_t task, bool waitsProperly) {
     vv_surf desc[5];
     unsigned ns = 0;
     IOLockLock(lock_);
@@ -484,7 +492,7 @@ IOReturn AppleVideoToolboxParavirtualizationDriver::sendMessage(AppleVideoToolbo
         }
     }
     IOLockUnlock(lock_);
-    uint32_t a[6] = {ns, len, 0, 0, 0, 0};
+    uint32_t a[6] = {ns, len, waitsProperly ? VV_MSG_WAITS_PROPERLY : 0u, 0, 0, 0};
     IOLockLock(g2hLock_);
     int rc = putG2H(VV_G_MSG, a, desc, ns * (uint32_t)sizeof(vv_surf), msg, len);
     IOLockUnlock(g2hLock_);
@@ -494,6 +502,27 @@ IOReturn AppleVideoToolboxParavirtualizationDriver::sendMessage(AppleVideoToolbo
     OSIncrementAtomic64((volatile SInt64 *)&stats_[0]);
     doorbell();
     return kIOReturnSuccess;
+}
+
+void AppleVideoToolboxParavirtualizationDriver::markTask(task_t t, bool on) {
+    IOLockLock(lock_);
+    for (unsigned i = 0; i < kMaxClients; i++) {
+        if (on ? !properTasks_[i] : properTasks_[i] == t) {
+            properTasks_[i] = on ? t : nullptr;
+            break;
+        }
+    }
+    IOLockUnlock(lock_);
+}
+
+bool AppleVideoToolboxParavirtualizationDriver::waitsProperly(task_t t) {
+    IOLockLock(lock_);
+    bool yes = false;
+    for (unsigned i = 0; i < kMaxClients && !yes; i++) {
+        yes = properTasks_[i] == t;
+    }
+    IOLockUnlock(lock_);
+    return yes;
 }
 
 void AppleVideoToolboxParavirtualizationDriver::uuidGone(const uint8_t *uuid) {
@@ -666,6 +695,7 @@ bool AppleVideoToolboxParavirtualizationUserClient::initWithTask(task_t owningTa
         return false;
     }
     task_ = owningTask;
+    marker_ = type == kTypeWaitsProperly;
     lock_ = IOLockAlloc();
     return lock_ != nullptr;
 }
@@ -674,6 +704,10 @@ bool AppleVideoToolboxParavirtualizationUserClient::start(IOService *provider) {
     drv_ = OSDynamicCast(AppleVideoToolboxParavirtualizationDriver, provider);
     if (!drv_ || !IOUserClient::start(provider)) {
         return false;
+    }
+    if (marker_) {
+        drv_->markTask(task_, true);
+        return true;
     }
     queue_ = VeneraVideoDataQueue::make(256 * 1024);
     if (!queue_) {
@@ -694,6 +728,10 @@ void AppleVideoToolboxParavirtualizationUserClient::closeDown() {
     nuuids_ = 0;
     IOLockUnlock(lock_);
     if (was || !drv_) {
+        return;
+    }
+    if (marker_) {
+        drv_->markTask(task_, false);
         return;
     }
     drv_->removeClient(this);
@@ -788,6 +826,9 @@ IOReturn AppleVideoToolboxParavirtualizationUserClient::registerNotificationPort
 
 IOReturn AppleVideoToolboxParavirtualizationUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *a,
                                                                         IOExternalMethodDispatch *, OSObject *, void *) {
+    if (marker_) {
+        return kIOReturnUnsupported;
+    }
     switch (selector) {
     case 0: {   // the send buffer (at least the size asked for) and the message queue, mapped into the process
         if (a->scalarInputCount < 1 || a->scalarOutputCount < 3) {
@@ -880,14 +921,18 @@ IOReturn AppleVideoToolboxParavirtualizationUserClient::externalMethod(uint32_t 
         if (!copy) {
             return kIOReturnNoMemory;
         }
-        bool hold = waitsForReply(copy, (uint32_t)len), busy = false;
+        // A synchronous decode from a process whose VideoToolbox waits properly isn't held: the hold keeps VideoToolbox's
+        // queue from answering the frame, which then comes after the call (VGMTLVTFix.m); venera-videod answers it as
+        // Apple's host does instead. The encoder's waits keep their hold.
+        bool proper = drv_->waitsProperly(task_) && !memcmp(copy + 8, "dfrm", 4);
+        bool hold = !proper && waitsForReply(copy, (uint32_t)len), busy = false;
         if (hold) {
             IOLockLock(lock_);
             waiting_ = true, waitReq_ = msgReq(copy), waitState_ = 0;
             busy = queue_ && queue_->holdsData();
             IOLockUnlock(lock_);
         }
-        IOReturn rc = drv_->sendMessage(this, copy, (uint32_t)len, ids, n, task_);
+        IOReturn rc = drv_->sendMessage(this, copy, (uint32_t)len, ids, n, task_, proper);
         IOFreeData(copy, len);
         if (hold) {   // until the answer is in VideoToolbox's hands (waitsForReply says why), 2 s at most
             uint64_t deadline;

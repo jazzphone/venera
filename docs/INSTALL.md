@@ -383,6 +383,11 @@ Files in `/Library/GPUBundles` the Metal driver reads (root only; delete them to
 - `VirtioGPUMetal-faildump`: save the text of each shader the translator can't take, to the process's cache folder
   (`faildump/NAME-STAGE.ll`, beside `spirv/`), to try the translator on. Its lines name the processes it's for, or
   it's empty for every process.
+- `VirtioGPUMetal-novtfix`: leave VideoToolbox's reply wait as Apple ships it. Since 0.1.10 the driver corrects it in
+  each process it loads into (Intel VideoToolbox turns a 10 s timeout into a 32-bit count of nanoseconds, which
+  overflows), so a synchronous video decode gets its frame before the call returns, as on a Mac: the moving
+  wallpaper's first still needs that. Only VideoToolbox's copy in that process's memory changes. Read when a process
+  starts.
 
 The accelerator flips at most once per 12 ms by default (`vgpuflipms=N` boot-arg, 0 = no limit).
 

@@ -79,6 +79,7 @@ static void logf_(const char *fmt, ...) {
 #define kVTVideoDecoderUnsupportedDataFormatErr (-12910)
 #define kVTVideoDecoderMalfunctionErr (-12911)
 #define kVTInvalidSessionErr (-12903)
+#define kVTDecodeFrame_EnableAsynchronousDecompression (1u << 0)
 #define kVTDecodeFrame_DoNotOutputFrame (1u << 1)
 #define kVTDecodeInfo_Asynchronous (1u << 0)
 #define kVTDecodeInfo_FrameDropped (1u << 1)
@@ -231,6 +232,7 @@ static void slot_take(int slot, int n) {
     slot_span[slot] = n;
 }
 static uint64_t host_req = 100;
+static uint32_t cur_msg_flags;   // the guest message being handled: its record's VV_MSG_ flags
 
 // ---- sessions ------------------------------------------------------------------------------------------------------
 
@@ -245,6 +247,7 @@ typedef struct frame_out {
     uint32_t surf;       // the guest's buffer, once it answered
     uint8_t uui[16];
     int answered;
+    int sync;      // a synchronous decode's frame, answered as Apple's host does (on_dfrm)
     struct timespec asked;   // when the Dbuf went out: an answer that never comes drops the frame (pump_stale)
     struct frame_out *next;
 } frame_out;
@@ -263,6 +266,9 @@ typedef struct {
     int npending;
     int finishing;   // a dfin waits for the queue to empty
     uint64_t fin_req;
+    int fin_dfrm;    // ... or a synchronous dfrm (on_dfrm): answered as a dfrm once its frame's Demt is answered
+    uint64_t sync_demt;          // that Demt's request, 0 when none is awaited
+    struct timespec sync_demt_at;
     // A dfin (VTDecompressionSessionFinishDelayedFrames) must put out every frame the decoder holds and keep its
     // references, as Apple's decoders do; FFmpeg can only drain to the end and start over. So the packets since the
     // last key frame are kept, and after a drain they go through the decoder again with their output thrown away.
@@ -447,7 +453,7 @@ static void send_pba(session *s) {
     free(p);
 }
 
-static void send_demt(session *s, frame_out *f, uint32_t inf) {
+static uint64_t send_demt(session *s, frame_out *f, uint32_t inf) {
     buf m = {0};
     msg_header(&m, "Demt", 2, s->uuid, ++host_req);
     field_s64(&m, "frm", f->frm);
@@ -459,6 +465,7 @@ static void send_demt(session *s, frame_out *f, uint32_t inf) {
     out.msg(&m);
     free(m.p);
     s->frames_out++;
+    return host_req;
 }
 
 // n free slots side by side (a frame bigger than one slot), starting at a multiple of n, so that a stream's frames
@@ -650,10 +657,12 @@ static void pump(session *s) {
     }
     while (s->head) {
         frame_out *f = s->head;
+        uint32_t async = f->sync ? 0 : kVTDecodeInfo_Asynchronous;
+        uint64_t req = 0;
         if (f->dropped) {
-            send_demt(s, f, kVTDecodeInfo_Asynchronous | kVTDecodeInfo_FrameDropped);
+            req = send_demt(s, f, async | kVTDecodeInfo_FrameDropped);
         } else if (f->err) {
-            send_demt(s, f, kVTDecodeInfo_Asynchronous);
+            req = send_demt(s, f, async);
         } else {
             if (!f->answered && f->dbuf_req && f->asked.tv_sec) {
                 struct timespec now;
@@ -669,7 +678,11 @@ static void pump(session *s) {
             }
             out.fill(f->surf, f->slot, f->w, f->h, f->stride, f->bps);
             f->slot = -1;   // the guest frees it (VV_G_SLOTDONE)
-            send_demt(s, f, kVTDecodeInfo_Asynchronous);
+            req = send_demt(s, f, async);
+        }
+        if (f->sync) {   // its call is answered once the guest has answered this
+            s->sync_demt = req;
+            clock_gettime(CLOCK_MONOTONIC, &s->sync_demt_at);
         }
         s->head = f->next;
         if (!s->head) {
@@ -681,6 +694,15 @@ static void pump(session *s) {
         av_frame_free(&f->f);
         free(f);
     }
+    if (s->finishing && !s->head && s->fin_dfrm && s->sync_demt) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec - s->sync_demt_at.tv_sec <= 2) {
+            return;   // the synchronous frame's Demt isn't answered yet (engine_msg pumps when it is)
+        }
+        VLOG("session %02x%02x%02x%02x: no answer to a synchronous frame in 2 s; its call answered anyway", s->uuid[0],
+             s->uuid[1], s->uuid[2], s->uuid[3]);
+    }
     if (s->finishing && !s->head) {
         // frames the decoder never put out (dropped by it) are reported dropped
         for (int i = 0; i < s->npending; i++) {
@@ -691,11 +713,16 @@ static void pump(session *s) {
         }
         s->npending = 0;
         buf r = {0};
-        msg_header(&r, "dfin", 4, s->uuid, s->fin_req);
+        msg_header(&r, s->fin_dfrm ? "dfrm" : "dfin", 4, s->uuid, s->fin_req);
         field_s32(&r, "err", 0);
+        if (s->fin_dfrm) {
+            field_u32(&r, "inf", 0);   // its frame went out before this answer: not asynchronous
+        }
         out.msg(&r);
         free(r.p);
         s->finishing = 0;
+        s->fin_dfrm = 0;
+        s->sync_demt = 0;
         if (!s->c) {   // a dsta since the dfin took the decoder away and did not get another
             return;
         }
@@ -760,6 +787,7 @@ static void collect(session *s) {
                 if (s->pending_fo[i]) {   // its buffer was asked for already: carry that over
                     frame_out *e = s->pending_fo[i];
                     f->dbuf_req = e->dbuf_req, f->answered = e->answered, f->surf = e->surf, f->err = e->err;
+                    f->sync = e->sync;
                     f->asked = e->asked;
                     memcpy(f->uui, e->uui, 16);
                     free(e);
@@ -1020,10 +1048,20 @@ static void on_dfrm(session *s, const msg *m) {
         send_demt(s, &f, kVTDecodeInfo_Asynchronous);
         return;
     }
+    // A synchronous decode (no EnableAsynchronousDecompression) from a process whose VideoToolbox waits properly
+    // (VV_MSG_WAITS_PROPERLY: VGMTLVTFix.m): its caller has the frame when the call returns, as on a Mac. Apple's host
+    // (tools/pvhost, PVHOST_ANSWER_DEMT) answers it with Dbuf, then the frame (Demt, decode order, inf 0), waits for
+    // the guest's answer to that, and only then answers the dfrm (inf 0). FFmpeg holds frames back for reordering,
+    // so the decoder is drained for it, and the packets since the last key frame go through again with their output
+    // thrown away, as after a dfin (pump). Answered Asynchronous at once, the frame came after the call: the moving
+    // wallpaper's still-frame loop found none, decoded the whole movie looking for one, and the screen stayed black.
+    int sync = (m->flags & 1) && (cur_msg_flags & VV_MSG_WAITS_PROPERLY) && !s->finishing &&
+               !(dfl & (kVTDecodeFrame_EnableAsynchronousDecompression | kVTDecodeFrame_DoNotOutputFrame));
     if (s->npending < 256) {
         frame_out *e = NULL;
         if (!(dfl & kVTDecodeFrame_DoNotOutputFrame)) {
             e = calloc(1, sizeof(*e));
+            e->sync = sync;
             e->frm = frm, e->slot = -1;
             e->dbuf_req = ++host_req;
             clock_gettime(CLOCK_MONOTONIC, &e->asked);
@@ -1036,6 +1074,19 @@ static void on_dfrm(session *s, const msg *m) {
         s->pending[s->npending] = frm;
         s->pending_dfl[s->npending] = dfl;
         s->pending_fo[s->npending++] = e;
+    } else {
+        sync = 0;
+    }
+    if (sync) {
+        free(r.p);
+        VLOG("frame %lld: synchronous: the decoder drained, the frame out, its answer, then the call's", (long long)frm);
+        avcodec_send_packet(s->c, NULL);
+        collect(s);
+        s->finishing = 1;
+        s->fin_dfrm = 1;
+        s->fin_req = m->req;
+        pump(s);
+        return;
     }
     field_s32(&r, "err", 0);
     field_u32(&r, "inf", kVTDecodeInfo_Asynchronous);
@@ -1084,6 +1135,11 @@ static void engine_msg(const uint8_t *p, size_t n, const struct vv_surf *surfs, 
         }
     }
     if (m.flags & 8) {   // the guest answering one of ours
+        if (!strcmp(m.type, "Demt") && s && s->sync_demt && m.req == s->sync_demt) {
+            s->sync_demt = 0;   // the synchronous frame is in the caller's hands: its call can be answered
+            pump(s);
+            return;
+        }
         if (!strcmp(m.type, "Dbuf") && s) {
             frame_out *hit = NULL;
             for (frame_out *f = s->head; f && !hit; f = f->next) {
@@ -1318,7 +1374,7 @@ static void engine_slotdone(int slot, int err) {
 // Now and then: sessions waiting on a buffer the guest may never give (pump drops a frame after 2 s).
 static void engine_tick(void) {
     for (int i = 0; i < MAX_SESSIONS; i++) {
-        if (sessions[i].used && sessions[i].head && !sessions[i].head->answered) {
+        if (sessions[i].used && ((sessions[i].head && !sessions[i].head->answered) || sessions[i].sync_demt)) {
             pump(&sessions[i]);
         }
     }
@@ -1525,7 +1581,9 @@ static void drain_g2h(void) {
             if (ns <= 5 && ml <= rec.len && ns * sizeof(struct vv_surf) + ml <= rec.len) {
                 struct vv_surf sf[5];
                 memcpy(sf, pay, ns * sizeof(struct vv_surf));
+                cur_msg_flags = rec.arg[2];
                 engine_msg(pay + ns * sizeof(struct vv_surf), ml, sf, (int)ns);
+                cur_msg_flags = 0;
             }
             break;
         }
