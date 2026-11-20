@@ -1321,8 +1321,7 @@ static void vg_surface_pull_locked(VGMTLTexture *t) {
 
 id<MTLTexture> vg_new_buffer_texture(id<MTLBuffer> buffer, MTLTextureDescriptor *d, NSUInteger offset, NSUInteger bpr) {
     const vg_format *f = vg_format_of(d.pixelFormat);
-    // Mip levels (round 11: WindowServer makes a 54x54 one with 6, and it was refused -- nothing drew): level 0 is the
-    // buffer's, the rest the image's own (filled by a blit's generateMipmaps, as Metal leaves them).
+    // Mip levels (round 11: WindowServer makes a 54x54 one with 6, and it was refused -- nothing drew): taken, as one.
     if (!f || (f->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT) || d.textureType != MTLTextureType2D || !bpr || bpr % f->bytes || offset + bpr * (d.height - 1) + d.width * f->bytes > buffer.length) {
         vglog("buffer texture: %lux%lu format %lu type %lu, %lu levels, at %lu, %lu bytes per row doesn't fit a %lu-byte "
               "buffer (2D color only)",
@@ -1330,16 +1329,18 @@ id<MTLTexture> vg_new_buffer_texture(id<MTLBuffer> buffer, MTLTextureDescriptor 
               (unsigned long)d.mipmapLevelCount, (unsigned long)offset, (unsigned long)bpr, (unsigned long)buffer.length);
         return nil;
     }
+    // One level only: the image's other levels were filled by nothing (Core Animation doesn't generate them for this
+    // texture, and the buffer holds level 0), and a badge's number drawn smaller than the texture sampled them: the
+    // Dock's badges showed their red circle without the number. One level is always the buffer's pixels.
+    if (d.mipmapLevelCount > 1) {
+        d = [d copy];
+        d.mipmapLevelCount = 1;
+    }
     VGMTLTexture *t = (VGMTLTexture *)vg_new_texture(buffer.device, d);
     if (t) {
         t->_srcBuffer = buffer;
         t->_srcOffset = offset;
         t->_srcBpr = bpr;
-        static int said;
-        if (d.mipmapLevelCount > 1 && said++ < 3) {
-            vglog("buffer texture: %lux%lu with %lu levels, level 0 from the buffer", (unsigned long)d.width,
-                  (unsigned long)d.height, (unsigned long)d.mipmapLevelCount);
-        }
     }
     return t;
 }
