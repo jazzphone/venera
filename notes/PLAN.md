@@ -2156,3 +2156,19 @@ TRIM, Upgrade without a USB disk, Retina modes, a faster first boot (a warm-up a
   its launch (its launch assertion ran out with nothing shown), so the screen stayed black; killing the extension
   brought the background back (a still, the extension not relaunched). Earlier the same day the first user's first
   frame took 28 s: the wallpaper shows only when its first frame beats that 60 s.
+  Recorded the same day (a third user's first login, venera-videod -v, 400 messages; tools/pvhost fed them, now
+  answering Demt with PVHOST_ANSWER_DEMT): the aerials' still frame is a synchronous decode with an output handler,
+  and Apple's host answers it Dbuf, then Demt (decode order, inf 0, a 544-byte dp2), waits for the guest's answer to
+  the Demt, and only then answers the dfrm (inf 0): the handler has the frame before the call returns. A real Mac does
+  the same (a test tool, vtsync: 7 of 8 frames in their own call, decode order). Ours answers the dfrm at once with
+  Asynchronous and the frames come later in display order (0 of 8 in their call), so the wallpaper decodes the next
+  sample, and the next, through the whole movie, 170 frames a second, and never has a still. The experiment patch
+  gets inf 0 and decode order but still a call late: VideoToolbox runs the handler on its serial
+  "paravirtualization.guest" queue, which also sends the guest's answers, so while VeneraVideo holds the sync send
+  (inside VideoToolbox's send lock) that queue waits, and the frame comes after the call. The hold exists for
+  VideoToolbox's wait: VTParavirtualizationReplyClerkWaitForReply (+0xb2) takes the timeout's nanoseconds with
+  cvttsd2si r14d (32-bit), and dispatch_time gets movsxd rsi, r14d (+0x102): 10 s overflows. Two same-length edits
+  fix it (f2 44 0f 2c f0 -> f2 4c 0f 2c f0; 49 63 f6 -> 4c 89 f6). With that fixed in a process, the send needs no
+  hold, and the host can answer as Apple's does. Not built yet: the patch (in-process from the Metal plugin, or
+  system-wide), the kext told which senders wait properly, and videod's synchronous path (decode order: FFmpeg's
+  HEVC holds frames for reordering).

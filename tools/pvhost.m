@@ -112,6 +112,19 @@ int main(int argc, char **argv) {
               OSStatus st = deliver(ses, bb, NULL, surfs, ids, 1);
               printf("answered Dbuf with surface %u (%zux%zu): status %d\n", IOSurfaceGetID(surf), w, ht, (int)st);
           } else if (!memcmp(h + 8, "Demt", 4)) {
+              if (getenv("PVHOST_ANSWER_DEMT")) {   // a guest's answer to the frame, as VideoToolbox sends once it has it
+                  NSMutableData *r = [NSMutableData dataWithBytes:h length:48];
+                  uint32_t flags = htonl(8);
+                  [r replaceBytesInRange:NSMakeRange(12, 4) withBytes:&flags];
+                  int32_t err = 0;
+                  box(r, "para,err=s32", &err, 4);
+                  CMBlockBufferRef bb = NULL;
+                  CMBlockBufferCreateWithMemoryBlock(NULL, NULL, r.length, NULL, NULL, 0, r.length, 0, &bb);
+                  CMBlockBufferReplaceDataBytes(r.bytes, bb, 0, r.length);
+                  deliver_fn deliver = dlsym(RTLD_DEFAULT, "VTParavirtualizationHostSessionDeliverMessageFromGuest");
+                  OSStatus st = deliver((__bridge CFTypeRef)gSession, bb, NULL, NULL, NULL, 0);
+                  printf("answered Demt: status %d\n", (int)st);
+              }
               for (id o in gSurfaces) {
                   CVPixelBufferRef pb = (__bridge CVPixelBufferRef)o;
                   CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
