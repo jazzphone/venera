@@ -2123,3 +2123,7 @@ TRIM, Upgrade without a USB disk, Retina modes, a faster first boot (a warm-up a
   subagent's, reviewed): such a buffer is a runtime array of its record (body_buf_dynamic_record_element_type), with a
   hand-written test. The crate's tests: 2402 pass, the same 85 fail as before (an old spirv-val, short corpora). VM 111:
   the hello pipeline builds, a boot refuses no shader (2 in the hour before), mtlcube/align/tess pass.
+  VM 111 through the whole Setup Assistant on the owner's console: the hello played (its text pipeline translated in
+  2.9 s, 2.2 MB of SPIR-V; a white screen meanwhile). The private seed was remade for the new translator from VM 111's
+  pool after the full setup (1927 translations, the hello's included; tools/seed-pool.sh SEED_FROM), and the
+  owner's kits on both nodes carry it (not a release: make-dist ships a seed only with VENERA_PRIVATE_SEED=1).
