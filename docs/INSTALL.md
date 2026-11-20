@@ -297,8 +297,8 @@ until the device is gone (`--remove-vm` on the host, start the VM again, run the
 
 ### Which processes use the driver
 
-WindowServer (the desktop), every app (a process running from an `.app` bundle, and the graphics process WebKit
-starts for Safari and other web views), and the background services that draw for the screen: `iconservicesagent`
+WindowServer (the desktop), every app (a process running from an `.app` bundle, an app extension (`.appex`, such as the
+Memoji editor), and the graphics process WebKit starts for Safari and other web views), and the background services that draw for the screen: `iconservicesagent`
 (every icon Finder, the Dock and open panels show), `CursorUIViewService`, `avconferenced` (video calls) and
 `mediaanalysisd` (the photo library's analysis). Other daemons don't, and neither do `loginwindow` and
 `SecurityAgent`, the processes that let you log in. Each process on the driver costs the host about 58 MB.

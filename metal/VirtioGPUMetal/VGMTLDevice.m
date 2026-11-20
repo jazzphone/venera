@@ -226,8 +226,11 @@ static BOOL vg_process_allowed(mach_port_t port) {
             return !vg_allow_file_has("services-off", NO);
         }
     }
+    // An app extension is an app's UI too, also one that a framework carries rather than an app: the Memoji editor
+    // (AvatarUI.framework's AvatarPickerMemojiPicker.appex, Setup Assistant's and System Settings' account picture)
+    // drew its Memoji for a moment from its host's pictures, then nothing, without a device of its own.
     NSString *bp = [[NSBundle mainBundle] bundlePath];
-    return [bp hasSuffix:@".app"] || [bp containsString:@".app/"];
+    return [bp hasSuffix:@".app"] || [bp containsString:@".app/"] || [bp hasSuffix:@".appex"];
 }
 
 // A refusal before [super initWithAcceleratorPort:] must not free the object: under ARC returning nil releases self,
