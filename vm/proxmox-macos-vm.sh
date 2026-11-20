@@ -644,6 +644,10 @@ tools_cd_old() {   # the VM's Venera Tools CD when it is another release's, else
   cur=$(disk_of "$slot")
   [[ $cur != *"/Venera-Tools-${VER:-guest}.iso" ]] && echo "$cur"
 }
+two_tablets() {   # the args' usb-tablet and Proxmox's own (tablet: 1, the default) both: an older VM's config
+  local c; c=$(qm config "$VMID")
+  grep -q -- '-device usb-tablet' <<<"$c" && ! grep -q '^tablet: 0' <<<"$c" && echo yes
+}
 swap_tools_cd() {   # this release's Venera Tools CD in place of an older one (a running VM's CD changes at once); the
                     # old ISO removed when no VM's config (snapshots included) names it any more
   local cur st new path slot; cur=$(tools_cd_old); [ -n "$cur" ] || return 0
@@ -990,6 +994,7 @@ upgrade_vm() {   # a VM with Venera: this release's host half on every node, the
   echo "    (an older guest agent that can't take it: from a USB disk, while someone is logged in with the screen unlocked)"
   [ -z "$user" ] || echo "    ($user is logged in: the restart closes their apps, and anything unsaved is lost)"
   [ -n "$(tools_cd_old)" ] && echo "  - the Venera Tools CD in $(tools_cd_slot): this release's in place of $(tools_cd_old)"
+  [ -n "$(two_tablets)" ] && echo "  - Proxmox's tablet off: the args' own is the VM's mouse (two, and the console's mouse can stop)"
   yes_no "Go ahead?" || die "nothing changed"
   for n in "${nodes[@]}"; do   # the other nodes first: the VM needs its socket wherever it starts
     echo "== the host half on $n"
@@ -1013,6 +1018,9 @@ upgrade_vm() {   # a VM with Venera: this release's host half on every node, the
   else guest "rm -f '$pkg'" >/dev/null; fi
   grep -qx 'rc=0' <<<"$out" || die "the install failed: its log is /Library/Application Support/Venera/install.log in macOS; nothing restarted"
   swap_tools_cd
+  if [ -n "$(two_tablets)" ]; then   # taken out of the running VM, no restart needed
+    qm set "$VMID" --tablet 0 >/dev/null && echo "   Proxmox's tablet off (the args' usb-tablet stays the mouse)"
+  fi
 }
 usb_upgrade_disk() {   # the guest package on a USB disk in the running VM, mounted by macOS: sets img and mnt
   mkdir -p /root/venera; img=/root/venera/venera-upgrade-$VMID.iso
