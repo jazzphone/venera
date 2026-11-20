@@ -145,7 +145,9 @@ Run it again with the VM's name:
 1. **Finish**, once macOS and Venera are installed. It reads Venera's status in macOS through the guest agent, then:
    - turns on hardware video (decoding and encoding): `install-host.sh --vm VMID` on each node the VM may run on, the others first,
      so the VM finds its socket wherever HA starts it;
-   - takes out the recovery disk (deleted) and the Venera Tools CD (its ISO stays in the storage, for the next VM);
+   - takes out the recovery disk (deleted). The Venera Tools CD stays in, on macOS's desktop: its Extras folder
+     (`venera-tune.sh`, a quieter macOS and server settings), `install-venera` and the package. On a node's own
+     storage in a cluster it would keep HA from starting the VM elsewhere, so there it asks to take the CD out too;
    - moves the guest agent to its virtio port, when Venera's agent is in and the VM still has the ISA one (made
      before 0.1.6): about ten times faster;
    - turns on the Proxmox console's clipboard (`vga: ...,clipboard=vnc`), which Venera's clipboard agent answers,
@@ -169,7 +171,9 @@ Run it again with the VM's name:
      choices macOS has now (hardware video, the Venera app, the system-volume copy for Safari WebGL);
    - the disk unplugged, then macOS restarted. Whoever is logged in loses unsaved work: the plan says who that is;
    - a VM on Venera's OpenCore from before 0.1.9: Lilu and VirtualSMC added to its OpenCore disk (saved to `/root`
-     first) and QEMU's `applesmc` taken out of its `args:`, so the restart is a shut-down and a start.
+     first) and QEMU's `applesmc` taken out of its `args:`, so the restart is a shut-down and a start;
+   - a Venera Tools CD from an earlier release, in ide1: this release's in its place (at once, the VM running), and
+     the old ISO removed when no VM uses it.
 5. **OpenCore**: moves the VM (stopped) to Venera's OpenCore image from this package: its EFI folder and config are
    replaced, and what was the VM's own is carried over (Venera's kexts and their entries, boot-args and SIP, the Mac
    identity, the screen size, the menu's timeout). What the old image brought that Venera doesn't need goes (its

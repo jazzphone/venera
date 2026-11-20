@@ -636,6 +636,28 @@ attach_venera_disk() {   # the Venera Tools CD in ide1 (macOS shows it on the de
   echo "   ide1: the Venera Tools CD ($st:iso/$iso)"
 }
 
+tools_cd_slot() {   # the slot holding a Venera Tools CD (ide1 as the script puts it, or another a person chose)
+  qm config "$VMID" | sed -n 's/^\(ide[0-3]\|sata[0-5]\|scsi[0-9]*\): \([^,]*Venera-Tools-[^,]*\.iso\),.*/\1/p' | head -1
+}
+tools_cd_old() {   # the VM's Venera Tools CD when it is another release's, else nothing
+  local slot cur; slot=$(tools_cd_slot); [ -n "$slot" ] || return 0
+  cur=$(disk_of "$slot")
+  [[ $cur != *"/Venera-Tools-${VER:-guest}.iso" ]] && echo "$cur"
+}
+swap_tools_cd() {   # this release's Venera Tools CD in place of an older one (a running VM's CD changes at once); the
+                    # old ISO removed when no VM's config (snapshots included) names it any more
+  local cur st new path slot; cur=$(tools_cd_old); [ -n "$cur" ] || return 0
+  slot=$(tools_cd_slot); st=${cur%%:*}; new="Venera-Tools-${VER:-guest}.iso"
+  path=$(pvesm path "$st:iso/$new" 2>/dev/null) || return 0
+  [ -f "$path" ] || venera_disk "$path"
+  qm set "$VMID" --"$slot" "$st:iso/$new,media=cdrom" >/dev/null || { warn "the Venera Tools CD couldn't be changed: $cur stays"; return 0; }
+  echo "   $slot: the Venera Tools CD is now $st:iso/$new"
+  # the whole volume id (storage:iso/name) as a disk's first field: another storage's ISO of the same name isn't it
+  if ! sed -n 's/^[a-z]*[0-9]*: \([^,]*\).*/\1/p' /etc/pve/nodes/*/qemu-server/*.conf 2>/dev/null | grep -qxF "$cur"; then
+    pvesm free "$cur" >/dev/null 2>&1 && echo "   $cur removed (no VM uses it)"
+  fi
+}
+
 finish_vm() {   # macOS and Venera installed: hardware video, the installer disks out, a restart; the old clean-ups
   local st="" up=0 nodes=() n
   echo; echo "== Finish VM $VMID"
@@ -662,9 +684,22 @@ finish_vm() {   # macOS and Venera installed: hardware video, the installer disk
     echo "  (hardware video: run this from the unpacked Venera-host folder; it carries the host's half)"
   fi
   if [ $VIDEO = 1 ]; then for n in $(vm_other_nodes); do no_yes "Hardware video on $n too (HA may start the VM there)?" "NODE:$n" && nodes+=("$n"); done; fi
-  for s in ide0 ide1; do
-    [ -n "$(disk_of $s)" ] && yes_no "Take out $s ($(disk_of $s): the macOS recovery or the Venera Tools CD)?" "TAKE_OUT" && drops+=("$s")
-  done
+  local keepcd="" cdslot; cdslot=$(tools_cd_slot)
+  # the recovery: a disk in ide0 (not an ISO)
+  case $(disk_of ide0) in "" | *:iso/*) ;; *) yes_no "Take out ide0 ($(disk_of ide0): the macOS recovery, deleted)?" "TAKE_OUT" && drops+=(ide0) ;; esac
+  if [ -n "$cdslot" ]; then
+    # the Venera Tools CD stays (Extras, install-venera, the package): macOS shows it on the desktop. On a node's own
+    # storage in a cluster it would keep HA from starting the VM elsewhere, so that one is asked about.
+    local cdst; cdst=$(disk_of "$cdslot"); cdst=${cdst%%:*}
+    if [ -n "$(vm_other_nodes 2>/dev/null)" ] && ! storage_shared "$cdst"; then
+      yes_no "Take out the Venera Tools CD (on $cdst, this node's own storage: HA can't start the VM elsewhere with it in)?" "TAKE_OUT" && drops+=("$cdslot")
+    else
+      keepcd="$cdslot, $(disk_of "$cdslot")"
+    fi
+  fi
+  if [ -n "$(disk_of ide1)" ] && [ "$cdslot" != ide1 ]; then
+    yes_no "Take out ide1 ($(disk_of ide1))?" "TAKE_OUT" && drops+=(ide1)
+  fi
   # Venera's agent answers on either port; the virtio one is ten times faster than the ISA serial port
   if [[ $st == *"guest agent"* ]] && ! qm config "$VMID" | grep -q '^agent:.*type=virtio'; then VIRTIO_AGENT=1; fi
   # the Proxmox console's clipboard (Venera's clipboard agent on the other end), where live migration keeps working
@@ -675,6 +710,7 @@ finish_vm() {   # macOS and Venera installed: hardware video, the installer disk
   echo; echo "== The plan"
   [ $VIDEO = 1 ] && echo "  - hardware video: install-host.sh --vm $VMID here${nodes[*]:+ and on ${nodes[*]}}$([ $HASDEV = 1 ] && echo " (the VM has its device: this updates the service)")"
   [ ${#drops[@]} -gt 0 ] && echo "  - take out ${drops[*]} (the recovery disk is deleted; the Venera Tools ISO stays in its storage)"
+  [ -n "$keepcd" ] && echo "  - the Venera Tools CD stays in ($keepcd): its Extras folder and the package, on macOS's desktop"
   [ $VIRTIO_AGENT = 1 ] && echo "  - the guest agent on its virtio port (faster than the ISA serial port)"
   [ $CLIP = 1 ] && echo "  - the Proxmox console's clipboard shared with macOS (display: clipboard=vnc)"
   [ $up = 1 ] && echo "  - in macOS: set the clock once, Apple's power logging (PerfPowerServices) off (it held a core at ~90%)"
@@ -953,6 +989,7 @@ upgrade_vm() {   # a VM with Venera: this release's host half on every node, the
   fi
   echo "    (an older guest agent that can't take it: from a USB disk, while someone is logged in with the screen unlocked)"
   [ -z "$user" ] || echo "    ($user is logged in: the restart closes their apps, and anything unsaved is lost)"
+  [ -n "$(tools_cd_old)" ] && echo "  - the Venera Tools CD in $(tools_cd_slot): this release's in place of $(tools_cd_old)"
   yes_no "Go ahead?" || die "nothing changed"
   for n in "${nodes[@]}"; do   # the other nodes first: the VM needs its socket wherever it starts
     echo "== the host half on $n"
@@ -975,6 +1012,7 @@ upgrade_vm() {   # a VM with Venera: this release's host half on every node, the
   if [ $via = usb ]; then guest "diskutil eject '$(dirname "$mnt")' >/dev/null 2>&1" >/dev/null; sleep 2; usb_disk del; rm -f "$img"
   else guest "rm -f '$pkg'" >/dev/null; fi
   grep -qx 'rc=0' <<<"$out" || die "the install failed: its log is /Library/Application Support/Venera/install.log in macOS; nothing restarted"
+  swap_tools_cd
 }
 usb_upgrade_disk() {   # the guest package on a USB disk in the running VM, mounted by macOS: sets img and mnt
   mkdir -p /root/venera; img=/root/venera/venera-upgrade-$VMID.iso

@@ -43,7 +43,8 @@ INSTALL=n                 # y: install macOS Tahoe with Venera now (typed into t
 APP=y                     # the Venera app in macOS
 MACOS_VOLUME=Macintosh HD # the macOS volume's name
 FINISH=y                  # Finish after the install (hardware video, the installer disks out, a restart)
-TAKE_OUT=y                # at Finish: take the recovery disk and the Venera Tools CD out
+TAKE_OUT=y                # at Finish: take the recovery disk out (the Venera Tools CD stays, with its Extras, unless
+                          # it is on a node's own storage in a cluster, where this takes it out too)
 
 # ---- an existing VM (NAME is one already) ----------------------------------------------------------------------------
 #WHAT=1                   # 1 Finish, 2 Ready for Venera, 3 the Mac identity, 4 Upgrade, 5 OpenCore, 6 startup settings,

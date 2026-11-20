@@ -36,6 +36,10 @@ check "the guest agent left out when it was" 'python3 -c "import plistlib,sys; a
 qm() { echo "machine: $MOCK_MACHINE"; }   # clipboard_ok reads the VM's machine
 cb() { MOCK_MACHINE=$1; VMID=999 clipboard_ok && echo on || echo off; }
 check "the console's clipboard where live migration keeps working (machine 10.1 up, or unpinned)" '[ "$(cb q35)" = on ] && [ "$(cb pc-q35-10.1+pve0)" = on ] && [ "$(cb pc-q35-11.1)" = on ] && [ "$(cb pc-q35-9.2+pve1)" = off ] && [ "$(cb pc-i440fx-8.1)" = off ]'
+qm() { echo "ide1: $MOCK_IDE1,media=cdrom"; }   # tools_cd_old reads the VM's CD slots
+oldcd() { MOCK_IDE1=$1; VER=$2 VMID=999 tools_cd_old; }
+check "a Tools CD in ide0 is found too" '[ "$(qm() { echo "ide0: diskstation:iso/Venera-Tools-0.1.9.iso,media=cdrom"; }; VMID=9 tools_cd_slot)" = ide0 ]'
+check "an older release's Tools CD is found, this release's and another ISO aren't" '[ "$(oldcd diskstation:iso/Venera-Tools-0.1.9.iso 0.1.10)" = diskstation:iso/Venera-Tools-0.1.9.iso ] && [ -z "$(oldcd diskstation:iso/Venera-Tools-0.1.10.iso 0.1.10)" ] && [ -z "$(oldcd local:iso/ubuntu.iso 0.1.10)" ]'
 unset -f qm
 LK='[{"kCGSSessionOnConsoleKey":true,"CGSSessionScreenIsLocked":true}]' NB='[{"kCGSSessionOnConsoleKey":false}]' OP='[{"kCGSSessionOnConsoleKey":true}]'
 check "a locked screen, nobody, and an open one" '[ "$(screen_says <<<"$LK")" = locked ] && [ "$(screen_says <<<"$NB")" = nobody ] && [ "$(screen_says <<<"$OP")" = open ] && [ "$(screen_says <<<"")" = open ]'
