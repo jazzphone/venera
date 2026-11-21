@@ -86,6 +86,10 @@ id<MTLBuffer> vg_new_buffer_nocopy(id<MTLDevice> device, void *pointer, NSUInteg
     uint32_t _shareParams[5];   // the creator's: VkFormat, width, height, usage, flags | tiling << 31
     uint64_t _shareSize;
     BOOL _shareable;   // exportable, offered to other processes at its first GPU write-back (vg_surface_wrote_back)
+    // A display stream's surface whose reader waits for pending writes (VGMTLLockWait.m, round 23): 1 tagged, 0 not
+    // yet (looked up again every 30th write).
+    int8_t _readerWaits;
+    uint32_t _readerChecks;
 }
 @property(readonly) id<MTLDevice> device;
 @property(copy, atomic) NSString *label;
@@ -102,6 +106,9 @@ void vg_surface_gpu_wrote(VGMTLTexture *t);
 // t's write-back made the surface's seed `seed` from `before`, nobody else having written: its siblings that matched
 // `before` match `seed` too, since they get t's pixels on the GPU (call with gVgSurfaceSync held).
 void vg_surface_siblings_synced(VGMTLTexture *t, uint32_t before, uint32_t seed);
+// A reader that waits for pending writes has tagged t's surface (VGMTLLockWait.m); mark or clear "write pending".
+BOOL vg_reader_waits(VGMTLTexture *t);
+void vg_lockwait_mark(VGMTLTexture *t, BOOL pending);
 // Records that `cmd` writes texture `t`: a surface texture is copied back to its IOSurface when `cmd` completes.
 void vg_cmd_wrote(id cmd, VGMTLTexture *t);
 void vg_cmd_wrote_rect(id cmd, VGMTLTexture *t, int32_t x0, int32_t y0, int32_t x1, int32_t y1);
@@ -160,6 +167,7 @@ BOOL vg_spirv_has_push_constants(NSData *spv);   // DescriptorSet 0 -> newSet (N
     VkCommandBuffer _cb;
     VkCommandBuffer _pendingCb;   // deferred work submitted just ahead of _cb (5c), freed at completion
     NSMutableData *_pendingOwned;
+    NSMutableArray *_pendingMarks;   // surfaces marked "write pending" for a waiting reader, cleared after the write-back
     int _timePair;   // GPU timestamps (5c), -1 when off
     BOOL _present;          // committed by commitAndWaitUntilSubmitted (Core Animation's display frames)
     BOOL _allTwinned;       // every IOSurface it wrote got a twin copy: waiting for the GPU is enough

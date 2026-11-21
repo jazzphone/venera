@@ -2283,3 +2283,16 @@ whether the display's refresh rate matters); closer to a real Mac's speed. Not H
   wait: the reader's IOSurface lock waits for the GPU. Next: have the accelerator kext make a reader of a surface
   with a pending write-back wait for it (IOSurface lock), and drop WindowServer's wait for the display stream. A
   Cmd-Shift-3 screenshot on VM 108 with the new wait: whole.
+- **The reader waits instead of WindowServer (the Mac's way), built, off by default** (VGMTLLockWait.m, the lockwait
+  flag file). In a reader process IOSurfaceLock -- an exported stub (NULL check, the surface's client, a tail jump)
+  -- is replaced by a copy that first waits while a display-stream surface is marked "write pending"; the reader tags
+  the stream's surfaces, and only for tagged ones WindowServer marks pending at the write-back's recording, clears it
+  once it's in, and doesn't wait. tools/mtllockwait (the handover in one process): with it commitAndWaitUntilSubmitted
+  0.25 ms and the lock 2.45 ms, without it 2.6-2.9 ms and 0.01 ms; no stale reads either way. The write-back's own lock
+  is AvoidSync now (it is the pending write). VM 109, owner connected: a moderate scripted drag 25.2 ms frame gaps
+  (WindowServer waiting) against 17.6 ms (reader waiting), the agent's frames more even (91-93 % of gaps under 20 ms
+  against 75-87 %); fast sweeps of a large window ~33 ms and the same stalls both ways. The owner: no difference he
+  could feel, "jittery" both ways, and once more pauses during fast drags with the reader waiting. So it stays off.
+  Its two flaws to fix before trying again: the mark is one flag, so a lock can wait for a newer write than the frame
+  it was handed; and the reader polls (100-500 us sleeps) instead of being woken. The jitter itself is WindowServer's
+  frame time with a large window moving fast (~33 ms, uneven), sharing or not: the speed work.

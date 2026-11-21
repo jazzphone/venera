@@ -1563,7 +1563,9 @@ static void vg_surface_debug(VGMTLTexture *t) {
             // two under a fast drag, and the parts it didn't redraw stayed old: pieces of windows left behind.
             os_unfair_lock_lock(&gVgSurfaceSync);   // until the seed our unlock makes is recorded (round 21)
             const uint32_t seedBefore = IOSurfaceGetSeed(t->_surface);
-            IOSurfaceLock(t->_surface, 0, NULL);
+            // AvoidSync: this write-back is the pending GPU write that a waiting reader's lock waits for
+            // (VGMTLLockWait.m)
+            IOSurfaceLock(t->_surface, kIOSurfaceLockAvoidSync, NULL);
             const BOOL othersWrote = !t->_neverSynced && seedBefore != t->_syncedSeed;
             uint8_t *base = IOSurfaceGetBaseAddressOfPlane(t->_surface, t->_plane);
             const uint8_t *from = t->_staging.map;
@@ -1581,7 +1583,7 @@ static void vg_surface_debug(VGMTLTexture *t) {
                 bytes = rowBytes * (size_t)(dr[3] - dr[1]);
             }
             uint32_t seed = 0;
-            IOSurfaceUnlock(t->_surface, 0, &seed);
+            IOSurfaceUnlock(t->_surface, kIOSurfaceLockAvoidSync, &seed);
             vg_perf(VG_PERF_WB_COPY, bytes, vg_now() - t0);
             if (vg_synclog()) {
                 vglog("synclog wrote back: cb %p surface %u rect %d,%d-%d,%d seed now %u%s", self,
@@ -1599,6 +1601,10 @@ static void vg_surface_debug(VGMTLTexture *t) {
     }
     [_surfacesWritten removeAllObjects];
     _surfaceDirty = nil;
+    for (VGMTLTexture *t in _pendingMarks) {   // written back (or failed): their readers may go on
+        vg_lockwait_mark(t, NO);
+    }
+    _pendingMarks = nil;
     if (_wroteBack) {   // commitAndWaitUntilSubmitted's caller may go on: the surfaces hold this frame (round 23)
         dispatch_semaphore_signal(_wroteBack);
     }
@@ -1675,6 +1681,9 @@ static void vg_surface_debug(VGMTLTexture *t) {
         NSMutableArray<VGMTLTexture *> *gpuWrote = [NSMutableArray arrayWithCapacity:_surfacesWritten.count];
         for (VGMTLTexture *t in _surfacesWritten) {
             [self barrier];
+            // its reader waits for the write-back (a display stream read by ScreensharingAgent, VGMTLLockWait.m): no
+            // need to wait for it here (round 23)
+            const BOOL readerWaits = vg_reader_waits(t);
             // A display frame: into the surface's twin, which the kext scans out (5c). Such a surface is only read on
             // the GPU (Core Animation) and from the twin (the display), so its CPU write-back is skipped
             // (VGMTL_TWIN_WRITEBACK=1 keeps it).
@@ -1707,7 +1716,7 @@ static void vg_surface_debug(VGMTLTexture *t) {
                 uint64_t nowNs = vg_now();
                 t->_hotWrites = t->_hotLast && nowNs - t->_hotLast < 100000000ull ? t->_hotWrites + 1 : 1;
                 t->_hotLast = nowNs;
-                if (!shown && (t->_hotWrites < 10 || !vg_surface_is_scanout(t))) {
+                if (!shown && (t->_hotWrites < 10 || !vg_surface_is_scanout(t)) && !readerWaits) {
                     _allTwinned = NO;
                 }
                 [gpuWrote addObject:t];
@@ -1723,7 +1732,7 @@ static void vg_surface_debug(VGMTLTexture *t) {
                     [noWriteBack addObject:t];
                     continue;
                 }
-            } else {
+            } else if (!readerWaits) {
                 _allTwinned = NO;
             }
             int32_t dr[4];
@@ -1757,6 +1766,13 @@ static void vg_surface_debug(VGMTLTexture *t) {
                                    {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {dr[0], dr[1], 0},
                                    {(uint32_t)(dr[2] - dr[0]), (uint32_t)(dr[3] - dr[1]), 1}};
             gVk.vkCmdCopyImageToBuffer(_cb, t->_image, VK_IMAGE_LAYOUT_GENERAL, t->_staging.buffer, 1, &c);
+            if (readerWaits) {   // a lock now waits until the write-back is in (finishWith clears it)
+                vg_lockwait_mark(t, YES);
+                if (!_pendingMarks) {
+                    _pendingMarks = [NSMutableArray array];
+                }
+                [_pendingMarks addObject:t];
+            }
         }
         if (noWriteBack) {
             [_surfacesWritten minusSet:noWriteBack];   // no CPU copy at completion either

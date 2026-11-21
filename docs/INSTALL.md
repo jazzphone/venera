@@ -395,6 +395,11 @@ Files in `/Library/GPUBundles` the Metal driver reads (root only; delete them to
   0.1.10 (since 0.1.13 the driver copies them from each other on the GPU; VideoToolbox's Metal transfer reads a
   picture's plane that way, for the login window's list of users and the Memoji picker). For comparing; with it, those
   pictures can come out stale. Read when a process starts.
+- `VirtioGPUMetal-lockwait`: the processes it names (one a line, e.g. `ScreensharingAgent`) wait in their
+  IOSurfaceLock for a display stream's frame to be written back, as on a Mac, so WindowServer needn't wait for it
+  before handing it over. An experiment, off without the file: WindowServer keeps more of its frames while someone
+  shares the screen, but it wasn't smoother to the eye. `VirtioGPUMetal-lockwaitmeasure` with it only logs the
+  timing of the display stream's frames (every 5 s). Read when a process starts.
 
 The accelerator flips at most once per 12 ms by default (`vgpuflipms=N` boot-arg, 0 = no limit).
 
