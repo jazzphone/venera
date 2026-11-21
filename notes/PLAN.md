@@ -2479,3 +2479,9 @@ corner to corner 8 times in one press (`qmpinput.py sweep`, 0.4 s each way) and 
   implicit sync with QEMU's readback of the twins. A per-submission cost in WindowServer's own context that grows
   with the screen's size. Next: fewer host submissions per frame (WindowServer makes 3-4 command buffers a frame), or
   a host-side profile (`perf` on the node: the owner's call).
+- **Not the images a context holds**: tools/mtlresident keeps 0 to 48 private 2880x1800 textures (to 949 MB), each
+  drawn once, and a tiny command buffer still round-trips in 0.97-1.10 ms. So batching submits on a residency theory
+  is unfounded. Ruled out for Retina's per-command-buffer wait, each by measurement: GPU work, a saturated host GPU,
+  the ring's wake-ups, fence polling, QEMU's flips and console readback, implicit sync on the twins, held images.
+  Left: something on the host side of WindowServer's own Venus context; needs a host profile (`perf` on the node,
+  the owner's call).
