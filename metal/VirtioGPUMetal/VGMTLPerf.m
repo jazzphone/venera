@@ -25,7 +25,10 @@ static const char *const kNames[VG_PERF_N] = {"pull copy", "pull GPU", "write-ba
                                               "completion: predecessor status wait",
                                               "fence: status probe",
                                               "fence: polling backoff and other overhead",
-                                              "GPU clock calibration: maximum deviation"};
+                                              "GPU clock calibration: maximum deviation",
+                                              "GPU idle before a command buffer (its start - the previous end, GPU clock)",
+                                              "command buffer commit->done: display frames only",
+                                              "GPU time: display frames only"};
 
 void vg_perf_count(int kind, uint64_t count, uint64_t bytes, uint64_t ns) {
     atomic_fetch_add_explicit(&gCount[kind], count, memory_order_relaxed);
@@ -123,7 +126,8 @@ static double vg_gpu_offset(void) {
     return o;
 }
 
-void vg_gpu_time_collect(int pair, uint64_t submittedNs, uint64_t observedNs) {
+void vg_gpu_time_collect(int pair, uint64_t submittedNs, uint64_t observedNs, BOOL present) {
+    static uint64_t lastEnd;   // the previous command buffer's end, in GPU ticks (completions come in commit order)
     uint64_t ts[2];
     if (pair < 0 || gVk.vkGetQueryPoolResults(gVk.device, gQueries, 2 * pair, 2, sizeof(ts), ts, sizeof(uint64_t),
                                               VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
@@ -132,7 +136,15 @@ void vg_gpu_time_collect(int pair, uint64_t submittedNs, uint64_t observedNs) {
     const double period = gVk.props.limits.timestampPeriod;
     if (ts[1] > ts[0]) {
         vg_perf(VG_PERF_GPU, 0, (uint64_t)((ts[1] - ts[0]) * period));
+        if (present) {
+            vg_perf(VG_PERF_GPU_PRESENT, 0, (uint64_t)((ts[1] - ts[0]) * period));
+        }
     }
+    // the GPU's own clock, no calibration: how long it sat without this queue's work before this one started (round 23)
+    if (lastEnd && ts[0] > lastEnd && (ts[0] - lastEnd) * period < 1e9) {
+        vg_perf(VG_PERF_GPU_GAP, 0, (uint64_t)((ts[0] - lastEnd) * period));
+    }
+    lastEnd = ts[1] > lastEnd ? ts[1] : lastEnd;
     double off = vg_gpu_offset();
     if (off != 0 && submittedNs && observedNs) {
         double start = ts[0] * period + off, end = ts[1] * period + off;

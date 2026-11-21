@@ -1,7 +1,8 @@
 // modetest (stage 5c): list the main display's modes, or switch to one and back, as the console user.
 //   modetest                 list modes (the current one marked)
 //   modetest W H [SECONDS] [2x]   switch to WxH (2x: the Retina one, twice the pixels), stay SECONDS (default 5; 0
-//                            stays), switch back; prints what CoreGraphics reports
+//                            stays: saved as the user's display setting), switch back; prints what CoreGraphics
+//                            reports
 #import <CoreGraphics/CoreGraphics.h>
 #import <Foundation/Foundation.h>
 
@@ -40,7 +41,17 @@ int main(int argc, char **argv) {
             return 1;
         }
         show(cur, "from ");
-        CGError e = CGDisplaySetDisplayMode(d, want, NULL);
+        CGError e;
+        if (secs == 0) {   // stays: committed as the user's setting (CGDisplaySetDisplayMode's lasts as long as this process)
+            CGDisplayConfigRef cfg = NULL;
+            e = CGBeginDisplayConfiguration(&cfg);
+            if (e == kCGErrorSuccess) {
+                e = CGConfigureDisplayWithDisplayMode(cfg, d, want, NULL);
+            }
+            e = e == kCGErrorSuccess ? CGCompleteDisplayConfiguration(cfg, kCGConfigurePermanently) : e;
+        } else {
+            e = CGDisplaySetDisplayMode(d, want, NULL);
+        }
         printf("set %zux%zu -> %d\n", w, h, e);
         CGDisplayModeRef now = CGDisplayCopyDisplayMode(d);
         show(now, "now ");

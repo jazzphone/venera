@@ -1567,7 +1567,7 @@ static void vg_surface_debug(VGMTLTexture *t) {
         vg_perf(VG_PERF_CB_WAIT, 0, observed - dequeued);
         gVk.vkDestroyFence(gVk.device, fence, NULL);
         if (_cb && waited == VK_SUCCESS) {
-            vg_gpu_time_collect(_timePair, _submitted, observed);
+            vg_gpu_time_collect(_timePair, _submitted, observed, _present);
         } else if (_streamWriteBacks.count) {
             [self fail:[NSString stringWithFormat:@"vkWaitForFences %d", waited]];
             status = MTLCommandBufferStatusError;
@@ -1624,6 +1624,9 @@ static void vg_surface_debug(VGMTLTexture *t) {
     _narena = 0;
     if (_submitted) {
         vg_perf(VG_PERF_CB, 0, _completed - _submitted);
+        if (_present) {
+            vg_perf(VG_PERF_CB_PRESENT, 0, _completed - _submitted);
+        }
     }
     if (status == MTLCommandBufferStatusCompleted) {
         for (VGMTLTexture *t in _surfacesWritten) {

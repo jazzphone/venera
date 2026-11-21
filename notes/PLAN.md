@@ -2469,3 +2469,13 @@ corner to corner 8 times in one press (`qmpinput.py sweep`, 0.4 s each way) and 
   on the GPU), framebuffer 0.6.3 (`vgpuvblhz`), and the measuring flags (`initperf`, `framesig`, `ringidle`,
   `locknames`, `lockwaitmeasure`). The owner's kits on both nodes are a private 0.1.13 with the seed (0.1.12's kept
   beside as kit-0.1.12). Open: Retina sizes (GPU work ~3 ms a command buffer, but ~45 ms through the host and back).
+- **Retina on VM 108 (2880x1800, `tools/modetest W H 0 2x` now saves the mode), no Screen Sharing.** Sweeps 33-36 ms
+  between frames (17.8 at 1280x800), scrolls 20-22 ms. GPU work per command buffer 3.3-3.6 ms, commit -> done 48-57 ms,
+  completions dispatched 39-40 ms after commit; a Venus fence probe 1.1-1.3 ms (0.13 at 1280x800). Fence feedback
+  (probes free) helps a little: dispatch 32-35 ms, sweeps 32.7-33.7, scrolls 20.2. Another process's small command
+  buffers still round-trip in ~1 ms (median) during a Retina sweep (spikes to 25-60 ms): the host GPU isn't
+  saturated. Calibration-free, on the GPU's clock: **WindowServer's queue sits idle 7.3 ms before each command buffer
+  at Retina (3.2 ms at 1280x800), for 3.5 ms of work (1.7 ms)**; display and other command buffers alike, so not
+  implicit sync with QEMU's readback of the twins. A per-submission cost in WindowServer's own context that grows
+  with the screen's size. Next: fewer host submissions per frame (WindowServer makes 3-4 command buffers a frame), or
+  a host-side profile (`perf` on the node: the owner's call).
