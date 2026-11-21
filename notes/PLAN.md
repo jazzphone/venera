@@ -2460,3 +2460,12 @@ corner to corner 8 times in one press (`qmpinput.py sweep`, 0.4 s each way) and 
   but commit -> GPU start 26-30 ms and GPU done -> seen 17-21 ms (`gputime`). Not QEMU's readback for the console
   (`acceltest flipms 33` halved the flips, frame gaps and latencies unchanged), not QEMU's CPU (main thread 35 %,
   the render server 35 %). Open: what in the host's path scales with the ~20 MB surfaces.
+
+### 0.1.13 (2026-11-21)
+
+- Released as v0.1.13 (bb0a5d4, Latest), the owner's OK: the Venus ICD bound at link time (GPU processes start
+  130-370 ms sooner), scanout surfaces and SkyLight's Selective Sharing not copied back, Screen Sharing's reader
+  waiting instead of WindowServer (on by default), the login window's user pictures (a surface's images kept in step
+  on the GPU), framebuffer 0.6.3 (`vgpuvblhz`), and the measuring flags (`initperf`, `framesig`, `ringidle`,
+  `locknames`, `lockwaitmeasure`). The owner's kits on both nodes are a private 0.1.13 with the seed (0.1.12's kept
+  beside as kit-0.1.12). Open: Retina sizes (GPU work ~3 ms a command buffer, but ~45 ms through the host and back).
