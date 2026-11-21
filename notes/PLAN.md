@@ -2313,3 +2313,136 @@ whether the display's refresh rate matters); closer to a real Mac's speed. Not H
   QEMU's main thread ~23 %: nothing saturated. Next: find what serializes the ~9 ms (the ring thread's decode of
   ~10,000 descriptor-set writes a second, the guest's fence polling in vn_relax, the completion thread's in-order
   handling), then the per-process device start-up (0.2-0.4 s), then the reader wait's second try.
+
+### Round 23 continuation: profiling, device startup and reader waits
+
+- The pinned Venus source polls in both fence modes. With feedback it reads the shared slot. With feedback off
+  it calls the host for fence status before each backoff. The Metal driver's old comment described an interrupt
+  wait that this path does not use. The new `perf` counters split commit preparation, `vkQueueSubmit`,
+  completion dispatch, predecessor-status waits, fence probes and fence backoff. `gputime` also reports clock
+  calibration uncertainty. The pre-GPU interval still includes host command processing and queueing behind
+  earlier GPU submissions. Treat descriptor writes as a candidate until host-side measurement distinguishes them.
+- Venus used to query physical-device groups twice on first enumeration, even for Metal, which only asks for
+  a single device. Group enumeration now runs on the first actual group query. `initperf` logs the device startup
+  phases for comparison. The two saved round trips are confirmed by the call paths. Their elapsed time on a
+  guest is still to be measured.
+- The opt-in Screen Sharing experiment uses Darwin notifications to wake a reader and pins the generation visible
+  at lock entry. Each surface can have one deferred write. Overlapping writes keep the writer wait, and a deferred
+  write has its own staging buffer so later submits cannot replace those bytes before the CPU copy. The hook sees
+  the IOSurface, so it cannot match the lock to SkyLight's earlier frame handoff. If a later generation was already
+  pending when the lock started, that ambiguity remains.
+
+Guest checks pending:
+
+1. On VM 108, repeat the same continuous sweep on the previous build and this one. Run with `perf` only, then
+   with `perf` and `gputime`. Repeat with fence feedback on and off, restarting WindowServer between flag changes.
+   Compare frame gap distributions as well as the host-probe and backoff totals per submitted buffer. Use the
+   calibration uncertainty when comparing pre- and post-GPU times. If most of the residual is pre-GPU, profile the
+   host ring thread's descriptor updates and queue submissions during the same sweep.
+2. Time fresh process starts on VM 108 with `initperf` and compare the physical-device phase on the two builds.
+   Repeat across several startups of the same Settings panes and compare the total startup as well.
+3. On VM 108, run `mtllockwait` with the flag off and on, and verify a Cmd-Shift-3 screenshot. On VM 109, with a
+   connected viewer, compare fast sweeps and scrolling with `lockwaitmeasure` first and reader waits second. Look
+   for stale frames, trails, visible pauses and lock timeouts alongside WindowServer's frame gaps. Keep the
+   experiment off until that comparison succeeds.
+
+### VNC output and the next Settings startup experiment
+
+- `python3 tools/vncgrab.py 108 10 --timings` on the Proxmox host times QEMU's raw incremental VNC updates,
+  without converting frames or writing images between requests. Its JSON separates the initial full update
+  from steady update gaps, receive duration, and raw pixel payload bytes. It measures a host-side raw VNC
+  client. It does not include browser decoding or the user's network path.
+- For an A/B run, collect WindowServer transaction gaps and flip durations with `acceltest pace` while the
+  same `qmpinput.py sweep` runs. Compare with host-side VNC gaps and with what the viewer shows at the same
+  guest resolution. Repeat in separate runs so a raw capture does not add load to the browser's measurement.
+  Long guest gaps point to the driver. Smooth guest gaps followed by long VNC gaps point to the host display
+  path. Smooth host VNC gaps followed by uneven viewer output point to encoding, delivery, or presentation.
+- `skipsoftware` is a separate startup experiment for the bundled Venus ICD. It still does the renderer's
+  initial properties query to identify CPU devices, then bypasses their extension, features, memory and queue
+  queries. Metal had already rejected CPU devices after Venus completed that work. Compare `initperf` and
+  click-to-usable time across cold opens of the same Settings panes with `skipsoftware` off and on. Repeat
+  with an already running pane to see how much of the remaining delay comes from process startup.
+
+### Round 23 VM comparison prepared locally
+
+- Built three signed x86_64 bundles and deployment archives under `build/round23/`, using the same SDK,
+  pinned Mesa 25.0.7 and translator for each. `baseline` is `91a9888` with Mesa patches through 0008.
+  `timing-control` uses the updated Metal bundle with Mesa through 0009, so it logs `initperf` while keeping
+  eager group queries. `patched` uses the same Metal build with Mesa through 0011. With `skipsoftware` off
+  it measures deferred group queries. With the flag on it also skips the CPU device's full capability queries.
+- The raw VNC timing and PPM capture paths passed local RFB fixtures, including an idle connection and a
+  stall after the first update. The simulated reader hook passed generation wake, timeout, failure, and
+  AvoidSync checks. The local sandbox could not create an IOSurface for the cross-process check.
+- On VM 108, confirm the 1280×800 display and the active Metal bundle and ICD before each build's runs.
+  Repeat the same `dragtest` window and QMP sweep, then use `dragtest`'s scripted scroll with identical timing.
+  Reset `acceltest pacereset` just before motion and collect `acceltest pace` as it ends. Run without a viewer
+  first, then with `vncgrab.py --timings`, then with only noVNC connected. Repeat runs and keep the browser
+  scale, viewport and quality fixed. Compare frame-gap distributions and flip times with the raw update gaps
+  and browser presentation separately. Use `timing-control` and `patched` with matching `perf` and `gputime`
+  flags for the Venus counters, and keep the reader-wait flag absent during the console work.
+- For System Settings, use General, Users & Groups, Sharing, and Network. Count a cold open only when the
+  pane runs in a fresh process, and a repeat open only when the pane keeps the same process. Pair the click
+  with the first complete visible pane and a responding control, then match its process to `initperf` in the
+  timing builds. Confirm the actual bundle loaded by each pane. If its sandbox rejects the dev copy, take a
+  VM 108 snapshot before using the system-volume bundle path. Keep the click-to-usable and device-phase
+  timings separate.
+- The local shell was denied outbound SSH before authentication. Guest baseline, patched timings, and the
+  VM 108 screenshot and reader-wait regressions are pending. VM 109's live Screen Sharing A/B follows those checks.
+
+### Round 23 continuation, measured on VM 108 (2026-11-21)
+
+Builds (signed x86_64 bundles; the loaded MacOS binary and ICD checked by hash in WindowServer before each run, the
+display 1280x800): `baseline` (91a9888), `timing-control` (Mesa through 0009), `patched` (through 0011), then
+`ringidle` (0012), `nulls` (`build-mesa.sh` binds the optional entrypoints to NULL at link time) and the `-fs`
+variants (today's Metal code with `framesig`, each with one of the three ICDs). Motion: `dragtest`'s window swung
+corner to corner 8 times in one press (`qmpinput.py sweep`, 0.4 s each way) and `dragtest`'s scripted scroll,
+`acceltest pace` around each, no viewer unless said.
+
+- **WindowServer during motion** (mean frame gap; commit -> done per command buffer): baseline sweep 20.0 / 23.0
+  ms, scroll 18.1 / 18.9 ms; timing-control sweep 18.6 / 17.7, scroll 19.3 / 19.3; nulls sweep 18.1 / 17.9,
+  scroll 18.4. Commit -> done ~10 ms in sweeps, ~7 ms in scrolls, unchanged by every build.
+- **The ~9 ms outside the GPU, split** (timing-control, `gputime`, calibration error 0.05-0.4 ms): sweep commit ->
+  GPU start 7.2-7.5 ms, GPU 1.75-1.85 ms, GPU done -> seen 1.7-2.1 ms; scroll 5.0 / 1.6 / 0.6 ms. Ruled out, each
+  measured: fence polling (without feedback ~24 host probes per command buffer at 0.17 ms; with feedback probes cost
+  0.008 ms but the wait and the frame gaps are the same); the host ring thread going to sleep (`ringidle` 20 ms
+  instead of 1: commit -> start 7.0-7.7 ms, no change; the ring thread ~55 % of a core in motion); the shared host
+  GPU (another process's small command buffers round-trip in 1-1.5 ms during a sweep, as idle); per-draw decoding
+  (`tools/mtldraws`: 2,000 draws add ~1.2 ms, ~0.6 us a draw); a backed-up ring (WindowServer's synchronous probes
+  take 0.16 ms). What is left is WindowServer's own command buffers queueing on its host queue; it isn't what
+  limits the frame rate (50-57 fps in these sweeps).
+- **The console's limit is QEMU's VNC, not the driver.** Raw VNC on the host during the same sweeps
+  (`vncgrab.py --timings`, no browser): 28.5-30.4 updates a second, gaps median 31.6-32.6 ms, p95 39-60 ms, a few
+  0.19-2 s stalls; each 4 MB update received in ~3 ms. QEMU refreshes VNC every ~30 ms. noVNC in Chrome on the same
+  LAN (0.35 ms ping), measured by wrapping the canvas draws: gaps median 33.4 ms in a sweep, **66.6 ms in scrolls
+  (~15 fps), with the raw client getting 30.4 updates a second at the same moment**. noVNC asks for the next update
+  only after drawing the last, so each frame costs two of QEMU's ticks. Not the browser (no long tasks, no late
+  animation frames), not the relay (`pveproxy`, `qm vncproxy` under 3 %), not QEMU's VNC encoder thread (9 %), not
+  JPEG (quality 9 and 2 gave the same 66.6 ms). Options are the owner's: a shorter VNC refresh in QEMU, a noVNC that
+  asks for the next update as one arrives, or another console path (SPICE).
+- **Loading the Venus ICD cost 130-370 ms in every process** (`initperf`; `dltime` in fresh processes: 130-146 ms
+  each, lazy or immediate binding, any path, the released 0.1.12 copy too; a trivial ad hoc dylib 0.3 ms, with IOKit
+  and libz 4 ms). Mesa's entrypoint tables reference ~1,543 optional entrypoints weakly and rely on missing ones
+  being NULL; linked with `-undefined dynamic_lookup`, dyld searched every loaded image for each at every load.
+  `build-mesa.sh` now defines each one still missing after the first link as a private absolute symbol at 0 and
+  links again: binding info 64,688 -> 128 bytes, nothing left to dyld, the tables NULL as before. ICD load 1.7-3.2 ms
+  in every process on 108 (WindowServer, mediaanalysisd, the panes, the tools); mtlprobe, mtlregroup, mtlsurface,
+  mtlrender, mtlcompute, mtlatlas pass.
+- **System Settings, cold opens** (General, Users & Groups, Sharing, Network; 2 rounds; the click to the screen
+  settling, from `framesig`): timing-control 854-1505 ms with device setup 198-405 ms (ICD 167-374); patched 837-879
+  ms, device 195-311 ms; patched + `skipsoftware` 844-913 ms, device 186-326 ms; nulls + `skipsoftware` 816-937 ms
+  (one 2.6 s), device 24-37 ms (ICD 1.7-3.2). The device setup is 7-10x shorter, but the pane is not visibly ready
+  sooner: it settles at ~0.85-0.9 s in every build, so the device isn't on the path to the first finished frame.
+  `skipsoftware` and the deferred group queries: no measurable effect (the physical-device phase is 4-8 ms either
+  way). Repeat opens of a running pane settle in 120-340 ms, with outliers (Sharing 1.7-7 s, Users 1.1 s).
+- Regressions on 108 with the working tree: `mtllockwait` (60 rounds, twice each) with the reader wait off: commit
+  3.7 ms, lock 0.02 ms, 0 stale; on: commit 0.2 ms, lock 3.1-3.4 ms, 0 stale, 0 timeouts. Three Cmd-Shift-3
+  screenshots whole.
+- **Screen Sharing A/B on VM 109** (the candidate build: today's working tree with the nulls ICD; the owner connected
+  from a Mac on the LAN; ScreensharingAgent hooked either way, `lockwaitmeasure` for A): the same continuous sweep
+  and scripted scroll. Sweeps, A (WindowServer waits): mean frame gap 19.9 / 23.3 ms, 223 of 353 and 117 of 298
+  frames at one VBL, WindowServer's wait 1.6-5.8 ms a submit, the agent's frames 91 % / 80 % under 20 ms apart; B
+  (the reader waits): 17.6 / 17.4 ms, 348 of 396 and 353 of 396 at one VBL, the wait 0.04 ms, 96 % / 95 % under 20 ms;
+  the agent's locks waited 2.4 ms on average (max 22-50 ms), none timed out in ~2,000. Scrolls about the same either
+  way (A 20.0-20.1, B 21.2-22.8 ms). The owner, watching B then A: no trails in either; B "may have looked slightly
+  smoother", close. The reworked reader wait (a pinned generation, a wake-up notification) has none of the first
+  version's 50-70 ms waits or pauses. It stays off by default pending the owner's decision.
