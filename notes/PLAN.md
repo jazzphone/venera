@@ -2305,3 +2305,11 @@ whether the display's refresh rate matters); closer to a real Mac's speed. Not H
   the old way back). VM 108, the same fast sweeps: mean frame gap 27.3 -> 21.4 ms (twice), frames at one VBL 86 of
   242 -> 212 of 316 and 219 of 318, the wait 2.62 -> 0.02 ms, write-backs 570 -> 1. Three Cmd-Shift-3 screenshots
   whole. Next seen: a command buffer's GPU work is 1.8 ms (timestamps) but commit -> done 10.8 ms.
+- **Where a fast drag's frame time goes (VM 108, open).** tools/qmpinput.py `sweep` (one press, the window swung
+  corner to corner, no pauses): mean frame gap 18.5 and 23.8 ms in two runs (the host's GPU is shared with VM 107:
+  noisy). A command buffer: 1.7 ms of GPU work, 10.7 ms commit -> done; an idle round trip 1 ms (tools/mtllat); the
+  in-flight depth (3, 6, 10, 16) changes nothing; WindowServer ~35 % of a core, mostly waiting. On the host,
+  WindowServer's virgl_render_server ring thread (vkr-ring) ran ~49 % of a core during a sweep, the vCPUs 16-33 %,
+  QEMU's main thread ~23 %: nothing saturated. Next: find what serializes the ~9 ms (the ring thread's decode of
+  ~10,000 descriptor-set writes a second, the guest's fence polling in vn_relax, the completion thread's in-order
+  handling), then the per-process device start-up (0.2-0.4 s), then the reader wait's second try.
