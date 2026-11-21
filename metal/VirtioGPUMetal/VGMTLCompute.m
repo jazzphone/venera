@@ -1552,7 +1552,8 @@ static void vg_surface_debug(VGMTLTexture *t) {
             uint64_t t0 = vg_now();
             int32_t dr[4];
             vg_dirty_rect(self, t, dr);
-            NSUInteger px = IOSurfaceGetBytesPerElementOfPlane(t->_surface, t->_plane);
+            // the image's texels, which a regrouping (round 23) makes bigger than the surface's elements
+            NSUInteger px = vg_bytes_per_pixel(t->_pixelFormat);
             // Did anyone else write the surface since we last pulled it? Then the rest of it is newer than our image,
             // and the next bind must pull it (5d): marking it synced kept Safari's page image without what WebKit had
             // painted on the CPU meanwhile, and Core Animation drew that part black. The seed is read before our own
@@ -1589,6 +1590,7 @@ static void vg_surface_debug(VGMTLTexture *t) {
             if (!othersWrote) {
                 t->_syncedSeed = seed;   // our own write: no pull needed for it
                 t->_neverSynced = NO;
+                vg_surface_siblings_synced(t, seedBefore, seed);   // nor for the plane's other images (round 23)
             }
             os_unfair_lock_unlock(&gVgSurfaceSync);
             vg_surface_wrote_back(t, seed);   // and none for a process sharing this image (5d)
@@ -1667,6 +1669,7 @@ static void vg_surface_debug(VGMTLTexture *t) {
             writeBackTwins = e && e[0] == '1';
         }
         NSMutableSet *noWriteBack = nil;
+        NSMutableArray<VGMTLTexture *> *gpuWrote = [NSMutableArray arrayWithCapacity:_surfacesWritten.count];
         for (VGMTLTexture *t in _surfacesWritten) {
             [self barrier];
             // A display frame: into the surface's twin, which the kext scans out (5c). Such a surface is only read on
@@ -1704,6 +1707,7 @@ static void vg_surface_debug(VGMTLTexture *t) {
                 if (!shown && (t->_hotWrites < 10 || !vg_surface_is_scanout(t))) {
                     _allTwinned = NO;
                 }
+                [gpuWrote addObject:t];
                 if (shown && !writeBackTwins) {
                     if (vg_synclog()) {
                         vglog("synclog shown, no write-back: surface %u %lux%lu seed %u synced %u",
@@ -1727,6 +1731,9 @@ static void vg_surface_debug(VGMTLTexture *t) {
                       dr[2], dr[3], _present ? " present" : "", twinned ? " twinned" : "", IOSurfaceGetSeed(t->_surface),
                       t->_syncedSeed);
             }
+            if (drawn) {
+                [gpuWrote addObject:t];
+            }
             if (!drawn) {   // stored, but nothing drawn into it: nothing to copy out
                 if (vg_synclog()) {
                     vglog("synclog nothing drawn, no write-back: surface %u %lux%lu", IOSurfaceGetID(t->_surface),
@@ -1741,7 +1748,7 @@ static void vg_surface_debug(VGMTLTexture *t) {
             if (!t->_staging.buffer && vg_staging_get(t->_surfaceBpr * t->_height, &t->_staging)) {
                 continue;   // no memory for its write-back (logged by the pool)
             }
-            NSUInteger px = IOSurfaceGetBytesPerElementOfPlane(t->_surface, t->_plane);
+            NSUInteger px = vg_bytes_per_pixel(t->_pixelFormat);   // the image's texels (a regrouping's are bigger)
             VkBufferImageCopy c = {(VkDeviceSize)dr[1] * t->_surfaceBpr + (VkDeviceSize)dr[0] * px,
                                    (uint32_t)(t->_surfaceBpr / px), (uint32_t)t->_height,
                                    {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {dr[0], dr[1], 0},
@@ -1794,6 +1801,11 @@ static void vg_surface_debug(VGMTLTexture *t) {
             [self fail:[NSString stringWithFormat:@"vkQueueSubmit %d", r]];
             gVk.vkDestroyFence(gVk.device, fence, NULL);
             fence = VK_NULL_HANDLE;
+        }
+        // Submitted: these images now hold their surfaces' newest pixels, and the plane's other images are copied
+        // from them on the GPU before their next use (round 23).
+        for (VGMTLTexture *t in r == VK_SUCCESS ? gpuWrote : @[]) {
+            vg_surface_gpu_wrote(t);
         }
     }
     NSArray *scheduled;

@@ -5,6 +5,7 @@
 // some bandwidth on GPUs that compress attachments. replaceRegion / getBytes are synchronous, as Metal's are: a
 // staging buffer and a one-shot command buffer each.
 #include <os/lock.h>
+#import <objc/runtime.h>
 #import "objects.h"
 
 // ---- formats -----------------------------------------------------------------------------------------------------
@@ -416,13 +417,16 @@ void vg_staging_put(vg_buffer *b) {
 // ---- deferred work (5c) --------------------------------------------------------------------------------------------
 
 typedef struct {
-    int kind;   // 0 init, 1 copy
+    int kind;   // 0 init, 1 copy, 2 image -> staging -> image (round 23)
     VkImage image;
     VkImageAspectFlags aspect;
     uint32_t mips, layers;
     VkBuffer src;
     VkBufferImageCopy copy;
     vg_buffer staging;   // owned when .buffer is set
+    VkImage from;        // kind 2: the source image, read into staging by copy0; then staging -> image by copy
+    VkBufferImageCopy copy0;
+    void *fromOwner;     // kind 2: the source image's texture, retained until the copy has run
 } vg_pending_op;
 
 static pthread_mutex_t gPendingLock = PTHREAD_MUTEX_INITIALIZER;
@@ -454,12 +458,29 @@ void vg_pending_copy(VkBuffer src, VkImage dst, const VkBufferImageCopy *c, cons
     vg_pending_push(&op);
 }
 
+void vg_pending_image_copy(VkImage from, id srcOwner, VkImage dst, const VkBufferImageCopy *c1,
+                           const VkBufferImageCopy *c2, const vg_buffer *staging) {
+    vg_pending_op op = {2, dst};
+    op.from = from;
+    op.copy0 = *c1;
+    op.copy = *c2;
+    op.staging = *staging;
+    op.src = staging->buffer;
+    op.fromOwner = (__bridge_retained void *)srcOwner;
+    vg_pending_push(&op);
+}
+
 void vg_pending_forget(VkImage image) {
+    // source textures released outside the lock (their dealloc comes back here)
+    __attribute__((objc_precise_lifetime)) NSMutableArray *drop = [NSMutableArray array];
     pthread_mutex_lock(&gPendingLock);
     size_t w = 0;
     for (size_t i = 0; i < gPendingCount; i++) {
         if (gPending[i].image == image) {
             vg_staging_put(&gPending[i].staging);
+            if (gPending[i].fromOwner) {
+                [drop addObject:(__bridge_transfer id)gPending[i].fromOwner];
+            }
         } else {
             gPending[w++] = gPending[i];
         }
@@ -497,13 +518,39 @@ BOOL vg_pending_record(VkCommandBuffer cb, NSMutableData **owned) {
     gVk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     NSMutableData *keep = [NSMutableData data];
+    NSMutableArray *owners = nil;
     for (size_t i = 0; i < n; i++) {
-        if (ops[i].kind == 1) {
+        if (ops[i].kind == 2) {
+            // Between images of one surface (round 23): whatever was copied before is in (a CPU pull of the source,
+            // say), the source into staging, then staging into the image, and the copies after see it.
+            VkMemoryBarrier b0 = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT,
+                                  VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
+            gVk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &b0,
+                                     0, NULL, 0, NULL);
+            gVk.vkCmdCopyImageToBuffer(cb, ops[i].from, VK_IMAGE_LAYOUT_GENERAL, ops[i].src, 1, &ops[i].copy0);
+            VkMemoryBarrier b1 = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                  VK_ACCESS_TRANSFER_READ_BIT};
+            gVk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &b1, 0,
+                                     NULL, 0, NULL);
+            gVk.vkCmdCopyBufferToImage(cb, ops[i].src, ops[i].image, VK_IMAGE_LAYOUT_GENERAL, 1, &ops[i].copy);
+            VkMemoryBarrier b2 = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                  VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
+            gVk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &b2, 0,
+                                     NULL, 0, NULL);
+            [keep appendBytes:&ops[i].staging length:sizeof(vg_buffer)];
+            if (!owners) {
+                owners = [NSMutableArray array];
+            }
+            [owners addObject:(__bridge_transfer id)ops[i].fromOwner];
+        } else if (ops[i].kind == 1) {
             gVk.vkCmdCopyBufferToImage(cb, ops[i].src, ops[i].image, VK_IMAGE_LAYOUT_GENERAL, 1, &ops[i].copy);
             if (ops[i].staging.buffer) {
                 [keep appendBytes:&ops[i].staging length:sizeof(vg_buffer)];
             }
         }
+    }
+    if (owners) {   // the source textures live as long as the stagings do: until the command buffer has run
+        objc_setAssociatedObject(keep, &gPendingLock, owners, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     VkMemoryBarrier after = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT,
                              VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
@@ -1224,6 +1271,23 @@ id<MTLTexture> vg_texture_view_swz(VGMTLTexture *p, MTLPixelFormat pf, MTLTextur
 
 os_unfair_lock gVgSurfaceSync = OS_UNFAIR_LOCK_INIT;
 static void vg_surface_pull_locked(VGMTLTexture *t);
+static void vg_sibling_sync_locked(VGMTLTexture *t);
+static BOOL vg_siblings_on(void);
+
+// The images of one surface plane in this process (round 23). A wrapper in another size or texel size than the first
+// one is an image of its own: VideoToolbox's Metal transfer reads a 512-wide BGRA plane as a 128-wide RGBA32Uint
+// texture (the same 2048-byte rows). Kept in step only through the surface's CPU copy, such an image read before a
+// sibling's GPU write was written back got stale pixels (0.1.10's striped Memoji). Now each submitted GPU write
+// numbers its image as the group's newest, and an image behind it is copied from it on the GPU before its next use.
+// The fields are guarded by gVgSurfaceSync; the group lives as long as one of its images (each holds it).
+@interface VGSurfaceGroup : NSObject {
+@public
+    NSHashTable<VGMTLTexture *> *roots;   // weak
+    uint64_t gen;                         // GPU writes submitted so far, to any of them
+}
+@end
+@implementation VGSurfaceGroup
+@end
 
 void vg_surface_pull(VGMTLTexture *t) {
     if (t && t->_parent) {
@@ -1250,7 +1314,98 @@ void vg_surface_pull(VGMTLTexture *t) {
     // half-done state read as someone else's write, and the pull it caused put an older frame over a newer one).
     os_unfair_lock_lock(&gVgSurfaceSync);
     vg_surface_pull_locked(t);
+    vg_sibling_sync_locked(t);
     os_unfair_lock_unlock(&gVgSurfaceSync);
+}
+
+void vg_surface_gpu_wrote(VGMTLTexture *t) {
+    while (t && t->_parent) {
+        t = t->_parent;
+    }
+    if (!t || !t->_group) {
+        return;
+    }
+    os_unfair_lock_lock(&gVgSurfaceSync);
+    VGSurfaceGroup *g = t->_group;
+    t->_gpuGen = ++g->gen;
+    os_unfair_lock_unlock(&gVgSurfaceSync);
+}
+
+void vg_surface_siblings_synced(VGMTLTexture *t, uint32_t before, uint32_t seed) {
+    VGSurfaceGroup *g = t->_group;
+    if (!g || g->roots.count < 2 || !vg_siblings_on()) {
+        return;
+    }
+    for (VGMTLTexture *s in g->roots) {
+        if (s != t && !s->_neverSynced && s->_syncedSeed == before) {
+            s->_syncedSeed = seed;   // t's write: s gets t's pixels on the GPU (vg_sibling_sync_locked), not a pull
+        }
+    }
+}
+
+static size_t vg_gcd(size_t a, size_t b) {
+    while (b) {
+        size_t r = a % b;
+        a = b, b = r;
+    }
+    return a;
+}
+
+// t is about to be used: if a sibling holds a newer GPU write, copy it in on the GPU, ahead of the next submit (the
+// write was submitted already, so it runs before; a write and a sibling's read in the same command buffer aren't
+// covered). A sibling that someone else's write has overtaken since (its seed no longer the surface's) is passed
+// over: t has pulled those bytes.
+// The VirtioGPUMetal-nosibling flag file turns it off (0.1.10's regroupings, synced through the CPU only), to compare.
+static BOOL vg_siblings_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = !vg_debug_flag("nosibling");
+    }
+    return on;
+}
+static void vg_sibling_sync_locked(VGMTLTexture *t) {
+    VGSurfaceGroup *g = t->_group;
+    if (!g || g->gen == t->_gpuGen || !vg_siblings_on()) {
+        return;
+    }
+    VGMTLTexture *n = nil;
+    for (VGMTLTexture *s in g->roots) {
+        if (s != t && s->_gpuGen > t->_gpuGen && (!n || s->_gpuGen > n->_gpuGen)) {
+            n = s;
+        }
+    }
+    if (!n) {
+        t->_gpuGen = g->gen;
+        return;
+    }
+    const uint32_t seed = IOSurfaceGetSeed(t->_surface);
+    const vg_format *nf = vg_format_of(n->_pixelFormat), *tf = vg_format_of(t->_pixelFormat);
+    if (n->_neverSynced || n->_syncedSeed != seed || !nf || !tf || !nf->bytes || !tf->bytes) {
+        t->_gpuGen = n->_gpuGen;
+        return;
+    }
+    // the bytes both images cover: the narrower one's rows, in whole texels of each
+    size_t nb = nf->bytes, tb = tf->bytes, unit = nb / vg_gcd(nb, tb) * tb;
+    size_t rowBytes = MIN(n->_width * nb, t->_width * tb);
+    rowBytes -= rowBytes % unit;
+    uint32_t rows = (uint32_t)MIN(n->_height, t->_height);
+    vg_buffer st;
+    if (!rowBytes || !rows || t->_surfaceBpr % nb || t->_surfaceBpr % tb ||
+        vg_staging_get(t->_surfaceBpr * rows, &st)) {
+        return;   // tried again at the next use
+    }
+    VkBufferImageCopy c1 = {0, (uint32_t)(t->_surfaceBpr / nb), rows, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
+                            {(uint32_t)(rowBytes / nb), rows, 1}};
+    VkBufferImageCopy c2 = {0, (uint32_t)(t->_surfaceBpr / tb), rows, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
+                            {(uint32_t)(rowBytes / tb), rows, 1}};
+    vg_pending_image_copy(n->_image, n, t->_image, &c1, &c2, &st);
+    if (vg_synclog()) {
+        vglog("synclog sibling: surface %u %lux%lu pf%lu <- %lux%lu pf%lu (generation %llu, had %llu)",
+              IOSurfaceGetID(t->_surface), (unsigned long)t->_width, (unsigned long)t->_height,
+              (unsigned long)t->_pixelFormat, (unsigned long)n->_width, (unsigned long)n->_height,
+              (unsigned long)n->_pixelFormat, (unsigned long long)n->_gpuGen, (unsigned long long)t->_gpuGen);
+    }
+    t->_gpuGen = n->_gpuGen;
 }
 
 static void vg_surface_pull_locked(VGMTLTexture *t) {
@@ -1491,6 +1646,19 @@ static VGMTLTexture *vg_surface_root_image(id<MTLDevice> device, MTLTextureDescr
     return (VGMTLTexture *)vg_new_texture(device, rd);
 }
 
+static BOOL vg_format_is_integer(MTLPixelFormat pf) {
+    switch (pf) {
+    case MTLPixelFormatR8Uint: case MTLPixelFormatR8Sint: case MTLPixelFormatR16Uint: case MTLPixelFormatR16Sint:
+    case MTLPixelFormatRG8Uint: case MTLPixelFormatRG8Sint: case MTLPixelFormatR32Uint: case MTLPixelFormatR32Sint:
+    case MTLPixelFormatRG16Uint: case MTLPixelFormatRG16Sint: case MTLPixelFormatRGBA8Uint: case MTLPixelFormatRGBA8Sint:
+    case MTLPixelFormatRGB10A2Uint: case MTLPixelFormatRG32Uint: case MTLPixelFormatRG32Sint: case MTLPixelFormatRGBA16Uint:
+    case MTLPixelFormatRGBA16Sint: case MTLPixelFormatRGBA32Uint: case MTLPixelFormatRGBA32Sint:
+        return YES;
+    default:
+        return NO;
+    }
+}
+
 id<MTLTexture> vg_new_surface_texture(id<MTLDevice> device, MTLTextureDescriptor *d, IOSurfaceRef surface, NSUInteger plane) {
     const vg_format *f = vg_format_of(d.pixelFormat);
     if (!surface || !f || (f->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT) || d.textureType != MTLTextureType2D ||
@@ -1501,13 +1669,17 @@ id<MTLTexture> vg_new_surface_texture(id<MTLDevice> device, MTLTextureDescriptor
     }
     size_t bpr = IOSurfaceGetBytesPerRowOfPlane(surface, plane);
     size_t sw = IOSurfaceGetWidthOfPlane(surface, plane), sh = IOSurfaceGetHeightOfPlane(surface, plane);
-    // Only in the plane's own element size. VideoToolbox's Metal transfer (VTMTSComputeFunction) asks for regroupings
-    // (a 512-wide BGRA plane as a 128-wide RGBA32Uint texture); refused, it converts on the CPU. Taken (0.1.10, for the
-    // login screen's list of user pictures), each regrouping was an image of its own, kept in step with the surface's
-    // other images only through the CPU's copy: read before a GPU write to the surface was written back, it got stale
-    // pixels, and the Memoji picker's stickers came out striped and mixed up. Taking them needs the images of one
-    // surface kept in step on the GPU first.
-    if (d.width > sw || d.height > sh || bpr % f->bytes || IOSurfaceGetBytesPerElementOfPlane(surface, plane) != f->bytes) {
+    // A plane's rows in its own elements, or regrouped into bigger integer ones: VideoToolbox's Metal transfer
+    // (VTMTSComputeFunction) reads a 512-wide BGRA plane as a 128-wide RGBA32Uint texture (the same 2048-byte rows)
+    // to convert a user's picture for the login screen's list of users; refused, it converts on the CPU, and that
+    // list showed no pictures. Integer texels carry the bits as they are. Such a regrouping is an image of its own,
+    // kept in step with the plane's other images on the GPU (VGSurfaceGroup, round 23): 0.1.10 took them with only the
+    // CPU copy between them, and the Memoji picker's stickers came out striped and mixed up. A regrouping into
+    // normalized or float texels stays refused (VideoToolbox's 10-bit copy into RGBA16Unorm texels came out wrong).
+    size_t eb = IOSurfaceGetBytesPerElementOfPlane(surface, plane);
+    BOOL fits = eb == f->bytes ? d.width <= sw
+                               : (vg_format_is_integer(d.pixelFormat) && eb && d.width * f->bytes <= sw * eb);
+    if (!fits || d.height > sh || bpr % f->bytes) {
         vglog("surface texture: %lux%lu format %lu doesn't fit surface %zux%zu, %zu bytes per row, %zu per element",
               (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.pixelFormat, sw, sh, bpr,
               IOSurfaceGetBytesPerElementOfPlane(surface, plane));
@@ -1519,8 +1691,10 @@ id<MTLTexture> vg_new_surface_texture(id<MTLDevice> device, MTLTextureDescriptor
     // WindowServer copied stale pixels forward (old window pieces left behind, flicker) once frames overlapped.
     static NSMapTable<NSString *, VGMTLTexture *> *roots;
     static pthread_mutex_t rootsLock = PTHREAD_MUTEX_INITIALIZER;
-    NSString *key = [NSString stringWithFormat:@"%u/%lu/%lux%lu", IOSurfaceGetID(surface), (unsigned long)plane,
-                                               (unsigned long)d.width, (unsigned long)d.height];
+    // (and the texel size: a regrouping's image can't have views in the plane's own texels, round 23)
+    NSString *key = [NSString stringWithFormat:@"%u/%lu/%lux%lu%@", IOSurfaceGetID(surface), (unsigned long)plane,
+                                               (unsigned long)d.width, (unsigned long)d.height,
+                                               f->bytes == eb ? @"" : [NSString stringWithFormat:@"/%u", (unsigned)f->bytes]];
     pthread_mutex_lock(&rootsLock);
     if (!roots) {
         roots = [NSMapTable strongToWeakObjectsMapTable];
@@ -1551,6 +1725,18 @@ id<MTLTexture> vg_new_surface_texture(id<MTLDevice> device, MTLTextureDescriptor
     t->_usage = d.usage;
     [roots setObject:t forKey:key];
     vg_root_keep(key, t);
+    // its siblings: the plane's images in other sizes or texel sizes (round 23)
+    static NSMapTable<NSString *, VGSurfaceGroup *> *groups;
+    if (!groups) {
+        groups = [NSMapTable strongToWeakObjectsMapTable];
+    }
+    NSString *gkey = [NSString stringWithFormat:@"%u/%lu", IOSurfaceGetID(surface), (unsigned long)plane];
+    VGSurfaceGroup *group = [groups objectForKey:gkey];
+    if (!group) {
+        group = [VGSurfaceGroup new];
+        group->roots = [NSHashTable weakObjectsHashTable];
+        [groups setObject:group forKey:gkey];
+    }
     pthread_mutex_unlock(&rootsLock);
     t->_surface = (IOSurfaceRef)CFRetain(surface);
     t->_scanout = -1;   // looked at the first time a display frame writes it
@@ -1561,6 +1747,11 @@ id<MTLTexture> vg_new_surface_texture(id<MTLDevice> device, MTLTextureDescriptor
         t->_neverSynced = NO;   // the creator's image holds what the surface does: nothing to pull
         t->_syncedSeed = IOSurfaceGetSeed(surface);
     }
+    os_unfair_lock_lock(&gVgSurfaceSync);
+    [group->roots addObject:t];
+    t->_group = group;
+    t->_gpuGen = 0;   // what the CPU holds; a sibling's newer GPU write is copied in at the pull below
+    os_unfair_lock_unlock(&gVgSurfaceSync);
     vg_surface_pull(t);
     static int said;
     if (said++ < 60) {

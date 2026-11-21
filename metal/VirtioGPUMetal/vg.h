@@ -130,6 +130,11 @@ void vg_staging_put(vg_buffer *b);
 void vg_pending_init_image(VkImage image, VkImageAspectFlags aspect, uint32_t mips, uint32_t layers);
 // staging (may be NULL) belongs to the queue from here on and is destroyed once the copy has run.
 void vg_pending_copy(VkBuffer src, VkImage dst, const VkBufferImageCopy *c, const vg_buffer *staging);
+// An image -> staging -> image copy (round 23: one surface plane's images of different texel sizes, where
+// vkCmdCopyImage isn't allowed): `from` image into staging by c1, staging into `dst` by c2. srcOwner is kept alive
+// until the copy has run; staging belongs to the queue.
+void vg_pending_image_copy(VkImage from, id srcOwner, VkImage dst, const VkBufferImageCopy *c1,
+                           const VkBufferImageCopy *c2, const vg_buffer *staging);
 void vg_pending_forget(VkImage image);   // an image going away: drop what waits for it
 // Records everything waiting into cb (barriers around it); the stagings to destroy after cb completes go to *owned
 // (an array of vg_buffer the caller frees with vg_pending_release). NO when nothing was waiting.

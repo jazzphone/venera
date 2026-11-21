@@ -391,6 +391,10 @@ Files in `/Library/GPUBundles` the Metal driver reads (root only; delete them to
   overflows), so a synchronous video decode gets its frame before the call returns, as on a Mac: the moving
   wallpaper's first still needs that. Only VideoToolbox's copy in that process's memory changes. Read when a process
   starts.
+- `VirtioGPUMetal-nosibling`: keep a surface's images in other texel sizes in step through its CPU copy only, as in
+  0.1.10 (since 0.1.13 the driver copies them from each other on the GPU; VideoToolbox's Metal transfer reads a
+  picture's plane that way, for the login window's list of users and the Memoji picker). For comparing; with it, those
+  pictures can come out stale. Read when a process starts.
 
 The accelerator flips at most once per 12 ms by default (`vgpuflipms=N` boot-arg, 0 = no limit).
 

@@ -1,5 +1,5 @@
 #!/bin/zsh
-# User-space tools for the VM (x86_64): build/vgputest, build/vkprobe, build/vkexec, build/acceltest, build/llvmprobe, build/mtlprobe, build/mtlcompute, build/mtlrender, build/mtltess, build/mtlcube, build/mtlalign, build/smckeys, build/mtllat, build/blobtest, build/dragtest, build/modetest (tools/pngdiff.m runs on the Mac: build it by hand) (+ metallibs)
+# User-space tools for the VM (x86_64): build/vgputest, build/vkprobe, build/vkexec, build/acceltest, build/llvmprobe, build/mtlprobe, build/mtlcompute, build/mtlrender, build/mtltess, build/mtlcube, build/mtlalign, build/mtlregroup, build/mtlpipe, build/vtstill, build/smckeys, build/mtllat, build/blobtest, build/dragtest, build/modetest (tools/pngdiff.m runs on the Mac: build it by hand) (+ metallibs)
 set -euo pipefail
 cd "${0:A:h}/.."
 mkdir -p build
@@ -25,6 +25,9 @@ $CC -fobjc-arc -framework Foundation -framework Metal tools/mtlptr.m -o build/mt
 $CC -fobjc-arc -framework Foundation -framework Metal tools/mtltess.m -o build/mtltess
 $CC -fobjc-arc -framework Foundation -framework Metal tools/mtlcube.m -o build/mtlcube
 $CC -fobjc-arc -framework Foundation -framework Metal tools/mtlalign.m -o build/mtlalign
+$CC -fobjc-arc -framework Foundation -framework Metal -framework IOSurface tools/mtlregroup.m -o build/mtlregroup
+$CC -fobjc-arc -framework Foundation -framework Metal tools/mtlpipe.m -o build/mtlpipe
+$CC -fobjc-arc -Wno-deprecated-declarations -framework Foundation -framework Metal -framework AVFoundation -framework CoreMedia -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers tools/vtstill.m -o build/vtstill
 $CC -framework IOKit tools/smckeys.c -o build/smckeys
 $CC -fobjc-arc -framework Foundation -framework CoreGraphics tools/wininfo.m -o build/wininfo
 $CC -fobjc-arc -Wno-deprecated-declarations -framework Foundation -framework Metal -framework CoreImage tools/citest.m -o build/citest

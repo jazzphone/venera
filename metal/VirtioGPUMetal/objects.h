@@ -53,6 +53,11 @@ id<MTLBuffer> vg_new_buffer_nocopy(id<MTLDevice> device, void *pointer, NSUInteg
     uint32_t _syncedSeed;   // the surface seed the image matches (after a pull or our own copy-out)
     BOOL _neverSynced;
     vg_buffer _staging;
+    // The other images of the same surface plane in this process (a regrouping into other texels, another size): a
+    // VGSurfaceGroup, and the group's write generation this image holds (round 23). A sibling behind the newest GPU
+    // write is copied from it on the GPU before it is used (vg_surface_pull), not from the surface's CPU copy.
+    id _group;
+    uint64_t _gpuGen;
     // A texture over a buffer's memory (newTextureWithDescriptor:offset:bytesPerRow: and the tiled/linear SPI): Venus
     // can't alias the two, so the image is refreshed from the buffer each time it is bound or read (5b).
     id _srcBuffer;
@@ -89,8 +94,14 @@ id<MTLBuffer> vg_new_buffer_nocopy(id<MTLDevice> device, void *pointer, NSUInteg
 void vg_surface_wrote_back(VGMTLTexture *t, uint32_t seed);
 void vg_texture_share_dealloc(VGMTLTexture *t);
 
-// The surface's CPU contents -> the image, when the surface changed since the image last matched it (synchronous).
+// The surface's CPU contents -> the image, when the surface changed since the image last matched it (synchronous);
+// then, when another image of the same surface plane holds a newer GPU write, a GPU copy from it (deferred work).
 void vg_surface_pull(VGMTLTexture *t);
+// A submitted command buffer wrote root t on the GPU: its image is now the surface's newest (round 23).
+void vg_surface_gpu_wrote(VGMTLTexture *t);
+// t's write-back made the surface's seed `seed` from `before`, nobody else having written: its siblings that matched
+// `before` match `seed` too, since they get t's pixels on the GPU (call with gVgSurfaceSync held).
+void vg_surface_siblings_synced(VGMTLTexture *t, uint32_t before, uint32_t seed);
 // Records that `cmd` writes texture `t`: a surface texture is copied back to its IOSurface when `cmd` completes.
 void vg_cmd_wrote(id cmd, VGMTLTexture *t);
 void vg_cmd_wrote_rect(id cmd, VGMTLTexture *t, int32_t x0, int32_t y0, int32_t x1, int32_t y1);
