@@ -1,4 +1,4 @@
-# the host stack this release was tested on (install-host.sh --record on the test host, 2026-11-19)
+# the host stack this release was tested on (install-host.sh --record on the test host, 2026-11-21)
 pve-qemu-kvm 11.1.3-1
 libvirglrenderer1 1.1.0-2
 virgl-server 1.1.0-2
