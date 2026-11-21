@@ -2192,3 +2192,33 @@ TRIM, Upgrade without a USB disk, Retina modes, a faster first boot (a warm-up a
   systemd unit: one started from an SSH session died with it); 107's agent couldn't take the package, the USB disk
   did. VM 108 lost its mouse after its restart: two tablets (Proxmox's and the args'), fixed with --tablet 0 and in
   Upgrade since (004fb03, after the release).
+
+### 0.1.11 (2026-11-20)
+
+- **0.1.10's Memoji came out striped and mixed up** (Setup Assistant's account step, Users & Groups' picture picker):
+  the surface-plane regrouping that let VideoToolbox convert the login list's pictures on the GPU (d3995dd) gave the
+  regrouped image stale pixels, being kept in step with the surface only through its CPU bytes. Reverted (7ba5122);
+  the login list's small pictures (two or more users) are missing again until a surface's images are kept in step
+  on the GPU. VM 108 with only the revert: clean.
+- VM script: an Upgrade turns Proxmox's own tablet off when the args bring one (two tablets: the console's mouse went
+  to the one macOS wasn't reading); a new VM under a removed VM's name replaces its unused OpenCore image.
+- Released as v0.1.11 (8bbac3f). VM 109's Upgrade stopped after the install: the package's agent swap took the
+  installer's answer with the old agent (fixed after the release, 1099a4a: the result is read from a file).
+
+### 0.1.12 (2026-11-21)
+
+- **Screen Sharing left trails behind a dragged window**; Proxmox's console didn't. Screen Sharing reads SkyLight's
+  display stream ("DisplayStream surface N/8", two surfaces written in turn in display command buffers) on the CPU
+  as soon as commitAndWaitUntilSubmitted returns. Written every frame, they fell under the rule that stops waiting
+  for a surface's write-back after 10 frames in a row (meant for CoreDisplay's scanout surfaces): their pixels came
+  back ~25 ms later and Screen Sharing sent the changed parts of an older frame. Found with `synclog` and a test
+  switch that waited for every write-back (no trails); only scanout surfaces (CreationProperties IsDisplayable) skip
+  the wait now (fbe1e5e). VM 107 over Screen Sharing: no trails, as smooth.
+- **The Memoji picker still showed 0.1.10's striped Memoji** under 0.1.11: it saves a picture of each animal in
+  `~/Library/Caches/Animoji` and shows it again rather than drawing it. The installer moves them aside once
+  (85d9970).
+- VM script (ca454ef): HA's VMs are stopped through HA (a shutdown from macOS made HA start the VM again at once,
+  and a config change went in as pending); Upgrade moves a guest agent on the ISA serial port (ten times slower,
+  dropped requests of a few KB) to its virtio port, its restart then a shut-down and a start.
+- Released as v0.1.12 (a080cec). Open: the login list's pictures, a DockHelper shader the translator refuses
+  (`llvm.fmuladd` on `<3 x half>`), Screen Sharing's frame rate (measure), speed.
