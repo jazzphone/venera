@@ -601,6 +601,19 @@ if [ ! -e "$V/wallpaper-exports-redone" ] && [ -d /var/db/Wallpapers ]; then
   run touch "$V/wallpaper-exports-redone"
   [ $moved = 0 ] || say "login screen: $moved moving wallpaper's copy set aside (made again at its user's next login)"
 fi
+# The Memoji picker's saved pictures (~/Library/Caches/Animoji, one per animal): drawn by 0.1.10 they came out striped
+# and mixed up, and the picker shows them again rather than drawing them. Moved aside once; the picker draws new ones.
+if [ ! -e "$V/animoji-caches-redone" ]; then
+  moved=0
+  for d in /Users/*/Library/Caches/Animoji; do
+    [ -d "$d" ] || continue
+    u=$(basename "$(dirname "$(dirname "$(dirname "$d")")")")
+    run mkdir -p "$V/old-animoji-caches"
+    run mv "$d" "$V/old-animoji-caches/$u-$(date +%Y%m%d%H%M%S)" && moved=$((moved + 1))
+  done
+  run touch "$V/animoji-caches-redone"
+  [ $moved = 0 ] || say "Memoji picker: $moved user's saved pictures set aside (drawn again when the picker opens)"
+fi
 
 # ---- 5. the Venera app ---------------------------------------------------------------------------------------------
 CUID=$(stat -f %u /dev/console)
