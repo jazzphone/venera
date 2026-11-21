@@ -129,6 +129,7 @@ id<MTLTexture> vg_texture_view(VGMTLTexture *p, MTLPixelFormat pf, MTLTextureTyp
 id<MTLTexture> vg_texture_view_swz(VGMTLTexture *p, MTLPixelFormat pf, MTLTextureType type, NSRange levels, NSRange slices,
                                    MTLTextureSwizzleChannels swz);
 id<MTLTexture> vg_new_buffer_texture(id<MTLBuffer> buffer, MTLTextureDescriptor *d, NSUInteger offset, NSUInteger bpr);
+VGMTLTexture *vg_new_zero_color_texture(id<MTLDevice> device, MTLTextureDescriptor *descriptor);
 
 @interface VGMTLSamplerState : NSObject <MTLSamplerState> {
 @public

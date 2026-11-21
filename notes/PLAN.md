@@ -2485,3 +2485,21 @@ corner to corner 8 times in one press (`qmpinput.py sweep`, 0.4 s each way) and 
   the ring's wake-ups, fence polling, QEMU's flips and console readback, implicit sync on the twins, held images.
   Left: something on the host side of WindowServer's own Venus context; needs a host profile (`perf` on the node,
   the owner's call).
+
+### Retina drag slowdown (2026-11-21)
+
+- On proxmox2, matching VM 108 drags measured 17.9 ms per frame at 1280x800 and 32.1 ms at 2880x1800.
+  The guest's `vkQueueSubmit` returned in about 0.01 ms. Intel render-engine busy time was 47% and 43%,
+  respectively. In the Retina host profile, 56% of CPU samples across the Venus ring and QEMU main threads landed
+  in `kernel_init_pages` and `shmem_get_folio_gfp` under i915's execbuffer validation. GEM tracepoints counted
+  1,574 render-worker allocations of the padded Retina image size (21,012,480 bytes) in a 6.5-second sweep.
+- WindowServer's framebuffer-fetch fallback made blank images at the size of the render pass for missing
+  attachments. These images are read-only and can share one explicitly cleared texture that covers the render
+  area. On VM 108, with the same test bundle and the cache off, on, then off, mean Retina frame gaps were
+  34.1, 18.6, and 36.4 ms. The render worker created 1,486, 1, and 1,378 Retina-size GEM objects and reported
+  132,825, 2,768, and 123,894 page allocation events during the three samples.
+- The signed development build with reuse enabled by default measured 18.4 ms at 1280x800 and 18.9 and 19.9 ms
+  in two 2880x1800 sweeps. WindowServer stayed up through both modes. The Metal rendering probe passed, including
+  framebuffer fetch, texture upload and readback, blending, and compute writes. Two 2880x1800 scanout captures
+  showed the test window in different positions with intact contents. VM 108 returned to 1280x800 with the signed
+  development build loaded.

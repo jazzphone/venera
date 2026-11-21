@@ -801,7 +801,7 @@ static __thread int gVgExt;
 static __thread int gVgImportFd = -1;
 static __thread const uint64_t *gVgImportParams;
 
-id<MTLTexture> vg_new_texture(id<MTLDevice> device, MTLTextureDescriptor *d) {
+static VGMTLTexture *vg_new_texture_impl(id<MTLDevice> device, MTLTextureDescriptor *d, BOOL clearColor) {
     const vg_format *f = vg_format_of(d.pixelFormat);
     if (vg_vulkan_init() || !f) {
         vglog("texture: pixel format %lu not supported yet", (unsigned long)d.pixelFormat);
@@ -983,8 +983,32 @@ id<MTLTexture> vg_new_texture(id<MTLDevice> device, MTLTextureDescriptor *d) {
         t->_shareSize = mai.allocationSize;
         t->_shareable = YES;   // initialized with the next submit like any image; offered at its first write-back
     }
-    vg_pending_init_image(image, aspect, mips, layers);   // UNDEFINED -> GENERAL for life, ahead of the next submit
+    if (clearColor) {
+        VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, layers};
+        if (!vg_one_shot(^(VkCommandBuffer cb) {
+                VkImageMemoryBarrier init = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0,
+                                             VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                                             VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                                             image, range};
+                gVk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                                         0, NULL, 0, NULL, 1, &init);
+                VkClearColorValue zero = {0};
+                gVk.vkCmdClearColorImage(cb, image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+            })) {
+            return nil;
+        }
+    } else {
+        vg_pending_init_image(image, aspect, mips, layers);   // UNDEFINED -> GENERAL for life, ahead of the next submit
+    }
     return t;
+}
+
+id<MTLTexture> vg_new_texture(id<MTLDevice> device, MTLTextureDescriptor *d) {
+    return vg_new_texture_impl(device, d, NO);
+}
+
+VGMTLTexture *vg_new_zero_color_texture(id<MTLDevice> device, MTLTextureDescriptor *descriptor) {
+    return vg_new_texture_impl(device, descriptor, YES);
 }
 
 // ---- MTLSamplerState ---------------------------------------------------------------------------------------------

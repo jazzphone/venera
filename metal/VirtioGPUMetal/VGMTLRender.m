@@ -1300,6 +1300,36 @@ static BOOL vg_can_feedback(VGMTLTexture *t, const char *why) {
     }
 }
 
+static VGMTLTexture *vg_fetch_image(id<MTLDevice> dev, MTLPixelFormat format, uint32_t width, uint32_t height, BOOL zero) {
+    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+                                                                               width:width
+                                                                              height:height
+                                                                           mipmapped:NO];
+    d.usage = MTLTextureUsageShaderRead;
+    d.storageMode = MTLStorageModePrivate;
+    return zero ? vg_new_zero_color_texture(dev, d) : (VGMTLTexture *)vg_new_texture(dev, d);
+}
+
+static VGMTLTexture *vg_fetch_blank(id<MTLDevice> dev, uint32_t width, uint32_t height) {
+    if (strcmp(getprogname(), "WindowServer")) {
+        return vg_fetch_image(dev, MTLPixelFormatBGRA8Unorm, width, height, NO);
+    }
+    // Fragment coordinates address this image directly. Missing attachments can share one cleared image large enough
+    // for the pass. At Retina, allocating a blank per encoder made i915 allocate and zero pages during submission.
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static VGMTLTexture *blank;
+    pthread_mutex_lock(&lock);
+    VGMTLTexture *result = blank;
+    if (!result || result->_width < width || result->_height < height) {
+        result = vg_fetch_image(dev, MTLPixelFormatBGRA8Unorm, width, height, YES);
+        if (result) {
+            blank = result;
+        }
+    }
+    pthread_mutex_unlock(&lock);
+    return result;
+}
+
 // Mode 4: end the pass, move each read attachment into the feedback loop layout (its writes so far -> the fragment
 // shader's reads), resume the pass in that layout and point set 3 at the attachments themselves. A fragment reads its
 // own pixel before this draw writes it, as with a copy; later draws are ordered by the next split's barrier.
@@ -1362,13 +1392,7 @@ static BOOL vg_can_feedback(VGMTLTexture *t, const char *why) {
             layout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
         } else {   // no attachment for this [[color(n)]]: a zeroed scratch image, as with copies
             if (!_fetchCopy[i]) {
-                MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                                                             width:_area.extent.width
-                                                                                            height:_area.extent.height
-                                                                                         mipmapped:NO];
-                td.usage = MTLTextureUsageShaderRead;
-                td.storageMode = MTLStorageModePrivate;
-                _fetchCopy[i] = (VGMTLTexture *)vg_new_texture(_owner.device, td);
+                _fetchCopy[i] = vg_fetch_blank(_owner.device, _area.extent.width, _area.extent.height);
                 if (!_fetchCopy[i]) {
                     [_owner fail:@"framebuffer fetch: no scratch image"];
                     return VK_NULL_HANDLE;
@@ -1429,14 +1453,8 @@ static BOOL vg_can_feedback(VGMTLTexture *t, const char *why) {
         VGMTLTexture *src = i < kVGMaxColor ? _colorTex[i] : nil;
         VGMTLTexture *dst = _fetchCopy[i];
         if (!dst) {
-            MTLTextureDescriptor *td = [MTLTextureDescriptor
-                texture2DDescriptorWithPixelFormat:src ? src->_pixelFormat : MTLPixelFormatBGRA8Unorm
-                                             width:_area.extent.width
-                                            height:_area.extent.height
-                                         mipmapped:NO];
-            td.usage = MTLTextureUsageShaderRead;
-            td.storageMode = MTLStorageModePrivate;
-            dst = (VGMTLTexture *)vg_new_texture(_owner.device, td);
+            dst = src ? vg_fetch_image(_owner.device, src->_pixelFormat, _area.extent.width, _area.extent.height, NO) :
+                        vg_fetch_blank(_owner.device, _area.extent.width, _area.extent.height);
             if (!dst) {
                 [_owner fail:@"framebuffer fetch: no scratch image"];
                 return VK_NULL_HANDLE;
