@@ -579,9 +579,14 @@ vm_other_nodes() {   # the other nodes the VM may run on: none when its disk is 
   other_nodes
 }
 backup_conf() { mkdir -p /root/macos-vm-backup; cp "/etc/pve/qemu-server/$VMID.conf" "/root/macos-vm-backup/$VMID.conf.$(date +%Y%m%d-%H%M%S)"; }
+ha_service() { ha-manager config 2>/dev/null | grep -qx "vm:$VMID"; }   # the VM is one of HA's services
 stop_vm() {   # shuts the VM down (from macOS, as the Apple menu does) and waits; HA's VMs through HA
   qm status "$VMID" | grep -q stopped && return 0
   echo "== shutting VM $VMID down"
+  # HA's own state to stopped first: HA starts a VM that shut down behind its back again at once, and a change made
+  # then goes in as pending while the VM comes back as it was (VM 107's agent port, 2026-11-20). qm start asks HA to
+  # start it again.
+  if ha_service; then ha-manager set "vm:$VMID" --state stopped >/dev/null 2>&1 || true; fi
   # through the guest agent when it answers: macOS at Setup Assistant (and while it starts up) doesn't act on the
   # power button Proxmox's shutdown presses, and the wait ran its full 10 minutes (2026-11-20)
   if qm guest cmd "$VMID" ping >/dev/null 2>&1; then
@@ -976,6 +981,10 @@ upgrade_vm() {   # a VM with Venera: this release's host half on every node, the
   user=$(tail -1 <<<"$st"); [ "$user" = root ] && user=""
   case " $(qm config "$VMID" | sed -n 's/^args: //p') " in *"/run/venera-video-$VMID.sock"*) HASDEV=1 ;; esac
   smc_plan
+  # Venera's agent answers on either port; the ISA serial one is ten times slower and drops big requests (the package
+  # through the agent timed out on VM 107): virtio, as Finish and new VMs have it, which QEMU adds only at a start
+  VIRTIO_AGENT=0
+  if [ $agent = 1 ] && ! qm config "$VMID" | grep -q '^agent:.*type=virtio'; then VIRTIO_AGENT=1; fi
   echo "  macOS has Venera $cur: hardware video $([ $video = 1 ] && echo on || echo off), the Venera app $([ $app = 1 ] && echo on || echo off), the guest agent $([ $agent = 1 ] && echo on || echo off), Safari WebGL (the system-volume copy) $([ $webgl = 1 ] && echo on || echo off)"
   if [ $HASDEV = 1 ]; then
     [ -n "$HOSTKIT" ] || die "VM $VMID has hardware video but Venera's host half isn't beside this script"
@@ -983,11 +992,15 @@ upgrade_vm() {   # a VM with Venera: this release's host half on every node, the
   fi
   echo; echo "== The plan"
   [ $HASDEV = 1 ] && echo "  - the host half: install-host.sh --vm $VMID here${nodes[*]:+ and on ${nodes[*]}} (running VMs keep their video connections)"
-  if [ $SMC_KEXTS = 1 ] || [ $SMC_ARGS = 1 ]; then
+  if [ $SMC_KEXTS = 1 ] || [ $SMC_ARGS = 1 ] || [ $VIRTIO_AGENT = 1 ]; then
     echo "  - in macOS: $(basename "$GPKG") through the guest agent, with the same choices"
     [ $SMC_KEXTS = 1 ] && echo "  - OpenCore: acidanthera's Lilu and VirtualSMC added, the OpenCore disk saved to /root first"
-    echo "  - the VM's SMC: VirtualSMC in place of QEMU's applesmc (with QEMU's alone, macOS's power logger can spin a CPU"
-    echo "    core for good), so the restart is a shut-down and a start"
+    if [ $SMC_KEXTS = 1 ] || [ $SMC_ARGS = 1 ]; then
+      echo "  - the VM's SMC: VirtualSMC in place of QEMU's applesmc (with QEMU's alone, macOS's power logger can spin a CPU"
+      echo "    core for good)"
+    fi
+    [ $VIRTIO_AGENT = 1 ] && echo "  - the guest agent on its virtio port (the ISA serial port is ten times slower and drops big requests)"
+    echo "    so the restart is a shut-down and a start$(ha_service && echo " (through HA: it may start the VM on another node)")"
   else
     echo "  - in macOS: $(basename "$GPKG") through the guest agent, with the same choices, then a restart"
   fi
@@ -1048,7 +1061,7 @@ usb_upgrade_disk() {   # the guest package on a USB disk in the running VM, moun
   if [ -z "$mnt" ]; then usb_disk del; rm -f "$img"; die "macOS didn't mount the USB disk in 2 minutes (did its screen lock?): nothing installed"; fi
 }
 upgrade_restart() {   # after upgrade_vm: macOS restarted, and what runs once it's back
-  if [ "${SMC_KEXTS:-0}" = 1 ] || [ "${SMC_ARGS:-0}" = 1 ]; then
+  if [ "${SMC_KEXTS:-0}" = 1 ] || [ "${SMC_ARGS:-0}" = 1 ] || [ "${VIRTIO_AGENT:-0}" = 1 ]; then
     stop_vm
     local smc_ok=1
     if [ "${SMC_KEXTS:-0}" = 1 ]; then
@@ -1058,7 +1071,10 @@ upgrade_restart() {   # after upgrade_vm: macOS restarted, and what runs once it
       echo "== OpenCore: Lilu and VirtualSMC (the old disk saved as $BK)"
       oc_add_smc || { smc_ok=0; warn "OpenCore wasn't changed (Venera's OpenCore, choice 5, brings them too): QEMU's applesmc stays"; }
     fi
-    [ $smc_ok = 1 ] && smc_args_off
+    if [ "${SMC_KEXTS:-0}" = 1 ] || [ "${SMC_ARGS:-0}" = 1 ]; then [ $smc_ok = 0 ] || smc_args_off; fi
+    if [ "${VIRTIO_AGENT:-0}" = 1 ]; then
+      qm set "$VMID" --agent enabled=1,type=virtio >/dev/null && echo "   guest agent port: virtio"
+    fi
     echo "== starting VM $VMID"
     qm start "$VMID" >/dev/null
     sleep 30
