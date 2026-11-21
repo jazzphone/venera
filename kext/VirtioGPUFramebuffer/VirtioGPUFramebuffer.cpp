@@ -49,7 +49,7 @@ constexpr uint32_t kMaxWidth = 3840;
 constexpr uint32_t kMaxHeight = 2400;
 constexpr uint32_t kSmallArea = 1920 * 1200; // the fallback's largest
 constexpr uint32_t kFlushIntervalMs = 33;
-constexpr uint32_t kVblHz = 60; // the rate the modes advertise; vgpuvblhz=N (24-240) runs the timer at N to measure
+constexpr uint32_t kVblHz = kVGPUDisplayRefreshHz; // vgpuvblhz=N (24-240) runs the timer at N to measure
 constexpr unsigned kMaxVblClients = 4;
 
 const char kPixelFormats[] = IO32BitDirectPixels "\0";
@@ -396,7 +396,7 @@ IOReturn VirtioGPUFramebuffer::getInformationForDisplayMode(IODisplayModeID id,
     bzero(info, sizeof(*info));
     info->nominalWidth = m->width;
     info->nominalHeight = m->height;
-    info->refreshRate = 60 << 16;
+    info->refreshRate = kVblHz << 16;
     info->maxDepthIndex = 0;
     info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag;
     if (m->width >= 2560) { // can back a Retina mode (the display override's scale-resolutions name these sizes)
@@ -473,7 +473,7 @@ IOReturn VirtioGPUFramebuffer::getTimingInfoForDisplayMode(IODisplayModeID id, I
     d.verticalBlanking = 30;
     d.verticalSyncOffset = 3;
     d.verticalSyncPulseWidth = 6;
-    d.pixelClock = (uint64_t)(m->width + 160) * (m->height + 30) * 60;
+    d.pixelClock = (uint64_t)(m->width + 160) * (m->height + 30) * kVblHz;
     d.minPixelClock = d.pixelClock;
     d.maxPixelClock = d.pixelClock;
     return kIOReturnSuccess;

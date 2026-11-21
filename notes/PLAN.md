@@ -2503,3 +2503,33 @@ corner to corner 8 times in one press (`qmpinput.py sweep`, 0.4 s each way) and 
   framebuffer fetch, texture upload and readback, blending, and compute writes. Two 2880x1800 scanout captures
   showed the test window in different positions with intact contents. VM 108 returned to 1280x800 with the signed
   development build loaded.
+
+### Scanout pacing audit (2026-11-21)
+
+- VM 108 with the Retina texture fix. Driving a matched drag with 60 Hz and 120 Hz input gave mean WindowServer
+  transaction gaps of 17.3 and 16.8 ms at 1280x800, and 22.6 and 17.8 ms at Retina. The in-guest display-link test
+  delivered almost 60 callbacks per second at both sizes. Its Retina transactions were 17.1 ms apart and
+  completed scanout flips were 20.3 ms apart.
+- Temporary kernel tracepoints matched the surface and generation when Metal prepared a copy and observed its
+  fence, and when the kernel queued and completed the display flip. In the steady part of the Retina drag, the
+  original 12 ms post-flip wait produced 19.65–19.77 ms mean flip gaps and 30.56–32.03 ms p95 transaction-to-flip
+  time. Counting the 12 ms from the flip's start gave 17.24 ms and 21.54 ms, respectively. The p95 wait for an
+  eligible frame to start flipping fell from 15.75–16.38 ms to 2.35 ms. With a second Venus context copying a Retina image at 60 Hz,
+  mean flip gaps fell from 19.44 to 17.18 ms and p95 transaction-to-flip time from 30.70 to 18.82 ms.
+- At 1280x800, applying 12 ms start-to-start to every flip left mean gaps near 16.7 ms but raised p99 flip gaps
+  from 20.24–20.74 ms to 23.28–25.03 ms across the two comparisons. The patch keeps the configured post-flip wait
+  when the call fits in the remaining part of a refresh interval. It shortens the wait when the call has used
+  more of the 60 Hz budget. An explicit throttle longer than a frame retains its full wait.
+- The Retina scanout calls averaged 0.4–0.7 ms for `SET_SCANOUT_BLOB` and 5.8–6.5 ms for `RESOURCE_FLUSH` in the
+  unloaded traces. An isolated 60 Hz texture-to-buffer copy on the same GPU took 1.25 ms at 1280x800 and 5.80 ms
+  at 2880x1800. The isolated copy and the in-guest fence interval measure different workloads.
+- A raw VNC client matched all 14 one-step window moves in each pacing mode. Median host input to changed
+  console pixels was 96.6 ms with the original pacing and 102.5 ms with 12 ms start-to-start. VM 108 has no
+  network interface, so LAN Screen Sharing remains to be measured. With the final build, the unmodified raw
+  VNC receiver got 24.72 Retina updates per second during a continuous drag.
+- The signed frame-budget build averaged 18.0–18.2 ms between Retina flips during drag, 18.1 ms during resize,
+  21.0 ms during guest-driven scroll, and 18.0 ms during drag with the second Venus context active. Both warm
+  1280x800 drags averaged 17.2 ms. The first 1280x800 drag after reboot hit 52 unready flips. Subsequent gesture
+  checks and warm repeats had zero, and the cause of the early stalls remains open. The Metal rendering probe
+  passed. Two scanout captures and a macOS shortcut screenshot at 2880x1800 showed intact window contents and
+  exposed background after motion. VM 108 is back at 1280x800 with the final accelerator and original core loaded.

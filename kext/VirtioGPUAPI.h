@@ -25,6 +25,7 @@
 #define kVGPULog "vgpu.log"
 
 #define kVGPUDisplayClass "VirtioGPUDisplay"
+#define kVGPUDisplayRefreshHz 60   // advertised by the framebuffer modes
 
 // ---- stage 5a: VirtioGPUAccel (Auxiliary KC) <-> VirtioGPUFramebuffer and the core ----
 // Asked of the framebuffer itself (callPlatformFunction on the VirtioGPUFramebuffer service).

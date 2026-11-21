@@ -438,12 +438,11 @@ static const int kPendingMax = 8;
 static PendingFlip gPending[kPendingMax];   // oldest first
 static int gPendingCount = 0;
 static SInt64 gFlipNs = 0, gFlipMaxNs = 0, gFlips = 0, gFlipsSkipped = 0, gFlipsUnready = 0;
-// The shortest time between two flips, in ms (0 = no limit). 12 by default (5c round 6): with the newest ready frame
-// flipped, 16 dropped a quarter of WindowServer's ~56 frames a second during a drag (flips 22 ms apart on average);
-// 12 follows it (18.5 ms) and still never flips twice inside one 60 Hz frame's jitter. QEMU's VNC server sends at
-// most one update per 30 ms anyway. Boot-arg vgpuflipms, or {"VirtioGPUFlipMs": n} at run time (`acceltest flipms N`).
+// Wait this many ms after a flip (0 = no limit). For display-rate pacing, the scanout call and the wait share one
+// refresh interval. A slower explicit throttle keeps its full wait. Override with vgpuflipms or `acceltest flipms N`.
 static volatile uint32_t gFlipMinMs = 12;
-static uint64_t gLastFlipAbs = 0;
+static constexpr uint64_t kFlipFrameNs = 1000000000ULL / kVGPUDisplayRefreshHz;
+static uint64_t gLastFlipAbs = 0, gLastFlipDurationNs = 0;
 
 // Pacing (5c round 3): how evenly frames come from WindowServer and go to the screen. Gaps between marks in ms,
 // counted in bins (gaps over 200 ms are idle time, not counted); flip durations likewise. VirtioGPUPacing;
@@ -496,11 +495,16 @@ static int paceLine(char *out, size_t n, const char *name, const Pace *p, const 
 static void publishShown(uint32_t surface);
 static void presentTick(OSObject *, IOTimerEventSource *) {
     for (;;) {
-        if (gFlipMinMs && gLastFlipAbs) {
+        uint64_t waitNs = (uint64_t)gFlipMinMs * 1000000ULL;
+        const uint64_t budget = gLastFlipDurationNs < kFlipFrameNs ? kFlipFrameNs - gLastFlipDurationNs : 0;
+        if (waitNs <= kFlipFrameNs && budget < waitNs) {
+            waitNs = budget;
+        }
+        if (waitNs && gLastFlipAbs) {
             uint64_t since = 0;
             absolutetime_to_nanoseconds(mach_absolute_time() - gLastFlipAbs, &since);
-            if (since < (uint64_t)gFlipMinMs * 1000000ULL) {   // too soon: come back, showing the newest frame then
-                gPresentTimer->setTimeoutUS((uint32_t)(((uint64_t)gFlipMinMs * 1000000ULL - since) / 1000) + 1);
+            if (since < waitNs) {   // too soon: come back, showing the newest frame then
+                gPresentTimer->setTimeoutUS((uint32_t)((waitNs - since) / 1000) + 1);
                 return;
             }
         }
@@ -556,14 +560,16 @@ static void presentTick(OSObject *, IOTimerEventSource *) {
             gPendingCount -= drop;
         }
         IOLockUnlock(gPresentLock);
-        uint64_t t0 = mach_absolute_time(), ns = 0;
+        const uint64_t flipStart = mach_absolute_time();
         if (core) {
             core->callPlatformFunction(gSymScanoutBlob, false, (void *)(uintptr_t)t[0], (void *)(uintptr_t)t[1],
                                        (void *)(uintptr_t)t[2], (void *)(uintptr_t)t[3]);
         }
         gLastFlipAbs = mach_absolute_time();
         publishShown(t[5]);   // what the screen shows now (the plugin's display snapshots read it)
-        absolutetime_to_nanoseconds(gLastFlipAbs - t0, &ns);
+        uint64_t ns = 0;
+        absolutetime_to_nanoseconds(gLastFlipAbs - flipStart, &ns);
+        gLastFlipDurationNs = ns;
         paceMark(&gPaceFlip, gLastFlipAbs);
         paceBin(&gFlipDur, ns, kDurEdges);
         gFlipNs += (SInt64)ns;

@@ -6,8 +6,8 @@
 #   qmpinput.py VMID click X Y
 #   qmpinput.py VMID rclick X Y                         a right click (a context menu)
 #   qmpinput.py VMID line X0 Y0 X1 Y1 SECONDS          press at (X0, Y0), move straight to (X1, Y1), release
-#   qmpinput.py VMID sweep X0 Y0 X1 Y1 SECONDS N       press at (X0, Y0), go to (X1, Y1) and back N times, SECONDS
-#                                                     each way, release: a fast drag with no pauses (round 23)
+#   qmpinput.py VMID sweep X0 Y0 X1 Y1 SECONDS N [HZ]  press at (X0, Y0), go to (X1, Y1) and back N times, SECONDS
+#                                                     each way, at HZ input events per second (default 60), then release
 # Coordinates are screen points of a 1280x800 display, top-left origin.
 import json, math, socket, sys, time
 
@@ -79,18 +79,21 @@ def main():
         elif what == "sweep":
             x0, y0, x1, y1, secs = (float(v) for v in sys.argv[3:8])
             n = int(sys.argv[8]) if len(sys.argv) > 8 else 4
+            rate = int(sys.argv[9]) if len(sys.argv) > 9 else 60
+            if rate <= 0:
+                sys.exit("sweep input rate must be positive")
             move(f, x0, y0); time.sleep(0.2)
             button(f, "left", True); time.sleep(0.15)
-            steps = max(2, int(secs * 60)); t0 = time.time(); k = 0
+            steps = max(2, int(secs * rate)); t0 = time.monotonic(); k = 0
             for leg in range(2 * n):
                 a, b = ((x0, y0), (x1, y1)) if leg % 2 == 0 else ((x1, y1), (x0, y0))
                 for i in range(1, steps + 1):
                     move(f, a[0] + (b[0] - a[0]) * i / steps, a[1] + (b[1] - a[1]) * i / steps)
                     k += 1
-                    time.sleep(max(0, t0 + k / 60.0 - time.time()))
+                    time.sleep(max(0, t0 + k / rate - time.monotonic()))
             time.sleep(0.1)
             button(f, "left", False)
-            print(f"sweep: {k} moves in {time.time() - t0:.1f} s")
+            print(f"sweep: {k} moves in {time.monotonic() - t0:.1f} s")
         elif what == "scroll":
             x, y, secs = float(sys.argv[3]), float(sys.argv[4]), float(sys.argv[5])
             d = sys.argv[6] if len(sys.argv) > 6 else "down"
