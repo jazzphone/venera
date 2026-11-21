@@ -343,7 +343,7 @@ agent_switch_later() {   # $1: the agent to start then ("" for none); stops both
 <plist version="1.0"><dict>
   <key>Label</key><string>local.venera.agent-swap</string>
   <key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string>
-  <string>sleep 10; while pgrep -f "Venera/release/install.sh|uninstall.sh" >/dev/null; do sleep 2; done; launchctl bootout system/com.macos.guest-agent 2>/dev/null; launchctl bootout system/local.venera.agent 2>/dev/null; sleep 1; $start rm -f '$SWAP_PLIST'; launchctl bootout system/local.venera.agent-swap</string></array>
+  <string>sleep 10; while pgrep -f "Venera/release/install.sh|uninstall.sh|/usr/sbin/installer " >/dev/null; do sleep 2; done; launchctl bootout system/com.macos.guest-agent 2>/dev/null; launchctl bootout system/local.venera.agent 2>/dev/null; sleep 1; $start rm -f '$SWAP_PLIST'; launchctl bootout system/local.venera.agent-swap</string></array>
   <key>RunAtLoad</key><true/>
   <key>LaunchOnlyOnce</key><true/>
 </dict></plist>

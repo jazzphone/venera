@@ -1012,8 +1012,15 @@ upgrade_vm() {   # a VM with Venera: this release's host half on every node, the
     usb_upgrade_disk || exit 1
   fi
   guest "printf '%s' '$(choices_xml $video $app $webgl $agent)' > /private/var/tmp/venera-choices.xml" >/dev/null
-  out=$(guest_rc 900 "/usr/sbin/installer -pkg '$mnt' -target / -applyChoiceChangesXML /private/var/tmp/venera-choices.xml 2>&1; rm -f /private/var/tmp/venera-choices.xml")
-  sed 's/^/   /' <<<"$out" | grep -v '^   rc='
+  # the result through a file: the package starts its guest agent in place of the running one once it has finished,
+  # and the installer's answer can go with the old agent (VM 109, 0.1.11: the Upgrade stopped there, macOS installed)
+  local res=/private/var/tmp/venera-install.out n
+  guest_rc 900 "/usr/sbin/installer -pkg '$mnt' -target / -applyChoiceChangesXML /private/var/tmp/venera-choices.xml >$res 2>&1; echo rc=\$? >>$res; rm -f /private/var/tmp/venera-choices.xml" >/dev/null
+  out=""; for n in $(seq 1 24); do
+    out=$(guest "cat $res 2>/dev/null"); grep -q '^rc=' <<<"$out" && break; sleep 5
+  done
+  guest "rm -f $res" >/dev/null
+  sed 's/^/   /' <<<"$out" | grep -v '^   rc=' || true
   if [ $via = usb ]; then guest "diskutil eject '$(dirname "$mnt")' >/dev/null 2>&1" >/dev/null; sleep 2; usb_disk del; rm -f "$img"
   else guest "rm -f '$pkg'" >/dev/null; fi
   grep -qx 'rc=0' <<<"$out" || die "the install failed: its log is /Library/Application Support/Venera/install.log in macOS; nothing restarted"
