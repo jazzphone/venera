@@ -14,7 +14,12 @@
 //
 // A reader pins the generation it sees when it enters IOSurfaceLock. Wakes prompt it to check the
 // surface's metadata; a subsequent generation does not extend that lock's wait. The hook cannot see
-// SkyLight's frame identity before the lock. The experiment stays off by default.
+// SkyLight's frame identity before the lock.
+//
+// On by default since round 23 (the owner's call after an A/B on VM 109: no trails either way, fast sweeps 17.4-17.6
+// ms frame gaps against 19.9-23.3 ms with the writer waiting, "slightly smoother"): WindowServer offers deferred
+// write-backs and ScreensharingAgent waits for them. The flag file VirtioGPUMetal-lockwait names other reader
+// processes instead (WindowServer always writes); VirtioGPUMetal-nolockwait turns it all off (the 0.1.12 behavior).
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurface.h>
 #include <dlfcn.h>
@@ -57,7 +62,7 @@ BOOL vg_lockwait_begin(VGMTLTexture *t) {
     static BOOL enabled;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        enabled = access("/Library/GPUBundles/VirtioGPUMetal-lockwait", F_OK) == 0 &&
+        enabled = access("/Library/GPUBundles/VirtioGPUMetal-nolockwait", F_OK) != 0 &&
                   (!strcmp(getprogname(), "WindowServer") || !strcmp(getprogname(), "mtllockwait"));
     });
     if (!enabled || !(t = vg_lockwait_root(t)) || !t->_surface) {
@@ -278,10 +283,13 @@ static BOOL vg_lockwait_install(void) {
 
 // The processes that read display streams and wait: the names in the flag file lockwait (none without it).
 static BOOL vg_lockwait_wanted(void) {
+    if (access("/Library/GPUBundles/VirtioGPUMetal-nolockwait", F_OK) == 0) {
+        return NO;
+    }
     NSString *s = [NSString stringWithContentsOfFile:@"/Library/GPUBundles/VirtioGPUMetal-lockwait"
                                             encoding:NSUTF8StringEncoding error:NULL];
     if (!s) {
-        return NO;
+        return !strcmp(getprogname(), "ScreensharingAgent");   // the default reader
     }
     NSArray *names = [[s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]]
         componentsSeparatedByString:@"\n"];

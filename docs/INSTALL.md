@@ -413,16 +413,13 @@ Files in `/Library/GPUBundles` the Metal driver reads (root only; delete them to
 - `VirtioGPUMetal-framesig` (WindowServer) logs a signature of what the display shows after each presented frame,
   with its time, whenever it changes: when the screen settles after a click, to time how long a window or a System
   Settings pane takes to be usable. Read when WindowServer starts.
-- `VirtioGPUMetal-lockwait` lets listed reader processes such as `ScreensharingAgent` wait on a notification
-  for a display stream's write-back. Only a reader that successfully subscribes and hooks IOSurfaceLock can
-  opt a surface in. A lock waits for the generation visible when it starts. On a timeout it returns an error.
-  This experiment is off by default. `VirtioGPUMetal-lockwaitmeasure` with it logs frame and lock timing without
-  enabling reader waits. Both files are read when the relevant process starts.
-
-The accelerator flips at most once per 12 ms by default (`vgpuflipms=N` boot-arg, 0 = no limit).
-
-## Known limits
-
+- `VirtioGPUMetal-nolockwait`: Screen Sharing's frames waited for by WindowServer again, as in 0.1.12. Since
+  0.1.13 Screen Sharing's capture process (`ScreensharingAgent`) waits in its IOSurfaceLock for a frame's CPU copy,
+  as on a Mac, and WindowServer doesn't: it keeps its frame rate while someone shares the screen. Read when a
+  process starts (restart macOS after changing it).
+- `VirtioGPUMetal-lockwait`: the reader processes that wait, one a line, in place of `ScreensharingAgent` (a screen
+  recorder, say). With `VirtioGPUMetal-lockwaitmeasure` too, they only log the timing of the display stream's frames
+  and locks every 5 s, without waiting. Read when a process starts.
 - **A major macOS upgrade needs a Venera release that knows it first**: the VM's SMC is acidanthera's VirtualSMC
   (through Lilu), and it runs only on the macOS versions its release knows (Tahoe in Lilu 1.7.2 and VirtualSMC 1.3.8).
   On a newer macOS it stays off, and with no SMC macOS can't start its apps. Upgrade Venera before the macOS upgrade
