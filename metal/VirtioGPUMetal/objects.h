@@ -72,6 +72,7 @@ id<MTLBuffer> vg_new_buffer_nocopy(id<MTLDevice> device, void *pointer, NSUInteg
     BOOL _twinRefused;   // the kext said no (not the screen's size): no twin, the CPU write-back stays
     uint32_t _hotWrites;   // display command buffers in a row that wrote it, each within 100 ms of the last (5c round 6)
     uint64_t _hotLast;
+    int8_t _scanout;   // CoreDisplay made it to scan out (IsDisplayable): 1, else 0; -1 not looked at yet
     // Shared with another process (5d, core 0.5.6): the image's memory is one blob resource both processes' contexts
     // have, registered with the kext by its creator and imported by the other. Each process's write-back tags the
     // surface (vg_surface_tag) so the other skips the pull of a frame its image already holds.

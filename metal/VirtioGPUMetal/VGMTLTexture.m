@@ -1553,6 +1553,7 @@ id<MTLTexture> vg_new_surface_texture(id<MTLDevice> device, MTLTextureDescriptor
     vg_root_keep(key, t);
     pthread_mutex_unlock(&rootsLock);
     t->_surface = (IOSurfaceRef)CFRetain(surface);
+    t->_scanout = -1;   // looked at the first time a display frame writes it
     t->_plane = plane;
     t->_surfaceBpr = bpr;
     t->_neverSynced = YES;

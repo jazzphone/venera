@@ -1188,6 +1188,24 @@ static VkImageSubresourceLayers vg_layers(VGMTLTexture *t, NSUInteger slice, NSU
 
 static BOOL vg_dirty_rect(VGMTLCommandBuffer *c, VGMTLTexture *t, int32_t r[4]);
 
+// CoreDisplay's own scanout surfaces (CreationProperties IsDisplayable): the display shows them through their twins,
+// and nothing reads their CPU bytes; looked at once a texture.
+static BOOL vg_surface_is_scanout(VGMTLTexture *t) {
+    if (t->_scanout < 0) {
+        t->_scanout = 0;
+        CFTypeRef cp = IOSurfaceCopyValue(t->_surface, CFSTR("CreationProperties"));
+        if (cp && CFGetTypeID(cp) == CFDictionaryGetTypeID()) {
+            CFTypeRef d = CFDictionaryGetValue((CFDictionaryRef)cp, CFSTR("IsDisplayable"));
+            t->_scanout = d && ((CFGetTypeID(d) == CFBooleanGetTypeID() && CFBooleanGetValue((CFBooleanRef)d)) ||
+                                (CFGetTypeID(d) == CFNumberGetTypeID() && [(__bridge NSNumber *)d boolValue]));
+        }
+        if (cp) {
+            CFRelease(cp);
+        }
+    }
+    return t->_scanout == 1;
+}
+
 @implementation VGMTLCommandBuffer
 @synthesize device = _device, commandQueue = _commandQueue, label = _label;
 
@@ -1675,12 +1693,15 @@ static void vg_surface_debug(VGMTLTexture *t) {
                 // Only a surface the display has shown skips its CPU write-back (5c round 6): Core Animation renders
                 // other screen-sized surfaces in display command buffers too, and some are read on the CPU right after
                 // commitAndWaitUntilSubmitted (a Cmd-Shift-3 screenshot came out blank, then blank one time in three
-                // without the wait). Those keep the write-back and the wait for it, except a surface written by every
-                // frame (one GPU-only intermediate a frame): after 10 such frames in a row it is waited for no more.
+                // without the wait). Those keep the write-back and the wait for it, except one of CoreDisplay's
+                // scanout surfaces written by every frame: after 10 such frames in a row it is waited for no more.
+                // Only a scanout surface: SkyLight's display stream ("DisplayStream surface N/8", what Screen Sharing
+                // and screen recording read) is written every frame too, and read on the CPU as soon as this returns;
+                // not waited for, Screen Sharing sent pieces of the frame before (trails it never redrew, 2026-11-20).
                 uint64_t nowNs = vg_now();
                 t->_hotWrites = t->_hotLast && nowNs - t->_hotLast < 100000000ull ? t->_hotWrites + 1 : 1;
                 t->_hotLast = nowNs;
-                if (!shown && t->_hotWrites < 10) {
+                if (!shown && (t->_hotWrites < 10 || !vg_surface_is_scanout(t))) {
                     _allTwinned = NO;
                 }
                 if (shown && !writeBackTwins) {
