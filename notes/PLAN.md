@@ -2446,3 +2446,17 @@ corner to corner 8 times in one press (`qmpinput.py sweep`, 0.4 s each way) and 
   way (A 20.0-20.1, B 21.2-22.8 ms). The owner, watching B then A: no trails in either; B "may have looked slightly
   smoother", close. The reworked reader wait (a pinned generation, a wake-up notification) has none of the first
   version's 50-70 ms waits or pauses. It stays off by default pending the owner's decision.
+- **The reader wait is on by default** (a635169, the owner's call): ScreensharingAgent waits for its frames and
+  WindowServer doesn't; `nolockwait` turns it off. VM 108, `mtllockwait`: not a listed reader 3.65 ms commit + 0.02
+  ms lock, listed 0.21 + 3.00 ms, listed with `nolockwait` 2.89 + 0.01 ms; no stale reads.
+- **Retina sizes, VM 109 at 2880x1800 ("looks like 1440x900"), the owner connected over Screen Sharing.** The owner
+  noticed it crawls. A real window drag (the sweep re-aimed for 1440x900 points; the first runs only moved the
+  cursor): with WindowServer waiting, mean frame gap 107 ms (~9 fps); with the reader wait 47-50 ms. SkyLight also
+  writes a full-screen **"Selective Sharing"** surface every frame while sharing; ScreensharingAgent never locks it
+  (the `locknames` flag: it locks only "DisplayStream surface N/8"), so it is a GPU-side source of the stream's
+  frames. It was copied back (20 MB) and waited for every frame. Now it has no write-back and no wait
+  (`selectivewriteback` brings them back): Retina sweeps 36-40 ms, WindowServer's waits 4.5-6.8 ms a submit (from
+  6-25 ms); the owner: Screen Sharing looks right. What remains at Retina: a command buffer's GPU work is 2.8-3.2 ms
+  but commit -> GPU start 26-30 ms and GPU done -> seen 17-21 ms (`gputime`). Not QEMU's readback for the console
+  (`acceltest flipms 33` halved the flips, frame gaps and latencies unchanged), not QEMU's CPU (main thread 35 %,
+  the render server 35 %). Open: what in the host's path scales with the ~20 MB surfaces.

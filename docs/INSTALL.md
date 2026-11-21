@@ -413,6 +413,11 @@ Files in `/Library/GPUBundles` the Metal driver reads (root only; delete them to
 - `VirtioGPUMetal-framesig` (WindowServer) logs a signature of what the display shows after each presented frame,
   with its time, whenever it changes: when the screen settles after a click, to time how long a window or a System
   Settings pane takes to be usable. Read when WindowServer starts.
+- `VirtioGPUMetal-selectivewriteback`: copy SkyLight's "Selective Sharing" surface back to CPU memory and wait for
+  it, as before 0.1.13. While the screen is shared it is written every frame and only read on the GPU (Screen
+  Sharing reads the display stream's surfaces). Read when WindowServer starts.
+- `VirtioGPUMetal-locknames`: a reader that waits (ScreensharingAgent) logs each surface it locks, once. Read when
+  the process starts.
 - `VirtioGPUMetal-nolockwait`: Screen Sharing's frames waited for by WindowServer again, as in 0.1.12. Since
   0.1.13 Screen Sharing's capture process (`ScreensharingAgent`) waits in its IOSurfaceLock for a frame's CPU copy,
   as on a Mac, and WindowServer doesn't: it keeps its frame rate while someone shares the screen. Read when a

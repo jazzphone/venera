@@ -1221,6 +1221,34 @@ static void vg_frame_signature(void) {
     }
 }
 
+// SkyLight's "Selective Sharing" surface, written every frame while the screen is shared: a source on the GPU for
+// the display stream's frames, which are what Screen Sharing reads on the CPU (ScreensharingAgent locks only the
+// "DisplayStream surface N/8" ones, VM 109). Copied back to CPU memory and waited for every frame, it cost
+// WindowServer most of its frame at Retina sizes (2880x1800: 20 MB a frame). No write-back and no wait now, as for a
+// scanout surface; the flag file VirtioGPUMetal-selectivewriteback brings them back. Round 23.
+static BOOL vg_surface_gpu_only(VGMTLTexture *t) {
+    static int keep = -1;
+    if (keep < 0) {
+        keep = vg_debug_flag("selectivewriteback");
+    }
+    if (keep) {
+        return NO;
+    }
+    if (t->_gpuOnly == 0) {
+        t->_gpuOnly = -1;
+        CFTypeRef nm = IOSurfaceCopyValue(t->_surface, kIOSurfaceName);
+        if (nm && CFGetTypeID(nm) == CFStringGetTypeID() &&
+            CFStringFind((CFStringRef)nm, CFSTR("Selective Sharing"), 0).location != kCFNotFound) {
+            t->_gpuOnly = 1;
+            vglog("surface %u is SkyLight's Selective Sharing: read on the GPU only, no write-back", IOSurfaceGetID(t->_surface));
+        }
+        if (nm) {
+            CFRelease(nm);
+        }
+    }
+    return t->_gpuOnly == 1;
+}
+
 static BOOL vg_surface_is_scanout(VGMTLTexture *t) {
     if (t->_scanout < 0) {
         t->_scanout = 0;
@@ -1745,6 +1773,18 @@ static void vg_surface_debug(VGMTLTexture *t) {
         for (VGMTLTexture *t in _surfacesWritten) {
             [self barrier];
             BOOL writerWaits = YES;
+            if (vg_surface_gpu_only(t)) {   // Selective Sharing: read on the GPU only, no copy anywhere (round 23)
+                [gpuWrote addObject:t];
+                if (vg_synclog()) {
+                    vglog("synclog gpu only, no write-back: surface %u %lux%lu", IOSurfaceGetID(t->_surface),
+                          (unsigned long)t->_width, (unsigned long)t->_height);
+                }
+                if (!noWriteBack) {
+                    noWriteBack = [NSMutableSet set];
+                }
+                [noWriteBack addObject:t];
+                continue;
+            }
             // A display frame: into the surface's twin, which the kext scans out (5c). Such a surface is only read on
             // the GPU (Core Animation) and from the twin (the display), so its CPU write-back is skipped
             // (VGMTL_TWIN_WRITEBACK=1 keeps it).

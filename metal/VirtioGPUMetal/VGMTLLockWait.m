@@ -174,6 +174,14 @@ static BOOL vg_is_stream_surface(IOSurfaceRef s) {
     if (name) {
         stream = CFGetTypeID(name) == CFStringGetTypeID() &&
                  CFStringFind((CFStringRef)name, CFSTR("DisplayStream"), 0).location != kCFNotFound;
+        static int names = -1;   // the flag file locknames: which surfaces this reader locks, each once
+        if (names < 0) {
+            names = vg_debug_flag("locknames");
+        }
+        if (names && CFGetTypeID(name) == CFStringGetTypeID()) {
+            vglog("lockwait: locks surface %u '%s' %zux%zu", sid, [(__bridge NSString *)name UTF8String],
+                  IOSurfaceGetWidth(s), IOSurfaceGetHeight(s));
+        }
         CFRelease(name);
     }
     if (stream && !gMeasureOnly) {
