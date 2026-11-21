@@ -89,6 +89,7 @@ id<MTLBuffer> vg_new_buffer_nocopy(id<MTLDevice> device, void *pointer, NSUInteg
     // A display stream's surface whose reader waits for pending writes (VGMTLLockWait.m, round 23): 1 tagged, 0 not
     // yet (looked up again every 30th write).
     int8_t _readerWaits;
+    BOOL _described;   // synclog has said what this surface is
     uint32_t _readerChecks;
 }
 @property(readonly) id<MTLDevice> device;

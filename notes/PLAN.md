@@ -2296,3 +2296,12 @@ whether the display's refresh rate matters); closer to a real Mac's speed. Not H
   Its two flaws to fix before trying again: the mark is one flag, so a lock can wait for a newer write than the frame
   it was handed; and the reader polls (100-500 us sleeps) instead of being woken. The jitter itself is WindowServer's
   frame time with a large window moving fast (~33 ms, uneven), sharing or not: the speed work.
+- **Speed: CoreDisplay's scanout surfaces no longer copied back to CPU memory (0.1.13).** WindowServer keeps six
+  1280x800 "CoreDisplay Scanout" surfaces (IsDisplayable); the display reads them through their twins. In a fast drag
+  (tools: fast108 in the scratch helpers, dragtest swept 0.4 s corner to corner, 13 sweeps) two of them, never shown
+  yet, were written back every frame (570 copies of 3.9 MB in 5 s) and waited for whenever a pause restarted the
+  10-frame rule: commitAndWaitUntilSubmitted 2.62 ms a submit. Now a scanout surface has no CPU write-back and no
+  wait, shown or not (screenshots read SkyLight's CaptureSurfaces, which keep both; the flag scanoutwriteback brings
+  the old way back). VM 108, the same fast sweeps: mean frame gap 27.3 -> 21.4 ms (twice), frames at one VBL 86 of
+  242 -> 212 of 316 and 219 of 318, the wait 2.62 -> 0.02 ms, write-backs 570 -> 1. Three Cmd-Shift-3 screenshots
+  whole. Next seen: a command buffer's GPU work is 1.8 ms (timestamps) but commit -> done 10.8 ms.

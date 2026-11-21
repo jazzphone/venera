@@ -395,6 +395,9 @@ Files in `/Library/GPUBundles` the Metal driver reads (root only; delete them to
   0.1.10 (since 0.1.13 the driver copies them from each other on the GPU; VideoToolbox's Metal transfer reads a
   picture's plane that way, for the login window's list of users and the Memoji picker). For comparing; with it, those
   pictures can come out stale. Read when a process starts.
+- `VirtioGPUMetal-scanoutwriteback`: copy CoreDisplay's scanout surfaces back to CPU memory when the display hasn't
+  shown them yet, as before 0.1.13 (since then only the display reads them, through their twins). Read when
+  WindowServer starts.
 - `VirtioGPUMetal-lockwait`: the processes it names (one a line, e.g. `ScreensharingAgent`) wait in their
   IOSurfaceLock for a display stream's frame to be written back, as on a Mac, so WindowServer needn't wait for it
   before handing it over. An experiment, off without the file: WindowServer keeps more of its frames while someone

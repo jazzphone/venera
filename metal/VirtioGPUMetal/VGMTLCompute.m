@@ -1716,14 +1716,25 @@ static void vg_surface_debug(VGMTLTexture *t) {
                 uint64_t nowNs = vg_now();
                 t->_hotWrites = t->_hotLast && nowNs - t->_hotLast < 100000000ull ? t->_hotWrites + 1 : 1;
                 t->_hotLast = nowNs;
-                if (!shown && (t->_hotWrites < 10 || !vg_surface_is_scanout(t)) && !readerWaits) {
+                // A CoreDisplay scanout surface (IsDisplayable) is read only by the display, through its twin, so its
+                // CPU copy and the wait for it go whether or not the display has shown it yet (round 23). WindowServer
+                // keeps six, and in a fast drag two of them never shown were written back every frame (3.9 MB each)
+                // and waited for whenever the drag paused (the 10-frame rule restarts): 2.6 ms of waiting a submit.
+                // Screenshots read SkyLight's CaptureSurfaces, which aren't scanout surfaces and keep both. The flag
+                // file VirtioGPUMetal-scanoutwriteback brings back the write-back of scanout surfaces not yet shown.
+                static int scanoutWB = -1;
+                if (scanoutWB < 0) {
+                    scanoutWB = vg_debug_flag("scanoutwriteback");
+                }
+                const BOOL scanoutOnly = !scanoutWB && vg_surface_is_scanout(t);
+                if (!shown && !scanoutOnly && (t->_hotWrites < 10 || !vg_surface_is_scanout(t)) && !readerWaits) {
                     _allTwinned = NO;
                 }
                 [gpuWrote addObject:t];
-                if (shown && !writeBackTwins) {
+                if ((shown || scanoutOnly) && !writeBackTwins) {
                     if (vg_synclog()) {
-                        vglog("synclog shown, no write-back: surface %u %lux%lu seed %u synced %u",
-                              IOSurfaceGetID(t->_surface), (unsigned long)t->_width, (unsigned long)t->_height,
+                        vglog("synclog %s, no write-back: surface %u %lux%lu seed %u synced %u",
+                              shown ? "shown" : "scanout", IOSurfaceGetID(t->_surface), (unsigned long)t->_width, (unsigned long)t->_height,
                               IOSurfaceGetSeed(t->_surface), t->_syncedSeed);
                     }
                     if (!noWriteBack) {
@@ -1737,6 +1748,23 @@ static void vg_surface_debug(VGMTLTexture *t) {
             }
             int32_t dr[4];
             BOOL drawn = vg_dirty_rect(self, t, dr);
+            if (vg_synclog() && drawn && !t->_described) {   // once: what the surface is (name, how it was made)
+                t->_described = YES;
+                CFTypeRef nm = IOSurfaceCopyValue(t->_surface, kIOSurfaceName);
+                CFTypeRef cp = IOSurfaceCopyValue(t->_surface, CFSTR("CreationProperties"));
+                NSString *keys = cp && CFGetTypeID(cp) == CFDictionaryGetTypeID()
+                                     ? [[(__bridge NSDictionary *)cp allKeys] componentsJoinedByString:@","]
+                                     : @"-";
+                vglog("synclog surface %u: name '%s', scanout %d, format 0x%x, creation keys %s", IOSurfaceGetID(t->_surface),
+                      nm && CFGetTypeID(nm) == CFStringGetTypeID() ? [(__bridge NSString *)nm UTF8String] : "",
+                      vg_surface_is_scanout(t), (unsigned)IOSurfaceGetPixelFormat(t->_surface), keys.UTF8String);
+                if (nm) {
+                    CFRelease(nm);
+                }
+                if (cp) {
+                    CFRelease(cp);
+                }
+            }
             if (vg_synclog() && drawn) {
                 vglog("synclog write: cb %p surface %u %lux%lu rect %d,%d-%d,%d%s%s seed %u synced %u", self,
                       IOSurfaceGetID(t->_surface), (unsigned long)t->_width, (unsigned long)t->_height, dr[0], dr[1],
