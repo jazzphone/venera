@@ -2222,3 +2222,49 @@ TRIM, Upgrade without a USB disk, Retina modes, a faster first boot (a warm-up a
   dropped requests of a few KB) to its virtio port, its restart then a shut-down and a start.
 - Released as v0.1.12 (a080cec). Open: the login list's pictures, a DockHelper shader the translator refuses
   (`llvm.fmuladd` on `<3 x half>`), Screen Sharing's frame rate (measure), speed.
+
+## Round 23 (2026-11-21): what still doesn't draw, speed, Screen Sharing
+
+The owner's list: fix what doesn't draw (the login window's small user pictures with two or more users, a DockHelper
+shader the translator refused), then sweep for more; Screen Sharing smoother (measure first: what limits it, and
+whether the display's refresh rate matters); closer to a real Mac's speed. Not HDR.
+
+- **DockHelper's refused shader doesn't come back.** It is RenderBox's `accumulator_color_fragment` (default.metallib,
+  one function constant: a `uint4` blend state, `_shader_state`), refused once on VM 108 on 2026-11-20 at 12:58 by a
+  development build ("declare without params: declare <3 x half> @llvm.fmuladd": the text ended mid-line). With the
+  driver's own text of it (shaderdump, VGMTL_NODISKCACHE=1) and 0.1.12's translator, 3,300 constant sets (random, and
+  random bit patterns) translate, on the Mac (tools/xlfc against a translator built for the Mac from the patched copy)
+  and in VM 108 (tools/mtlpipe, MTLPIPE_FUZZ); none has been refused since 0.1.10 on 108. The faildump flag file stays
+  on for DockHelper and Dock on 108 to catch it if it does.
+- **The login window's user pictures, the GPU way (bd7a68f).** VideoToolbox's Metal transfer reads a 512-wide BGRA
+  plane as a 128-wide RGBA32Uint texture; 0.1.10 took such regroupings with only the surface's CPU copy between the
+  plane's images (stale reads: 0.1.10's striped Memoji), 0.1.11 refused them. Now the images of one surface plane are a
+  group: a submitted GPU write makes its image the newest, an image behind it is copied from it on the GPU (image ->
+  staging -> image, deferred work ahead of the next submit) before its use, and a write-back counts for the siblings
+  too. Found on the way: a write-back copied the image in the surface's element size, which a regrouping's 16-byte
+  texels overran. tools/mtlregroup (write through one, read at once through the other, both ways, ten rounds without
+  waits, then the CPU copy): PASS on VM 108; with the nosibling flag (0.1.10's sync) all four checks fail. With
+  WindowServer on the build: the Memoji picker clean through RGBA32Uint regroupings (saved pictures moved aside), a
+  10-bit Tahoe Day still the same as the CPU's decode (tools/vtstill: brightest 689 vs 690, mean 363 vs 364), a window
+  drag's synclog one pull and no sibling copies. The login window with two users (a second one added on 108): both
+  small pictures show.
+- **Sweep (1c)**: VM 108 opened every app in /Applications, /System/Applications and Utilities for 12 s each (not the
+  ones that sound, record, log out or restore), every System Settings pane, Mission Control and Quick Look, on the
+  build above. No shader refused, no translation failed, no LENIENT selector. Left: QuickTime Player and the Memoji
+  editor ask for a normalized regrouping (RGBA8Unorm over a 1-byte plane, 180x720 of 720x720), still refused, so
+  VideoToolbox converts on the CPU (0.1.10 saw such a regrouping "come out wrong", likely the stale-image bug: try it
+  now); Contacts logs "Apple's stitcher failed" (function stitching); four helpers without a device
+  (VTDecoderXPCService, efilogin-helper, Safari's platform helper, LocalAuthenticationRemoteService).
+- **System Settings' panes feel slow**: each pane is its own process, and the driver's device takes 0.2-0.4 s of it
+  (load -> Vulkan device on VM 109: General 0.40 s, Users & Groups 0.33, Sharing 0.23, Network 0.19), nearly all in
+  Venus' instance and device creation. No translations in them; iconservicesagent's icon work ~0.4 s of driver time
+  over two minutes. A start-up to make shorter for every process.
+- **Screen Sharing, measured (VM 109, the owner connected from a Mac on the LAN, 0.1.12)**. Not CPU: over 100 s of
+  drag, scroll and video, WindowServer used 25 % of a core, screensharingd 6 %, ScreensharingAgent 3 %; no
+  VideoToolbox encoder session (videod saw only the video's decode). ScreensharingAgent: 2,741 frames in its first
+  82 s (~33 a second), capture latency 131-232 ms, mean 189. The same 10 s scripted drag (tools/dragtest, qmpinput):
+  alone, frame gaps mean 17.5 ms (584 of 628 at one VBL), commitAndWaitUntilSubmitted waits 0.15 ms; sharing, mean
+  23.5 ms (~42 fps, 202 of 444 at one VBL, 156 at two), waits 2.37 ms each, about 1,800 of them in the run. So 0.1.12's
+  wait for the display stream's CPU copy (the trails fix) costs WindowServer a quarter of its frames while sharing.
+  The login failures first that day: screensharingd's RSA-SRP said "client evidence does not match" for the right
+  password, also after the password was set again; a restart of the VM (a fresh screensharingd) took it.
