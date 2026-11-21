@@ -49,7 +49,7 @@ constexpr uint32_t kMaxWidth = 3840;
 constexpr uint32_t kMaxHeight = 2400;
 constexpr uint32_t kSmallArea = 1920 * 1200; // the fallback's largest
 constexpr uint32_t kFlushIntervalMs = 33;
-constexpr uint32_t kVblIntervalUs = 16667; // 60 Hz, the rate the modes advertise
+constexpr uint32_t kVblHz = 60; // the rate the modes advertise; vgpuvblhz=N (24-240) runs the timer at N to measure
 constexpr unsigned kMaxVblClients = 4;
 
 const char kPixelFormats[] = IO32BitDirectPixels "\0";
@@ -140,6 +140,7 @@ private:
     IOWorkLoop *vblLoop_ = nullptr;
     IOTimerEventSource *vblTimer_ = nullptr;
     uint64_t vblCount_ = 0;
+    uint32_t vblHz_ = kVblHz;
     uint64_t vblInterval_ = 0, vblNext_ = 0;   // absolute time: each tick on its deadline, not 16.667 ms after the last (round 21)
     uint32_t presents_ = 0;
 };
@@ -281,7 +282,15 @@ bool VirtioGPUFramebuffer::start(IOService *provider) {
         log("VBL timer setup failed");
         return false;
     }
-    nanoseconds_to_absolutetime((uint64_t)kVblIntervalUs * 1000, &vblInterval_);
+    uint32_t hz = kVblHz;
+    if (PE_parse_boot_argn("vgpuvblhz", &hz, sizeof(hz)) && (hz < 24 || hz > 240)) {
+        hz = kVblHz;
+    }
+    vblHz_ = hz;
+    if (hz != kVblHz) {
+        log("VBL timer at %u Hz (vgpuvblhz; the modes still say %u)", hz, kVblHz);
+    }
+    nanoseconds_to_absolutetime(1000000000ull / hz, &vblInterval_);
     vblNext_ = mach_absolute_time() + vblInterval_;
     vblTimer_->wakeAtTime(vblNext_);
     if (!IOFramebuffer::start(provider)) {
@@ -636,7 +645,7 @@ IOReturn VirtioGPUFramebuffer::registerForInterruptType(IOSelect type, IOFBInter
             if (interruptRef) {
                 *interruptRef = &vbl_[i];
             }
-            log("VBL handler %u registered (timer, 60 Hz)", i);
+            log("VBL handler %u registered (timer, %u Hz)", i, vblHz_);
             return kIOReturnSuccess;
         }
     }
@@ -674,7 +683,7 @@ void VirtioGPUFramebuffer::vblTick(IOTimerEventSource *) {
             proc(vbl_[i].target, vbl_[i].ref);
         }
     }
-    if (vblCount_ % 600 == 0) { // every ~10 s
+    if (vblCount_ % (vblHz_ * 10) == 0) { // every ~10 s
         setProperty("VirtioGPUVBLCount", vblCount_, 64);
         setProperty("VirtioGPUPipePresents", presents_, 32);
     }

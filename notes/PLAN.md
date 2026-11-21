@@ -2268,3 +2268,9 @@ whether the display's refresh rate matters); closer to a real Mac's speed. Not H
   wait for the display stream's CPU copy (the trails fix) costs WindowServer a quarter of its frames while sharing.
   The login failures first that day: screensharingd's RSA-SRP said "client evidence does not match" for the right
   password, also after the password was set again; a restart of the VM (a fresh screensharingd) took it.
+- **The refresh rate doesn't matter here (framebuffer 0.6.3: `vgpuvblhz=N`, 24-240, runs the VBL timer at N for
+  measuring; the modes still say 60).** VM 108, the same 10 s scripted drag (tools/drag-perf.sh): at 60 Hz mean frame
+  gaps 18.9 and 17.7 ms; with the timer at 120 Hz (2,400 VBLs in ~21 s, checked) 17.7 and 17.6 ms, the gaps still
+  15-18 ms: WindowServer paces to the mode's 60 Hz, not the VBL. Each display frame's command buffer takes ~10 ms
+  commit to done, Screen Sharing captures ~33 a second and Proxmox's console shows ~33, so a mode above 60 Hz isn't
+  worth advertising. Not tried: 30 Hz (it can't change that answer).
