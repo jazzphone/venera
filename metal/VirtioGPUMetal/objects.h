@@ -164,6 +164,7 @@ BOOL vg_spirv_has_push_constants(NSData *spv);   // DescriptorSet 0 -> newSet (N
     BOOL _present;          // committed by commitAndWaitUntilSubmitted (Core Animation's display frames)
     BOOL _allTwinned;       // every IOSurface it wrote got a twin copy: waiting for the GPU is enough
     dispatch_semaphore_t _gpuDone;   // signaled once the fence is (before the CPU write-backs)
+    dispatch_semaphore_t _wroteBack;   // signaled once the CPU write-backs are in (round 23), before the handlers
     dispatch_group_t _fenced;        // left once the fence is (vg_present_throttle waits on it)
     BOOL _fencedEntered;
     NSMutableData *_twinFrames;      // (surface id, frame) pairs to mark ready once the GPU is done (5c round 3)

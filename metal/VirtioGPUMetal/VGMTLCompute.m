@@ -1599,6 +1599,9 @@ static void vg_surface_debug(VGMTLTexture *t) {
     }
     [_surfacesWritten removeAllObjects];
     _surfaceDirty = nil;
+    if (_wroteBack) {   // commitAndWaitUntilSubmitted's caller may go on: the surfaces hold this frame (round 23)
+        dispatch_semaphore_signal(_wroteBack);
+    }
     for (id<MTLDrawable> d in _drawables) {
         [d present];
     }
@@ -1909,6 +1912,7 @@ static void vg_present_throttle(VGMTLCommandBuffer *cb) {
     BOOL wroteSurfaces = _surfacesWritten.count > 0;
     _present = YES;
     _gpuDone = wroteSurfaces ? dispatch_semaphore_create(0) : nil;
+    _wroteBack = wroteSurfaces ? dispatch_semaphore_create(0) : nil;
     [self commit];
     static int twinWait = -1;
     if (twinWait < 0) {
@@ -1929,8 +1933,13 @@ static void vg_present_throttle(VGMTLCommandBuffer *cb) {
             } else {
                 vg_present_throttle(self);
             }
-        } else {
+        } else if (_status == MTLCommandBufferStatusError || !_wroteBack) {
             dispatch_group_wait(_done, DISPATCH_TIME_FOREVER);
+        } else {
+            // Until its surfaces' CPU copies are in (round 23): a reader of them (Screen Sharing's display stream,
+            // a screenshot) gets them as soon as this returns. Waiting for the whole completion -- the queue's
+            // handlers and the clean-up after them too -- cost WindowServer a quarter of its frames while sharing.
+            dispatch_semaphore_wait(_wroteBack, DISPATCH_TIME_FOREVER);
         }
         vg_perf(VG_PERF_SUBMIT_WAIT, 0, vg_now() - t0);
     }

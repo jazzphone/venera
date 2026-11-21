@@ -2274,3 +2274,12 @@ whether the display's refresh rate matters); closer to a real Mac's speed. Not H
   15-18 ms: WindowServer paces to the mode's 60 Hz, not the VBL. Each display frame's command buffer takes ~10 ms
   commit to done, Screen Sharing captures ~33 a second and Proxmox's console shows ~33, so a mode above 60 Hz isn't
   worth advertising. Not tried: 30 Hz (it can't change that answer).
+- **WindowServer waits only for the write-backs now, not the whole completion**, in commitAndWaitUntilSubmitted
+  (handlers and clean-up no longer in it). Measured on VM 109 in one sharing session, the same scripted drag: 0.1.12
+  mean frame gaps 32.8 and 32.3 ms, waits 3.7-3.8 ms each; the new build 30.7-31.8 ms (4 runs), waits 3.7-4.1 ms:
+  about 1 ms better, within the noise. Without sharing 17.5 ms either way. The morning's session had shown 23.5 ms
+  sharing: the cost depends on the session (the viewer's window or quality, likely), and in this one sharing nearly
+  halves WindowServer's frames. What it waits for is the GPU finishing the frame. A Mac doesn't make WindowServer
+  wait: the reader's IOSurface lock waits for the GPU. Next: have the accelerator kext make a reader of a surface
+  with a pending write-back wait for it (IOSurface lock), and drop WindowServer's wait for the display stream. A
+  Cmd-Shift-3 screenshot on VM 108 with the new wait: whole.
