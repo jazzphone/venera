@@ -18,6 +18,21 @@ NSString *vg_resource_path(const char *name) {
     return [[contents stringByAppendingPathComponent:@"Resources"] stringByAppendingPathComponent:@(name)];
 }
 
+static VkResult (*gWaitForFenceTimed)(VkDevice, VkFence, uint64_t *, uint64_t *);
+
+VkResult vg_wait_for_fence(VkFence fence, BOOL profile) {
+    if (!profile || !gWaitForFenceTimed) {
+        return gVk.vkWaitForFences(gVk.device, 1, &fence, VK_TRUE, UINT64_MAX);
+    }
+    uint64_t probes, probeNs;
+    const uint64_t start = vg_now();
+    VkResult result = gWaitForFenceTimed(gVk.device, fence, &probes, &probeNs);
+    const uint64_t elapsed = vg_now() - start;
+    vg_perf_count(VG_PERF_FENCE_PROBES, probes, 0, probeNs);
+    vg_perf(VG_PERF_FENCE_BACKOFF, 0, elapsed > probeNs ? elapsed - probeNs : 0);
+    return result;
+}
+
 static uint32_t (*gResIdOf)(VkDevice, VkDeviceMemory);
 static int (*gImportSurface)(VkDevice, uint32_t, uint64_t *);
 BOOL gVgSharing;
@@ -31,11 +46,24 @@ uint32_t vg_memory_res_id(VkDeviceMemory memory) {
 }
 
 static int vg_vulkan_init_locked(void) {
-    // Fence waits through the kernel's interrupt instead of Venus' shared-memory fence feedback (5c): feedback is polled
-    // with short usleeps that macOS stretches under load (median small submit under WindowServer load: 8.3 ms with
-    // feedback, 5.8 ms without, tools/mtllat). A VN_PERF the process set itself wins.
+    // Venus polls either way: with feedback it reads a shared slot, and without it each status probe goes to the
+    // host. Without feedback was faster in the original loaded mtllat comparison. An explicit VN_PERF wins.
+    const BOOL profile = vg_debug_flag("initperf");
+    uint64_t phaseStart = profile ? vg_now() : 0;
     if (access("/Library/GPUBundles/VirtioGPUMetal-fencefeedback", F_OK) != 0) {   // the flag file keeps feedback
         setenv("VN_PERF", "no_fence_feedback", 0);
+    }
+    // How long the host's ring thread keeps polling after the last command before it sleeps (Mesa patch 0012):
+    // the flag file ringidle holds microseconds (100 to 100000). A VENERA_RING_IDLE_US the process set itself wins.
+    NSString *idle = [NSString stringWithContentsOfFile:@"/Library/GPUBundles/VirtioGPUMetal-ringidle"
+                                               encoding:NSUTF8StringEncoding error:NULL];
+    idle = [idle stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (idle.integerValue >= 100 && idle.integerValue <= 100000) {
+        setenv("VENERA_RING_IDLE_US", idle.UTF8String, 0);
+        static int said;
+        if (!said++) {
+            vglog("vulkan: the renderer's ring stays awake %ld us after its last command (ringidle)", (long)idle.integerValue);
+        }
     }
     NSString *path = vg_resource_path("libvulkan_virtio.dylib");
     void *lib = path ? dlopen(path.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL) : NULL;
@@ -43,6 +71,12 @@ static int vg_vulkan_init_locked(void) {
         vglog("vulkan: dlopen %s: %s", path.UTF8String, dlerror());
         return -1;
     }
+    if (profile) {
+        uint64_t now = vg_now();
+        vglog("initperf: ICD load %.2f ms", (now - phaseStart) / 1e6);
+        phaseStart = now;
+    }
+    gWaitForFenceTimed = dlsym(lib, "vn_macos_wait_for_fence_timed");
     gResIdOf = (uint32_t(*)(VkDevice, VkDeviceMemory))dlsym(lib, "vn_macos_device_memory_res_id");   // Mesa patch 0006
     gImportSurface = (int (*)(VkDevice, uint32_t, uint64_t *))dlsym(lib, "vn_macos_import_surface");    // Mesa patch 0007
     PFN_negotiate negotiate = (PFN_negotiate)dlsym(lib, "vk_icdNegotiateLoaderICDInterfaceVersion");
@@ -62,10 +96,22 @@ static int vg_vulkan_init_locked(void) {
         vglog("vulkan: vkCreateInstance %d", r);
         return -1;
     }
+    if (profile) {
+        uint64_t now = vg_now();
+        vglog("initperf: instance %.2f ms", (now - phaseStart) / 1e6);
+        phaseStart = now;
+    }
     // Instance-level lookups first; device-level ones are refreshed through vkGetDeviceProcAddr below.
 #define VG_LOAD(name) gVk.name = (PFN_##name)gipa(gVk.instance, #name);
     VG_VK_FUNCS(VG_LOAD)
 #undef VG_LOAD
+    if (vg_debug_flag("skipsoftware")) {
+        void (*skipCPUDevices)(VkInstance) = dlsym(lib, "vn_macos_skip_cpu_devices");
+        if (skipCPUDevices) {
+            skipCPUDevices(gVk.instance);
+            vglog("vulkan: skipping CPU Vulkan devices before capability queries");
+        }
+    }
     VkPhysicalDevice devs[8];
     uint32_t n = 8;
     r = gVk.vkEnumeratePhysicalDevices(gVk.instance, &n, devs);
@@ -171,6 +217,11 @@ static int vg_vulkan_init_locked(void) {
     if (wantFeedback && !ffl.attachmentFeedbackLoopLayout) {
         vglog("vulkan: no attachmentFeedbackLoopLayout: framebuffer fetch stays with copies");
     }
+    if (profile) {
+        uint64_t now = vg_now();
+        vglog("initperf: physical device and capabilities %.2f ms", (now - phaseStart) / 1e6);
+        phaseStart = now;
+    }
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2, 0, 1, &qci, 0, NULL, next, base, NULL};
     for (;;) {
         r = gVk.vkCreateDevice(gVk.physical, &dci, NULL, &gVk.device);
@@ -192,6 +243,11 @@ static int vg_vulkan_init_locked(void) {
         vglog("vulkan: vkCreateDevice %d", r);
         return -1;
     }
+    if (profile) {
+        uint64_t now = vg_now();
+        vglog("initperf: logical device %.2f ms", (now - phaseStart) / 1e6);
+        phaseStart = now;
+    }
 #define VG_LOAD_DEV(name)                                                                                           \
     {                                                                                                               \
         PFN_vkVoidFunction f = gVk.vkGetDeviceProcAddr(gVk.device, #name);                                          \
@@ -208,6 +264,9 @@ static int vg_vulkan_init_locked(void) {
     if (r != VK_SUCCESS) {
         vglog("vulkan: vkCreateCommandPool %d", r);
         return -1;
+    }
+    if (profile) {
+        vglog("initperf: queue and command pool %.2f ms", (vg_now() - phaseStart) / 1e6);
     }
     // Buffers are made with device addresses when the device has them (Metal tessellation's control stage reads the
     // factor and vertex buffers through them); the flag file VirtioGPUMetal-nobda makes them as before.

@@ -1,0 +1,54 @@
+From fc181da69a12d24722072c5e6476c660920b788d Mon Sep 17 00:00:00 2001
+From: Codex <noreply@openai.com>
+Date: Sat, 21 Nov 2026 12:26:05 -0500
+Subject: [PATCH] venus: allow Venera to skip CPU Vulkan devices before
+ capability queries
+
+---
+ src/virtio/vulkan/vn_instance.h        |  3 +++
+ src/virtio/vulkan/vn_physical_device.c | 23 +++++++++++++++++++++++
+ 2 files changed, 26 insertions(+)
+
+diff --git a/src/virtio/vulkan/vn_instance.h b/src/virtio/vulkan/vn_instance.h
+index 6704064..21ab304 100644
+--- a/src/virtio/vulkan/vn_instance.h
++++ b/src/virtio/vulkan/vn_instance.h
+@@ -69,2 +69,5 @@ struct vn_instance {
+       bool groups_initialized;
++#ifdef __APPLE__
++      bool skip_cpu_devices;
++#endif
+
+diff --git a/src/virtio/vulkan/vn_physical_device.c b/src/virtio/vulkan/vn_physical_device.c
+index 18b7ddd..1a33b9b 100644
+--- a/src/virtio/vulkan/vn_physical_device.c
++++ b/src/virtio/vulkan/vn_physical_device.c
+@@ -1236,2 +1236,11 @@ vn_physical_device_init_renderer_version(
+
++#ifdef __APPLE__
++   /* Venera's Metal device selection already excludes CPU Vulkan drivers.
++    * Stop before querying their full capabilities if this instance opts in.
++    */
++   if (instance->physical_device.skip_cpu_devices &&
++       props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU)
++      return VK_ERROR_INITIALIZATION_FAILED;
++#endif
++
+    /* device version for internal use is capped */
+@@ -1663,2 +1672,16 @@ vn_instance_enumerate_physical_device_groups(struct vn_instance *instance)
+
++#ifdef __APPLE__
++PUBLIC void vn_macos_skip_cpu_devices(VkInstance instance_handle);
++
++PUBLIC void
++vn_macos_skip_cpu_devices(VkInstance instance_handle)
++{
++   struct vn_instance *instance = vn_instance_from_handle(instance_handle);
++   mtx_lock(&instance->physical_device.mutex);
++   if (!instance->physical_device.initialized)
++      instance->physical_device.skip_cpu_devices = true;
++   mtx_unlock(&instance->physical_device.mutex);
++}
++#endif
++
+ /* physical device commands */

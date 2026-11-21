@@ -1190,6 +1190,37 @@ static BOOL vg_dirty_rect(VGMTLCommandBuffer *c, VGMTLTexture *t, int32_t r[4]);
 
 // CoreDisplay's own scanout surfaces (CreationProperties IsDisplayable): the display shows them through their twins,
 // and nothing reads their CPU bytes; looked at once a texture.
+// The framesig flag file (WindowServer, read at its start): after each presented frame, a signature of what the display
+// shows (a 64x40 grid of pixels from the twin the kext flipped to last) and its time, logged when it changed: when a
+// pane or window stops changing after a click, to time "click to usable" (round 23).
+static void vg_frame_signature(void) {
+    static int on = -1;
+    static uint64_t last;
+    if (on < 0) {
+        on = vg_debug_flag("framesig");
+    }
+    if (!on) {
+        return;
+    }
+    VGMTLTexture *t = vg_twinned_shown();
+    const vg_buffer *tw = t ? (t->_twinUse && t->_twin2.map ? &t->_twin2 : &t->_twin) : NULL;
+    if (!tw || !tw->map || !t->_width || !t->_height) {
+        return;
+    }
+    const uint32_t *px = tw->map;
+    uint64_t h = 1469598103934665603ull;
+    for (NSUInteger y = 0; y < 40; y++) {
+        const uint32_t *row = px + (y * t->_height / 40) * t->_width;
+        for (NSUInteger x = 0; x < 64; x++) {
+            h = (h ^ row[x * t->_width / 64]) * 1099511628211ull;
+        }
+    }
+    if (h != last) {
+        last = h;
+        vglog("framesig %llu %016llx", (unsigned long long)clock_gettime_nsec_np(CLOCK_REALTIME), (unsigned long long)h);
+    }
+}
+
 static BOOL vg_surface_is_scanout(VGMTLTexture *t) {
     if (t->_scanout < 0) {
         t->_scanout = 0;
@@ -1205,6 +1236,22 @@ static BOOL vg_surface_is_scanout(VGMTLTexture *t) {
     }
     return t->_scanout == 1;
 }
+
+// A later submit may use the same texture's staging buffer while an opted-in reader waits for this frame.
+@interface VGStreamWriteBack : NSObject {
+@public
+    vg_buffer staging;
+    BOOL copied;
+}
+@end
+
+@implementation VGStreamWriteBack
+- (void)dealloc {
+    if (staging.buffer) {
+        vg_staging_put(&staging);
+    }
+}
+@end
 
 @implementation VGMTLCommandBuffer
 @synthesize device = _device, commandQueue = _commandQueue, label = _label;
@@ -1480,19 +1527,22 @@ static void vg_surface_debug(VGMTLTexture *t) {
             atomically:NO];
     }
 }
-- (void)finishWith:(MTLCommandBufferStatus)status fence:(VkFence)fence {
+- (void)finishWith:(MTLCommandBufferStatus)status fence:(VkFence)fence profile:(BOOL)profile {
     VGCALL("cb %p completing, status %lu", self, (unsigned long)status);
     uint64_t dequeued = vg_now();
     if (_submitted) {
         vg_perf(VG_PERF_CB_QUEUE, 0, dequeued - _submitted);
     }
     if (fence) {
-        gVk.vkWaitForFences(gVk.device, 1, &fence, VK_TRUE, UINT64_MAX);
-        gVk.vkDestroyFence(gVk.device, fence, NULL);
+        VkResult waited = vg_wait_for_fence(fence, profile);
         uint64_t observed = vg_now();
         vg_perf(VG_PERF_CB_WAIT, 0, observed - dequeued);
-        if (_cb) {
+        gVk.vkDestroyFence(gVk.device, fence, NULL);
+        if (_cb && waited == VK_SUCCESS) {
             vg_gpu_time_collect(_timePair, _submitted, observed);
+        } else if (_streamWriteBacks.count) {
+            [self fail:[NSString stringWithFormat:@"vkWaitForFences %d", waited]];
+            status = MTLCommandBufferStatusError;
         }
     }
     if (_snapNumber) {
@@ -1508,6 +1558,9 @@ static void vg_surface_debug(VGMTLTexture *t) {
             vg_twin_mark(pair[2 * i], pair[2 * i + 1], YES, NULL);
         }
         _twinFrames = nil;
+    }
+    if (_present) {
+        vg_frame_signature();
     }
     if (_gpuDone) {
         dispatch_semaphore_signal(_gpuDone);
@@ -1546,7 +1599,9 @@ static void vg_surface_debug(VGMTLTexture *t) {
     }
     if (status == MTLCommandBufferStatusCompleted) {
         for (VGMTLTexture *t in _surfacesWritten) {
-            if (!t->_staging.map) {
+            VGStreamWriteBack *stream = [_streamWriteBacks objectForKey:t];
+            const uint8_t *from = stream ? stream->staging.map : t->_staging.map;
+            if (!from) {
                 continue;   // its staging couldn't be had at commit
             }
             uint64_t t0 = vg_now();
@@ -1565,10 +1620,13 @@ static void vg_surface_debug(VGMTLTexture *t) {
             const uint32_t seedBefore = IOSurfaceGetSeed(t->_surface);
             // AvoidSync: this write-back is the pending GPU write that a waiting reader's lock waits for
             // (VGMTLLockWait.m)
-            IOSurfaceLock(t->_surface, kIOSurfaceLockAvoidSync, NULL);
+            kern_return_t locked = IOSurfaceLock(t->_surface, kIOSurfaceLockAvoidSync, NULL);
+            if (stream && locked != KERN_SUCCESS) {
+                os_unfair_lock_unlock(&gVgSurfaceSync);
+                continue;
+            }
             const BOOL othersWrote = !t->_neverSynced && seedBefore != t->_syncedSeed;
             uint8_t *base = IOSurfaceGetBaseAddressOfPlane(t->_surface, t->_plane);
-            const uint8_t *from = t->_staging.map;
             size_t bytes = 0;
             if (dr[0] == 0 && dr[2] == (int32_t)t->_width) {   // whole rows: one copy
                 size_t off = (size_t)dr[1] * t->_surfaceBpr;
@@ -1583,7 +1641,10 @@ static void vg_surface_debug(VGMTLTexture *t) {
                 bytes = rowBytes * (size_t)(dr[3] - dr[1]);
             }
             uint32_t seed = 0;
-            IOSurfaceUnlock(t->_surface, kIOSurfaceLockAvoidSync, &seed);
+            kern_return_t unlocked = IOSurfaceUnlock(t->_surface, kIOSurfaceLockAvoidSync, &seed);
+            if (stream) {
+                stream->copied = unlocked == KERN_SUCCESS;
+            }
             vg_perf(VG_PERF_WB_COPY, bytes, vg_now() - t0);
             if (vg_synclog()) {
                 vglog("synclog wrote back: cb %p surface %u rect %d,%d-%d,%d seed now %u%s", self,
@@ -1601,10 +1662,11 @@ static void vg_surface_debug(VGMTLTexture *t) {
     }
     [_surfacesWritten removeAllObjects];
     _surfaceDirty = nil;
-    for (VGMTLTexture *t in _pendingMarks) {   // written back (or failed): their readers may go on
-        vg_lockwait_mark(t, NO);
+    for (VGMTLTexture *t in _streamWriteBacks) {
+        VGStreamWriteBack *stream = [_streamWriteBacks objectForKey:t];
+        vg_lockwait_end(t, stream->copied);
     }
-    _pendingMarks = nil;
+    _streamWriteBacks = nil;
     if (_wroteBack) {   // commitAndWaitUntilSubmitted's caller may go on: the surfaces hold this frame (round 23)
         dispatch_semaphore_signal(_wroteBack);
     }
@@ -1668,6 +1730,7 @@ static void vg_surface_debug(VGMTLTexture *t) {
     dispatch_group_enter(_fenced);
     _fencedEntered = YES;
     _submitted = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    const BOOL profile = vg_perf_on();
     VkFence fence = VK_NULL_HANDLE;
     if (_cb && !_error) {
         // IOSurface textures this command buffer wrote: image -> staging, written into the surface at completion.
@@ -1681,9 +1744,7 @@ static void vg_surface_debug(VGMTLTexture *t) {
         NSMutableArray<VGMTLTexture *> *gpuWrote = [NSMutableArray arrayWithCapacity:_surfacesWritten.count];
         for (VGMTLTexture *t in _surfacesWritten) {
             [self barrier];
-            // its reader waits for the write-back (a display stream read by ScreensharingAgent, VGMTLLockWait.m): no
-            // need to wait for it here (round 23)
-            const BOOL readerWaits = vg_reader_waits(t);
+            BOOL writerWaits = YES;
             // A display frame: into the surface's twin, which the kext scans out (5c). Such a surface is only read on
             // the GPU (Core Animation) and from the twin (the display), so its CPU write-back is skipped
             // (VGMTL_TWIN_WRITEBACK=1 keeps it).
@@ -1727,9 +1788,7 @@ static void vg_surface_debug(VGMTLTexture *t) {
                     scanoutWB = vg_debug_flag("scanoutwriteback");
                 }
                 const BOOL scanoutOnly = !scanoutWB && vg_surface_is_scanout(t);
-                if (!shown && !scanoutOnly && (t->_hotWrites < 10 || !vg_surface_is_scanout(t)) && !readerWaits) {
-                    _allTwinned = NO;
-                }
+                writerWaits = !shown && !scanoutOnly && (t->_hotWrites < 10 || !vg_surface_is_scanout(t));
                 [gpuWrote addObject:t];
                 if ((shown || scanoutOnly) && !writeBackTwins) {
                     if (vg_synclog()) {
@@ -1743,8 +1802,6 @@ static void vg_surface_debug(VGMTLTexture *t) {
                     [noWriteBack addObject:t];
                     continue;
                 }
-            } else if (!readerWaits) {
-                _allTwinned = NO;
             }
             int32_t dr[4];
             BOOL drawn = vg_dirty_rect(self, t, dr);
@@ -1775,6 +1832,9 @@ static void vg_surface_debug(VGMTLTexture *t) {
                 [gpuWrote addObject:t];
             }
             if (!drawn) {   // stored, but nothing drawn into it: nothing to copy out
+                if (writerWaits) {
+                    _allTwinned = NO;
+                }
                 if (vg_synclog()) {
                     vglog("synclog nothing drawn, no write-back: surface %u %lux%lu", IOSurfaceGetID(t->_surface),
                           (unsigned long)t->_width, (unsigned long)t->_height);
@@ -1785,7 +1845,24 @@ static void vg_surface_debug(VGMTLTexture *t) {
                 [noWriteBack addObject:t];
                 continue;
             }
-            if (!t->_staging.buffer && vg_staging_get(t->_surfaceBpr * t->_height, &t->_staging)) {
+            VGStreamWriteBack *stream = nil;
+            if (writerWaits && vg_lockwait_begin(t)) {
+                stream = [VGStreamWriteBack new];
+                if (vg_staging_get(t->_surfaceBpr * t->_height, &stream->staging)) {
+                    vg_lockwait_end(t, YES);
+                    stream = nil;
+                } else {
+                    if (!_streamWriteBacks) {
+                        _streamWriteBacks = [NSMapTable strongToStrongObjectsMapTable];
+                    }
+                    [_streamWriteBacks setObject:stream forKey:t];
+                }
+            }
+            if (writerWaits && !stream) {
+                _allTwinned = NO;
+            }
+            vg_buffer *staging = stream ? &stream->staging : &t->_staging;
+            if (!staging->buffer && vg_staging_get(t->_surfaceBpr * t->_height, staging)) {
                 continue;   // no memory for its write-back (logged by the pool)
             }
             NSUInteger px = vg_bytes_per_pixel(t->_pixelFormat);   // the image's texels (a regrouping's are bigger)
@@ -1793,14 +1870,7 @@ static void vg_surface_debug(VGMTLTexture *t) {
                                    (uint32_t)(t->_surfaceBpr / px), (uint32_t)t->_height,
                                    {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {dr[0], dr[1], 0},
                                    {(uint32_t)(dr[2] - dr[0]), (uint32_t)(dr[3] - dr[1]), 1}};
-            gVk.vkCmdCopyImageToBuffer(_cb, t->_image, VK_IMAGE_LAYOUT_GENERAL, t->_staging.buffer, 1, &c);
-            if (readerWaits) {   // a lock now waits until the write-back is in (finishWith clears it)
-                vg_lockwait_mark(t, YES);
-                if (!_pendingMarks) {
-                    _pendingMarks = [NSMutableArray array];
-                }
-                [_pendingMarks addObject:t];
-            }
+            gVk.vkCmdCopyImageToBuffer(_cb, t->_image, VK_IMAGE_LAYOUT_GENERAL, staging->buffer, 1, &c);
         }
         if (noWriteBack) {
             [_surfacesWritten minusSet:noWriteBack];   // no CPU copy at completion either
@@ -1839,14 +1909,25 @@ static void vg_surface_debug(VGMTLTexture *t) {
         }
         cbs[ncb++] = _cb;
         VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-        gVk.vkCreateFence(gVk.device, &fci, NULL, &fence);
-        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, ncb, cbs, 0, NULL};
-        pthread_mutex_lock(&gVk.lock);
-        VkResult r = gVk.vkQueueSubmit(gVk.queue, 1, &si, fence);
-        pthread_mutex_unlock(&gVk.lock);
-        if (r != VK_SUCCESS) {
-            [self fail:[NSString stringWithFormat:@"vkQueueSubmit %d", r]];
-            gVk.vkDestroyFence(gVk.device, fence, NULL);
+        VkResult r = gVk.vkCreateFence(gVk.device, &fci, NULL, &fence);
+        if (r == VK_SUCCESS) {
+            VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, ncb, cbs, 0, NULL};
+            pthread_mutex_lock(&gVk.lock);
+            uint64_t submitStart = profile ? vg_now() : 0;
+            r = gVk.vkQueueSubmit(gVk.queue, 1, &si, fence);
+            uint64_t submitEnd = profile ? vg_now() : 0;
+            pthread_mutex_unlock(&gVk.lock);
+            if (profile) {
+                vg_perf(VG_PERF_COMMIT_PREP, 0, submitStart - _submitted);
+                vg_perf(VG_PERF_QUEUE_SUBMIT, 0, submitEnd - submitStart);
+            }
+            if (r != VK_SUCCESS) {
+                [self fail:[NSString stringWithFormat:@"vkQueueSubmit %d", r]];
+                gVk.vkDestroyFence(gVk.device, fence, NULL);
+                fence = VK_NULL_HANDLE;
+            }
+        } else {
+            [self fail:[NSString stringWithFormat:@"vkCreateFence %d", r]];
             fence = VK_NULL_HANDLE;
         }
         // Submitted: these images now hold their surfaces' newest pixels, and the plane's other images are copied
@@ -1878,13 +1959,19 @@ static void vg_surface_debug(VGMTLTexture *t) {
     }
     // In order on the queue's serial queue when the caller named a completion queue; otherwise as before (a handler
     // that waits for a later command buffer of the same queue must not deadlock behind it).
+    uint64_t enqueued = profile && fence ? vg_now() : 0;
     dispatch_async(q && q->_userCompletion ? q->_serial : dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+        uint64_t started = enqueued ? vg_now() : 0;
         VGMTLCommandBuffer *prev = self->_prev;
         self->_prev = nil;
         if (prev) {
             dispatch_group_wait(prev->_statusSet, DISPATCH_TIME_FOREVER);
         }
-        [self finishWith:end fence:fence];
+        if (enqueued) {
+            vg_perf(VG_PERF_COMPLETION_DISPATCH, 0, started - enqueued);
+            vg_perf(VG_PERF_COMPLETION_ORDER, 0, prev ? vg_now() - started : 0);
+        }
+        [self finishWith:end fence:fence profile:profile];
         dispatch_group_leave(self->_done);
     });
 }

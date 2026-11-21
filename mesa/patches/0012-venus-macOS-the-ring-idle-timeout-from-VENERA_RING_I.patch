@@ -1,0 +1,50 @@
+From 0125b53dbda4bd8c9881fe1d95d58bd1579a0cdb Mon Sep 17 00:00:00 2001
+From: Venera <venera@localhost>
+Date: Sat, 21 Nov 2026 13:43:54 -0500
+Subject: [PATCH] venus: macOS: the ring idle timeout from VENERA_RING_IDLE_US
+
+The renderer's ring thread keeps polling for this long after its last command
+before it sleeps and needs a notify to wake (through the kernel, QEMU's main
+loop and the render server). 1 ms stays the default.
+---
+ src/virtio/vulkan/vn_ring.c | 24 +++++++++++++++++++++++-
+ 1 file changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/src/virtio/vulkan/vn_ring.c b/src/virtio/vulkan/vn_ring.c
+index 4e0cff9..e322156 100644
+--- a/src/virtio/vulkan/vn_ring.c
++++ b/src/virtio/vulkan/vn_ring.c
+@@ -13,7 +13,29 @@
+ #include "vn_instance.h"
+ #include "vn_renderer.h"
+ 
+-#define VN_RING_IDLE_TIMEOUT_NS (1ull * 1000 * 1000)
++#define VN_RING_IDLE_TIMEOUT_NS (vn_ring_idle_timeout_ns())
++
++/* macOS (Venera): how long the renderer's ring thread keeps polling after its last command before it sleeps and
++ * needs a notify to wake, from VENERA_RING_IDLE_US (100 us to 100 ms) or 1 ms. Each wake-up goes guest -> kernel
++ * -> QEMU's main loop -> the render server, and WindowServer submits in bursts about 17 ms apart, so with 1 ms the
++ * ring sleeps between nearly every burst.
++ */
++static uint64_t
++vn_ring_idle_timeout_ns(void)
++{
++   static uint64_t ns;
++   if (!ns) {
++      uint64_t v = 1000ull * 1000;
++      const char *e = getenv("VENERA_RING_IDLE_US");
++      if (e) {
++         const unsigned long long us = strtoull(e, NULL, 10);
++         if (us >= 100 && us <= 100000)
++            v = (uint64_t)us * 1000;
++      }
++      ns = v;
++   }
++   return ns;
++}
+ 
+ static_assert(ATOMIC_INT_LOCK_FREE == 2 && sizeof(atomic_uint) == 4,
+               "vn_ring_shared requires lock-free 32-bit atomic_uint");
+-- 
+2.54.0 (Apple Git-157)
+

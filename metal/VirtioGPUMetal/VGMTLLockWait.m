@@ -7,77 +7,100 @@
 // frame over (the trails fix) -- and while someone shares the screen, that wait costs WindowServer up to half its
 // frames (VM 109: 17.5 ms frame gaps alone, 31-33 ms sharing).
 //
-// Now the reader waits instead, as on a Mac:
-// - In the processes the flag file VirtioGPUMetal-lockwait names (ScreensharingAgent; off when there is no file),
-//   IOSurfaceLock is replaced by a copy of itself that first waits while the surface is marked "write pending". The
-//   exported IOSurfaceLock is a stub (NULL check, the surface's client object, a tail jump to the real lock), so the
-//   replacement re-does it exactly, after checking its bytes; another macOS build's stub is left alone.
-// - The first time such a reader locks a display-stream surface (its name has "DisplayStream"), it tags the surface
-//   (VeneraReaderWaits). Only for tagged surfaces does WindowServer mark "write pending" (VeneraPending) when it
-//   records the write-back, clear it once the write-back is in, and skip its own wait. Every other surface -- one
-//   another capture app reads, a screenshot's -- keeps the writer's wait.
+// An opted-in reader tags a display-stream surface after subscribing to Darwin notifications. The writer
+// publishes a write's generation before handing the surface over, then clears it and wakes readers after
+// writing the CPU pixels. Only one asynchronous write can be pending per surface. A second submit uses the
+// writer's normal wait so an earlier completion cannot clear a later pending write.
 //
-// Off by default. Measured on VM 109 with the owner connected over Screen Sharing: with a moderate drag WindowServer
-// went from 25.2 ms frame gaps (waiting) to 17.6 ms (as without sharing) and the agent's frames came more evenly; with
-// fast sweeps of a large window both ways gave ~33 ms and the same stalls (WindowServer's own frame time is the limit
-// there). The owner felt no improvement, and once more pauses during fast drags (the agent's thread blocked up to
-// ~50 ms in a lock). The flag file lockwaitmeasure times the agent's display-stream locks without waiting (every 5 s:
-// frames, gaps, waits).
+// A reader pins the generation it sees when it enters IOSurfaceLock. Wakes prompt it to check the
+// surface's metadata; a subsequent generation does not extend that lock's wait. The hook cannot see
+// SkyLight's frame identity before the lock. The experiment stays off by default.
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurface.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <mach/mach.h>
+#include <notify.h>
 #include <os/lock.h>
+#include <os/os_sync_wait_on_address.h>
+#include <stdatomic.h>
 #include <string.h>
 #import "objects.h"
 
-BOOL vg_debug_flag(const char *name);
+static CFStringRef const kVgPending = CFSTR("VeneraPendingGeneration");
+static CFStringRef const kVgReaderWaits = CFSTR("VeneraReaderWakeEnabled");
+static const char kVgWriteBackNotification[] = "org.venera.metal.display-stream-writeback";
+static _Atomic uint32_t gWakeSequence;
+static os_unfair_lock gWriterLock = OS_UNFAIR_LOCK_INIT;
+static int64_t gNextGeneration;
 
-static CFStringRef const kVgPending = CFSTR("VeneraPending");
-static CFStringRef const kVgReaderWaits = CFSTR("VeneraReaderWaits");
-
-// ---- the writer's side -----------------------------------------------------------------------------------------------
-
-// YES when a reader that waits has tagged t's surface (looked up again now and then until it has).
-BOOL vg_reader_waits(VGMTLTexture *t) {
-    while (t && t->_parent) {
-        t = t->_parent;
-    }
-    if (!t || !t->_surface) {
-        return NO;
-    }
-    if (t->_readerWaits) {
-        return t->_readerWaits > 0;
-    }
-    if (t->_readerChecks++ % 30) {   // an IPC each: every 30th write until a reader tags it
-        return NO;
-    }
-    CFTypeRef v = IOSurfaceCopyValue(t->_surface, kVgReaderWaits);
-    if (v) {
-        CFRelease(v);
-        t->_readerWaits = 1;
-        static int said;
-        if (said++ < 8) {
-            vglog("lockwait: surface %u %lux%lu is read by a reader that waits: marked pending at its writes, not waited "
-                  "for", IOSurfaceGetID(t->_surface), (unsigned long)t->_width, (unsigned long)t->_height);
+static int64_t vg_pending_generation(IOSurfaceRef surface) {
+    int64_t generation = 0;
+    CFTypeRef value = IOSurfaceCopyValue(surface, kVgPending);
+    if (value) {
+        if (CFGetTypeID(value) == CFNumberGetTypeID()) {
+            CFNumberGetValue((CFNumberRef)value, kCFNumberSInt64Type, &generation);
         }
-        return YES;
+        CFRelease(value);
     }
-    return NO;
+    return generation;
 }
 
-void vg_lockwait_mark(VGMTLTexture *t, BOOL pending) {
+static VGMTLTexture *vg_lockwait_root(VGMTLTexture *t) {
     while (t && t->_parent) {
         t = t->_parent;
     }
-    if (!t || !t->_surface) {
-        return;
+    return t;
+}
+
+BOOL vg_lockwait_begin(VGMTLTexture *t) {
+    static BOOL enabled;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        enabled = access("/Library/GPUBundles/VirtioGPUMetal-lockwait", F_OK) == 0 &&
+                  (!strcmp(getprogname(), "WindowServer") || !strcmp(getprogname(), "mtllockwait"));
+    });
+    if (!enabled || !(t = vg_lockwait_root(t)) || !t->_surface) {
+        return NO;
     }
-    if (pending) {
-        IOSurfaceSetValue(t->_surface, kVgPending, kCFBooleanTrue);
-    } else {
+
+    BOOL published = NO;
+    os_unfair_lock_lock(&gWriterLock);
+    if (!t->_readerWaits && t->_readerChecks++ % 30 == 0) {
+        CFTypeRef tag = IOSurfaceCopyValue(t->_surface, kVgReaderWaits);
+        if (tag) {
+            CFRelease(tag);
+            t->_readerWaits = notify_post(kVgWriteBackNotification) == NOTIFY_STATUS_OK;
+        }
+    }
+    if (t->_readerWaits && vg_pending_generation(t->_surface) <= 0) {
+        int64_t generation = ++gNextGeneration;
+        CFNumberRef value = CFNumberCreate(NULL, kCFNumberSInt64Type, &generation);
+        if (value) {
+            IOSurfaceSetValue(t->_surface, kVgPending, value);
+            CFRelease(value);
+            published = vg_pending_generation(t->_surface) == generation;
+        }
+    }
+    os_unfair_lock_unlock(&gWriterLock);
+    return published;
+}
+
+void vg_lockwait_end(VGMTLTexture *t, BOOL written) {
+    t = vg_lockwait_root(t);
+    os_unfair_lock_lock(&gWriterLock);
+    if (written) {
         IOSurfaceRemoveValue(t->_surface, kVgPending);
+    } else {
+        int64_t generation = -vg_pending_generation(t->_surface);
+        CFNumberRef value = CFNumberCreate(NULL, kCFNumberSInt64Type, &generation);
+        if (value) {
+            IOSurfaceSetValue(t->_surface, kVgPending, value);
+            CFRelease(value);
+        }
     }
+    os_unfair_lock_unlock(&gWriterLock);
+    notify_post(kVgWriteBackNotification);
 }
 
 // ---- the reader's side -----------------------------------------------------------------------------------------------
@@ -157,10 +180,7 @@ static BOOL vg_is_stream_surface(IOSurfaceRef s) {
     gSeenStream[slot] = stream;
     os_unfair_lock_unlock(&gSeenLock);
     if (stream) {
-        static int said;
-        if (said++ < 8) {
-            vglog("lockwait: surface %u is a display stream's: tagged, its locks wait for its pending writes", sid);
-        }
+        vglog("lockwait: surface %u is a display stream%s", sid, gMeasureOnly ? " (timing only)" : " (tagged)");
     }
     return stream;
 }
@@ -170,32 +190,48 @@ static kern_return_t vg_surface_lock_hook(IOSurfaceRef s, IOSurfaceLockOptions o
         return (kern_return_t)0xe00002c2;   // kIOReturnBadArgument, as the stub answers
     }
     if (!(options & kIOSurfaceLockAvoidSync) && vg_is_stream_surface(s)) {
-        uint64_t t0 = 0;
-        for (int i = 0; !gMeasureOnly; i++) {
-            CFTypeRef v = IOSurfaceCopyValue(s, kVgPending);
-            if (!v) {
-                break;
+        int64_t target = gMeasureOnly ? 0 : vg_pending_generation(s);
+        uint64_t t0 = target > 0 ? vg_now() : 0;
+        kern_return_t error = target < 0 ? kIOReturnNotReady : KERN_SUCCESS;
+        if (target > 0) {
+            const uint64_t deadline = t0 + 100000000ull;
+            for (;;) {
+                // Take the wake sequence before checking metadata so a write in between either changes the
+                // predicate or makes the compare-and-wait return immediately.
+                uint32_t expected = atomic_load_explicit(&gWakeSequence, memory_order_acquire);
+                int64_t pending = vg_pending_generation(s);
+                if (pending != target) {
+                    error = pending == -target ? kIOReturnNotReady : KERN_SUCCESS;
+                    break;
+                }
+                uint64_t now = vg_now();
+                if (now >= deadline) {
+                    error = kIOReturnTimeout;
+                    break;
+                }
+                if (os_sync_wait_on_address_with_timeout(&gWakeSequence, expected, sizeof(expected),
+                        OS_SYNC_WAIT_ON_ADDRESS_NONE, OS_CLOCK_MACH_ABSOLUTE_TIME, deadline - now) < 0 &&
+                    errno != EINTR && errno != ETIMEDOUT) {
+                    error = kIOReturnTimeout;
+                    break;
+                }
             }
-            CFRelease(v);
-            if (!t0) {
-                t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-            }
-            if (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0 > 100000000ull) {   // 100 ms: a writer that went away
-                gTimeouts++;
-                break;
-            }
-            usleep(i < 20 ? 100 : 500);
         }
-        uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        uint64_t now = vg_now();
         vg_lockwait_stat(now, t0 ? now - t0 : 0);
         if (t0) {
-            gWaits++;
-            gWaitNs += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
-            uint64_t n = gWaits;
-            if (n == 1 || n % 1000 == 0) {
-                vglog("lockwait: %llu waits for a pending write, %.2f ms each on average, %llu gave up at 100 ms",
-                      (unsigned long long)n, gWaitNs / 1e6 / n, (unsigned long long)gTimeouts);
+            uint64_t total = atomic_fetch_add(&gWaitNs, now - t0) + now - t0;
+            if (error == kIOReturnTimeout) {
+                atomic_fetch_add(&gTimeouts, 1);
             }
+            uint64_t n = atomic_fetch_add(&gWaits, 1) + 1;
+            if (n == 1 || n % 1000 == 0) {
+                vglog("lockwait: %llu waits for a pending write, %.2f ms each on average, %llu timed out",
+                      (unsigned long long)n, total / 1e6 / n, (unsigned long long)atomic_load(&gTimeouts));
+            }
+        }
+        if (error != KERN_SUCCESS) {
+            return error;
         }
     }
     void *client = *(void **)((char *)s + *gClientOffset);
@@ -252,12 +288,32 @@ static BOOL vg_lockwait_wanted(void) {
     return [names containsObject:@(getprogname())];
 }
 
+static uint32_t vg_lockwait_subscribe(int *token) {
+    return notify_register_dispatch(kVgWriteBackNotification, token,
+        dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(int _) {
+            atomic_fetch_add_explicit(&gWakeSequence, 1, memory_order_release);
+            os_sync_wake_by_address_all(&gWakeSequence, sizeof(uint32_t), OS_SYNC_WAKE_BY_ADDRESS_NONE);
+        });
+}
+
 __attribute__((constructor)) static void vg_lockwait_init(void) {
     @autoreleasepool {
-        gMeasureOnly = vg_debug_flag("lockwaitmeasure");
-        if (vg_lockwait_wanted() && vg_lockwait_install()) {
-            vglog(gMeasureOnly ? "lockwait: this process's display-stream locks are timed, not made to wait (lockwaitmeasure)"
-                               : "lockwait: this process's IOSurfaceLock waits for a display stream's pending writes");
+        if (!vg_lockwait_wanted()) {
+            return;
         }
+        gMeasureOnly = vg_debug_flag("lockwaitmeasure");
+        int token = -1;
+        if (!gMeasureOnly && vg_lockwait_subscribe(&token) != NOTIFY_STATUS_OK) {
+            vglog("lockwait: could not subscribe to write-back notifications");
+            return;
+        }
+        if (!vg_lockwait_install()) {
+            if (token >= 0) {
+                notify_cancel(token);
+            }
+            return;
+        }
+        vglog(gMeasureOnly ? "lockwait: this process's display-stream locks are timed, with no reader wait"
+                           : "lockwait: this process's IOSurfaceLock waits for pending display-stream writes");
     }
 }

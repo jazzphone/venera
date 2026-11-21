@@ -88,7 +88,7 @@ id<MTLBuffer> vg_new_buffer_nocopy(id<MTLDevice> device, void *pointer, NSUInteg
     BOOL _shareable;   // exportable, offered to other processes at its first GPU write-back (vg_surface_wrote_back)
     // A display stream's surface whose reader waits for pending writes (VGMTLLockWait.m, round 23): 1 tagged, 0 not
     // yet (looked up again every 30th write).
-    int8_t _readerWaits;
+    BOOL _readerWaits;
     BOOL _described;   // synclog has said what this surface is
     uint32_t _readerChecks;
 }
@@ -108,15 +108,14 @@ void vg_surface_gpu_wrote(VGMTLTexture *t);
 // `before` match `seed` too, since they get t's pixels on the GPU (call with gVgSurfaceSync held).
 void vg_surface_siblings_synced(VGMTLTexture *t, uint32_t before, uint32_t seed);
 // A reader that waits for pending writes has tagged t's surface (VGMTLLockWait.m); mark or clear "write pending".
-BOOL vg_reader_waits(VGMTLTexture *t);
-void vg_lockwait_mark(VGMTLTexture *t, BOOL pending);
+BOOL vg_lockwait_begin(VGMTLTexture *t);
+void vg_lockwait_end(VGMTLTexture *t, BOOL written);
 // Records that `cmd` writes texture `t`: a surface texture is copied back to its IOSurface when `cmd` completes.
 void vg_cmd_wrote(id cmd, VGMTLTexture *t);
 void vg_cmd_wrote_rect(id cmd, VGMTLTexture *t, int32_t x0, int32_t y0, int32_t x1, int32_t y1);
 // Display-surface twins (5c): make and register one for a root surface texture that qualifies (WindowServer, BGRA,
 // screen-sized); forget it (the kext first) before the texture goes.
 BOOL vg_twin_ensure(VGMTLTexture *t);
-BOOL vg_debug_flag(const char *name);   // /Library/GPUBundles/VirtioGPUMetal-NAME (VGMTLDevice.m)
 // YES: shown on the display already. use (a submitted frame): which twin to copy it into, 0 or 1.
 BOOL vg_twin_mark(uint32_t surface, uint32_t frame, BOOL ready, uint32_t *use);
 int vg_snap_wanted(void);
@@ -168,7 +167,7 @@ BOOL vg_spirv_has_push_constants(NSData *spv);   // DescriptorSet 0 -> newSet (N
     VkCommandBuffer _cb;
     VkCommandBuffer _pendingCb;   // deferred work submitted just ahead of _cb (5c), freed at completion
     NSMutableData *_pendingOwned;
-    NSMutableArray *_pendingMarks;   // surfaces marked "write pending" for a waiting reader, cleared after the write-back
+    NSMapTable *_streamWriteBacks;   // separate staging for surfaces handed over before write-back
     int _timePair;   // GPU timestamps (5c), -1 when off
     BOOL _present;          // committed by commitAndWaitUntilSubmitted (Core Animation's display frames)
     BOOL _allTwinned;       // every IOSurface it wrote got a twin copy: waiting for the GPU is enough

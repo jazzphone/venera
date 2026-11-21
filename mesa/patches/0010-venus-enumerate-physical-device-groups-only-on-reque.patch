@@ -1,0 +1,117 @@
+From f0aeac299cabec968dbb9c384f3601c0a5095332 Mon Sep 17 00:00:00 2001
+From: Codex <noreply@openai.com>
+Date: Sat, 21 Nov 2026 12:11:35 -0500
+Subject: [PATCH 10/10] venus: enumerate physical device groups only on request
+
+---
+ src/virtio/vulkan/vn_instance.h        |  1 +
+ src/virtio/vulkan/vn_physical_device.c | 46 +++++++++++++++++---------
+ 2 files changed, 31 insertions(+), 16 deletions(-)
+
+diff --git a/src/virtio/vulkan/vn_instance.h b/src/virtio/vulkan/vn_instance.h
+index 919c926..6704064 100644
+--- a/src/virtio/vulkan/vn_instance.h
++++ b/src/virtio/vulkan/vn_instance.h
+@@ -67,4 +67,5 @@ struct vn_instance {
+       mtx_t mutex;
+       bool initialized;
++      bool groups_initialized;
+
+       struct vn_physical_device *devices;
+diff --git a/src/virtio/vulkan/vn_physical_device.c b/src/virtio/vulkan/vn_physical_device.c
+index 0a95f89..18b7ddd 100644
+--- a/src/virtio/vulkan/vn_physical_device.c
++++ b/src/virtio/vulkan/vn_physical_device.c
+@@ -1419,5 +1419,5 @@ vn_instance_enumerate_physical_device_groups_locked(
+    result = vn_call_vkEnumeratePhysicalDeviceGroups(ring, instance_handle,
+                                                     &count, NULL);
+-   if (result != VK_SUCCESS)
++   if (result != VK_SUCCESS || !count)
+       return result;
+
+@@ -1491,5 +1491,4 @@ vn_instance_enumerate_physical_device_groups_locked(
+
+    count = supported_count;
+-   assert(count);
+
+    vk_free(alloc, temp_objs);
+@@ -1593,5 +1592,5 @@ filter_physical_devices(struct vn_physical_device *physical_devs,
+
+ static VkResult
+-vn_instance_enumerate_physical_devices_and_groups(struct vn_instance *instance)
++vn_instance_enumerate_physical_devices(struct vn_instance *instance)
+ {
+    const VkAllocationCallbacks *alloc = &instance->base.base.alloc;
+@@ -1604,6 +1603,4 @@ vn_instance_enumerate_physical_devices_and_groups(struct vn_instance *instance)
+    if (instance->physical_device.initialized)
+       goto unlock;
+-   instance->physical_device.initialized = true;
+-
+    result = enumerate_physical_devices(instance, &physical_devs, &count);
+    if (result != VK_SUCCESS)
+@@ -1613,4 +1610,5 @@ vn_instance_enumerate_physical_devices_and_groups(struct vn_instance *instance)
+    if (!count) {
+       vk_free(alloc, physical_devs);
++      instance->physical_device.initialized = true;
+       goto unlock;
+    }
+@@ -1631,15 +1629,7 @@ vn_instance_enumerate_physical_devices_and_groups(struct vn_instance *instance)
+    }
+
+-   result = vn_instance_enumerate_physical_device_groups_locked(
+-      instance, physical_devs, count);
+-   if (result != VK_SUCCESS) {
+-      for (uint32_t i = 0; i < count; i++)
+-         vn_physical_device_fini(&physical_devs[i]);
+-      vk_free(alloc, physical_devs);
+-      goto unlock;
+-   }
+-
+    instance->physical_device.devices = physical_devs;
+    instance->physical_device.device_count = count;
++   instance->physical_device.initialized = true;
+
+ unlock:
+@@ -1648,4 +1638,28 @@ unlock:
+ }
+
++static VkResult
++vn_instance_enumerate_physical_device_groups(struct vn_instance *instance)
++{
++   VkResult result = vn_instance_enumerate_physical_devices(instance);
++   if (result != VK_SUCCESS)
++      return result;
++
++   /* Metal asks for a single physical device, so avoid the two extra
++    * round trips unless a client actually enumerates device groups.
++    */
++   mtx_lock(&instance->physical_device.mutex);
++   if (!instance->physical_device.groups_initialized) {
++      if (instance->physical_device.device_count) {
++         result = vn_instance_enumerate_physical_device_groups_locked(
++            instance, instance->physical_device.devices,
++            instance->physical_device.device_count);
++      }
++      instance->physical_device.groups_initialized = result == VK_SUCCESS;
++   }
++   mtx_unlock(&instance->physical_device.mutex);
++
++   return result;
++}
++
+ /* physical device commands */
+
+@@ -1658,5 +1672,5 @@ vn_EnumeratePhysicalDevices(VkInstance _instance,
+
+    VkResult result =
+-      vn_instance_enumerate_physical_devices_and_groups(instance);
++      vn_instance_enumerate_physical_devices(instance);
+    if (result != VK_SUCCESS)
+       return vn_error(instance, result);
+@@ -1683,5 +1697,5 @@ vn_EnumeratePhysicalDeviceGroups(
+
+    VkResult result =
+-      vn_instance_enumerate_physical_devices_and_groups(instance);
++      vn_instance_enumerate_physical_device_groups(instance);
+    if (result != VK_SUCCESS)
+       return vn_error(instance, result);

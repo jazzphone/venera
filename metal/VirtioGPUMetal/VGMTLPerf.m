@@ -11,19 +11,30 @@ static _Atomic uint64_t gCount[VG_PERF_N], gBytes[VG_PERF_N], gNs[VG_PERF_N];
 static const char *const kNames[VG_PERF_N] = {"pull copy", "pull GPU", "write-back copy",
                                               "command buffer commit->done (includes the write-back GPU copy)", "one-shot",
                                               "replaceRegion upload (deferred)", "deferred ops recorded (bytes = ops)",
-                                              "framebuffer fetch copy (bytes ~ pixels x 4)", "completion: in line after commit",
+                                              "framebuffer fetch copy (bytes ~ pixels x 4)", "completion: commit -> first fence check",
                                               "completion: fence wait", "GPU time (timestamps)", "staging pool hit", "staging pool miss (new buffer)",
                                               "commitAndWaitUntilSubmitted: waited (GPU, or the write-back)",
                                               "shader translated", "shader from the disk cache",
                                               "waitUntilCompleted: blocked",
                                               "latency: commit -> GPU starts it", "latency: GPU done -> guest sees it",
                                               "descriptor set written", "descriptor set reused",
-                                              "draw state commands skipped"};
+                                              "draw state commands skipped",
+                                              "commit: prepare through submit lock",
+                                              "commit: vkQueueSubmit",
+                                              "completion: dispatch delay",
+                                              "completion: predecessor status wait",
+                                              "fence: status probe",
+                                              "fence: polling backoff and other overhead",
+                                              "GPU clock calibration: maximum deviation"};
 
-void vg_perf(int kind, uint64_t bytes, uint64_t ns) {
-    atomic_fetch_add_explicit(&gCount[kind], 1, memory_order_relaxed);
+void vg_perf_count(int kind, uint64_t count, uint64_t bytes, uint64_t ns) {
+    atomic_fetch_add_explicit(&gCount[kind], count, memory_order_relaxed);
     atomic_fetch_add_explicit(&gBytes[kind], bytes, memory_order_relaxed);
     atomic_fetch_add_explicit(&gNs[kind], ns, memory_order_relaxed);
+}
+
+void vg_perf(int kind, uint64_t bytes, uint64_t ns) {
+    vg_perf_count(kind, 1, bytes, ns);
 }
 
 static void vg_perf_report(void) {
@@ -96,7 +107,7 @@ static double vg_gpu_offset(void) {
         get = (PFN_vkGetCalibratedTimestampsEXT)gVk.vkGetDeviceProcAddr(gVk.device, "vkGetCalibratedTimestampsEXT");
     }
     uint64_t now = vg_now();
-    if (get && now - at > 1000000000ull) {
+    if (get && (!at || now - at > 1000000000ull)) {
         VkCalibratedTimestampInfoEXT info = {VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT, NULL, VK_TIME_DOMAIN_DEVICE_EXT};
         uint64_t dev = 0, dev_max = 0;
         uint64_t t0 = vg_now();
@@ -104,6 +115,7 @@ static double vg_gpu_offset(void) {
             uint64_t t1 = vg_now();
             offset = (double)(t0 + t1) / 2 - dev * (double)gVk.props.limits.timestampPeriod;
             at = t1;
+            vg_perf(VG_PERF_CALIBRATION, 0, MAX(dev_max, (t1 - t0) / 2));
         }
     }
     double o = offset;

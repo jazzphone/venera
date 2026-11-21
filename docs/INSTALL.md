@@ -377,7 +377,16 @@ Files in `/Library/GPUBundles` the Metal driver reads (root only; delete them to
   and falls back to copies without it). Read when WindowServer starts: reboot after changing it.
 - `VirtioGPUMetal-perf`: log where WindowServer's frames spend their time every 5 s (to
   `/var/tmp/VirtioGPUMetal.log` and the system log; WindowServer notices the file within 5 s).
-- `VirtioGPUMetal-gputime`: with it, GPU timings too (costs a little). Read when a process starts.
+- `VirtioGPUMetal-gputime` adds GPU timings and the uncertainty of the GPU-to-guest clock calibration.
+  Read when a process starts. With `perf`, compare the pre-submit, completion dispatch, predecessor wait and
+  Venus fence probe counters. Timestamp queries add their own work, so use the same timing flags in both builds
+  when comparing frame times.
+- `VirtioGPUMetal-initperf` logs the time to load the Vulkan driver, create an instance, enumerate the GPU and
+  its capabilities, create a logical device and set up its queue. Leave the file empty for all processes or list
+  process names, one per line.
+- `VirtioGPUMetal-skipsoftware` asks the bundled Venus driver to skip full capability queries for CPU Vulkan
+  devices. Metal already selects a hardware GPU. Use with `initperf` to compare fresh launches. Read when a
+  process starts. This experiment is off by default.
 - `VirtioGPUMetal-eagerlib`: read every shader of a Metal library when it loads, as before 0.1.9 (the driver reads
   one when an app first asks for it). Read when a process starts.
 - `VirtioGPUMetal-faildump`: save the text of each shader the translator can't take, to the process's cache folder
@@ -398,11 +407,17 @@ Files in `/Library/GPUBundles` the Metal driver reads (root only; delete them to
 - `VirtioGPUMetal-scanoutwriteback`: copy CoreDisplay's scanout surfaces back to CPU memory when the display hasn't
   shown them yet, as before 0.1.13 (since then only the display reads them, through their twins). Read when
   WindowServer starts.
-- `VirtioGPUMetal-lockwait`: the processes it names (one a line, e.g. `ScreensharingAgent`) wait in their
-  IOSurfaceLock for a display stream's frame to be written back, as on a Mac, so WindowServer needn't wait for it
-  before handing it over. An experiment, off without the file: WindowServer keeps more of its frames while someone
-  shares the screen, but it wasn't smoother to the eye. `VirtioGPUMetal-lockwaitmeasure` with it only logs the
-  timing of the display stream's frames (every 5 s). Read when a process starts.
+- `VirtioGPUMetal-ringidle` holds a number of microseconds (100 to 100000): how long the host's Venus ring thread
+  keeps polling after the last command before it sleeps and needs a wake-up (default 1000). For measuring; 20000
+  made no difference to WindowServer. Read when a process starts.
+- `VirtioGPUMetal-framesig` (WindowServer) logs a signature of what the display shows after each presented frame,
+  with its time, whenever it changes: when the screen settles after a click, to time how long a window or a System
+  Settings pane takes to be usable. Read when WindowServer starts.
+- `VirtioGPUMetal-lockwait` lets listed reader processes such as `ScreensharingAgent` wait on a notification
+  for a display stream's write-back. Only a reader that successfully subscribes and hooks IOSurfaceLock can
+  opt a surface in. A lock waits for the generation visible when it starts. On a timeout it returns an error.
+  This experiment is off by default. `VirtioGPUMetal-lockwaitmeasure` with it logs frame and lock timing without
+  enabling reader waits. Both files are read when the relevant process starts.
 
 The accelerator flips at most once per 12 ms by default (`vgpuflipms=N` boot-arg, 0 = no limit).
 

@@ -1,0 +1,55 @@
+From b7d97cd568a6d77ee7872c9396e70bbff05f5642 Mon Sep 17 00:00:00 2001
+From: Codex <noreply@openai.com>
+Date: Sat, 21 Nov 2026 12:11:14 -0500
+Subject: [PATCH 09/10] venus: time fence probes separately from polling
+ backoff on macOS
+
+---
+ src/virtio/vulkan/vn_queue.c | 36 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+
+diff --git a/src/virtio/vulkan/vn_queue.c b/src/virtio/vulkan/vn_queue.c
+index 7745333..1b41193 100644
+--- a/src/virtio/vulkan/vn_queue.c
++++ b/src/virtio/vulkan/vn_queue.c
+@@ -1747,4 +1747,40 @@ vn_WaitForFences(VkDevice device,
+ }
+
++#ifdef __APPLE__
++PUBLIC VkResult vn_macos_wait_for_fence_timed(VkDevice device, VkFence fence,
++                                             uint64_t *probe_count,
++                                             uint64_t *probe_ns);
++
++/* Venera's optional per-command-buffer diagnostic. The single-fence wait
++ * follows the normal Venus path, but distinguishes status checks (which
++ * round-trip to the host without feedback) from the backoff between them.
++ */
++PUBLIC VkResult
++vn_macos_wait_for_fence_timed(VkDevice device,
++                             VkFence fence,
++                             uint64_t *probe_count,
++                             uint64_t *probe_ns)
++{
++   struct vn_device *dev = vn_device_from_handle(device);
++   struct vn_relax_state relax_state =
++      vn_relax_init(dev->instance, VN_RELAX_REASON_FENCE);
++   VkResult result = VK_NOT_READY;
++   *probe_count = 0;
++   *probe_ns = 0;
++
++   while (result == VK_NOT_READY) {
++      const int64_t start = os_time_get_nano();
++      result = vn_GetFenceStatus(device, fence);
++      *probe_ns += os_time_get_nano() - start;
++      (*probe_count)++;
++      result = vn_update_sync_result(dev, result, OS_TIMEOUT_INFINITE,
++                                     &relax_state);
++   }
++
++   vn_relax_fini(&relax_state);
++   return vn_result(dev->instance, result);
++}
++#endif
++
+ static VkResult
+ vn_create_sync_file(struct vn_device *dev,

@@ -29,9 +29,13 @@ int main(int argc, char **argv) {
         d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
         id<MTLTexture> tex = [dev newTextureWithDescriptor:d iosurface:s plane:0];
         id<MTLCommandQueue> q = [dev newCommandQueue];
-        IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);   // a first read, as a reader's (it tags the surface)
-        IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
-        int stale = 0;
+        if (IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL) != KERN_SUCCESS) {
+            fprintf(stderr, "mtllockwait: initial surface lock failed\n");
+            CFRelease(s);
+            return 1;
+        }
+        IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);   // the first read tags the surface
+        int stale = 0, lockErrors = 0;
         double commitMs = 0, lockMs = 0;
         for (int r = 0; r < rounds; r++) {
             uint8_t b = (uint8_t)(r * 37 + 11), g = (uint8_t)(r * 91 + 7), rr = (uint8_t)(r * 53 + 3);
@@ -45,21 +49,25 @@ int main(int argc, char **argv) {
             uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
             [(id<VGSubmit>)cb commitAndWaitUntilSubmitted];
             uint64_t t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-            IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
+            kern_return_t locked = IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
             uint64_t t2 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            commitMs += (t1 - t0) / 1e6, lockMs += (t2 - t1) / 1e6;
+            if (locked != KERN_SUCCESS) {
+                lockErrors++;
+                continue;
+            }
             const uint32_t *px = IOSurfaceGetBaseAddress(s);
             uint32_t want = b | (uint32_t)g << 8 | (uint32_t)rr << 16 | 0xffu << 24;
             if (px[0] != want || px[(H - 1) * W + W - 1] != want) {
                 stale++;
             }
             IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
-            commitMs += (t1 - t0) / 1e6, lockMs += (t2 - t1) / 1e6;
             usleep(16000);
         }
         printf("mtllockwait: %d rounds: commit to return %.2f ms, lock %.2f ms on average; %d stale reads\n", rounds,
                commitMs / rounds, lockMs / rounds, stale);
         printf(stale ? "mtllockwait: FAIL (%d stale reads)\n" : "mtllockwait: PASS\n", stale);
         CFRelease(s);
-        return stale != 0;
+        return stale || lockErrors;
     }
 }
