@@ -2974,3 +2974,14 @@ Six vCPUs showed no repeatable benefit in this comparison. Screen Sharing resize
 so the viewer rates are directional. The genie workload includes deliberate idle gaps, and this run did not measure
 continuous pointer drags or input-to-display latency. VM 109 was restored to four vCPUs and 1440x900 at 1x,
 with `perf` as its only driver flag. The viewer session was closed.
+
+### 0.1.18 (2026-11-22)
+
+- Released as v0.1.18 (d987d94, Latest), the owner's OK: Codex's 180659e (a pipeline state's Vulkan pipelines,
+  modules and layouts released with it; a command buffer keeps the state until it completes) and 393ff83 (notes).
+  Checked first on 108 with the candidate bundle: mtlrender, mtlcompute, mtllifetime (200) and mtlsurface passed,
+  WindowServer drew. The owner's kits on both nodes are 0.1.18, kit-0.1.17 kept beside, kit-0.1.16 removed.
+- VMs 109, 108 and 107 upgraded from the kits, no viewers connected: WindowServer on the 0.1.18 Metal bundle
+  (82c2fba3e688, as built), modes kept (109 1440x900 1x, 108 1280x800 1x, 107 1440x900 1x: 107's was set to 1440x900
+  in System Settings at 12:39, after the 0.1.17 check), 107's HelperPod running. 108's snapshot pre-0-1-18 taken
+  before and deleted after.
