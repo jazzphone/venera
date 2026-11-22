@@ -2956,3 +2956,21 @@ matrices, the tint multipliers and the translated filter shaders were all right 
   `64,160`. VM 108 stored `64,128`, consistent with applying the RGB blend equation to the remapped alpha.
   An Apple M5 Max running macOS 27.2.1 stored `64,0` for the same synthetic surface. A native reference for
   RenderBox's exact surface and descriptor is still needed to establish Apple's behavior for that case.
+
+### Screen Sharing with four and six vCPUs (0.1.17, 2026-11-22)
+
+VM 109 ran at 1440x900 Retina (2880x1800) on both CPU allocations. The Mac's Screen Sharing viewer was connected
+for two 19-second captures per workload. Viewer gaps are between changed frames in a fixed-size crop sampled at
+60 Hz. Dispatch delay is the median of the driver's five-second window means.
+
+| Metric | 4 vCPUs | 6 vCPUs |
+|---|---:|---:|
+| Scroll, changed viewer frames per second | 32.7–34.6 | 26.2–29.8 |
+| Scroll, p95 viewer gap | 50–67 ms | 50–67 ms |
+| Scroll, completion dispatch delay | 1.00–1.07 ms | 1.06–1.65 ms |
+| Genie, completion dispatch delay | 4.17–5.12 ms | 5.49–7.08 ms |
+
+Six vCPUs showed no repeatable benefit in this comparison. Screen Sharing resized its window after reconnecting,
+so the viewer rates are directional. The genie workload includes deliberate idle gaps, and this run did not measure
+continuous pointer drags or input-to-display latency. VM 109 was restored to four vCPUs and 1440x900 at 1x,
+with `perf` as its only driver flag. The viewer session was closed.
