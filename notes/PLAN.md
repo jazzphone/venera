@@ -2567,3 +2567,67 @@ corner to corner 8 times in one press (`qmpinput.py sweep`, 0.4 s each way) and 
   counted per 1/60 s (with `-frames:v` and `-fps_mode passthrough`: without them a raw capture ran away to 85 GB).
   A scripted drag reached the viewer at ~40 updates/s. 108 sat at its lock screen after restarts: its frame counts
   then are the lock screen clock's, not a test's.
+
+### Round 23, night (2026-11-21): Screen Sharing's trails looked for unattended; 1x against Retina
+
+- **A stream reader with nobody connected** (ca5b0ac, `tools/streamprobe.m` + `streamprobe.sh`). Only Screen
+  Sharing's agent has Screen Recording, and launch constraints let only Apple's own job start it, so the job's next
+  launch gets the probe library (`launchctl debug --environment DYLD_INSERT_LIBRARIES=...`, AMFI off) and is
+  kickstarted; no permission is granted. The probe keeps a client's picture from each frame's dirty rectangles and,
+  when the stream stops, compares it with the last frame in 8x8 tiles; it also checks reads against WindowServer's
+  stamps (below). **The agent uses ScreenCaptureKit, not CGDisplayStream** (`SCStream`, `SCStreamFrameInfoDirtyRects`,
+  queue depth, minimum frame interval; it locks read-only, option 0x1). With the probe's SCStream read off its queue,
+  WindowServer cycled all 8 "DisplayStream surface N/8" and wrote a GPU-only Selective Sharing surface every frame, as
+  in the owner's sessions. As a stand-in for a viewer it matches: on the earlier test build at Retina, shared genie
+  32.3 ms a frame (the owner's session: 34-38), sweep 19.0 (18.9).
+- **No trails without the stream's twin, in ~40 runs** (VM 109, 1x 1440x900 and Retina 2880x1800; the twin switched
+  live, `twinkeep` on the test build, then `twindrop`, confirmed by synclog's "twinned" marks): CGDisplayStream and
+  ScreenCaptureKit, reads at once or off-queue 8-30 ms later, read-only and read-write locks, the reader not waiting
+  (`nolockwait`: the writer waits then), six busy CPU loops beside it, the Dock changing (dragtest's icon, genies).
+  `streamsum`: every stamped read matched what the write-back copied (443 reads, 0 differing, no seed moved, nothing
+  changed while read). The stream's last frame at rest against the screen as QEMU's VNC shows it (below the menu bar,
+  whose capture indicator goes with the stream): the same in 6 of 6 sweeps, 3 with the twin and 3 without. The only
+  tiles that ever differed were faint ones on the Dock's glass edge (2-32 levels apart), with or without the twin.
+- **In the owner's sessions the agent's locks never waited**: every `lockwait 5 s` line of the evening said "waits
+  mean 0.00", so the agent reads a frame after its write-back has landed, and a stale read at the lock isn't the cause.
+  Without the stream's twin, the stream's pixels are right as written and as read; the trails need the real pipeline
+  (the agent's encoder and the network viewer). **Next, with the owner connected**: `: > VirtioGPUMetal-streamsum`,
+  `echo DisplayStream > VirtioGPUMetal-twindrop` (both live), a drag, then the agent's `streamsum:` lines. Reads that
+  match their write-backs while trails show would put the cause in the agent's encoding or the viewer, which the twin's
+  extra GPU time only changes the timing of; reads that differ would show when.
+- **New flags** (ca5b0ac): `VirtioGPUMetal-twindrop` (a surface-name piece a line; those surfaces lose their twin,
+  live; the inverse of the removed `twinkeep`) and `VirtioGPUMetal-streamsum` (WindowServer stamps each tagged stream
+  write-back with 16 band sums and its seed; the reader's hook checks against them and logs mismatches). The hook
+  logs each reader's lock options once.
+- **VM 109 has this build** (bundle d051cc500d72: ca5b0ac's code, but for a line wrap in `vg_streamsum_stamp`), the
+  leftover `twinkeep` gone, `perf` the only flag. Measured with the probe as the shared reader (SCStream, read 8 ms
+  off its queue) and alone; WindowServer's frame gaps, mean ms:
+
+  | mode | sweep alone | genie alone | scroll alone | sweep shared | genie shared | scroll shared |
+  |---|---|---|---|---|---|---|
+  | 1440x900 Retina (2880x1800) | 18.2 | 20.5 | 22.0 | 20.8 | 30.6 | 24.3 |
+  | 1280x800 1x | 17.6 | 18.9 | 17.1 | 17.2 | 18.4 | 20.0 |
+  | 1440x900 1x | 18.3 | 18.9 | 19.6 | 17.3 | 19.1 | 19.6 |
+  | 1680x1050 1x | 17.6 | 18.6 | 18.8 | 17.4 | 18.6 | 19.4 |
+  | 1920x1080 1x | 22.1 | 18.6 | 18.0 | 20.6 | 18.7 | 19.4 |
+  | 1920x1200 1x | 17.7 | 18.6 | 18.7 | 17.4 | 18.7 | 18.5 |
+
+  Every 1x size holds about 60 fps shared too; Retina's genie shared is the outlier. The probe doesn't encode or send,
+  so a real viewer's numbers will be somewhat higher. 109 is back at 1440x900 1x, the owner's choice since 21:08.
+- **What System Settings offers** (109, Displays, screenshots through QEMU's VNC). Every mode carries macOS's
+  Television flag (IOFlags 0x00100000, not the framebuffer's; the display's EDID is QEMU's), and Settings lists it
+  the way it lists a TV's. Without "Show all resolutions": 3840 x 2160, 2560 x 1440, 1280 x 800 (Default), 1080p, all
+  1x, and not the current mode. With it: 3840 x 2160, 2880 x 1800, 2560 x 1600, 2560 x 1440 (the framebuffer's modes
+  2560 wide and more, at 1x: chosen in Settings, 3840 x 2160 gave a 1x 3840x2160 desktop), 1920 x 1200, 1920 x 1080
+  (Retina, 3840x2160 pixels), 1680 x 1050, 1440 x 900 (Retina), 1440 x 900 (low resolution) (1x), 1280 x 800
+  (Default) (1x), 1280 x 720 (Retina), 1024 x 768, 1080p (1x 1920x1080). So the 1x sizes are there already, but only
+  under "Show all resolutions", and only the "(low resolution)" or "1080p" label says which is which; CoreGraphics'
+  public list has no 1x mode above 1920x1200 (modetest: those modes appear only as Retina). Making the short list hold
+  the common 1x sizes beside the Retina ones is a framebuffer change (each mode's flags: Always Show 0x8 on the common
+  1x sizes, or dropping the TV treatment) that needs a look in Settings after it: VM 108 logged in, or the owner's OK
+  for 109. Not done tonight: 108 was at its lock screen.
+- **0.1.15, ready for the owner's OK** (not cut): 5d922cc (no twin for surfaces the display never shows: at Retina,
+  shared, genie 66 -> 34-38 ms a frame and drag 41.5 -> 18.9 in the owner's session, genie 30.6 with the probe),
+  mtllockwait's size argument, and ca5b0ac (off-by-default flags and tools). To cut it: VERSION and
+  packaging/host/TESTED as 028f0c1 did, then `packaging/make-dist.sh` and the release, as for 0.1.14. If the 1x mode
+  flags land first, they belong in it.
