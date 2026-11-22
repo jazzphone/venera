@@ -3039,3 +3039,18 @@ reproduce on 0.1.18 (82c2fba3e688) on VM 108, and the candidate (5ad49ece8556, w
   list holds 32; more in flight at once are made and destroyed.
 - VM 108 restored: link to the system copy (0.1.18), WindowServer on it, 1280x800 1x, the `gputime` and `snap`
   flag files removed (`perf` kept). The candidate stays in /Library/GPUBundles/Venera/dev.
+
+### 0.1.19 (2026-11-22)
+
+- Released as v0.1.19 (59a1069, Latest), the owner's OK: the Metal submission fixes (7528be3; notes b1618ae). The
+  release's Metal bundle is the one tested on 108 above (5ad49ece8556); nothing else changed since 0.1.18, and the
+  host stack still matches packaging/host/TESTED. The owner's kits are the private 0.1.19 (seed) on both nodes:
+  proxmox2's /root/vgpu/kit (kit-0.1.18 kept beside, kit-0.1.17 removed) and /root/venera/kit, proxmox1's
+  /root/venera/kit (kit-0.1.18 kept, kit-0.1.17 removed).
+- VMs 109, 108 and 107 upgraded from the kits (systemd-run units, 109 on proxmox1 at the same time as 108 then 107),
+  no viewers checked. After: WindowServer on the 0.1.19 bundle (5ad49ece8556) in all three; modes kept (108
+  1280x800 1x, 107 and 109 1440x900 1x); 107's HelperPod running. 108's dev bundle removed before; its snapshot
+  pre-0-1-19 taken before and deleted after.
+- The host-side display path (D-Bus + VA-API, branch claude/inspiring-dijkstra-b7eda1, 0d61dab) is held, and its
+  follow-ups with it: it needs a patched pve-qemu and gives up Proxmox's web console, and Venera runs on stock
+  Proxmox.
