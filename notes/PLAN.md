@@ -2867,3 +2867,41 @@ corner to corner 8 times in one press (`qmpinput.py sweep`, 0.4 s each way) and 
   resample commit -> composite -> drawdiff passes) are kept outside the repository with the session notes; the
   r23-dd4 logs were not kept beyond those numbers. VM 108 is back on the 0.1.16 system-volume driver at 1x 1280x800,
   `perf` its only flag.
+
+### A Retina performance pass on the shipped driver (0.1.16, 2026-11-22)
+
+VM 109 at 1440x900 Retina (2880x1800), the release bundle (122872177f8c), `framesig` on for per-frame presentation
+times (one registry read a frame), the perf counters' 5 s windows for the rest (their medians and p95s are of window
+means, not of samples). Warm runs; each workload twice, 20 s: a continuous drag sweep, dragtest's scroll, dragtest's
+minimize mode (a genie and a restore every 2 s). No drawdiff, pixel checks or pictures. The viewer: the owner's Screen
+Sharing window on the build Mac, captured with ffmpeg (avfoundation, 60 fps, cropped to the window found by its
+CGWindow bounds; mpdecimate + showinfo: the gaps between changed frames under 250 ms).
+
+| run | WindowServer frame gaps, median / p95 | viewer frame gaps, median / p95 (mean) | fence wait | dispatch delay | CPU write-back |
+|---|---|---|---|---|---|
+| sweep, alone | 16.7-16.9 / 21-34 ms | - | 3.4-3.7 | 2.1 | (none) |
+| scroll, alone | 15.8-16.1 / 32-36 | - | 4.7-4.8 | 1.7 | (none) |
+| genie, alone | 10.0-10.4 / 18-21 | - | 4.5-4.9 | 2.4-3.4 (one 28 ms window) | (none) |
+| sweep, viewer | 9.1-11.7 / 21 | 16.7 / 66.7 (31) | 3.7-3.8 | 2.5-4.4 | 2.5-2.6 |
+| scroll, viewer | 18.4-19.0 / 37-39 | 33.3 / 50.0 (30) | 3.5 | 0.9-1.0 | 1.5 |
+| genie, viewer | 16.2-17.3 / 31-33 | 16.7 / 50.0 (24) | 4.1-4.3 | 5.6-6.9 | 1.7-1.9 |
+
+(ms; fence wait, dispatch delay and write-back are medians of window means.) ScreensharingAgent read the stream every
+~20 ms in the sweep and every ~30 ms in the scroll, its locks waiting 2-4 ms for the write-back. During a viewer sweep
+(top, 4 vCPUs): WindowServer 82%, screensharingd 73%, kernel 35%, ScreensharingAgent 10%, replayd 6%.
+
+- **The largest repeatable bottleneck is past the driver**: with a viewer, WindowServer still presents a frame every
+  16-19 ms (median) but the viewer changes every ~30 ms on average (about 33 a second; p95 50-67 ms), and the agent
+  reads the stream no faster than that in the scroll. screensharingd's encoding of 2880x1800 frames (73% of a core)
+  is the likeliest limit; the driver's own share per stream frame is the CPU write-back (1.5-2.6 ms) and the reader's
+  wait for it (2-4 ms).
+- **Completion dispatch delay** repeated with a viewer in the genie (5.6-6.9 ms against 2.4-3.4 alone). A sample of
+  WindowServer during viewer genies: the completion blocks run on GCD's global workers (WindowServer sets no
+  completion queue), spend their time in `vg_wait_for_fence`, then the write-back, then `framesig`'s registry read;
+  none waits on a lock or another completion, and the workers are parked ~87% of the samples. So the delay is a
+  worker's wake-up under CPU contention (screensharingd and WindowServer on 4 vCPUs), not ordering. Nothing proposed.
+- **The capture's size** (the probe only: Screen Sharing's agent picks its own, `VG_SP_SIZE` in tools/streamprobe.m):
+  the probe as reader, 1440x900 requested while the desktop stays 2880x1800, against the native 2880x1800, A/B/B/A:
+  the CPU write-back fell from 1.5-2.6 to 0.6 ms a stream frame, the probe's locks from 1.7-1.9 to 0.6 ms, the
+  genie's dispatch delay from 5.2-5.8 to 2.0-2.6 ms; WindowServer's frame gaps about the same (scroll 17.5 vs 17.9 ms
+  median). The write-back scales with the capture's size; presentation doesn't.

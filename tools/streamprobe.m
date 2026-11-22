@@ -23,6 +23,8 @@
 //   VG_SP_ASYNC     1: read each frame later on another queue (the frame kept meanwhile), as the agent's encoder
 //                   does; with VG_SP_HOLD, that much later
 //   VG_SP_QUEUE     the stream's queue depth (default 8, the agent's)
+//   VG_SP_SIZE      WxH: ask ScreenCaptureKit for a capture of that size instead of the display's pixels (Screen
+//                   Sharing's agent picks its own; this is the probe's only)
 //   VG_SP_EVERY     1: also compare the client image with each whole frame as it comes (8x8 tiles), so a region that
 //                   a frame's dirty rectangles left wrong is seen even if a later frame redraws it; counts, the
 //                   largest difference, and the first frames that differ with their regions
@@ -778,6 +780,12 @@ static void sck_run(CGDirectDisplayID d, size_t w, size_t h, dispatch_queue_t q,
     SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
     SCStreamConfiguration *cfg = [SCStreamConfiguration new];
     cfg.width = w, cfg.height = h;
+    const char *size = getenv("VG_SP_SIZE");   // a capture smaller than the display (WxH pixels), the probe's only
+    unsigned sw = 0, sh = 0;
+    if (size && sscanf(size, "%ux%u", &sw, &sh) == 2 && sw && sh) {
+        cfg.width = sw, cfg.height = sh;
+        fprintf(gOut, "capture requested at %ux%u (the display is %zux%zu)\n", sw, sh, w, h);
+    }
     cfg.pixelFormat = 'BGRA';
     cfg.queueDepth = getenv("VG_SP_QUEUE") ? atoi(getenv("VG_SP_QUEUE")) : 8;
     cfg.minimumFrameInterval = CMTimeMake(1, 60);
