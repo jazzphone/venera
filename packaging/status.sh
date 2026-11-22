@@ -23,6 +23,7 @@ tail -2 "/Library/Application Support/Venera/watch.log" 2>/dev/null | sed 's/^/ 
 if launchctl print system/local.venera.agent >/dev/null 2>&1; then
   echo "  guest agent: local.venera.agent loaded ($(tail -1 /var/log/venera-agent.log 2>/dev/null | cut -c21- | cut -c1-90))"
   ioreg -rc VeneraConsole -d1 -w0 2>/dev/null | sed -n 's/.*"VeneraConsolePorts" = (\(.*\))/    VeneraConsole ports: \1/p' 
+  ioreg -rc VeneraBalloon -d1 -w0 2>/dev/null | sed -n 's/.*"VeneraBalloonState" = "\(.*\)"/    VeneraBalloon (Proxmox'"'"'s memory figure): \1/p'
 elif [ -f /Library/LaunchDaemons/com.macos.guest-agent.plist ]; then echo "  guest agent: mac-guest-agent (not Venera's)"
 else echo "  guest agent: none (Proxmox can't shut the VM down cleanly or show its addresses)"; fi
 echo

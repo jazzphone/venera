@@ -16,7 +16,7 @@ Third-party parts:
 | OpenCore (acidanthera's OpenCorePkg release, unmodified) | the host package's `opencore/` image, made by `vm/opencore/build.sh` | BSD-3-Clause |
 | `macrecovery.py` (OpenCorePkg) | the host package, for the VM script | BSD-3-Clause |
 
-`kext/VeneraHide`, `kext/VeneraConsole` and the rest of Venera's own code are under Venera's license above; `vm/` (the
-VM script, the OpenCore config and ACPI table) is MIT (`vm/LICENSE`). Each release's `Venera-sources-VERSION.tar`
-(`tools/make-sources.sh`) carries the sources of everything above, and `packaging/UPSTREAM` lists each with its
-checksum. A release carries these texts in `licenses/`.
+`kext/VeneraHide`, `kext/VeneraConsole`, `kext/VeneraBalloon` and the rest of Venera's own code are under Venera's
+license above; `vm/` (the VM script, the OpenCore config and ACPI table) is MIT (`vm/LICENSE`). Each release's
+`Venera-sources-VERSION.tar` (`tools/make-sources.sh`) carries the sources of everything above, and
+`packaging/UPSTREAM` lists each with its checksum. A release carries these texts in `licenses/`.

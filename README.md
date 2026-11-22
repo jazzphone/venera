@@ -93,7 +93,8 @@ release was tested on (`TESTED`) and says how to go back after an update that br
 | `VirtioGPUMetal.bundle` | /Library/GPUBundles | the Metal driver: Metal's API over Vulkan (Mesa's Venus, patched for macOS), Metal shaders translated to SPIR-V, IOSurfaces as host GPU images |
 | `VeneraVideo.kext` | Boot KC (OpenCore) | hardware video decoding and encoding: VideoToolbox's paravirtual decoder and encoder, over a shared-memory device to `venera-videod` on the host |
 | `VeneraConsole.kext` | Boot KC (OpenCore) | QEMU's virtio-serial device (the guest agent's port, SPICE's agent channel) in place of Apple's console driver, which stalls when the host hangs up mid-answer |
-| `venera-agent` | launch daemon | the guest agent: the QEMU guest agent protocol Proxmox speaks (shutdown, addresses, `qm guest exec`, files, passwords) over the VM's agent port |
+| `VeneraBalloon.kext` | Boot KC (OpenCore) | QEMU's virtio-balloon device, statistics only: macOS's memory figures (from `venera-agent`) to Proxmox, so it shows the VM's real memory use; never inflates |
+| `venera-agent` | launch daemon | the guest agent: the QEMU guest agent protocol Proxmox speaks (shutdown, addresses, `qm guest exec`, files, passwords) over the VM's agent port, and the memory figures for VeneraBalloon |
 | `venera-clipboard` | launch agent | the clipboard: the SPICE agent protocol on `com.redhat.spice.0`, in step with the Mac's pasteboard (Proxmox's noVNC console, or a SPICE client) |
 
 A display frame never touches the guest's CPU: Core Animation renders it on the host GPU, the driver copies it into a

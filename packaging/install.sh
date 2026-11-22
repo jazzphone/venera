@@ -19,7 +19,9 @@
 #      questions as notifications and shows what runs; --no-app leaves it out (the watcher then asks in dialogs)
 #   6. the guest agent (local.venera.agent): Proxmox's `qm agent` and `qm guest` (shutdown from the Proxmox page, the
 #      VM's IP addresses, commands and files from the host); it takes the place of mac-guest-agent if that is there.
-#      Its port's driver, VeneraConsole.kext, goes into OpenCore in step 2 (from the next restart). With it, the
+#      Its port's driver, VeneraConsole.kext, goes into OpenCore in step 2 (from the next restart), and with it
+#      VeneraBalloon.kext (the VM's balloon device, statistics only: the agent hands it macOS's memory figures, so
+#      Proxmox shows the VM's memory as Activity Monitor does). With them, the
 #      clipboard agent (local.venera.clipboard, in each user's session): the Proxmox console's clipboard.
 #      Installed in the first pass too (it needs no restart); --no-agent leaves it out, or takes it out
 # Then reboot. ./uninstall.sh undoes all of it; ./status.sh shows what runs.
@@ -264,15 +266,22 @@ if [ $NO_OC = 0 ]; then
   [ $TWO_PASS = 1 ] || oc_kext VirtioGPU "Venera core (virtio-gpu)"   # the first of two passes: the driver comes in the second
   [ $VIDEO = 1 ] && oc_kext VeneraVideo "Venera video decoding (through the host)"
   # the guest agent's port: VeneraConsole.kext in place of Apple's virtio console (which stalls when the host hangs
-  # up mid-answer); off again with --no-agent
+  # up mid-answer); and VeneraBalloon.kext, which takes the agent's memory figures to Proxmox through the balloon
+  # device; both off again with --no-agent
   CONSOLE=0
   if [ $NO_AGENT = 0 ] && [ -d "$PAYLOAD/OpenCore/VeneraConsole.kext" ]; then
     oc_kext VeneraConsole "Venera console (the guest agent's port)"
     CONSOLE=1
+    if [ -d "$PAYLOAD/OpenCore/VeneraBalloon.kext" ]; then
+      oc_kext VeneraBalloon "Venera balloon statistics (Proxmox's memory figure)"
+      CONSOLE=2
+    fi
   elif [ $NO_AGENT = 1 ]; then
     i=0; N=$(pl -extract Kernel.Add raw -o -)
     while [ $i -lt "$N" ]; do
-      [ "$(pl -extract Kernel.Add.$i.BundlePath raw -o - 2>/dev/null)" = VeneraConsole.kext ] && run pl -replace Kernel.Add.$i.Enabled -bool NO
+      case "$(pl -extract Kernel.Add.$i.BundlePath raw -o - 2>/dev/null)" in
+      VeneraConsole.kext | VeneraBalloon.kext) run pl -replace Kernel.Add.$i.Enabled -bool NO ;;
+      esac
       i=$((i + 1))
     done
   fi
@@ -305,9 +314,9 @@ if [ $NO_OC = 0 ]; then
     die "config.plist didn't validate after the edit; restored the backup"
   }
   if [ $TWO_PASS = 1 ]; then
-    say "OpenCore: security settings$([ $VIDEO = 1 ] && echo ", VeneraVideo.kext")$([ $CONSOLE = 1 ] && echo ", VeneraConsole.kext"), boot-args \"${NEW# }\" (backup: $BACKUP)"
+    say "OpenCore: security settings$([ $VIDEO = 1 ] && echo ", VeneraVideo.kext")$([ $CONSOLE -ge 1 ] && echo ", VeneraConsole.kext")$([ $CONSOLE = 2 ] && echo ", VeneraBalloon.kext"), boot-args \"${NEW# }\" (backup: $BACKUP)"
   else
-    say "OpenCore: VirtioGPU.kext$([ $VIDEO = 1 ] && echo ", VeneraVideo.kext")$([ $CONSOLE = 1 ] && echo ", VeneraConsole.kext") enabled, boot-args \"${NEW# }\" (backup: $BACKUP)"
+    say "OpenCore: VirtioGPU.kext$([ $VIDEO = 1 ] && echo ", VeneraVideo.kext")$([ $CONSOLE -ge 1 ] && echo ", VeneraConsole.kext")$([ $CONSOLE = 2 ] && echo ", VeneraBalloon.kext") enabled, boot-args \"${NEW# }\" (backup: $BACKUP)"
   fi
   cleanup
 else
@@ -315,6 +324,7 @@ else
   say "  to boot-args yourself (INSTALL.md)."
   [ $VIDEO = 1 ] && say "  And payload/OpenCore/VeneraVideo.kext, for hardware video."
   [ $NO_AGENT = 0 ] && say "  And payload/OpenCore/VeneraConsole.kext, for the guest agent's port (it works without, more slowly to recover)."
+  [ $NO_AGENT = 0 ] && say "  And payload/OpenCore/VeneraBalloon.kext, for Proxmox's memory figure (the VM's balloon device on)."
 fi
 
 # ---- 6. the guest agent (runs in either pass: it needs no restart) -----------------------------------------------

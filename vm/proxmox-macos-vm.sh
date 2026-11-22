@@ -29,6 +29,8 @@
 #                             can't address: the driver finds no GPU memory
 #   a USB sound device      - Safari won't start streaming video (YouTube) without an audio output; macOS has no driver
 #                             for QEMU's HDA but drives USB audio itself
+#   the balloon device      - statistics only (VeneraBalloon.kext; never inflates, its minimum is the VM's memory):
+#                             without it Proxmox shows the QEMU process's memory, which macOS's caches fill
 #   SIP 0x203, AMFI off     - set in OpenCore before macOS is installed, so Venera installs in one pass (otherwise its
 #                             installer changes them first and finishes after a restart)
 #   the video device last   - added at Finish: without VeneraVideo.kext, macOS hangs on it and finds no OpenCore disk
@@ -340,7 +342,7 @@ oc_transplant() {   # OLD-config NEW-config: writes the merge into NEW
   python3 - "$1" "$2" <<'PY'
 import plistlib, sys
 old = plistlib.load(open(sys.argv[1], "rb")); new = plistlib.load(open(sys.argv[2], "rb"))
-mine = ("VirtioGPU.kext", "VeneraVideo.kext", "VeneraConsole.kext")
+mine = ("VirtioGPU.kext", "VeneraVideo.kext", "VeneraConsole.kext", "VeneraBalloon.kext")
 kept = [k for k in old["Kernel"]["Add"] if k.get("BundlePath") in mine]
 new["Kernel"]["Add"] += kept
 g = "7C436110-AB2A-4BBB-A880-FE41995C9F82"
@@ -365,7 +367,7 @@ update_opencore() {   # the VM stopped, OCIMG its OpenCore disk
   oc_mount
   old=$(ls -d "$MNT"/EFI/OC/Kexts/*.kext 2>/dev/null | xargs -n1 basename 2>/dev/null | tr '\n' ' ')
   cp "$MNT/EFI/OC/config.plist" "$w/old/config.plist"
-  for k in VirtioGPU VeneraVideo VeneraConsole; do [ -d "$MNT/EFI/OC/Kexts/$k.kext" ] && cp -R "$MNT/EFI/OC/Kexts/$k.kext" "$w/old/"; done
+  for k in VirtioGPU VeneraVideo VeneraConsole VeneraBalloon; do [ -d "$MNT/EFI/OC/Kexts/$k.kext" ] && cp -R "$MNT/EFI/OC/Kexts/$k.kext" "$w/old/"; done
   echo "   the old EFI folder's kexts: $old"
   rm -rf "$MNT/EFI"
   cp -R "$w/src/EFI" "$MNT/"
@@ -578,6 +580,12 @@ vm_other_nodes() {   # the other nodes the VM may run on: none when its disk is 
   fi
   other_nodes
 }
+# Proxmox's memory figure for the VM comes from its balloon device's statistics (VeneraBalloon.kext reports them; it
+# never inflates). The balloon's minimum is the VM's memory, so Proxmox never asks for any back; QEMU adds the device
+# only when the VM starts.
+vm_memory() { local m; m=$(qm config "$VMID" | sed -n 's/^memory: //p'); m=${m#current=}; m=${m%%,*}; echo "${m:-2048}"; }
+no_balloon() { [ "$(qm config "$VMID" | sed -n 's/^balloon: //p')" = 0 ]; }   # the device off (older Venera VMs)
+balloon_on() { qm set "$VMID" --balloon "$(vm_memory)" >/dev/null && echo "   balloon device on (minimum $(vm_memory) MB: Proxmox's memory figure from macOS)"; }
 backup_conf() { mkdir -p /root/macos-vm-backup; cp "/etc/pve/qemu-server/$VMID.conf" "/root/macos-vm-backup/$VMID.conf.$(date +%Y%m%d-%H%M%S)"; }
 ha_service() { ha-manager config 2>/dev/null | grep -qx "vm:$VMID"; }   # the VM is one of HA's services
 stop_vm() {   # shuts the VM down (from macOS, as the Apple menu does) and waits; HA's VMs through HA
@@ -679,7 +687,7 @@ finish_vm() {   # macOS and Venera installed: hardware video, the installer disk
     echo "  (no guest agent answers: can't read Venera's status. Venera's installer puts one in, its Proxmox guest agent"
     echo "   choice; on a VM made before 0.1.6 the agent port may be ISA: it answers there too)"
   fi
-  local VIDEO=0 drops=() HASDEV=0 RESTART=0 VIRTIO_AGENT=0 CLIP=0
+  local VIDEO=0 drops=() HASDEV=0 RESTART=0 VIRTIO_AGENT=0 CLIP=0 BALLOON=0
   case " $(qm config "$VMID" | sed -n 's/^args: //p') " in *"/run/venera-video-$VMID.sock"*) HASDEV=1 ;; esac
   gpu_scan
   if [ "$GPU_KIND" = intel ] && [ -n "$HOSTKIT" ]; then
@@ -711,17 +719,20 @@ finish_vm() {   # macOS and Venera installed: hardware video, the installer disk
   fi
   # Venera's agent answers on either port; the virtio one is ten times faster than the ISA serial port
   if [[ $st == *"guest agent"* ]] && ! qm config "$VMID" | grep -q '^agent:.*type=virtio'; then VIRTIO_AGENT=1; fi
+  # Proxmox's memory figure: the balloon device for VeneraBalloon.kext, which comes with Venera's agent
+  if [[ $st == *"guest agent"* ]] && no_balloon; then BALLOON=1; fi
   # the Proxmox console's clipboard (Venera's clipboard agent on the other end), where live migration keeps working
   if [[ $st == *"guest agent"* ]] && ! qm config "$VMID" | grep -q '^vga:.*clipboard=vnc'; then
     if clipboard_ok; then CLIP=1; else echo "  (the console's clipboard: not on a VM pinned below machine 10.1, which then couldn't live-migrate)"; fi
   fi
-  { [ $VIDEO = 1 ] && [ $HASDEV = 0 ]; } || [ ${#drops[@]} -gt 0 ] || [ $VIRTIO_AGENT = 1 ] || [ $CLIP = 1 ] && RESTART=1
+  { [ $VIDEO = 1 ] && [ $HASDEV = 0 ]; } || [ ${#drops[@]} -gt 0 ] || [ $VIRTIO_AGENT = 1 ] || [ $CLIP = 1 ] || [ $BALLOON = 1 ] && RESTART=1
   echo; echo "== The plan"
   [ $VIDEO = 1 ] && echo "  - hardware video: install-host.sh --vm $VMID here${nodes[*]:+ and on ${nodes[*]}}$([ $HASDEV = 1 ] && echo " (the VM has its device: this updates the service)")"
   [ ${#drops[@]} -gt 0 ] && echo "  - take out ${drops[*]} (the recovery disk is deleted; the Venera Tools ISO stays in its storage)"
   [ -n "$keepcd" ] && echo "  - the Venera Tools CD stays in ($keepcd): its Extras folder and the package, on macOS's desktop"
   [ $VIRTIO_AGENT = 1 ] && echo "  - the guest agent on its virtio port (faster than the ISA serial port)"
   [ $CLIP = 1 ] && echo "  - the Proxmox console's clipboard shared with macOS (display: clipboard=vnc)"
+  [ $BALLOON = 1 ] && echo "  - the balloon device on, minimum $(vm_memory) MB (never inflates): Proxmox shows macOS's own memory use"
   [ $up = 1 ] && echo "  - in macOS: set the clock once, Apple's power logging (PerfPowerServices) off (it held a core at ~90%)"
   [ $RESTART = 1 ] && echo "  - shut VM $VMID down and start it again (QEMU picks up the device and disk changes when it starts)"
   yes_no "Go ahead?" || die "nothing changed"
@@ -742,6 +753,7 @@ finish_vm() {   # macOS and Venera installed: hardware video, the installer disk
   for s in "${drops[@]}"; do drop_disk "$s"; done
   [ $VIRTIO_AGENT = 0 ] || { qm set "$VMID" --agent enabled=1,type=virtio >/dev/null; echo "   guest agent port: virtio"; }
   [ $CLIP = 0 ] || { qm set "$VMID" --vga "$(qm config "$VMID" | sed -n 's/^vga: //p'),clipboard=vnc" >/dev/null; echo "   display: the console's clipboard on"; }
+  [ $BALLOON = 0 ] || balloon_on
   [ $RESTART = 0 ] || { echo "== starting VM $VMID"; qm start "$VMID"; }
   echo "== Done. In macOS, the Venera app (Applications) shows what runs. The config before: /root/macos-vm-backup/."
 }
@@ -758,6 +770,7 @@ ready_vm() {   # an existing macOS VM (stopped): the host's packages, the displa
   echo "  - here${nodes[*]:+ and on ${nodes[*]}}: install $(missing_pkgs $VENUS_PKGS genisoimage)(those missing), KVM ignore_msrs on"
   echo "  - VM $VMID: display virtio-gl (was $(qm config "$VMID" | sed -n 's/^vga: //p'))"
   [ "$new" = "$cur" ] || echo "  - its args gain: $(comm -13 <(tr ' ' '\n' <<<"$cur" | sort -u) <(tr ' ' '\n' <<<"$new" | sort -u) | tr '\n' ' ')"
+  no_balloon && echo "  - the balloon device on, minimum $(vm_memory) MB (never inflates): with Venera, Proxmox shows macOS's own memory use"
   [ -n "$GPKG" ] && echo "  - the Venera Tools CD in ide1 with $(basename "$GPKG")"
   echo "  (the config is backed up to /root/macos-vm-backup first)"
   yes_no "Go ahead?" || die "nothing changed"
@@ -765,6 +778,7 @@ ready_vm() {   # an existing macOS VM (stopped): the host's packages, the displa
   for n in "${nodes[@]}"; do echo "== $n"; on_node "$n" "$(declare -f missing_pkgs host_prep); host_prep $VENUS_PKGS" || die "$n's packages didn't install (apt on $n)"; done
   backup_conf
   qm set "$VMID" --vga "virtio-gl$(clipboard_ok && echo ,clipboard=vnc)" --args "$new" >/dev/null; echo "   display virtio-gl, args updated"
+  ! no_balloon || balloon_on
   attach_venera_disk
   echo "== Done. Start VM $VMID, open Install Venera on the Venera Tools CD (on the desktop) and restart when"
   echo "   it says so (when SIP has to change it finishes after one more restart). Then run this again and choose Finish."
@@ -985,6 +999,10 @@ upgrade_vm() {   # a VM with Venera: this release's host half on every node, the
   # through the agent timed out on VM 107): virtio, as Finish and new VMs have it, which QEMU adds only at a start
   VIRTIO_AGENT=0
   if [ $agent = 1 ] && ! qm config "$VMID" | grep -q '^agent:.*type=virtio'; then VIRTIO_AGENT=1; fi
+  # Proxmox's memory figure (after 0.1.15): VeneraBalloon.kext comes with the agent and reports through the balloon device,
+  # which Venera's VMs were made without; QEMU adds it at a start
+  BALLOON=0
+  if [ $agent = 1 ] && no_balloon; then BALLOON=1; fi
   echo "  macOS has Venera $cur: hardware video $([ $video = 1 ] && echo on || echo off), the Venera app $([ $app = 1 ] && echo on || echo off), the guest agent $([ $agent = 1 ] && echo on || echo off), Safari WebGL (the system-volume copy) $([ $webgl = 1 ] && echo on || echo off)"
   if [ $HASDEV = 1 ]; then
     [ -n "$HOSTKIT" ] || die "VM $VMID has hardware video but Venera's host half isn't beside this script"
@@ -992,7 +1010,7 @@ upgrade_vm() {   # a VM with Venera: this release's host half on every node, the
   fi
   echo; echo "== The plan"
   [ $HASDEV = 1 ] && echo "  - the host half: install-host.sh --vm $VMID here${nodes[*]:+ and on ${nodes[*]}} (running VMs keep their video connections)"
-  if [ $SMC_KEXTS = 1 ] || [ $SMC_ARGS = 1 ] || [ $VIRTIO_AGENT = 1 ]; then
+  if [ $SMC_KEXTS = 1 ] || [ $SMC_ARGS = 1 ] || [ $VIRTIO_AGENT = 1 ] || [ $BALLOON = 1 ]; then
     echo "  - in macOS: $(basename "$GPKG") through the guest agent, with the same choices"
     [ $SMC_KEXTS = 1 ] && echo "  - OpenCore: acidanthera's Lilu and VirtualSMC added, the OpenCore disk saved to /root first"
     if [ $SMC_KEXTS = 1 ] || [ $SMC_ARGS = 1 ]; then
@@ -1000,6 +1018,7 @@ upgrade_vm() {   # a VM with Venera: this release's host half on every node, the
       echo "    core for good)"
     fi
     [ $VIRTIO_AGENT = 1 ] && echo "  - the guest agent on its virtio port (the ISA serial port is ten times slower and drops big requests)"
+    [ $BALLOON = 1 ] && echo "  - the balloon device on, minimum $(vm_memory) MB (never inflates): Proxmox shows macOS's own memory use"
     echo "    so the restart is a shut-down and a start$(ha_service && echo " (through HA: it may start the VM on another node)")"
   else
     echo "  - in macOS: $(basename "$GPKG") through the guest agent, with the same choices, then a restart"
@@ -1061,7 +1080,7 @@ usb_upgrade_disk() {   # the guest package on a USB disk in the running VM, moun
   if [ -z "$mnt" ]; then usb_disk del; rm -f "$img"; die "macOS didn't mount the USB disk in 2 minutes (did its screen lock?): nothing installed"; fi
 }
 upgrade_restart() {   # after upgrade_vm: macOS restarted, and what runs once it's back
-  if [ "${SMC_KEXTS:-0}" = 1 ] || [ "${SMC_ARGS:-0}" = 1 ] || [ "${VIRTIO_AGENT:-0}" = 1 ]; then
+  if [ "${SMC_KEXTS:-0}" = 1 ] || [ "${SMC_ARGS:-0}" = 1 ] || [ "${VIRTIO_AGENT:-0}" = 1 ] || [ "${BALLOON:-0}" = 1 ]; then
     stop_vm
     local smc_ok=1
     if [ "${SMC_KEXTS:-0}" = 1 ]; then
@@ -1075,6 +1094,7 @@ upgrade_restart() {   # after upgrade_vm: macOS restarted, and what runs once it
     if [ "${VIRTIO_AGENT:-0}" = 1 ]; then
       qm set "$VMID" --agent enabled=1,type=virtio >/dev/null && echo "   guest agent port: virtio"
     fi
+    [ "${BALLOON:-0}" = 0 ] || balloon_on
     echo "== starting VM $VMID"
     qm start "$VMID" >/dev/null
     sleep 30
@@ -1100,7 +1120,7 @@ upgrade_restart() {   # after upgrade_vm: macOS restarted, and what runs once it
 }
 upgrade_status() {   # what runs in macOS after the upgrade's restart
   sleep 20
-  st=$(guest 'V="/Library/Application Support/Venera"; echo "Venera $(cat "$V/VERSION")"; kextstat 2>/dev/null | grep -o "VeneraVideo ([0-9.]*)"; kextstat 2>/dev/null | grep -o "VirtualSMC ([0-9.]*)"; ioreg -rc VirtioGPUAccel -d1 2>/dev/null | sed -n "s/.*\"VirtioGPUArmState\" = \"\(.*\)\"/desktop: \1/p"')
+  st=$(guest 'V="/Library/Application Support/Venera"; echo "Venera $(cat "$V/VERSION")"; kextstat 2>/dev/null | grep -o "VeneraVideo ([0-9.]*)"; kextstat 2>/dev/null | grep -o "VirtualSMC ([0-9.]*)"; ioreg -rc VeneraBalloon -d1 -w0 2>/dev/null | sed -n "s/.*\"VeneraBalloonState\" = \"\(.*\)\"/memory figure for Proxmox: \1/p"; ioreg -rc VirtioGPUAccel -d1 2>/dev/null | sed -n "s/.*\"VirtioGPUArmState\" = \"\(.*\)\"/desktop: \1/p"')
   if [ -n "$st" ]; then sed 's/^/   /' <<<"$st"; else warn "macOS's guest agent hasn't answered since the restart: check the VM's console"; fi
   echo "== Done. In macOS, the Venera app (Applications) shows what runs."
 }
@@ -1405,7 +1425,7 @@ VGA=vmware
 if [ $VENERA = 1 ]; then VGA=virtio-gl,clipboard=vnc; ARGS=$(screen_args "$(venera_args "$ARGS" $AUDIO)" "$RES")
 elif [ $AUDIO = 1 ]; then ARGS="$ARGS -audiodev spice,id=vsnd -device usb-audio,audiodev=vsnd"; fi
 qm create "$VMID" --name "$NAME" --ostype other --machine q35 --bios ovmf \
-  --cores "$CORES" --sockets 1 ${PCORES:+--affinity "$PCORES"} --memory "$MEM" --balloon 0 \
+  --cores "$CORES" --sockets 1 ${PCORES:+--affinity "$PCORES"} --memory "$MEM" --balloon "$([ $VENERA = 1 ] && echo "$MEM" || echo 0)" \
   --vga $VGA --tablet 0 --agent enabled=1,type=virtio \
   --net0 "vmxnet3,bridge=$BRIDGE${VLAN:+,tag=$VLAN},firewall=0" \
   --efidisk0 "$STORAGE:1,efitype=4m,pre-enrolled-keys=0" \

@@ -3,7 +3,7 @@
 // addresses on the VM's Summary, commands and files from the host, and the clock set; Venera's VM script reads
 // Venera's status and installs upgrades through it.
 //
-//   venera-agent [--device PATH] [--stdio] [--answer-max BYTES] [--version]   (VENERA_AGENT_TRACE=1: log every request)
+//   venera-agent [--device PATH] [--stdio] [--answer-max BYTES] [--version] [--memory]   (VENERA_AGENT_TRACE=1: log every request)
 //
 // The port: QEMU's virtio-serial channel org.qemu.guest_agent.0 when the VM has one (Proxmox's agent type virtio),
 // through Venera's own driver (VeneraConsole.kext) when it is in, else through macOS's tty for it; else the ISA
@@ -17,10 +17,16 @@
 // -freeze-list/-thaw (macOS can't freeze APFS: freeze syncs the disks and reports none frozen), guest-get-fsinfo,
 // guest-get-users, guest-get-load, guest-fstrim (APFS trims at mount: says so), guest-set-user-password (`qm guest
 // passwd`), and the suspend and memory-block commands answered as Unsupported.
+//
+// And Proxmox's memory figure: with VeneraBalloon.kext (QEMU's virtio-balloon device, statistics only) in, the agent
+// hands it macOS's memory figures every 2 s (`venera-agent --memory` prints them), so Proxmox shows the VM's memory as
+// Activity Monitor does instead of the QEMU process's, which macOS's caches fill.
 #import <Foundation/Foundation.h>
 #import <OpenDirectory/OpenDirectory.h>
 #import <IOKit/IOKitLib.h>
 #include "../kext/VeneraConsole/VeneraConsoleAPI.h"
+#include "../kext/VeneraBalloon/VeneraBalloonAPI.h"
+#include <mach/mach.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <glob.h>
@@ -750,6 +756,101 @@ static NSString *findDevice(void) {
     return found;
 }
 
+// ---- Proxmox's memory figure ---------------------------------------------------------------------------------------
+
+// macOS's memory as Activity Monitor counts it. Its Memory Used is the anonymous pages (purgeable ones included) +
+// Wired + Compressed: checked on VM 108, where it read 3.46 GB while App Memory (anonymous less purgeable) and Wired
+// added to 3.42, the purgeable pages' 43 MB apart; Cached Files (file-backed + purgeable) counts the purgeable pages
+// too. Those caches and the free pages are what macOS gives back when an app asks, so "free" for the host is the total
+// less Memory Used, and Proxmox's figure (total - free) is Memory Used. The kernel's own free count alone would leave
+// the caches looking used, as the QEMU process's figure does.
+static BOOL memoryFigures(uint64_t v[kVBStatCount]) {
+    static mach_port_t host;
+    if (!host) host = mach_host_self();
+    vm_statistics64_data_t s;
+    mach_msg_type_number_t n = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(host, HOST_VM_INFO64, (host_info64_t)&s, &n) != KERN_SUCCESS) return NO;
+    uint64_t total = 0;
+    size_t len = sizeof total;
+    if (sysctlbyname("hw.memsize", &total, &len, NULL, 0) != 0 || !total) return NO;
+    uint64_t page = vm_page_size;
+    uint64_t used = ((uint64_t)s.internal_page_count + s.wire_count + s.compressor_page_count) * page;
+    v[kVBTotal] = total;
+    v[kVBFree] = total > used ? total - used : 0;
+    v[kVBAvail] = v[kVBFree];
+    v[kVBCaches] = ((uint64_t)s.external_page_count + s.purgeable_count) * page;
+    v[kVBSwapIn] = s.swapins * page;
+    v[kVBSwapOut] = s.swapouts * page;
+    v[kVBMajorFaults] = s.pageins;
+    v[kVBMinorFaults] = s.faults > s.pageins ? s.faults - s.pageins : 0;
+    return YES;
+}
+
+static io_connect_t openBalloon(void) {
+    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("VeneraBalloon"));
+    if (!svc) return 0;
+    io_connect_t c = 0;
+    if (IOServiceOpen(svc, mach_task_self(), 0, &c) != KERN_SUCCESS) c = 0;
+    IOObjectRelease(svc);
+    return c;
+}
+
+// Every 2 s (Proxmox asks QEMU for fresh figures every 2 s and reads them every 10); without the kext, a look for it
+// every minute (it comes with an OpenCore restart, and the balloon device with the VM's next start).
+static void startBalloon(void) {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        io_connect_t c = 0;
+        BOOL said = NO;
+        for (;;) {
+            if (!c && !(c = openBalloon())) {
+                if (!said) logf_(@"no VeneraBalloon.kext (or no balloon device): Proxmox shows the QEMU process's memory");
+                said = YES;
+                sleep(60);
+                continue;
+            }
+            uint64_t v[kVBStatCount];
+            if (memoryFigures(v)) {
+                kern_return_t kr = IOConnectCallScalarMethod(c, kVBMethodSetStats, v, kVBStatCount, NULL, NULL);
+                if (kr != KERN_SUCCESS) {
+                    logf_(@"VeneraBalloon: 0x%x: opening it again", kr);
+                    IOServiceClose(c);
+                    c = 0;
+                    said = NO;
+                    sleep(5);
+                    continue;
+                }
+                static BOOL first = YES;
+                if (first) {
+                    logf_(@"on VeneraBalloon: Proxmox gets macOS's memory figures (%llu of %llu MB used)",
+                          (v[kVBTotal] - v[kVBFree]) >> 20, v[kVBTotal] >> 20);
+                    first = NO;
+                }
+            }
+            sleep(2);
+        }
+    });
+}
+
+static int printMemory(void) {
+    uint64_t v[kVBStatCount];
+    if (!memoryFigures(v)) { fprintf(stderr, "host_statistics64 failed\n"); return 1; }
+    printf("total %llu MB, used %llu MB (Activity Monitor's Memory Used), free %llu MB, cached files %llu MB\n"
+           "swapped in %llu MB, out %llu MB; page-ins %llu, other faults %llu\n",
+           v[kVBTotal] >> 20, (v[kVBTotal] - v[kVBFree]) >> 20, v[kVBFree] >> 20, v[kVBCaches] >> 20,
+           v[kVBSwapIn] >> 20, v[kVBSwapOut] >> 20, v[kVBMajorFaults], v[kVBMinorFaults]);
+    io_connect_t c = openBalloon();
+    if (!c) { printf("VeneraBalloon: not there (or not root)\n"); return 0; }
+    uint64_t st[4];
+    uint32_t outs = 4;
+    if (IOConnectCallScalarMethod(c, kVBMethodState, NULL, 0, st, &outs) == KERN_SUCCESS) {
+        if (st[1] == ~0ULL) printf("VeneraBalloon: %llu stats buffers to the host, no figures from the agent yet\n", st[0]);
+        else printf("VeneraBalloon: %llu stats buffers to the host, the agent's last figures %llu ms ago (stale past %llu); "
+                    "the host's balloon target %llu MB (not acted on)\n", st[0], st[1], st[3], st[2] * 4096 >> 20);
+    }
+    IOServiceClose(c);
+    return 0;
+}
+
 // The agent port through VeneraConsole.kext, when it has the virtio-serial devices: the first that has a port of
 // that name and lets us open it.
 static io_connect_t openConsole(void) {
@@ -874,11 +975,13 @@ int main(int argc, char **argv) {
             else if (!strcmp(argv[i], "--device") && i + 1 < argc) dev = @(argv[++i]);
             else if (!strcmp(argv[i], "--answer-max") && i + 1 < argc) gAnswerMax = strtoull(argv[++i], NULL, 10);
             else if (!strcmp(argv[i], "--version")) { printf("venera-agent %s\n", VENERA_VERSION); return 0; }
-            else { fprintf(stderr, "usage: venera-agent [--device PATH] [--stdio] [--answer-max BYTES] [--version]\n"); return 2; }
+            else if (!strcmp(argv[i], "--memory")) return printMemory();
+            else { fprintf(stderr, "usage: venera-agent [--device PATH] [--stdio] [--answer-max BYTES] [--version] [--memory]\n"); return 2; }
         }
         signal(SIGPIPE, SIG_IGN);
         setup();
         if (!gStdio) startWatchdog();
+        if (!gStdio) startBalloon();
         if (gStdio) {
             gOut = 1;
             serve(0);

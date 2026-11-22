@@ -110,7 +110,7 @@ check "screen sizes: up to 3840x2400 with Venera, larger without" '(screen_size 
 python3 - "$OLDCFG" "$W/old.plist" <<'PY'
 import plistlib, sys
 c = plistlib.load(open(sys.argv[1], "rb"))
-for k in ("VirtioGPU", "VeneraVideo"):
+for k in ("VirtioGPU", "VeneraVideo", "VeneraBalloon"):
     c["Kernel"]["Add"].append({"Arch": "x86_64", "BundlePath": k + ".kext", "Comment": "Venera", "Enabled": True,
                                "ExecutablePath": "Contents/MacOS/" + k, "MaxKernel": "", "MinKernel": "", "PlistPath": "Contents/Info.plist"})
 c["NVRAM"]["Add"]["7C436110-AB2A-4BBB-A880-FE41995C9F82"]["boot-args"] = "keepsyms=1 vgpuaccel=4"
@@ -122,7 +122,7 @@ cp "$CFG" "$W/moved.plist"; oc_transplant "$W/old.plist" "$W/moved.plist" >/dev/
 check "an older VM moved to Venera's OpenCore: its kexts, boot-args, identity and screen kept, the old extras gone" 'python3 -c "
 import plistlib, sys
 c = plistlib.load(open(\"$W/moved.plist\", \"rb\")); add = [k[\"BundlePath\"] for k in c[\"Kernel\"][\"Add\"]]
-sys.exit(not (add == [\"Lilu.kext\", \"VirtualSMC.kext\", \"VeneraHide.kext\", \"VirtioGPU.kext\", \"VeneraVideo.kext\"]
+sys.exit(not (add == [\"Lilu.kext\", \"VirtualSMC.kext\", \"VeneraHide.kext\", \"VirtioGPU.kext\", \"VeneraVideo.kext\", \"VeneraBalloon.kext\"]
     and c[\"NVRAM\"][\"Add\"][\"7C436110-AB2A-4BBB-A880-FE41995C9F82\"][\"boot-args\"] == \"keepsyms=1 vgpuaccel=4\"
     and c[\"PlatformInfo\"][\"Generic\"][\"SystemSerialNumber\"] == \"C02OWNSERIAL\" and c[\"UEFI\"][\"Output\"][\"Resolution\"] == \"1280x800@32\"
     and c[\"Misc\"][\"Boot\"][\"PickerMode\"] == \"Builtin\" and not c[\"UEFI\"][\"Drivers\"][1][\"Path\"].startswith(\"OpenCanopy\")))"'
@@ -168,6 +168,16 @@ check "an answered question takes the file's value, a missing key its default" '
 check "yes/no from the file, nodes from NODES, and Go ahead is yes" '! no_yes "q" INSTALL 2>/dev/null && no_yes "q" VENERA 2>/dev/null && ! no_yes "q" NODE:pve2 2>/dev/null && yes_no "Go ahead?" 2>/dev/null'
 ANSWERS=""
 check "a package that isn't installed is missing" '[ "$(missing_pkgs bash no-such-package-here)" = "no-such-package-here " ]'
+# the balloon device (Proxmox's memory figure): its minimum is the VM's memory, in either form Proxmox writes it
+VMID=999
+qm() { printf '%s\n' "${QMCONF[@]}"; }
+QMCONF=("memory: 8192" "balloon: 0")
+check "an older Venera VM: no balloon device, 8192 MB" 'no_balloon && [ "$(vm_memory)" = 8192 ]'
+QMCONF=("memory: current=16384,max=32768")
+check "memory as current=...: its current size; the balloon on by default" '! no_balloon && [ "$(vm_memory)" = 16384 ]'
+QMCONF=("balloon: 8192")
+check "no memory line: Proxmox's default 2048" '! no_balloon && [ "$(vm_memory)" = 2048 ]'
+unset -f qm
 rm -rf "$W" "$CFG"
 [ $fail = 0 ] && echo "all passed"
 exit $fail

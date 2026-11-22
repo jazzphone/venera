@@ -6,6 +6,7 @@
 #   VeneraVideo.kext          - hardware video decoding through the host (Apple's paravirtualized VideoToolbox), OpenCore
 #   VeneraHide.kext           - hides the VM from kern.hv_vmm_present (Apple Account sign-in), OpenCore; replaces VMHide
 #   VeneraConsole.kext        - QEMU's virtio-serial device (the guest agent's port) in place of Apple's driver, OpenCore
+#   VeneraBalloon.kext        - QEMU's virtio-balloon device, statistics only (Proxmox's memory figure), OpenCore
 set -euo pipefail
 cd "${0:A:h}/.."
 SDK=$(xcrun --sdk macosx --show-sdk-path)
@@ -17,8 +18,8 @@ CXXFLAGS=($COMMON -std=gnu++17 -fno-rtti -fno-exceptions -fapple-kext)
 CFLAGS=($COMMON -std=gnu11)
 
 # only the kexts: build/ also holds the translator, the Metal bundle and the test tools
-rm -rf build/obj build/VirtioGPU.kext build/VirtioGPUFramebuffer.kext build/VirtioGPUAccel.kext build/VeneraVideo.kext build/VeneraConsole.kext build/VeneraHide.kext && mkdir -p build
-for NAME in VirtioGPU VirtioGPUFramebuffer VirtioGPUAccel VeneraVideo VeneraConsole VeneraHide; do
+rm -rf build/obj build/VirtioGPU.kext build/VirtioGPUFramebuffer.kext build/VirtioGPUAccel.kext build/VeneraVideo.kext build/VeneraConsole.kext build/VeneraBalloon.kext build/VeneraHide.kext && mkdir -p build
+for NAME in VirtioGPU VirtioGPUFramebuffer VirtioGPUAccel VeneraVideo VeneraConsole VeneraBalloon VeneraHide; do
   SRC=kext/$NAME
   EXTRA=()
   [[ $NAME == VirtioGPUAccel ]] && EXTRA=(-DNM_TAHOE -Ivendor/nullmoth/accel -Ivendor/nullmoth/accel/re -Ivendor/nullmoth/accel/iofam -Ivendor/nullmoth/agdc)
@@ -26,7 +27,7 @@ for NAME in VirtioGPU VirtioGPUFramebuffer VirtioGPUAccel VeneraVideo VeneraCons
   OBJ=build/obj/$NAME
   mkdir -p $OBJ "$OUT/Contents/MacOS"
   SRCS=($SRC/*.cpp)
-  [[ $NAME == VeneraConsole ]] && SRCS+=(kext/VirtioGPU/VirtioPCI.cpp)   # the virtio-pci transport, shared
+  [[ $NAME == VeneraConsole || $NAME == VeneraBalloon ]] && SRCS+=(kext/VirtioGPU/VirtioPCI.cpp)   # the virtio-pci transport, shared
   for f in $SRCS; do
     xcrun clang++ "${CXXFLAGS[@]}" "${EXTRA[@]}" -c "$f" -o "$OBJ/${f:t:r}.o"
   done

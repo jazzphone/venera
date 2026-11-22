@@ -2687,3 +2687,50 @@ corner to corner 8 times in one press (`qmpinput.py sweep`, 0.4 s each way) and 
 - **Proxmox shows macOS VMs' RAM as full**: it takes `mem = total_mem - free_mem` only from a virtio-balloon device's
   guest statistics (PVE's QemuServer.pm `$ballooncb`), else the QEMU process's memory; Venera's VMs have `balloon: 0`
   and macOS has no balloon driver. A stats-only balloon driver is proposed as its own task.
+
+### Proxmox's memory figure: VeneraBalloon.kext (2026-11-22)
+
+- **Why macOS VMs looked full.** Proxmox (QemuServer.pm, `$ballooncb` after `query-balloon`) shows `mem = total_mem -
+  free_mem` only when the VM's virtio-balloon device has guest statistics; otherwise `mem` is the QEMU process's memory
+  (`memhost`), which macOS fills with caches (108: 8.7 GB of 8). Venera's VMs were made with `balloon: 0`.
+- **Apple's driver doesn't do it.** With the device on (108, `balloon: 8192`), AppleVirtIO.kext's AppleVirtIOBalloon
+  takes it through Apple's transport and negotiates the stats queue, but its buffers carry no figures: `ballooninfo`
+  had `last_update` and `mem_swapped_in: 0`, no `total_mem` or `free_mem`, so Proxmox kept showing `memhost`. It
+  didn't inflate (the target is the full memory), so the device on before Venera is in is harmless.
+- **VeneraBalloon.kext** (kext/VeneraBalloon, OpenCore like VeneraConsole: Apple's transport takes every virtio device
+  in the Boot KC, so an Auxiliary KC driver would come too late): 1af4:1002/1045, probe score 1000000, its own copy of
+  the virtio-pci transport (VirtioPCI.cpp). Takes VERSION_1 and STATS_VQ only (QEMU offers 0x10130000032: page
+  poisoning, free page reporting and ring features besides, all refused), sets up inflate, deflate and stats queues,
+  never puts a page in the balloon; the host's target (num_pages) is read and shown, not acted on. No interrupts: the
+  avail rings ask for none and a 1 s IOTimerEventSource (and each agent update) takes the stats buffer back and hands it
+  over refilled. QEMU reads a buffer as it arrives and returns it at its polling interval (Proxmox sets 2 s).
+- **The figures come from venera-agent** (decided: the kernel's page counts aren't KPI, `host_statistics64` in user
+  space is what vm_stat and Activity Monitor read). A thread in the agent hands the kext 8 values every 2 s through a
+  root-only user client (VeneraBalloonAPI.h): MEMTOT (hw.memsize), MEMFREE and AVAIL (the total less Activity
+  Monitor's Memory Used), CACHES (Cached Files), swap in/out bytes, page-ins as major faults, the other faults as
+  minor. Figures over 30 s old (no agent) go out as MEMTOT alone, and Proxmox falls back to `memhost` rather than show
+  a stale figure. `venera-agent --memory` prints the figures and the kext's state; status.sh and Upgrade's status line
+  show the kext's `VeneraBalloonState`.
+- **Which "used"**: Activity Monitor on 108 read Memory Used 3.46 GB while App Memory 2.13 + Wired 1.29 = 3.42: its
+  Memory Used counts the purgeable pages too (anonymous pages incl. purgeable, 570,029, + wired 337,538 = 3.46 GB to
+  the MB), and its Cached Files (file-backed + purgeable) counts them again. The agent matches Memory Used, so Proxmox's
+  bar is Activity Monitor's Memory Used. (The brief's "free + inactive + speculative + purgeable" would have counted
+  inactive anonymous pages as free, ~1 GB off on 108.)
+- **Checked on VM 108** (snapshot `pre-balloon` first): `qm status 108 --verbose` `mem` 3.29-3.67 GB, `freemem` and
+  `ballooninfo` (`total_mem`, `free_mem`, faults) there, `memhost` 8.1-8.7 GB beside it; `/cluster/resources` (the UI)
+  3.0 GB of 8; Activity Monitor's Memory Used 3.46 GB against the agent's 3,550 MB and Proxmox's 3,561 MB two seconds
+  later. A 2 GB allocation (perl): 3,560 -> 6,054 MB within 5 s, back to 3,415 when it exited. The agent stopped
+  (SIGSTOP) for 50 s: figures held 30 s, then `mem` = `memhost` (8.4 GB, no `freemem`), real figures again 15 s after
+  it went on.
+- **The VM script**: a new Venera VM is made with `--balloon <memory>` (minimum = memory: Proxmox never balloons, no
+  auto-ballooning); Ready for Venera, Finish and Upgrade turn it on for a VM with `balloon: 0` (Finish and Upgrade only
+  when Venera's agent is in, which brings the kext), which makes the restart a shut-down and a start (QEMU adds the
+  device at a start). Upgrade's restart path run on 108 with `balloon: 0` (the script's own `upgrade_restart`,
+  BALLOON=1; not a full Upgrade, which needs a kit): device on, 8192 MB minimum, `mem` 3.29 GB after the start.
+  vm/test.sh: `vm_memory` (`memory: current=...` too) and `no_balloon`, and oc_transplant keeps VeneraBalloon.kext.
+- **The installer**: VeneraBalloon.kext goes into OpenCore with the guest agent's choice (beside VeneraConsole), off
+  with `--no-agent`, removed by uninstall.sh. Dry runs on 108 (the guest's 0.1.15 release folder with this install.sh,
+  uninstall.sh and the kext): added/enabled with `--video`, disabled with `--no-agent`, removed by uninstall.
+- **VM 108 now** runs this build's venera-agent (labeled 0.1.15) and VeneraBalloon.kext 0.1.0 injected by
+  `vm-remote.sh deploy`, `balloon: 8192`. VMs 107 and 109 untouched (still `balloon: 0`); their next Upgrade turns the
+  device on, with a shut-down and a start. Not released.

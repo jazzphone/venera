@@ -165,7 +165,8 @@ next to it (`config.plist.venera-DATE`), and then:
 5. starts the watcher (`local.venera.watch`, below);
 6. installs the Venera app and its login item (`local.venera.helper`);
 7. installs and starts the guest agent (`local.venera.agent`, below); this one runs in the first pass too, since it
-   needs no restart. Its port's driver, `VeneraConsole.kext`, goes into OpenCore with step 1.
+   needs no restart. Its port's driver, `VeneraConsole.kext`, goes into OpenCore with step 1, and with it
+   `VeneraBalloon.kext` (Proxmox's memory figure, below).
 
 Options: `--level 2` installs everything with the software desktop (the framebuffer and the accelerator, Metal only
 for allow-listed test tools); `--no-opencore` skips step 1 and 2 for people who manage `config.plist` themselves (add
@@ -203,6 +204,8 @@ speaks the QEMU guest agent protocol that Proxmox uses with Linux and Windows gu
   a check mark or an emoji, and times out; the agent drops what it left behind and answers the next request);
 - `qm guest passwd VMID USER` sets a local account's password, as an administrator's reset does (the login keychain
   keeps the old password, and macOS offers to update it at the next login);
+- the VM's **memory** in Proxmox (the Summary, the node's VM list) is macOS's own, as Activity Monitor counts it,
+  instead of always full (below);
 - a backup's `fs-freeze` syncs the disks (APFS can't be frozen from outside the kernel: macOS reports no file system
   frozen, and the backup goes on as crash-consistent), and `fstrim` says APFS trims by itself.
 
@@ -218,6 +221,20 @@ own vdagent then joins the noVNC console's clipboard to it (text, UTF-8). Left a
 SPICE client instead (remote-viewer), which also takes images (PNG). A VM pinned to a machine version below 10.1
 can't live-migrate with the VNC clipboard; the VM script turns it on only where it can (new VMs, Ready, Finish).
 Its messages are in the unified log: `log show --last 1h --predicate 'process == "venera-clipboard"'`.
+
+**The VM's memory in Proxmox.** Proxmox takes a guest's memory use from the VM's balloon device, when the guest's
+driver for it reports statistics; otherwise it shows the QEMU process's memory, which macOS soon fills with caches, so
+a macOS VM looked full all the time. With the agent comes `VeneraBalloon.kext` (through OpenCore, from the next
+restart), a driver for the balloon device that only reports: every 2 s the agent reads macOS's page counts (as
+`vm_stat` and Activity Monitor do) and the driver hands them to QEMU, with "free" meaning what macOS can give back
+(the total less Activity Monitor's **Memory Used**). So Proxmox's memory figure is Activity Monitor's Memory Used,
+and its Cached Files count as free. It never inflates: the VM script sets the balloon's minimum to the VM's memory
+(**Hardware > Memory > Minimum memory** equal to **Memory**, `balloon: <memory>`), so Proxmox never asks for memory
+back; a new VM has it, and Upgrade sets it on an existing one (QEMU adds the device when it starts: a shut-down and
+a start). By hand: tick **Ballooning Device** with Minimum memory equal to Memory, then shut the VM down and start
+it. `venera-agent --memory` (as root) shows the figures and what the driver last sent; when the agent stops, after
+30 s the driver sends the total alone and Proxmox shows its own figure again. Without Venera's driver, macOS's own
+(AppleVirtIOBalloon) takes the device and reports nothing useful.
 
 **Turn it on in Proxmox**: the VM's **Options > QEMU Guest Agent**: on, with **Type** VirtIO (the default), then shut
 the VM down and start it (QEMU adds the port when it starts). The agent also answers on the ISA serial port (Type ISA),
