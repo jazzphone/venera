@@ -2734,3 +2734,22 @@ corner to corner 8 times in one press (`qmpinput.py sweep`, 0.4 s each way) and 
 - **VM 108 now** runs this build's venera-agent (labeled 0.1.15) and VeneraBalloon.kext 0.1.0 injected by
   `vm-remote.sh deploy`, `balloon: 8192`. VMs 107 and 109 untouched (still `balloon: 0`); their next Upgrade turns the
   device on, with a shut-down and a start. Not released.
+
+### Codex's audit of 72d8729 (2026-11-22)
+
+- **Stencil state leaked at each render-pass split** (`VGMTLRender.m`, the fetch resume's `memset` of `_last`, whose
+  `sds` is a strong reference): released first now; the build's `-Wnontrivial-memaccess` warning is gone.
+- **Scanout readiness behind a predecessor's write-back: not happening.** VM 108 at 2880x1800, 0.1.15, sweep, genie
+  and scroll, alone and with the stream probe as a shared reader: "completion: predecessor status wait" 0.001 ms a
+  command buffer in every case (fence waits 4.7-8.2 ms). Nothing to change. Seen on the way: the genie alone spent
+  11.8 ms a command buffer in "completion: dispatch delay" (thread scheduling, not ordering); and 108 shared ran far
+  slower than 109 did (genie 80 ms, scroll 74 ms a frame against 30.6 and 24.3).
+- **Framebuffer-fetch scratch images in app processes: not worth a pool.** 109's log since its 06:46 restart (the
+  owner's use, perf on): WindowServer ~1 million fetches, all in place with its one shared blank; in apps only the
+  copy fallback, rarely: Console ~190 fetches (~200 MB copied), Spotlight ~150, wallpaper extensions a handful. A few
+  hundred scratch allocations an hour, against the ~1,400 a drag sweep that made WindowServer slow.
+- **Video, several 4K streams at once: no daemon queueing to fix.** VM 108, `vtprobe -decode 300` of a 3840x2160
+  10-bit HEVC file: one stream 167 fps; two at once 82 + 60 (143 together); three 60 + 52 + 38 (150 together). The
+  host GPU is what they share; the daemon's synchronous copy adds no visible queueing, and the slowest of three
+  streams still decodes above 30 fps. Shares are uneven. Left as it is.
+- **The DisplayStream twin**: waits for the owner's viewer (`streamsum` + `twindrop`, round 23 night).

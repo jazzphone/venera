@@ -1292,7 +1292,8 @@ static BOOL vg_can_feedback(VGMTLTexture *t, const char *why) {
     VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, _area, 1, 0, _ncolor, color, _depthTex ? &depth : NULL,
                           _stencilTex ? &stencil : NULL};
     gVk.vkCmdBeginRendering(cb, &ri);
-    memset(&_last, 0, sizeof(_last));   // a new rendering scope: dynamic state is sent again
+    _last.sds = nil;   // ARC's release first: the memset below would leave it retained (the stencil state leaked)
+    memset((void *)&_last, 0, sizeof(_last));   // a new rendering scope: dynamic state is sent again
     static int logged;
     if (logged++ < 3) {
         vglog("render: an attachment bound as a texture: feedback loop layout (mask 0x%x, %ux%u)", mask,
