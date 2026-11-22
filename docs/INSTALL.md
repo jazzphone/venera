@@ -413,6 +413,7 @@ Files in `/Library/GPUBundles` the Metal driver reads (root only; delete them to
 - `VirtioGPUMetal-framesig` (WindowServer) logs a signature of what the display shows after each presented frame,
   with its time, whenever it changes: when the screen settles after a click, to time how long a window or a System
   Settings pane takes to be usable. Read when WindowServer starts.
+- `VirtioGPUMetal-twinall`: give every surface written in a display frame a twin again, including the ones the display never shows (a window flattened for the genie, screenshots' capture surfaces). Rechecked every 2 s.
 - `VirtioGPUMetal-selectivewriteback`: copy SkyLight's "Selective Sharing" surface back to CPU memory and wait for
   it, as before 0.1.13. While the screen is shared it is written every frame and only read on the GPU (Screen
   Sharing reads the display stream's surfaces). Read when WindowServer starts.

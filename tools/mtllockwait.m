@@ -3,7 +3,7 @@
 // once locked and read on the CPU, as ScreensharingAgent does. Every read must see its frame's color: either the
 // commit waited for the write-back, or (with this process on the lockwait list) the lock waits for it.
 //   printf 'mtllockwait\n' > /Library/GPUBundles/VirtioGPUMetal-lockwait     (the reader's hook in this process)
-//   VGMTL_ENABLE=1 ./mtllockwait [ROUNDS]
+//   VGMTL_ENABLE=1 ./mtllockwait [ROUNDS [WIDTH HEIGHT]]   (1280x800 by default; 2880 1800 is a Retina display's)
 // Prints each phase's time (commit to return, lock) and "mtllockwait: PASS" or "FAIL (n stale reads)".
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurface.h>
@@ -16,7 +16,7 @@
 int main(int argc, char **argv) {
     @autoreleasepool {
         int rounds = argc > 1 ? atoi(argv[1]) : 60;
-        enum { W = 1280, H = 800 };
+        const int W = argc > 3 ? atoi(argv[2]) : 1280, H = argc > 3 ? atoi(argv[3]) : 800;
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
         printf("mtllockwait: device %s\n", dev.name.UTF8String);
         IOSurfaceRef s = IOSurfaceCreate((__bridge CFDictionaryRef) @{

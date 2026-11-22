@@ -173,7 +173,50 @@ VGMTLTexture *vg_twinned_shown(void) {
     }
 }
 
+// Surfaces WindowServer writes in display command buffers that the display never scans out (round 23, VM 109 at
+// 2880x1800 shared over Screen Sharing): a window flattened for an effect ("flattened-surface": the genie, a window
+// dragged while the screen is shared), a screenshot's "CaptureSurface", and Selective Sharing. Each got a twin all
+// the same, a copy into host memory at every write on top of its write-back, and each new flattened window a fresh
+// pair of host allocations: shared, a genie took 66 ms a frame and a window drag 41.5 ms; without these twins, 34-38
+// and 18.9 ms. SkyLight's display stream ("DisplayStream surface N/8", what Screen Sharing reads) keeps its twin:
+// without it, frames came faster still but a dragged window left trails in what Screen Sharing showed (the VM's own
+// screen was clean, and every stream frame was copied back whole); why the twin's copy prevents them is open. The
+// flag file VirtioGPUMetal-twinall gives every surface its twin again (rechecked every 2 s).
+static BOOL vg_surface_never_shown(VGMTLTexture *t) {
+    static int all = -1;
+    static uint64_t checked;
+    const uint64_t now = vg_now();
+    if (all < 0 || now - checked > 2000000000ull) {
+        all = vg_debug_flag("twinall");
+        checked = now;
+    }
+    if (all) {
+        return NO;
+    }
+    if (t->_neverShown == 0) {
+        t->_neverShown = -1;
+        CFTypeRef nm = IOSurfaceCopyValue(t->_surface, kIOSurfaceName);
+        if (nm && CFGetTypeID(nm) == CFStringGetTypeID()) {
+            static const CFStringRef kNames[] = {CFSTR("flattened-surface"), CFSTR("CaptureSurface"),
+                                                 CFSTR("Selective Sharing")};
+            for (size_t i = 0; i < sizeof(kNames) / sizeof(kNames[0]); i++) {
+                if (CFStringFind((CFStringRef)nm, kNames[i], 0).location != kCFNotFound) {
+                    t->_neverShown = 1;
+                    break;
+                }
+            }
+        }
+        if (nm) {
+            CFRelease(nm);
+        }
+    }
+    return t->_neverShown == 1;
+}
+
 BOOL vg_twin_ensure(VGMTLTexture *t) {
+    if (t->_surface && !t->_plane && !t->_parent && vg_surface_never_shown(t)) {
+        return NO;   // nothing scans it out: no twin, no copy into one (one made under twinall goes unused)
+    }
     if (t->_twinRes) {
         return YES;
     }

@@ -91,6 +91,7 @@ id<MTLBuffer> vg_new_buffer_nocopy(id<MTLDevice> device, void *pointer, NSUInteg
     BOOL _readerWaits;
     BOOL _described;   // synclog has said what this surface is
     int8_t _gpuOnly;   // SkyLight's Selective Sharing surface: 1, not: -1, not looked at yet: 0
+    int8_t _neverShown;   // named as a surface the display never scans out (no twin): 1, not: -1, not looked at yet: 0
     uint32_t _readerChecks;
 }
 @property(readonly) id<MTLDevice> device;

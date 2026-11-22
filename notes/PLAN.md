@@ -2533,3 +2533,37 @@ corner to corner 8 times in one press (`qmpinput.py sweep`, 0.4 s each way) and 
   checks and warm repeats had zero, and the cause of the early stalls remains open. The Metal rendering probe
   passed. Two scanout captures and a macOS shortcut screenshot at 2880x1800 showed intact window contents and
   exposed background after motion. VM 108 is back at 1280x800 with the final accelerator and original core loaded.
+
+### After 0.1.14 (2026-11-21, evening)
+
+- The owner's kits on both nodes are a private 0.1.14 with the seed (0.1.12's and 0.1.13's kept beside). VM 109
+  upgraded to 0.1.14 by the VM script's Upgrade (its own systemd unit): package 0.1.14, framebuffer 0.6.3, the
+  release Metal bundle with the link-time-bound ICD, Retina mode kept.
+- **Retina on VM 109 with 0.1.14, nobody connected** (2880x1800, the sweep aimed for 1440x900 points): mean frame
+  gap 17.8 ms in a sweep (it was 34-36 ms on 108 and 47-107 ms on 109 over Screen Sharing before the blank-texture
+  reuse and the pacing fix), 21.2 ms in the scripted scroll; WindowServer's waits 0.01-0.8 ms.
+- **The cold-start stalls are the boot's warm-up, not the first drag.** VM 108 (Codex's final build) restarted,
+  the load left to settle, then two sweeps: 16.7 and 16.6 ms mean, 0 unready flips in either; the kext had counted
+  8 unready flips during the boot itself, before any drag. A drag during the boot's background translation is what
+  stalls. Display command buffers complete in ~2.0 ms on this build (10 ms on the morning's).
+- **Shared Retina on VM 109: "very very slow" was animations, not drags** (the owner, connected over Screen
+  Sharing). Scripted drags looked fine, but a genie (minimize) shared drew 16 frames 66 ms apart (37 frames, 21.8 ms
+  alone). The synclog showed why: every surface written in a display command buffer got a twin, including surfaces
+  the display never scans out -- SkyLight's display stream (2880x1800, every frame while shared), the window
+  flattened for the genie ("flattened-surface", new each time: a fresh pair of host blobs), screenshots'
+  "CaptureSurface". An isolated 2880x1800 clear plus write-back is 8-9 ms (`mtllockwait 60 2880 1800`, VM 108), but
+  the stream's copy took ~29 ms from commit to done queued behind the frame's other work.
+- **No twin for flattened-surface, CaptureSurface, Selective Sharing** (`vg_surface_never_shown`, flag file
+  `VirtioGPUMetal-twinall` restores them, rechecked every 2 s). VM 109 shared, 0.1.14 -> this build: genie 66 ->
+  34-38 ms a frame, scripted drag 41.5 -> 18.9 ms, scroll 41.7 -> 25.5 ms; alone the genie 21.8 -> 19.5 ms. VM 108
+  (2880x1800, nobody connected): genies 22-25 ms, minimized windows' Dock thumbnails and a Cmd-Shift-3 screenshot
+  intact.
+- **The display stream keeps its twin.** Without it everything was faster still (genie 28-31 ms, drag 21.4) but
+  the owner saw a dragged window leave trails in Screen Sharing (live A/B with twinall, then a per-name test flag:
+  trails only when the stream had no twin). The VM's own screen (vncgrab) was clean, every stream write was copied
+  back whole (115 of 115 in a sweep), the reader wait never timed out. Why the stream's twin copy prevents the
+  trails is open: next, a content check in ScreensharingAgent's lock hook (what it reads vs the frame written).
+- Measuring Screen Sharing from the client: `ffmpeg -f avfoundation` capture of the viewer window, changed frames
+  counted per 1/60 s (with `-frames:v` and `-fps_mode passthrough`: without them a raw capture ran away to 85 GB).
+  A scripted drag reached the viewer at ~40 updates/s. 108 sat at its lock screen after restarts: its frame counts
+  then are the lock screen clock's, not a test's.
