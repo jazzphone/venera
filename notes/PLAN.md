@@ -2772,3 +2772,29 @@ corner to corner 8 times in one press (`qmpinput.py sweep`, 0.4 s each way) and 
   `freemem`; VeneraBalloon 0.1.0 and framebuffer 0.6.4 loaded; WindowServer on the 0.1.16 Metal bundle (122872177f8c,
   as built); 107's HelperPod running. 108's snapshot pre-0-1-16 taken before and deleted after (the owner wants it
   without snapshots).
+
+### Codex's follow-ups after 0.1.16 (2026-11-22)
+
+- **1280x800 Retina against 1440x900 Retina** (21% fewer pixels), VM 108, alone: sweep 21.1 vs 26.4 ms a frame, genie
+  30.0 vs 27.3, scroll 21.7 vs 22.1; shared (the probe as reader): genie 117 vs 96, scroll 75 vs 77. No real gain.
+  108 shared is bound by something of its own (109 shared scrolled at 24 ms), so only "alone" counts.
+- **The twin as the CPU copy's source** (prototype, flag `twinreadback`: the display stream's rows copied from the
+  twin the GPU had just filled, no staging copy, a twin being read not written meanwhile): not kept. 108 Retina
+  shared, off/on/off/on: genie 53 and 67 ms off, 110 and 100 on; sweep ~25 either way; scroll noisy (74/43 off,
+  44/82 on); the CPU copy itself 3.6-3.7 ms off, 4.0-4.5 on; command buffers no shorter.
+- **The probe checks every frame** (`VG_SP_EVERY=1`, tools/streamprobe.m): after each frame's dirty rectangles it
+  compares the client image with the whole frame in 8x8 tiles and saves the worst frame's pictures. Retina trails
+  found unattended, all with the probe reading (SCStream) during sweep, genie and scroll on 108:
+  - 1440x900 Retina: 7-8 frames of ~600 left the client wrong by more than 32, up to 255 (the Dock's icons sliding
+    over for the minimized window, 3,272 pixels in the Dock band); later frames repaired them (0 at the end).
+  - 1440x900 1x: none above 33 (faint glass, everywhere a few levels).
+  - 1440x900 1x with the probe held 40 ms a frame (as slow as at Retina): none above 33. Not the reader falling
+    behind.
+  - Retina with Selective Sharing written back (`selectivewriteback`, WindowServer restarted): up to 244. Not that.
+  - The same 2560x1600 pixels: 1x up to 33, 1280x800 Retina up to 189. The Retina scale factor, not the pixel count.
+  So at scale 2 a stream frame changes pixels outside the dirty rectangles SkyLight reports (the Dock's animation,
+  glass), which a later frame repairs; a viewer that misses the repair keeps them: the owner's Retina-only trails,
+  with or without the twin, reads matching. The VM's own screen shows whole frames and stays clean. Open: whether
+  SkyLight's damage or Venera's rendering (drawing beyond a pass's scissor at scale 2, say) is out of line.
+- **Partial console readback** (Codex item 3) not started: it needs QEMU's egl-headless path changed on the hosts as
+  well as Venera's flush rectangles; scoped for the owner.

@@ -23,6 +23,9 @@
 //   VG_SP_ASYNC     1: read each frame later on another queue (the frame kept meanwhile), as the agent's encoder
 //                   does; with VG_SP_HOLD, that much later
 //   VG_SP_QUEUE     the stream's queue depth (default 8, the agent's)
+//   VG_SP_EVERY     1: also compare the client image with each whole frame as it comes (8x8 tiles), so a region that
+//                   a frame's dirty rectangles left wrong is seen even if a later frame redraws it; counts, the
+//                   largest difference, and the first frames that differ with their regions
 //   VG_SP_RAW       1: also the last frame as OUT-last.raw (BGRA, rows packed), to check against what the display
 //                   shows (QEMU's VNC: vncgrab.py on the host)
 //   VG_SP_SCALE     dirty rectangles' scale to pixels (default 1: they are in the stream's pixels)
@@ -132,6 +135,39 @@ static IOSurfaceLockOptions gOpts;
 static int gHoldMs;
 static IOSurfaceRef gLast;
 static uint64_t gFrames, gRects, gPixels, gIdle, gLockNs, gLockMax, gSame, gDiffer, gSeedMoved, gNoStamp, gTorn;
+static int gEvery;
+static const char *gOutPrefix;
+static uint64_t gEveryFrames, gEveryBig, gEveryTiles;
+static int gEveryMaxDiff;
+
+// The client image against the whole frame in 8x8 tiles (VG_SP_EVERY): tiles that differ, their bounding box and
+// the largest channel difference.
+static size_t compare_tiles(const uint8_t *base, size_t bpr, size_t w, size_t h, int *maxDiff, size_t box[4]) {
+    size_t tiles = 0;
+    box[0] = w, box[1] = h, box[2] = 0, box[3] = 0;
+    *maxDiff = 0;
+    for (size_t ty = 0; ty < h; ty += 8) {
+        for (size_t tx = 0; tx < w; tx += 8) {
+            const size_t len = (tx + 8 <= w ? 8 : w - tx) * 4;
+            BOOL d = NO;
+            for (size_t y = ty; y < ty + 8 && y < h; y++) {
+                const uint8_t *a = gShadow + y * gBpr + tx * 4, *b = base + y * bpr + tx * 4;
+                if (memcmp(a, b, len)) {
+                    d = YES;
+                    for (size_t i = 0; i < len; i++) {
+                        int diff = abs((int)a[i] - (int)b[i]);
+                        *maxDiff = diff > *maxDiff ? diff : *maxDiff;
+                    }
+                }
+            }
+            if (d) {
+                tiles++;
+                box[0] = MIN(box[0], tx), box[1] = MIN(box[1], ty), box[2] = MAX(box[2], tx + 8), box[3] = MAX(box[3], ty + 8);
+            }
+        }
+    }
+    return tiles;
+}
 static uint64_t gFirst, gLastAt;
 static double gMaxX, gMaxY;
 
@@ -223,6 +259,34 @@ static void process(IOSurfaceRef s, const CGRect *r, size_t n, const CGRect *mr,
         }
         gRects += n;
     }
+    if (gEvery && gShadow && w == gW && h == gH) {   // the client image against this whole frame
+        int maxDiff = 0;
+        size_t box[4];
+        size_t tiles = compare_tiles(base, bpr, w, h, &maxDiff, box);
+        if (tiles) {
+            gEveryFrames++, gEveryTiles += tiles;
+            gEveryBig += maxDiff > 32;
+            gEveryMaxDiff = maxDiff > gEveryMaxDiff ? maxDiff : gEveryMaxDiff;
+            if (gEveryFrames <= 3 || (maxDiff > 32 && gEveryBig <= 20)) {   // the first few, and every big one
+                fprintf(gOut, "frame %llu: client differs in %zu tiles within %zu,%zu-%zu,%zu, up to %d apart (%zu dirty "
+                        "rects)\n", (unsigned long long)gFrames, tiles, box[0], box[1], box[2], box[3], maxDiff, n);
+                for (size_t i = 0; maxDiff > 32 && i < n && i < 8; i++) {
+                    fprintf(gOut, "    dirty rect %.0f,%.0f %.0fx%.0f\n", r[i].origin.x, r[i].origin.y, r[i].size.width,
+                            r[i].size.height);
+                }
+            }
+            static int saved;
+            if (maxDiff > 32 && maxDiff > saved) {   // the worst so far, as pictures: the client, the frame, the tiles
+                saved = maxDiff;
+                char path[512];
+                snprintf(path, sizeof(path), "%s-big-client.png", gOutPrefix);
+                write_png(path, gShadow, gW, gH, gBpr, 1);
+                snprintf(path, sizeof(path), "%s-big-frame.png", gOutPrefix);
+                write_png(path, base, w, h, bpr, 1);
+                fprintf(gOut, "    (saved as the worst so far: frame %llu)\n", (unsigned long long)gFrames);
+            }
+        }
+    }
     sums(base, w, h, bpr, after);   // did it change while we read it?
     if (memcmp(band, after, sizeof(band))) {
         if (gTorn++ < 30) {
@@ -312,6 +376,11 @@ static void finish(const char *out) {
     if (gMoves) {
         fprintf(gOut, "moves (%s): %llu moved rects, %.1f Mpx moved\n", gMoves == 1 ? "from" : "to",
                 (unsigned long long)gMovedRects, gMovedPixels / 1e6);
+    }
+    if (gEvery) {
+        fprintf(gOut, "every frame: %llu of %llu frames left the client off (%llu by more than 32), %llu tiles in all, up to "
+                "%d apart\n", (unsigned long long)gEveryFrames, (unsigned long long)gFrames, (unsigned long long)gEveryBig,
+                (unsigned long long)gEveryTiles, gEveryMaxDiff);
     }
     fprintf(gOut, "stamps: %llu same, %llu differ, %llu seed moved, %llu unstamped; %llu changed while read\n",
             (unsigned long long)gSame, (unsigned long long)gDiffer, (unsigned long long)gSeedMoved,
@@ -479,6 +548,7 @@ __attribute__((constructor)) static void streamprobe(void) {
     }
     @autoreleasepool {
         const char *out = getenv("VG_SP_OUT") ?: "/var/tmp/vgpu/sp/sp";
+        gOutPrefix = out;
         char path[512];
         snprintf(path, sizeof(path), "%s.txt", out);
         gOut = fopen(path, "w") ?: stderr;
@@ -488,6 +558,7 @@ __attribute__((constructor)) static void streamprobe(void) {
         gHoldMs = getenv("VG_SP_HOLD") ? atoi(getenv("VG_SP_HOLD")) : 0;
         gMoves = getenv("VG_SP_MOVES") ? atoi(getenv("VG_SP_MOVES")) : 0;
         gAsync = getenv("VG_SP_ASYNC") ? atoi(getenv("VG_SP_ASYNC")) : 0;
+        gEvery = getenv("VG_SP_EVERY") ? atoi(getenv("VG_SP_EVERY")) : 0;
         const char *hook = "none";
         if (!getenv("VG_SP_NOHOOK")) {   // the GPU bundle, and with it the lock hook
             void *b = dlopen("/Library/GPUBundles/VirtioGPUMetal.bundle/Contents/MacOS/VirtioGPUMetal", RTLD_NOW);
