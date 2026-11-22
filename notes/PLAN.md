@@ -2905,3 +2905,25 @@ CGWindow bounds; mpdecimate + showinfo: the gaps between changed frames under 25
   the CPU write-back fell from 1.5-2.6 to 0.6 ms a stream frame, the probe's locks from 1.7-1.9 to 0.6 ms, the
   genie's dispatch delay from 5.2-5.8 to 2.0-2.6 ms; WindowServer's frame gaps about the same (scroll 17.5 vs 17.9 ms
   median). The write-back scales with the capture's size; presentation doesn't.
+
+### Tinted icons came out green (2026-11-22)
+
+With Icon & widget style Tinted, the Dock's and every app's icons came out the wrong color: Blue and Graphite gave
+green and yellow-green glyphs, Red was mostly right but Maps and Contacts had wrong pieces. iconservicesagent draws
+them with RenderBox. A pass at a time (passlog, a pass dump of every attachment): a `plane_image_stretch` pass sampled
+a glyph mask and wrote it pure yellow (R = G, B = 0) on opaque black. The mask's texture is RG8Unorm over an IOSurface
+of pixel format **'LA08'** (8-bit luminance + alpha), which RenderBox renders into and samples back. Apple's GPUs treat
+such a surface as luminance-alpha: a sample reads (L, L, L, A) and a render target keeps a fragment's red and alpha.
+Read as plain RG8 it came back (L, A, 0, 1): every mask opaque, its luminance and alpha as red and green. The color
+matrices, the tint multipliers and the translated filter shaders were all right (checked first).
+
+- A luminance-alpha surface's texture ('LA08', 'LA16' wrapped as a two-channel format) samples through a second
+  view, swizzled (R, R, R, G) under its own swizzle (`_sampleView`; views of it and framebuffer-fetch copies of it
+  too). The image keeps the plane's bytes (R = L, G = A), so CPU uploads, readbacks and surface syncing don't change.
+- A pipeline drawing into one stores alpha in green: a pipeline with a two-channel color format keeps its fragment
+  SPIR-V, and with such an attachment bound uses a variant whose output there stores (r, a, b, a)
+  (`vg_spirv_alpha_to_green`), with green written when alpha is. A clear's green is its alpha.
+- Checked on 108: Blue, Graphite, Green, Pink and Red all tint as on a Mac, Maps and Contacts included.
+- Debugging aids kept: the shader dump writes a file set per specialization (a hash of the function constants) and,
+  sandboxed, into the process's own cache or temporary directory; the pass log names a pipeline's constant 0 and each
+  texture's pixel format and swizzle.

@@ -37,6 +37,10 @@ id<MTLBuffer> vg_new_buffer_nocopy(id<MTLDevice> device, void *pointer, NSUInteg
     VkDeviceMemory _memory;
     VkImageView _view;
     VkImageView _attView;   // depth and stencil together, for a depth-stencil attachment (5d); else null
+    // A luminance-alpha IOSurface's texture ('LA08', 'LA16' as a two-channel format): sampled through _sampleView, as
+    // (L, L, L, A); drawn into by pipelines that store alpha in green (vg_texture_make_la)
+    VkImageView _sampleView;
+    BOOL _la;
     VkFormat _format;
     VkImageAspectFlags _aspect;
     MTLPixelFormat _pixelFormat;
@@ -165,6 +169,8 @@ typedef struct {
 void vg_apply_static_samplers(NSDictionary *refl, vg_binding *bindings, int n);
 int vg_spirv_bindings(NSData *spv, uint32_t set, vg_binding *out, int max, NSString **error);
 NSData *vg_spirv_retarget_set(NSData *spv, uint32_t newSet);
+NSData *vg_spirv_alpha_to_green(NSData *spv, uint32_t locations);   // outputs at those locations store (r, a, b, a)
+void vg_texture_make_la(VGMTLTexture *t);   // an LA surface's texture: sampled (L, L, L, A) (VGMTLTexture.m)
 BOOL vg_spirv_has_push_constants(NSData *spv);   // DescriptorSet 0 -> newSet (NV's fragment move)
 
 @interface VGMTLCommandBuffer : NSObject <MTLCommandBuffer> {

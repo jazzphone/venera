@@ -218,6 +218,11 @@ enum { kVGMaxColor = 8 };
     VkPipelineColorBlendAttachmentState _blend[kVGMaxColor];
     VkPipeline _pipelines[12];   // points, lines, triangles; the same with depth clamped (MTLDepthClipModeClamp); then all
                                  // six for attachments in the feedback loop layout (5d)
+    // Drawing into luminance-alpha surfaces (vg_texture_make_la): a pipeline with a two-channel color format keeps its
+    // fragment module's SPIR-V; the variants that store alpha in green, by (attachment mask << 4 | slot)
+    NSData *_fsSpv;
+    NSMutableDictionary<NSNumber *, NSNumber *> *_laPipelines;
+    NSMutableDictionary<NSNumber *, NSNumber *> *_laModules;
     // Tessellation (5d): _vs is then the evaluation stage, _tvs and _tcs the generated vertex and control stages; the
     // control stage pulls from Metal vertex buffers _tessVb[0.._tessNvb) (vg_tess_push.vb in that order).
     BOOL _tess;
@@ -228,6 +233,8 @@ enum { kVGMaxColor = 8 };
 @property(readonly) id<MTLDevice> device;
 @property(readonly) NSString *label;
 @end
+
+static VkShaderModule vg_module(NSData *spv);
 
 @implementation VGMTLRenderPipelineState
 @synthesize label = _label;
@@ -250,10 +257,47 @@ enum { kVGMaxColor = 8 };
 // feedback (5d): drawing while an attachment is in the feedback loop layout -- read in place by a framebuffer fetch, or
 // bound as an ordinary texture by the app itself (RenderBox's programmable blending reads its color target as texture(4)).
 - (VkPipeline)pipelineForClass:(int)cls clamp:(BOOL)clamp feedback:(BOOL)feedback error:(NSString **)error {
+    return [self pipelineForClass:cls clamp:clamp feedback:feedback la:0 error:error];
+}
+// la: the color attachments that are luminance-alpha surfaces' textures (their outputs store alpha in green)
+- (VkPipeline)pipelineForClass:(int)cls clamp:(BOOL)clamp feedback:(BOOL)feedback la:(uint32_t)la error:(NSString **)error {
     const int slot = cls + (clamp ? 3 : 0) + (feedback ? 6 : 0);
+    la &= (1u << _ncolor) - 1;
+    if (la && !_fsSpv) {
+        la = 0;   // not a two-channel format there: the attachment was bound to a pipeline of another format
+    }
     @synchronized(self) {
-        if (_pipelines[slot]) {
+        if (!la && _pipelines[slot]) {
             return _pipelines[slot];
+        }
+        NSNumber *laKey = @(la << 4 | (uint32_t)slot);
+        if (la && _laPipelines[laKey]) {
+            return (VkPipeline)[_laPipelines[laKey] unsignedLongLongValue];
+        }
+        VkShaderModule fsModule = _fs;
+        VkPipelineColorBlendAttachmentState blend[kVGMaxColor];
+        memcpy(blend, _blend, sizeof(blend));
+        if (la) {
+            fsModule = (VkShaderModule)[_laModules[@(la)] unsignedLongLongValue];
+            if (!fsModule) {
+                NSData *spv = vg_spirv_alpha_to_green(_fsSpv, la);
+                if (!spv) {
+                    vglog("render pipeline %s: luminance-alpha target 0x%x: the fragment module couldn't be rewritten",
+                          _name.UTF8String, la);
+                    return [self pipelineForClass:cls clamp:clamp feedback:feedback la:0 error:error];
+                }
+                fsModule = vg_module(spv);
+                if (!_laModules) {
+                    _laModules = [NSMutableDictionary dictionary];
+                }
+                _laModules[@(la)] = @((uint64_t)fsModule);
+            }
+            for (uint32_t i = 0; i < _ncolor; i++) {   // green is alpha now: written when alpha is
+                if (la & (1u << i)) {
+                    VkColorComponentFlags m = blend[i].colorWriteMask & ~VK_COLOR_COMPONENT_G_BIT;
+                    blend[i].colorWriteMask = m | ((m & VK_COLOR_COMPONENT_A_BIT) ? VK_COLOR_COMPONENT_G_BIT : 0);
+                }
+            }
         }
         static const VkPrimitiveTopology kTopology[3] = {VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST,
                                                          VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
@@ -261,7 +305,7 @@ enum { kVGMaxColor = 8 };
         VkPipelineShaderStageCreateInfo stages[4] = {
             {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
              _tess ? VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT : VK_SHADER_STAGE_VERTEX_BIT, _vs, "main", NULL},
-            {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, _fs, "main", NULL},
+            {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fsModule, "main", NULL},
             {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, _tvs, "main", NULL},
             {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, _tcs, "main",
              NULL}};
@@ -286,7 +330,7 @@ enum { kVGMaxColor = 8 };
         VkPipelineDepthStencilStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
         ds.maxDepthBounds = 1.0f;
         VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0,
-                                                  VK_FALSE, VK_LOGIC_OP_COPY, _ncolor, _blend};
+                                                  VK_FALSE, VK_LOGIC_OP_COPY, _ncolor, blend};
         static const VkDynamicState kDynamic[] = {
             VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
             VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
@@ -314,13 +358,22 @@ enum { kVGMaxColor = 8 };
         if ((_fetchMask || feedback) && gVk.feedbackLoop) {
             gci.flags |= VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;   // samples its attachment (mode 4)
         }
-        VkResult r = gVk.vkCreateGraphicsPipelines(gVk.device, VK_NULL_HANDLE, 1, &gci, NULL, &_pipelines[slot]);
+        VkPipeline made = VK_NULL_HANDLE;
+        VkResult r = gVk.vkCreateGraphicsPipelines(gVk.device, VK_NULL_HANDLE, 1, &gci, NULL, &made);
         vg_trace_sync("vkCreateGraphicsPipelines");
         if (r != VK_SUCCESS) {
             *error = [NSString stringWithFormat:@"%@: vkCreateGraphicsPipelines %d", _name, r];
-            _pipelines[slot] = VK_NULL_HANDLE;
+            return VK_NULL_HANDLE;
         }
-        return _pipelines[slot];
+        if (la) {
+            if (!_laPipelines) {
+                _laPipelines = [NSMutableDictionary dictionary];
+            }
+            _laPipelines[laKey] = @((uint64_t)made);
+        } else {
+            _pipelines[slot] = made;
+        }
+        return made;
     }
 }
 @end
@@ -446,6 +499,16 @@ id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRende
         p = [VGMTLRenderPipelineState new];
         p->_dev = device;
         p->_name = [NSString stringWithFormat:@"%@+%@", d.vertexFunction.name, d.fragmentFunction.name ?: @"-"];
+        if (vg_passlog()) {   // debugging: the fragment function's constant 0, as words, in its name
+            NSData *c0 = [(id)d.fragmentFunction respondsToSelector:@selector(vgFC)] ? [(id)d.fragmentFunction vgFC][@0] : nil;
+            if (c0.length >= 4 && !(c0.length % 4)) {
+                NSMutableString *w = [NSMutableString stringWithString:@"@"];
+                for (NSUInteger k = 0; k < c0.length / 4; k++) {
+                    [w appendFormat:@"%s%x", k ? "." : "", ((const uint32_t *)c0.bytes)[k]];
+                }
+                p->_name = [p->_name stringByAppendingString:w];
+            }
+        }
         uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         p->_samples = MAX(d.rasterSampleCount, 1);
         p->_alphaToCoverage = d.alphaToCoverageEnabled;
@@ -503,6 +566,13 @@ id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRende
             }
             p->_vs = vg_module(vs);
             p->_fs = fs ? vg_module(fs) : VK_NULL_HANDLE;
+            for (uint32_t i = 0; fs && i < kVGMaxColor; i++) {   // could draw into a luminance-alpha surface
+                VkFormat cf = d.colorAttachments[i].pixelFormat ? vg_vk_format(d.colorAttachments[i].pixelFormat) : 0;
+                if (cf == VK_FORMAT_R8G8_UNORM || cf == VK_FORMAT_R8G8_SRGB || cf == VK_FORMAT_R16G16_UNORM ||
+                    cf == VK_FORMAT_R16G16_SFLOAT) {
+                    p->_fsSpv = fs;
+                }
+            }
             if (p->_tess) {
                 p->_tvs = vg_module(tvs);
                 p->_tcs = vg_module(tcs);
@@ -683,6 +753,7 @@ id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRende
     uint32_t _ncolor;
     VGMTLTexture *_fetchCopy[kVGMaxColor];   // scratch copies, made at the first fetch draw of the encoder
     BOOL _feedback[kVGMaxColor];             // in the feedback loop layout since a fetch split (mode 4)
+    uint32_t _laMask;                        // attachments that are luminance-alpha surfaces' textures
     NSMutableOrderedSet *_dbgPipes;          // debugging (VirtioGPUMetal-passlog): what this pass drew with
     uint32_t _dbgDraws, _dbgRefused, _dbgSplits;
     NSMutableArray *_dbgUniforms;   // (name, stage, VkBuffer, offset) of each draw's buffer 0, copied out at endEncoding
@@ -1181,8 +1252,10 @@ static void vg_dd_reload(void) {
             uint32_t b = _pso->_fb[k].binding;
             if (_pso->_fb[k].type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE && b >= 32 && b < 160) {
                 VGMTLTexture *tx = _ft.tex[b - 32];
-                [_dbgSeq appendFormat:@"[t%u=%p %lux%lu]", b - 32, tx, tx ? (unsigned long)tx->_width : 0,
-                                      tx ? (unsigned long)tx->_height : 0];
+                MTLTextureSwizzleChannels sw = tx ? [(id<MTLTexture>)tx swizzle] : (MTLTextureSwizzleChannels){0, 0, 0, 0};
+                [_dbgSeq appendFormat:@"[t%u=%p %lux%lu pf%lu sw%u%u%u%u%@]", b - 32, tx, tx ? (unsigned long)tx->_width : 0,
+                                      tx ? (unsigned long)tx->_height : 0, tx ? (unsigned long)tx->_pixelFormat : 0,
+                                      sw.red, sw.green, sw.blue, sw.alpha, tx && tx->_surface ? @" surf" : @""];
             }
         }
         BOOL ok = [self prepareDrawInner:type];
@@ -1248,7 +1321,7 @@ static void vg_dd_reload(void) {
             }
         }
     }
-    VkPipeline pipe = [_pso pipelineForClass:cls clamp:_depthClamp feedback:anyFeedback error:&why];
+    VkPipeline pipe = [_pso pipelineForClass:cls clamp:_depthClamp feedback:anyFeedback la:_laMask error:&why];
     if (!pipe) {
         [_owner fail:why];
         return NO;
@@ -1596,6 +1669,9 @@ static VGMTLTexture *vg_fetch_blank(id<MTLDevice> dev, uint32_t width, uint32_t 
         VkImageLayout layout = VK_IMAGE_LAYOUT_GENERAL;
         if (i < _ncolor && _feedback[i]) {
             view = _colorInfo[i].imageView;
+            if ((_laMask & (1u << i)) && _colorTex[i]->_view == view && _colorTex[i]->_sampleView) {
+                view = _colorTex[i]->_sampleView;   // a luminance-alpha surface's: read as (L, L, L, A)
+            }
             layout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
         } else {   // no attachment for this [[color(n)]]: a zeroed scratch image, as with copies
             if (!_fetchCopy[i]) {
@@ -1666,6 +1742,9 @@ static VGMTLTexture *vg_fetch_blank(id<MTLDevice> dev, uint32_t width, uint32_t 
                 [_owner fail:@"framebuffer fetch: no scratch image"];
                 return VK_NULL_HANDLE;
             }
+            if (src && (_laMask & (1u << i))) {
+                vg_texture_make_la(dst);   // a luminance-alpha surface's copy: read as (L, L, L, A)
+            }
             _fetchCopy[i] = dst;
             [_owner->_keep addObject:dst];
         }
@@ -1685,7 +1764,7 @@ static VGMTLTexture *vg_fetch_blank(id<MTLDevice> dev, uint32_t width, uint32_t 
                 vg_perf(VG_PERF_FETCH, (uint64_t)(x1 - x0) * (y1 - y0) * 4, 0);
             }
         }
-        ii[nw] = (VkDescriptorImageInfo){VK_NULL_HANDLE, dst->_view, VK_IMAGE_LAYOUT_GENERAL};
+        ii[nw] = (VkDescriptorImageInfo){VK_NULL_HANDLE, dst->_sampleView ?: dst->_view, VK_IMAGE_LAYOUT_GENERAL};
         wr[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, VK_NULL_HANDLE, 192 + i, 0, 1,
                                         VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &ii[nw], NULL, NULL};
         nw++;
@@ -2394,6 +2473,11 @@ static VkAttachmentStoreOp vg_store(MTLStoreAction a) {
     for (uint32_t i = 0; i < ncolor; i++) {
         e->_colorInfo[i] = color[i];
         e->_colorTex[i] = (VGMTLTexture *)d.colorAttachments[i].texture;
+        if (e->_colorTex[i] && e->_colorTex[i]->_la && color[i].imageView) {
+            e->_laMask |= 1u << i;   // its green holds alpha: a clear's too
+            color[i].clearValue.color.float32[1] = color[i].clearValue.color.float32[3];
+            e->_colorInfo[i].clearValue.color.float32[1] = color[i].clearValue.color.float32[3];
+        }
     }
     e->_ncolor = ncolor;
     // A surface's written part (5d): a cleared one all of the pass's area, a loaded one what the draws touch (added at

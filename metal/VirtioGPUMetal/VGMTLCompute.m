@@ -233,6 +233,95 @@ NSData *vg_spirv_retarget_set(NSData *spv, uint32_t newSet) {
     return m;
 }
 
+// A fragment module for a pipeline drawing into a luminance-alpha surface's texture (vg_texture_make_la): each 4-wide
+// output at one of `locations` (a bit per location; Index 1, a dual-source blend's second color, left alone) stores
+// (r, a, b, a), so the target's green keeps the fragment's alpha, as Apple's GPUs keep an LA surface's. nil if an
+// output there is written in pieces (an access chain) or isn't 4 wide.
+NSData *vg_spirv_alpha_to_green(NSData *spv, uint32_t locations) {
+    const uint32_t *w = spv.bytes;
+    size_t n = spv.length / 4;
+    if (n < 5) {
+        return nil;
+    }
+    uint32_t bound = w[3];
+    if (!bound || bound > (1u << 22)) {
+        return nil;
+    }
+    // per id: its Location (~0 none), a vector type's width, an Output pointer type's pointee, the 4-wide type stored
+    // through a chosen output; flags: Index 1, chosen
+    uint32_t *loc = malloc(sizeof(uint32_t) * bound * 4);
+    uint8_t *flags = calloc(bound, 1);
+    if (!loc || !flags) {
+        free(loc);
+        free(flags);
+        return nil;
+    }
+    uint32_t *vecCount = loc + bound, *ptrType = loc + 2 * (size_t)bound, *vecOf4 = loc + 3 * (size_t)bound;
+    memset(loc, 0xff, sizeof(uint32_t) * bound);
+    memset(vecCount, 0, sizeof(uint32_t) * bound * 3);
+    NSData *result = nil;
+    NSMutableData *out = nil;
+    BOOL any = NO;
+    for (size_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) {
+            goto done;
+        }
+        if (op == 71 && len >= 4 && w[i + 1] < bound && w[i + 2] == 30) {   // OpDecorate Location
+            loc[w[i + 1]] = w[i + 3];
+        } else if (op == 71 && len >= 4 && w[i + 1] < bound && w[i + 2] == 32 && w[i + 3] == 1) {   // Index 1
+            flags[w[i + 1]] |= 1;
+        } else if (op == 23 && len >= 4 && w[i + 1] < bound) {   // OpTypeVector
+            vecCount[w[i + 1]] = w[i + 3];
+        } else if (op == 32 && len >= 4 && w[i + 1] < bound && w[i + 2] == 3) {   // OpTypePointer Output
+            ptrType[w[i + 1]] = w[i + 3];
+        } else if (op == 59 && len >= 4 && w[i + 2] < bound && w[i + 3] == 3) {   // OpVariable Output
+            uint32_t v = w[i + 2], l = loc[v];
+            if (l < 32 && (locations & (1u << l)) && !(flags[v] & 1)) {
+                uint32_t pt = w[i + 1] < bound ? ptrType[w[i + 1]] : 0;
+                if (!pt || vecCount[pt] != 4) {
+                    goto done;
+                }
+                vecOf4[v] = pt;
+                flags[v] |= 2;
+            }
+        }
+        i += len;
+    }
+#define VG_TARGET(id) ((id) < w[3] && (flags[id] & 2))
+    out = [NSMutableData dataWithCapacity:spv.length + 64];
+    [out appendBytes:w length:5 * 4];
+    for (size_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if ((op == 65 || op == 66 || op == 67) && len >= 4 && VG_TARGET(w[i + 3])) {
+            goto done;   // an access chain into the output: a piece of it written
+        }
+        if (op == 62 && len >= 3 && VG_TARGET(w[i + 1])) {   // OpStore %output %value: shuffle the value first
+            uint32_t id = bound++;
+            const uint32_t sh[9] = {9u << 16 | 79, vecOf4[w[i + 1]], id, w[i + 2], w[i + 2], 0, 3, 2, 3};
+            [out appendBytes:sh length:sizeof(sh)];
+            NSMutableData *st = [NSMutableData dataWithBytes:w + i length:len * 4];
+            ((uint32_t *)st.mutableBytes)[2] = id;
+            [out appendData:st];
+            any = YES;
+        } else {
+            [out appendBytes:w + i length:len * 4];
+        }
+        i += len;
+    }
+#undef VG_TARGET
+    if (!any) {
+        result = spv;   // nothing stored there
+        goto done;
+    }
+    ((uint32_t *)out.mutableBytes)[3] = bound;
+    result = out;
+done:
+    free(loc);
+    free(flags);
+    return result;
+}
+
 // ---- descriptors from a stage's argument tables ------------------------------------------------------------------
 
 // What an unbound slot reads (5b): Metal tolerates a declared resource the draw never touches (Core Animation's
@@ -382,7 +471,10 @@ VkDescriptorSet vg_write_set(VGMTLCommandBuffer *cmd, VkDescriptorSetLayout dsl,
                     layout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
                 }
             }
-            iinfo[i] = (VkDescriptorImageInfo){VK_NULL_HANDLE, tex->_view, layout};
+            iinfo[i] = (VkDescriptorImageInfo){VK_NULL_HANDLE,
+                                               type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE && tex->_sampleView ? tex->_sampleView
+                                                                                                          : tex->_view,
+                                               layout};
             if (type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
                 [cmd fail:[NSString stringWithFormat:@"%@: combined image-samplers aren't supported yet", who]];
                 return VK_NULL_HANDLE;

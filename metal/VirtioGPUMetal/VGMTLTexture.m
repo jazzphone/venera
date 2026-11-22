@@ -92,6 +92,63 @@ static VkComponentMapping vg_components(MTLPixelFormat pf, MTLTextureSwizzleChan
     return (VkComponentMapping){out[0], out[1], out[2], out[3]};
 }
 
+// A luminance-alpha IOSurface ('LA08', 'LA16') wrapped as a two-channel texture: Apple's GPUs read it as (L, L, L, A)
+// and a render target of it keeps a fragment's red and alpha. RenderBox renders tinted icons' glyph masks into them
+// (iconservicesagent) and samples them back; read as plain RG they came out (L, A, 0, 1): yellow-green glyphs, and
+// masks opaque everywhere. The image keeps the plane's bytes (R = L, G = A). Sampling goes through a second view,
+// swizzled (R, R, R, G) under the texture's own swizzle; a pipeline drawing into one stores alpha in green
+// (vg_spirv_alpha_to_green), and its clear color does the same.
+static BOOL vg_two_channel(MTLPixelFormat pf) {
+    return pf == MTLPixelFormatRG8Unorm || pf == MTLPixelFormatRG8Unorm_sRGB || pf == MTLPixelFormatRG16Unorm ||
+           pf == MTLPixelFormatRG16Float;
+}
+static BOOL vg_surface_is_la(IOSurfaceRef s) {
+    OSType f = s ? IOSurfaceGetPixelFormat(s) : 0;
+    return f == 'LA08' || f == 'LA16';
+}
+static VkComponentMapping vg_components_la(MTLTextureSwizzleChannels s) {
+    const VkComponentSwizzle base[4] = {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R,
+                                        VK_COMPONENT_SWIZZLE_G};
+    MTLTextureSwizzle ch[4] = {MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha};
+    if (s.red || s.green || s.blue || s.alpha) {
+        ch[0] = s.red, ch[1] = s.green, ch[2] = s.blue, ch[3] = s.alpha;
+    }
+    VkComponentSwizzle out[4];
+    for (int i = 0; i < 4; i++) {
+        switch (ch[i]) {
+        case MTLTextureSwizzleZero: out[i] = VK_COMPONENT_SWIZZLE_ZERO; break;
+        case MTLTextureSwizzleOne: out[i] = VK_COMPONENT_SWIZZLE_ONE; break;
+        case MTLTextureSwizzleRed: out[i] = base[0]; break;
+        case MTLTextureSwizzleGreen: out[i] = base[1]; break;
+        case MTLTextureSwizzleBlue: out[i] = base[2]; break;
+        default: out[i] = base[3]; break;
+        }
+    }
+    return (VkComponentMapping){out[0], out[1], out[2], out[3]};
+}
+// t (a whole image, or a view's range in `range`) becomes an LA texture: its sampling view
+static void vg_texture_la_view(VGMTLTexture *t, VkImageViewType vtype, VkImageSubresourceRange range) {
+    if (t->_sampleView || !vg_two_channel(t->_pixelFormat)) {
+        return;
+    }
+    VkImageViewUsageCreateInfo uci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, NULL, VK_IMAGE_USAGE_SAMPLED_BIT};
+    VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &uci, 0, t->_image, vtype, t->_format,
+                                 vg_components_la(t->_swz), range};
+    if (gVk.vkCreateImageView(gVk.device, &vci, NULL, &t->_sampleView) == VK_SUCCESS) {
+        t->_la = YES;
+    } else {
+        t->_sampleView = VK_NULL_HANDLE;
+        vglog("texture: a luminance-alpha surface's sampling view failed (format %lu)", (unsigned long)t->_pixelFormat);
+    }
+}
+// A whole single-image 2D texture of an LA surface's format (a surface's first wrapper, a fetch copy of one)
+void vg_texture_make_la(VGMTLTexture *t) {
+    if (t && t->_type == MTLTextureType2D) {
+        vg_texture_la_view(t, VK_IMAGE_VIEW_TYPE_2D, (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0,
+                                                                               (uint32_t)t->_mips, 0, 1});
+    }
+}
+
 // What a sampling view (and a copy) of a format covers: depth of a depth-stencil format, stencil of a stencil-only one.
 static VkImageAspectFlags vg_view_aspect(VkImageAspectFlags a) {
     return (a & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT : a;
@@ -719,6 +776,9 @@ BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
     }
     if (_attView) {
         gVk.vkDestroyImageView(gVk.device, _attView, NULL);
+    }
+    if (_sampleView) {
+        gVk.vkDestroyImageView(gVk.device, _sampleView, NULL);
     }
     if (_parent) {
         return;   // a view: the image and its memory are the parent's
@@ -1359,6 +1419,9 @@ id<MTLTexture> vg_texture_view_swz(VGMTLTexture *p, MTLPixelFormat pf, MTLTextur
     t->_pixelFormat = pf;
     t->_format = f->vk;
     t->_aspect = f->aspect;
+    if (p->_la && (p->_imageUsage & VK_IMAGE_USAGE_SAMPLED_BIT)) {   // a view of a luminance-alpha surface's image
+        vg_texture_la_view(t, vtype, vci.subresourceRange);
+    }
     t->_type = type;
     t->_width = MAX(p->_width >> levels.location, 1u);
     t->_height = MAX(p->_height >> levels.location, 1u);
@@ -1840,6 +1903,9 @@ id<MTLTexture> vg_new_surface_texture(id<MTLDevice> device, MTLTextureDescriptor
     }
     pthread_mutex_unlock(&rootsLock);
     t->_surface = (IOSurfaceRef)CFRetain(surface);
+    if (vg_surface_is_la(surface)) {
+        vg_texture_make_la(t);
+    }
     t->_scanout = -1;   // looked at the first time a display frame writes it
     t->_plane = plane;
     t->_surfaceBpr = bpr;
