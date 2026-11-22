@@ -2760,3 +2760,15 @@ corner to corner 8 times in one press (`qmpinput.py sweep`, 0.4 s each way) and 
   without the twin" was chance. At 1x 1440x900, the owner's everyday mode, no trails ("super smooth"). Open: Retina
   trails come after the read (what SkyLight draws into the stream, or the agent's encoding and the viewer); the
   unattended probe's client picture and the stream's last frame never showed them. No change to the default.
+
+### 0.1.16 (2026-11-22)
+
+- Released as v0.1.16 (f2b0db9, Latest), the owner's OK: VeneraBalloon.kext (Proxmox's memory figure from macOS) and
+  the stencil-state leak fixed. The private build (the seed) ran normally again (Docker restarted); the owner's kits
+  on both nodes are 0.1.16, kit-0.1.15 kept beside.
+- VMs 109, 108 and 107 upgraded from the kits (109 on its node at the same time as 108 then 107 on theirs). 109 and
+  107 were shut down and started for the balloon device (Upgrade's own step); 108 had it already. Checked after: every
+  saved display mode kept (109 1440x900 1x, 108 and 107 1280x800 1x); Proxmox's `mem` 3.6, 3.7 and 3.4 GB of 8 with
+  `freemem`; VeneraBalloon 0.1.0 and framebuffer 0.6.4 loaded; WindowServer on the 0.1.16 Metal bundle (122872177f8c,
+  as built); 107's HelperPod running. 108's snapshot pre-0-1-16 taken before and deleted after (the owner wants it
+  without snapshots).
