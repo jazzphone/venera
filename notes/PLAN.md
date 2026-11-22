@@ -2680,7 +2680,7 @@ corner to corner 8 times in one press (`qmpinput.py sweep`, 0.4 s each way) and 
   (0x100007) was kept after upgrading to 0.6.4, and also to a build that kept the Default flag (0.6.5, dropped):
   macOS doesn't show the framebuffer's Default flag on 1280x800 once the EDID names 2560x1600 anyway. Why 107 lost its
   mode is open (its pre-upgrade files were overwritten when its mode was set again). The release notes say one of
-  three VMs needed its mode picked again.
+  three VMs needed its mode picked again. Restarted afterwards (the owner's word), 107 kept its 1x 1280x800 and HelperPod started.
 - **The "31 MB VRAM"** in System Information is the framebuffer's scanout aperture (3840x2160x4 bytes), not what
   rendering uses: Metal reports `recommendedMaxWorkingSetSize` 2.67 GB (a third of the VM's 8 GB) and
   `maxBufferLength` 2 GB (mtlprobe, 109). Only apps that read System Information's VRAM figure could be misled.
