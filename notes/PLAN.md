@@ -2985,3 +2985,57 @@ with `perf` as its only driver flag. The viewer session was closed.
   (82c2fba3e688, as built), modes kept (109 1440x900 1x, 108 1280x800 1x, 107 1440x900 1x: 107's was set to 1440x900
   in System Settings at 12:39, after the 0.1.17 check), 107's HelperPod running. 108's snapshot pre-0-1-18 taken
   before and deleted after.
+
+### Metal submission order, deferred uploads and command pools (2026-11-22, after 0.1.18)
+
+Codex's fresh review named three submission problems; one was reproduced by Codex, two were static. All three
+reproduce on 0.1.18 (82c2fba3e688) on VM 108, and the candidate (5ad49ece8556, working tree) fixes all three.
+`tools/mtlorder.m` is the regression: ten cases, run on the Mac too as the reference (Apple M5 Max, macOS 27.2).
+
+- **Enqueue order** (reproduced). `-enqueue` only set the status, so command buffers of one queue ran in commit
+  order: enqueue A, enqueue B, commit B, commit A left A's 0x11 in all 4,096 bytes (the M5 Max: B's 0x22).
+  0.1.18 also failed `implicit` (B enqueued by its commit after A's enqueue), `held` (B completed before A was
+  committed) and `order` (16 reserved in order, committed shuffled: handlers ran 11,2,10,9,...). Now each queue
+  hands out a place at enqueue (or at commit, for one not enqueued); a command buffer committed behind an
+  uncommitted place waits without holding its thread, and the commit that fills the gap submits the waiting ones
+  after it (`-[VGMTLCommandQueue vg_ready:ticket:]`). What commit did after the status change (write-back copies,
+  twin numbering, the submit, handlers) is `submitInOrder`, run in queue order. Each queue keeps its own order: in
+  `held`, another queue's work completed while A was uncommitted. `commitAndWaitUntilSubmitted` and
+  `waitUntilScheduled` (was empty) wait for the submit.
+- **Deferred uploads overtaken** (static finding, reproduced). The process-wide list of deferred work (image
+  inits, replaceRegion uploads, plane copies) was taken under its own lock and submitted later under the queue's:
+  another thread's submit could come between and run a command buffer that read an image whose upload was still
+  waiting in the first thread's unsubmitted command buffer. `queues` (8 threads, a queue each, a new texture
+  uploaded and copied out per command buffer) lost 32 of 800 uploads on 0.1.18; `parallel` lost 20. Now
+  `vg_submit` takes the work and submits it in one step under one lock (recording it is a few barriers and copies;
+  nothing waits for the GPU there), and `vg_one_shot` submits through it. A/B with only that gap reopened (a flag
+  in a throwaway build): 9 and 10 of 1,600 uploads lost; closed: 0 in every run since.
+- **One command pool, recorded without its lock** (static finding, reproduced with GPU timestamps on). Venus keeps
+  per-pool state that recording touches: a list of query records (`vkCmdResetQueryPool`/`vkCmdWriteTimestamp`)
+  and a scratch buffer for present-layout barriers (not used by Venera). With `VirtioGPUMetal-gputime`, 0.1.18
+  hung in 3 of 3 runs of `mtlorder 300 16` (killed at 150 s; one also lost uploads): one thread spinning in
+  `vn_queue_submit` -> `vn_cmd_pool_alloc_query_record` on the corrupted list, every other thread behind the
+  queue lock (sample saved in the VM, /var/tmp/mtlorder-0118-gputime-hang.txt). The candidate: 3 of 3 passed,
+  about 3 s each. Each command buffer now has a pool of its own from a free list (`vg_cmdpool_get`/`put`, 32
+  kept), returned once its command buffers are freed after the fence; the shared `gVk.pool` is gone. Without
+  `gputime` the shipped driver records no queries, so this was latent for users.
+- **Apple's reference, where Venera differs on purpose**: a completed handler that waits for a later command
+  buffer of its queue never returns on the M5 Max (handlers run one at a time per queue) and Venera's returns
+  (`handler`, INFO); an enqueued command buffer released uncommitted holds its queue for good on the M5 Max and
+  Venera gives its place up (`dropped`, INFO). Committing twice is logged and ignored.
+- **Regressions on 108, the candidate**: mtlorder 0 failures (200 x 8 and 300 x 16); mtlprobe, mtlrender,
+  mtlcompute, mtlsurface, mtlregroup, mtllifetime 200, mtllockwait 60 (1280x800, 3.04 ms) and 30 (2880x1800,
+  11.58 ms), mtlatlas, mtlsource, mtlptr pass. `mtlsurface --la-blend` fails as on 0.1.18 (64,128, the open LA08
+  question above). WindowServer ran the candidate after a reboot (dev link), drew, and left no crash reports.
+- **Frame pacing, `gesture-bench.sh` (drag, resize, scroll, minimize; warm runs, two samples per build)**: 1x
+  mean frame gaps 16.6-16.7 ms in both builds (minimize 17.3 once on 0.1.18). Retina 1440x900: 0.1.18 drag
+  17.7/17.9, resize 17.0/16.7, scroll 16.6/16.6, minimize 16.8/16.9 ms; candidate 17.2/17.0, 17.0/16.7, 16.8/16.7,
+  16.6/17.8. Same within the run-to-run spread. The kext's flip call took 1.9-2.4 ms at 1x on 0.1.18 after 10 hours
+  up and 2.6-3.0 ms right after a reboot, in both builds: the boot, not the driver. VM 107's desktop shared the
+  GPU throughout.
+- **Limits**: the reorder case is a probe; WindowServer's own traces always had enqueue and commit in the same
+  order, so the desktop isn't expected to change, and the Retina trails are a separate question (SkyLight's
+  damage, above). A vkQueueSubmit failure still loses the deferred work taken for it (logged now). The pool free
+  list holds 32; more in flight at once are made and destroyed.
+- VM 108 restored: link to the system copy (0.1.18), WindowServer on it, 1280x800 1x, the `gputime` and `snap`
+  flag files removed (`perf` kept). The candidate stays in /Library/GPUBundles/Venera/dev.
