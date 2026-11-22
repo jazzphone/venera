@@ -1,5 +1,7 @@
 // modetest (stage 5c): list the main display's modes, or switch to one and back, as the console user.
-//   modetest                 list modes (the current one marked)
+//   modetest                 list modes (the current one marked), each with its IOKit flags and whether macOS calls it
+//                            usable for the desktop; "dup" marks a mode macOS lists only when asked for its duplicate
+//                            low-resolution modes (kCGDisplayShowDuplicateLowResolutionModes)
 //   modetest W H [SECONDS] [2x]   switch to WxH (2x: the Retina one, twice the pixels), stay SECONDS (default 5; 0
 //                            stays: saved as the user's display setting), switch back; prints what CoreGraphics
 //                            reports
@@ -11,6 +13,13 @@ static void show(CGDisplayModeRef m, const char *tag) {
            CGDisplayModeGetPixelWidth(m), CGDisplayModeGetPixelHeight(m), CGDisplayModeGetRefreshRate(m));
 }
 
+static void showFull(CGDisplayModeRef m, const char *tag, BOOL dup) {
+    printf("%s%zux%zu (%zux%zu pixels) %.0f Hz  io 0x%08x%s%s\n", tag, CGDisplayModeGetWidth(m),
+           CGDisplayModeGetHeight(m), CGDisplayModeGetPixelWidth(m), CGDisplayModeGetPixelHeight(m),
+           CGDisplayModeGetRefreshRate(m), CGDisplayModeGetIOFlags(m),
+           CGDisplayModeIsUsableForDesktopGUI(m) ? " desktop" : "", dup ? " dup" : "");
+}
+
 int main(int argc, char **argv) {
     @autoreleasepool {
         CGDirectDisplayID d = CGMainDisplayID();
@@ -18,9 +27,20 @@ int main(int argc, char **argv) {
         NSDictionary *opts = @{(id)kCGDisplayShowDuplicateLowResolutionModes : @YES};
         NSArray *modes = CFBridgingRelease(CGDisplayCopyAllDisplayModes(d, (__bridge CFDictionaryRef)opts));
         if (argc < 3) {
+            showFull(cur, "current: ", NO);
+            NSArray *plain = CFBridgingRelease(CGDisplayCopyAllDisplayModes(d, NULL));
             for (id o in modes) {
                 CGDisplayModeRef m = (__bridge CGDisplayModeRef)o;
-                show(m, CGDisplayModeGetIODisplayModeID(m) == CGDisplayModeGetIODisplayModeID(cur) ? "* " : "  ");
+                BOOL listed = NO;
+                for (id p in plain) {
+                    CGDisplayModeRef q = (__bridge CGDisplayModeRef)p;
+                    listed |= CGDisplayModeGetIODisplayModeID(q) == CGDisplayModeGetIODisplayModeID(m) &&
+                              CGDisplayModeGetPixelWidth(q) == CGDisplayModeGetPixelWidth(m) &&
+                              CGDisplayModeGetWidth(q) == CGDisplayModeGetWidth(m);
+                }
+                showFull(m, CGDisplayModeGetIODisplayModeID(m) == CGDisplayModeGetIODisplayModeID(cur) &&
+                                    CGDisplayModeGetPixelWidth(m) == CGDisplayModeGetPixelWidth(cur) &&
+                                    CGDisplayModeGetWidth(m) == CGDisplayModeGetWidth(cur) ? "* " : "  ", !listed);
             }
             return 0;
         }

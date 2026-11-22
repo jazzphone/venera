@@ -108,6 +108,103 @@ void vg_lockwait_end(VGMTLTexture *t, BOOL written) {
     notify_post(kVgWriteBackNotification);
 }
 
+// ---- stream sums (round 23: why the display stream's twin keeps trails out of Screen Sharing) ------------------------
+// The flag file VirtioGPUMetal-streamsum (empty, or naming WindowServer and the reader): WindowServer stamps each
+// deferred display-stream write-back with the surface's seed after it and a sum of each of 16 bands of rows (every
+// 4th pixel of every 4th row), and the reader's lock checks what it is about to read against that stamp. tools/
+// streamprobe.m (a reader of its own) uses the same sums and stamp.
+static CFStringRef const kVgStamp = CFSTR("VeneraWriteBackSums");
+enum { kVgBands = 16 };
+typedef struct {
+    uint32_t seed, frame;
+    uint64_t band[kVgBands];
+} vg_stream_stamp;
+
+static void vg_stream_sums(const uint8_t *base, size_t w, size_t h, size_t bpr, uint64_t band[kVgBands]) {
+    for (int b = 0; b < kVgBands; b++) {
+        uint64_t x = 1469598103934665603ull;
+        for (size_t y = h * b / kVgBands & ~(size_t)3; y < h * (b + 1) / kVgBands; y += 4) {
+            const uint32_t *row = (const uint32_t *)(base + y * bpr);
+            for (size_t i = 0; i < w; i += 4) {
+                x = (x ^ row[i]) * 1099511628211ull;
+            }
+        }
+        band[b] = x;
+    }
+}
+
+static BOOL vg_streamsum_on(void) {
+    static int on = -1;
+    static uint64_t checked;
+    const uint64_t now = vg_now();
+    if (on < 0 || now - checked > 2000000000ull) {
+        on = vg_debug_flag("streamsum");
+        checked = now;
+    }
+    return on == 1;
+}
+
+void vg_streamsum_stamp(VGMTLTexture *t, uint32_t seed) {
+    if (!(t = vg_lockwait_root(t)) || !t->_readerWaits || !vg_streamsum_on()) {
+        return;
+    }
+    static uint32_t frames;
+    vg_stream_stamp st = {seed, ++frames, {0}};
+    IOSurfaceLock(t->_surface, kIOSurfaceLockAvoidSync | kIOSurfaceLockReadOnly, NULL);
+    IOSurfaceRef s = t->_surface;
+    vg_stream_sums(IOSurfaceGetBaseAddress(s), IOSurfaceGetWidth(s), IOSurfaceGetHeight(s), IOSurfaceGetBytesPerRow(s),
+                   st.band);
+    IOSurfaceUnlock(t->_surface, kIOSurfaceLockAvoidSync | kIOSurfaceLockReadOnly, NULL);
+    CFDataRef d = CFDataCreate(NULL, (const UInt8 *)&st, sizeof(st));
+    if (d) {
+        IOSurfaceSetValue(t->_surface, kVgStamp, d);
+        CFRelease(d);
+    }
+}
+
+// The reader's check, after its lock: what it reads against the stamp. Counted, and the first mismatches logged.
+static _Atomic uint64_t gSumSame, gSumDiffer, gSumSeedMoved, gSumNoStamp;
+static void vg_streamsum_check(IOSurfaceRef s, int64_t target, uint64_t waited) {
+    if (!vg_streamsum_on()) {
+        return;
+    }
+    vg_stream_stamp st;
+    CFTypeRef v = IOSurfaceCopyValue(s, kVgStamp);
+    BOOL have = v && CFGetTypeID(v) == CFDataGetTypeID() && CFDataGetLength(v) == sizeof(st);
+    if (have) {
+        memcpy(&st, CFDataGetBytePtr(v), sizeof(st));
+    }
+    if (v) {
+        CFRelease(v);
+    }
+    if (!have) {
+        atomic_fetch_add(&gSumNoStamp, 1);
+        return;
+    }
+    uint64_t band[kVgBands];
+    vg_stream_sums(IOSurfaceGetBaseAddress(s), IOSurfaceGetWidth(s), IOSurfaceGetHeight(s), IOSurfaceGetBytesPerRow(s),
+                   band);
+    uint32_t differ = 0;
+    for (int b = 0; b < kVgBands; b++) {
+        differ |= (band[b] != st.band[b]) << b;
+    }
+    const uint32_t seed = IOSurfaceGetSeed(s);
+    if (seed != st.seed) {
+        atomic_fetch_add(&gSumSeedMoved, 1);
+    }
+    uint64_t n = differ ? atomic_fetch_add(&gSumDiffer, 1) + 1 : 0;
+    if (!differ) {
+        atomic_fetch_add(&gSumSame, 1);
+    }
+    if (differ && (n <= 20 || n % 200 == 0)) {
+        vglog("streamsum: surface %u read differs from write-back %u (bands 0x%04x), seed %u stamped %u, pending %lld, "
+              "waited %.2f ms; %llu same, %llu differ, %llu seed moved, %llu unstamped", IOSurfaceGetID(s), st.frame,
+              differ, seed, st.seed, (long long)target, waited / 1e6, (unsigned long long)atomic_load(&gSumSame),
+              (unsigned long long)n, (unsigned long long)atomic_load(&gSumSeedMoved),
+              (unsigned long long)atomic_load(&gSumNoStamp));
+    }
+}
+
 // ---- the reader's side -----------------------------------------------------------------------------------------------
 
 typedef kern_return_t (*vg_lock_inner_fn)(void *client, IOSurfaceLockOptions options, uint32_t *seed);
@@ -203,6 +300,10 @@ static kern_return_t vg_surface_lock_hook(IOSurfaceRef s, IOSurfaceLockOptions o
         return (kern_return_t)0xe00002c2;   // kIOReturnBadArgument, as the stub answers
     }
     if (!(options & kIOSurfaceLockAvoidSync) && vg_is_stream_surface(s)) {
+        static _Atomic uint32_t optionsSeen;   // which lock options this reader uses (each set once)
+        if (!(atomic_fetch_or(&optionsSeen, 1u << (options & 7)) & (1u << (options & 7)))) {
+            vglog("lockwait: this reader locks display-stream surfaces with options 0x%x", (unsigned)options);
+        }
         int64_t target = gMeasureOnly ? 0 : vg_pending_generation(s);
         uint64_t t0 = target > 0 ? vg_now() : 0;
         kern_return_t error = target < 0 ? kIOReturnNotReady : KERN_SUCCESS;
@@ -246,6 +347,12 @@ static kern_return_t vg_surface_lock_hook(IOSurfaceRef s, IOSurfaceLockOptions o
         if (error != KERN_SUCCESS) {
             return error;
         }
+        void *client = *(void **)((char *)s + *gClientOffset);
+        kern_return_t r = gInner(client, options, seed);
+        if (r == KERN_SUCCESS) {
+            vg_streamsum_check(s, target, t0 ? now - t0 : 0);
+        }
+        return r;
     }
     void *client = *(void **)((char *)s + *gClientOffset);
     return gInner(client, options, seed);

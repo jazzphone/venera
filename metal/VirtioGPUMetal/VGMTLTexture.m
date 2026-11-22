@@ -181,20 +181,49 @@ VGMTLTexture *vg_twinned_shown(void) {
 // and 18.9 ms. SkyLight's display stream ("DisplayStream surface N/8", what Screen Sharing reads) keeps its twin:
 // without it, frames came faster still but a dragged window left trails in what Screen Sharing showed (the VM's own
 // screen was clean, and every stream frame was copied back whole); why the twin's copy prevents them is open. The
-// flag file VirtioGPUMetal-twinall gives every surface its twin again (rechecked every 2 s).
+// flag file VirtioGPUMetal-twinall gives every surface its twin again, and VirtioGPUMetal-twindrop (a piece of a surface
+// name a line, e.g. "DisplayStream") takes the twin from those surfaces too, for live A/Bs; both rechecked every 2 s.
+static NSArray<NSString *> *gTwinDrop;
+static uint32_t gTwinDropEpoch = 1;
+static void vg_twindrop_reload(void) {
+    NSString *s = [NSString stringWithContentsOfFile:@"/Library/GPUBundles/VirtioGPUMetal-twindrop"
+                                            encoding:NSUTF8StringEncoding error:NULL];
+    NSMutableArray<NSString *> *names = [NSMutableArray array];
+    for (NSString *line in [s componentsSeparatedByString:@"\n"]) {
+        NSString *n = [line stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (n.length) {
+            [names addObject:n];
+        }
+    }
+    @synchronized([VGMTLTexture class]) {   // committing threads read it
+        if (![names isEqualToArray:gTwinDrop ?: @[]]) {
+            gTwinDrop = names.count ? [names copy] : nil;
+            gTwinDropEpoch++;
+            vglog("twindrop: %s", names.count ? [names componentsJoinedByString:@", "].UTF8String : "(none)");
+        }
+    }
+}
 static BOOL vg_surface_never_shown(VGMTLTexture *t) {
     static int all = -1;
     static uint64_t checked;
     const uint64_t now = vg_now();
     if (all < 0 || now - checked > 2000000000ull) {
         all = vg_debug_flag("twinall");
+        vg_twindrop_reload();
         checked = now;
     }
     if (all) {
         return NO;
     }
-    if (t->_neverShown == 0) {
+    NSArray<NSString *> *drop;
+    uint32_t epoch;
+    @synchronized([VGMTLTexture class]) {
+        drop = gTwinDrop;
+        epoch = gTwinDropEpoch;
+    }
+    if (t->_neverShown == 0 || t->_neverShownEpoch != epoch) {
         t->_neverShown = -1;
+        t->_neverShownEpoch = epoch;
         CFTypeRef nm = IOSurfaceCopyValue(t->_surface, kIOSurfaceName);
         if (nm && CFGetTypeID(nm) == CFStringGetTypeID()) {
             static const CFStringRef kNames[] = {CFSTR("flattened-surface"), CFSTR("CaptureSurface"),
@@ -203,6 +232,11 @@ static BOOL vg_surface_never_shown(VGMTLTexture *t) {
                 if (CFStringFind((CFStringRef)nm, kNames[i], 0).location != kCFNotFound) {
                     t->_neverShown = 1;
                     break;
+                }
+            }
+            for (NSString *piece in drop) {
+                if (t->_neverShown != 1 && [(__bridge NSString *)nm containsString:piece]) {
+                    t->_neverShown = 1;
                 }
             }
         }

@@ -1688,6 +1688,9 @@ static void vg_surface_debug(VGMTLTexture *t) {
             }
             os_unfair_lock_unlock(&gVgSurfaceSync);
             vg_surface_wrote_back(t, seed);   // and none for a process sharing this image (5d)
+            if (unlocked == KERN_SUCCESS) {
+                vg_streamsum_stamp(t, seed);   // the flag file streamsum: for the reader's check (VGMTLLockWait.m)
+            }
             vg_surface_debug(t);
         }
     }

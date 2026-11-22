@@ -92,6 +92,7 @@ id<MTLBuffer> vg_new_buffer_nocopy(id<MTLDevice> device, void *pointer, NSUInteg
     BOOL _described;   // synclog has said what this surface is
     int8_t _gpuOnly;   // SkyLight's Selective Sharing surface: 1, not: -1, not looked at yet: 0
     int8_t _neverShown;   // named as a surface the display never scans out (no twin): 1, not: -1, not looked at yet: 0
+    uint32_t _neverShownEpoch;   // the twindrop list it was looked up against (VGMTLTexture.m)
     uint32_t _readerChecks;
 }
 @property(readonly) id<MTLDevice> device;
@@ -118,6 +119,7 @@ void vg_cmd_wrote_rect(id cmd, VGMTLTexture *t, int32_t x0, int32_t y0, int32_t 
 // Display-surface twins (5c): make and register one for a root surface texture that qualifies (WindowServer, BGRA,
 // screen-sized); forget it (the kext first) before the texture goes.
 BOOL vg_twin_ensure(VGMTLTexture *t);
+void vg_streamsum_stamp(VGMTLTexture *t, uint32_t seed);
 // YES: shown on the display already. use (a submitted frame): which twin to copy it into, 0 or 1.
 BOOL vg_twin_mark(uint32_t surface, uint32_t frame, BOOL ready, uint32_t *use);
 int vg_snap_wanted(void);
