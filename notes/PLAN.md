@@ -2659,3 +2659,17 @@ corner to corner 8 times in one press (`qmpinput.py sweep`, 0.4 s each way) and 
   mtllockwait's size argument, and ca5b0ac (off-by-default flags and tools). To cut it: VERSION and
   packaging/host/TESTED as 028f0c1 did, then `packaging/make-dist.sh` and the release, as for 0.1.14. With it goes
   framebuffer 0.6.4 (both 1x and Retina of every size in Settings, below).
+
+### 0.1.15 (2026-11-22)
+
+- Released as v0.1.15 (9a7c322, Latest), the owner's OK: no twin for surfaces the display never shows (5d922cc),
+  framebuffer 0.6.4 (both 1x and Retina of every size in Settings, d6ed14c), the stream probe and the `twindrop` /
+  `streamsum` flags (ca5b0ac), mtllockwait's size argument. TESTED re-recorded on both nodes (the same stack as
+  0.1.14). The public assets were built by make-dist; the private build (the seed) stopped at make-host because Docker
+  Desktop's engine answered 500, so the owner's kits are the public host directory with the private package and
+  Tools CD in guest/ and SHA256SUMS redone (60.5 MB, as 0.1.14's); kit-0.1.14 kept beside on both nodes.
+- VMs 109 and 108 upgraded from the kits by the VM script's Upgrade (each its own systemd unit). Both run
+  framebuffer 0.6.4 (its EDID rewrite logged) and WindowServer the 0.1.15 Metal bundle (109 the kept copy, the
+  link already on the system-volume copy; 108 the kept copy); their dev bundles removed. 109 kept the owner's
+  1440x900 1x through the EDID change (the saved-mode reset feared in the release notes didn't happen); 108 is at
+  1x 1280x800 (snapshot pre-0-1-15 before). VM 107 (left alone) and VM 113 (never used) not upgraded.
