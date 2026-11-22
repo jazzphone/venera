@@ -2672,4 +2672,18 @@ corner to corner 8 times in one press (`qmpinput.py sweep`, 0.4 s each way) and 
   framebuffer 0.6.4 (its EDID rewrite logged) and WindowServer the 0.1.15 Metal bundle (109 the kept copy, the
   link already on the system-volume copy; 108 the kept copy); their dev bundles removed. 109 kept the owner's
   1440x900 1x through the EDID change (the saved-mode reset feared in the release notes didn't happen); 108 is at
-  1x 1280x800 (snapshot pre-0-1-15 before). VM 107 (left alone) and VM 113 (never used) not upgraded.
+  1x 1280x800 (snapshot pre-0-1-15 before). VM 113 (never used) not upgraded.
+- **VM 107 upgraded too** (the owner's word; its storage takes no snapshot). HelperPod came back with the session.
+  It came up in 1x 2560x1600 (the EDID's preferred size): its saved sets (1920x1080 1x with IOFlags 0x100003, and
+  1280x800 1x with 0x100007, both from 2026-11-21) weren't used. Put back to 1x 1280x800 with modetest (saved).
+  Guessed cause, the Default flag 0.6.4 no longer sets: disproved on 108. A saved 1280x800 written under 0.6.3
+  (0x100007) was kept after upgrading to 0.6.4, and also to a build that kept the Default flag (0.6.5, dropped):
+  macOS doesn't show the framebuffer's Default flag on 1280x800 once the EDID names 2560x1600 anyway. Why 107 lost its
+  mode is open (its pre-upgrade files were overwritten when its mode was set again). The release notes say one of
+  three VMs needed its mode picked again.
+- **The "31 MB VRAM"** in System Information is the framebuffer's scanout aperture (3840x2160x4 bytes), not what
+  rendering uses: Metal reports `recommendedMaxWorkingSetSize` 2.67 GB (a third of the VM's 8 GB) and
+  `maxBufferLength` 2 GB (mtlprobe, 109). Only apps that read System Information's VRAM figure could be misled.
+- **Proxmox shows macOS VMs' RAM as full**: it takes `mem = total_mem - free_mem` only from a virtio-balloon device's
+  guest statistics (PVE's QemuServer.pm `$ballooncb`), else the QEMU process's memory; Venera's VMs have `balloon: 0`
+  and macOS has no balloon driver. A stats-only balloon driver is proposed as its own task.
