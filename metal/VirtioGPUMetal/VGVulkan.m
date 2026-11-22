@@ -258,15 +258,8 @@ static int vg_vulkan_init_locked(void) {
     VG_VK_FUNCS(VG_LOAD_DEV)
 #undef VG_LOAD_DEV
     gVk.vkGetDeviceQueue(gVk.device, gVk.queueFamily, 0, &gVk.queue);
-    VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL,
-                                   VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, gVk.queueFamily};
-    r = gVk.vkCreateCommandPool(gVk.device, &pci, NULL, &gVk.pool);
-    if (r != VK_SUCCESS) {
-        vglog("vulkan: vkCreateCommandPool %d", r);
-        return -1;
-    }
     if (profile) {
-        vglog("initperf: queue and command pool %.2f ms", (vg_now() - phaseStart) / 1e6);
+        vglog("initperf: queue %.2f ms", (vg_now() - phaseStart) / 1e6);
     }
     // Buffers are made with device addresses when the device has them (Metal tessellation's control stage reads the
     // factor and vertex buffers through them); the flag file VirtioGPUMetal-nobda makes them as before.

@@ -177,6 +177,10 @@ BOOL vg_spirv_has_push_constants(NSData *spv);   // DescriptorSet 0 -> newSet (N
 @public
     VkCommandBuffer _cb;
     VkCommandBuffer _pendingCb;   // deferred work submitted just ahead of _cb (5c), freed at completion
+    VkCommandPool _cmdPool;       // this command buffer's own pool (vg_cmdpool_get), back to the free list at completion
+    uint64_t _ticket;             // its place on its queue, taken at enqueue (explicit, or at commit)
+    BOOL _ticketed, _committed;
+    dispatch_group_t _scheduledGroup;   // left once it is submitted (or failed), in its queue's order
     NSMutableData *_pendingOwned;
     NSMapTable *_streamWriteBacks;   // separate staging for surfaces handed over before write-back
     int _timePair;   // GPU timestamps (5c), -1 when off
@@ -218,6 +222,7 @@ BOOL vg_spirv_has_push_constants(NSData *spv);   // DescriptorSet 0 -> newSet (N
 @property(readonly) id<MTLCommandQueue> commandQueue;
 @property(copy, atomic) NSString *label;
 - (BOOL)begin;
+- (void)submitInOrder;   // VGMTLCommandQueue: its turn on the queue has come
 - (void)fail:(NSString *)why;
 - (void)barrier;
 - (VkDescriptorSet)allocSet:(VkDescriptorSetLayout)dsl;

@@ -703,29 +703,125 @@ void vg_pending_release(NSMutableData *owned) {
     }
 }
 
+// ---- command pools and submission -----------------------------------------------------------------------------
+
+static pthread_mutex_t gCmdPoolLock = PTHREAD_MUTEX_INITIALIZER;
+static VkCommandPool gCmdPools[32];   // free pools; more in flight at once are made, and destroyed beyond these
+static int gNCmdPools;
+
+VkCommandPool vg_cmdpool_get(void) {
+    pthread_mutex_lock(&gCmdPoolLock);
+    if (gNCmdPools) {
+        VkCommandPool p = gCmdPools[--gNCmdPools];
+        pthread_mutex_unlock(&gCmdPoolLock);
+        return p;
+    }
+    pthread_mutex_unlock(&gCmdPoolLock);
+    VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL,
+                                   VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, gVk.queueFamily};
+    VkCommandPool p = VK_NULL_HANDLE;
+    VkResult r = gVk.vkCreateCommandPool(gVk.device, &pci, NULL, &p);
+    if (r != VK_SUCCESS) {
+        vglog("vulkan: vkCreateCommandPool %d", r);
+        return VK_NULL_HANDLE;
+    }
+    return p;
+}
+
+void vg_cmdpool_put(VkCommandPool pool) {
+    if (!pool) {
+        return;
+    }
+    pthread_mutex_lock(&gCmdPoolLock);
+    if (gNCmdPools < (int)(sizeof(gCmdPools) / sizeof(gCmdPools[0]))) {
+        gCmdPools[gNCmdPools++] = pool;
+        pthread_mutex_unlock(&gCmdPoolLock);
+        return;
+    }
+    pthread_mutex_unlock(&gCmdPoolLock);
+    gVk.vkDestroyCommandPool(gVk.device, pool, NULL);
+}
+
+static BOOL vg_pending_any(void) {
+    pthread_mutex_lock(&gPendingLock);
+    BOOL any = gPendingCount > 0;
+    pthread_mutex_unlock(&gPendingLock);
+    return any;
+}
+
+// Taking the deferred work and submitting it are one step under this lock (see vg.h). Recording the deferred work is a
+// few barriers and copies; nothing here waits for the GPU.
+static pthread_mutex_t gSubmitLock = PTHREAD_MUTEX_INITIALIZER;
+
+VkResult vg_submit(VkCommandPool pool, const VkCommandBuffer *cbs, uint32_t count, VkFence fence,
+                   VkCommandBuffer *pendingCb, NSMutableData **owned) {
+    VkCommandBuffer all[8];
+    if (count > 7) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    uint32_t n = 0;
+    *pendingCb = VK_NULL_HANDLE;
+    *owned = nil;
+    pthread_mutex_lock(&gSubmitLock);
+    if (vg_pending_any()) {
+        VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, pool,
+                                          VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+        VkCommandBuffer pcb = VK_NULL_HANDLE;
+        if (gVk.vkAllocateCommandBuffers(gVk.device, &ai, &pcb) == VK_SUCCESS) {
+            VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL,
+                                           VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
+            gVk.vkBeginCommandBuffer(pcb, &bi);
+            BOOL any = vg_pending_record(pcb, owned);
+            gVk.vkEndCommandBuffer(pcb);
+            if (any) {
+                all[n++] = pcb;
+                *pendingCb = pcb;
+            } else {   // a forgotten image took the last of it (vg_pending_forget)
+                gVk.vkFreeCommandBuffers(gVk.device, pool, 1, &pcb);
+            }
+        } else {
+            vglog("submit: no command buffer for the deferred work; it waits for the next submit");
+        }
+    }
+    memcpy(all + n, cbs, count * sizeof(*cbs));
+    n += count;
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, n, all, 0, NULL};
+    pthread_mutex_lock(&gVk.lock);
+    VkResult r = gVk.vkQueueSubmit(gVk.queue, 1, &si, fence);
+    pthread_mutex_unlock(&gVk.lock);
+    pthread_mutex_unlock(&gSubmitLock);
+    if (r != VK_SUCCESS && *owned) {
+        vglog("submit: vkQueueSubmit %d lost %lu deferred staging buffer(s) of work", r,
+              (unsigned long)((*owned).length / sizeof(vg_buffer)));
+    }
+    return r;
+}
+
 // ---- one-shot command buffers ------------------------------------------------------------------------------------
 
 BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
     uint64_t t0 = vg_now();
-    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, gVk.pool,
+    VkCommandPool pool = vg_cmdpool_get();
+    if (!pool) {
+        return NO;
+    }
+    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, pool,
                                       VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
     VkCommandBuffer cb = VK_NULL_HANDLE;
-    pthread_mutex_lock(&gVk.lock);
     VkResult r = gVk.vkAllocateCommandBuffers(gVk.device, &ai, &cb);
-    pthread_mutex_unlock(&gVk.lock);
     if (r != VK_SUCCESS) {
+        vg_cmdpool_put(pool);
         return NO;
     }
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL,
                                    VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
     gVk.vkBeginCommandBuffer(cb, &bi);
-    // Whatever earlier command buffers did is visible to this one, and this one's writes to the host.
+    // Whatever earlier command buffers did (the deferred work vg_submit puts just ahead of this one included) is
+    // visible to this one, and this one's writes to the host.
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT,
                           VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
     gVk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
                              NULL, 0, NULL);
-    NSMutableData *owned = nil;
-    vg_pending_record(cb, &owned);   // deferred work first: it came before this
     record(cb);
     VkMemoryBarrier hb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT,
                           VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_READ_BIT};
@@ -736,18 +832,19 @@ BOOL vg_one_shot(void (^record)(VkCommandBuffer cb)) {
     VkFence fence = VK_NULL_HANDLE;
     VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     gVk.vkCreateFence(gVk.device, &fci, NULL, &fence);
-    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &cb, 0, NULL};
-    pthread_mutex_lock(&gVk.lock);
-    r = gVk.vkQueueSubmit(gVk.queue, 1, &si, fence);
-    pthread_mutex_unlock(&gVk.lock);
+    VkCommandBuffer pendingCb = VK_NULL_HANDLE;
+    NSMutableData *owned = nil;
+    r = vg_submit(pool, &cb, 1, fence, &pendingCb, &owned);
     if (r == VK_SUCCESS) {
         gVk.vkWaitForFences(gVk.device, 1, &fence, VK_TRUE, UINT64_MAX);
     }
     gVk.vkDestroyFence(gVk.device, fence, NULL);
     vgtrace("one-shot: done (%d)", r);
-    pthread_mutex_lock(&gVk.lock);
-    gVk.vkFreeCommandBuffers(gVk.device, gVk.pool, 1, &cb);
-    pthread_mutex_unlock(&gVk.lock);
+    gVk.vkFreeCommandBuffers(gVk.device, pool, 1, &cb);
+    if (pendingCb) {
+        gVk.vkFreeCommandBuffers(gVk.device, pool, 1, &pendingCb);
+    }
+    vg_cmdpool_put(pool);
     vg_pending_release(owned);
     vg_perf(VG_PERF_ONESHOT, 0, vg_now() - t0);
     return r == VK_SUCCESS;

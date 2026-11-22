@@ -827,15 +827,27 @@ id<MTLComputePipelineState> vg_new_compute_pipeline_sd(id<MTLDevice> device, id<
 
 @class VGMTLCommandQueue;
 
-// Command buffers of one queue complete in commit order on the queue's serial queue (one VkQueue runs them in that
-// order anyway), and their completed handlers run in that order on the caller's completion queue when it set one
-// (Core Animation does, -setCompletionQueue:, and keeps fence bookkeeping that isn't safe from concurrent handlers).
+// Command buffers of one queue run in the order they were enqueued, as Metal's do: -enqueue (or -commit, for one not
+// enqueued) takes the next place on the queue, and a command buffer committed while one ahead of it is still
+// uncommitted waits, without holding up its thread, until that one is committed; the commit that fills the gap then
+// submits the waiting ones after it. Committed in the opposite order of their enqueues, two command buffers used to
+// run in commit order (the later one's writes were overwritten by the earlier one's). Each queue keeps its own order:
+// one waiting for an uncommitted place holds up no other queue.
+// They complete in that order on the queue's serial queue (one VkQueue runs them in that order anyway), and their
+// completed handlers run in that order on the caller's completion queue when it set one (Core Animation does,
+// -setCompletionQueue:, and keeps fence bookkeeping that isn't safe from concurrent handlers).
 @interface VGMTLCommandQueue : NSObject <MTLCommandQueue> {
 @public
     dispatch_queue_t _serial;
     dispatch_queue_t _userCompletion;
-    VGMTLCommandBuffer *_lastCommitted;   // for completing in commit order (see commit)
+    VGMTLCommandBuffer *_lastCommitted;   // for completing in queue order (see submitInOrder)
+    pthread_mutex_t _order;
+    uint64_t _nextTicket, _nextSubmit;
+    NSMutableDictionary<NSNumber *, id> *_ready;   // committed (or dropped: NSNull) places after the next to submit
+    BOOL _draining;                                // a thread is submitting this queue's ready command buffers
 }
+- (uint64_t)vg_reserve;
+- (void)vg_ready:(id)cb ticket:(uint64_t)ticket;
 @property(readonly) id<MTLDevice> device;
 @property(copy, atomic) NSString *label;
 @end
@@ -849,6 +861,8 @@ id<MTLComputePipelineState> vg_new_compute_pipeline_sd(id<MTLDevice> device, id<
 - (instancetype)initWithDevice:(id<MTLDevice>)device {
     if ((self = [super init])) {
         _device = device;
+        pthread_mutex_init(&_order, NULL);
+        _ready = [NSMutableDictionary dictionary];
         // USER_INTERACTIVE (5c round 3): Venus waits for a fence with short sleeps, which macOS stretches at lower
         // classes; completions gate what WindowServer shows next.
         _serial = dispatch_queue_create("local.homelab.VirtioGPUMetal.completion",
@@ -858,6 +872,42 @@ id<MTLComputePipelineState> vg_new_compute_pipeline_sd(id<MTLDevice> device, id<
     return self;
 }
 - (void)setCompletionQueue:(dispatch_queue_t)q { _userCompletion = q; }
+- (uint64_t)vg_reserve {
+    pthread_mutex_lock(&_order);
+    uint64_t t = _nextTicket++;
+    pthread_mutex_unlock(&_order);
+    return t;
+}
+// A place is ready: its command buffer was committed (or, NSNull, released uncommitted). The first thread to find the
+// next place ready submits it and every ready one after it, in order; the others return at once.
+- (void)vg_ready:(id)cb ticket:(uint64_t)ticket {
+    pthread_mutex_lock(&_order);
+    _ready[@(ticket)] = cb;
+    if (_draining) {
+        pthread_mutex_unlock(&_order);
+        return;
+    }
+    _draining = YES;
+    for (;;) {
+        id next = _ready[@(_nextSubmit)];
+        if (!next) {
+            break;
+        }
+        [_ready removeObjectForKey:@(_nextSubmit)];
+        _nextSubmit++;
+        pthread_mutex_unlock(&_order);
+        if (next != [NSNull null]) {
+            [(VGMTLCommandBuffer *)next submitInOrder];
+        }
+        next = nil;
+        pthread_mutex_lock(&_order);
+    }
+    _draining = NO;
+    pthread_mutex_unlock(&_order);
+}
+- (void)dealloc {
+    pthread_mutex_destroy(&_order);
+}
 - (void)setSubmissionQueue:(dispatch_queue_t)q { }
 - (void)setGPUPriority:(NSUInteger)p { }
 - (id<MTLCommandBuffer>)commandBuffer;
@@ -1412,11 +1462,30 @@ static BOOL vg_surface_is_scanout(VGMTLTexture *t) {
         _done = dispatch_group_create();
         _statusSet = dispatch_group_create();
         _fenced = dispatch_group_create();
+        _scheduledGroup = dispatch_group_create();
         _status = MTLCommandBufferStatusNotEnqueued;
         _surfacesWritten = [NSMutableSet set];
         _drawables = [NSMutableArray array];
     }
     return self;
+}
+
+// Released without a commit: its place on the queue goes (Apple's driver keeps it, and the queue waits for good), and
+// a command buffer encoded but never committed gives back what it holds.
+- (void)dealloc {
+    if (_ticketed && !_committed && [(NSObject *)_commandQueue isKindOfClass:[VGMTLCommandQueue class]]) {
+        VGMTLCommandQueue *q = (VGMTLCommandQueue *)_commandQueue;
+        uint64_t ticket = _ticket;
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+            [q vg_ready:[NSNull null] ticket:ticket];
+        });
+    }
+    if (!_committed && _cmdPool) {
+        if (_cb) {
+            gVk.vkFreeCommandBuffers(gVk.device, _cmdPool, 1, &_cb);
+        }
+        vg_cmdpool_put(_cmdPool);
+    }
 }
 
 - (void)fail:(NSString *)why {
@@ -1431,13 +1500,17 @@ static BOOL vg_surface_is_scanout(VGMTLTexture *t) {
     if (_cb) {
         return YES;
     }
-    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, gVk.pool,
+    _cmdPool = vg_cmdpool_get();
+    if (!_cmdPool) {
+        return NO;
+    }
+    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, _cmdPool,
                                       VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
-    pthread_mutex_lock(&gVk.lock);
     VkResult r = gVk.vkAllocateCommandBuffers(gVk.device, &ai, &_cb);
-    pthread_mutex_unlock(&gVk.lock);
     if (r != VK_SUCCESS) {
         _cb = VK_NULL_HANDLE;
+        vg_cmdpool_put(_cmdPool);
+        _cmdPool = VK_NULL_HANDLE;
         return NO;
     }
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL,
@@ -1551,7 +1624,17 @@ static BOOL vg_surface_is_scanout(VGMTLTexture *t) {
     });
 }
 - (void)enqueue {
-    if (_status == MTLCommandBufferStatusNotEnqueued) {
+    VGMTLCommandQueue *q = [(NSObject *)_commandQueue isKindOfClass:[VGMTLCommandQueue class]]
+                               ? (VGMTLCommandQueue *)_commandQueue
+                               : nil;
+    @synchronized(self) {
+        if (_status != MTLCommandBufferStatusNotEnqueued) {
+            return;
+        }
+        if (q) {
+            _ticket = [q vg_reserve];
+            _ticketed = YES;
+        }
         _status = MTLCommandBufferStatusEnqueued;
     }
 }
@@ -1718,18 +1801,17 @@ static void vg_surface_debug(VGMTLTexture *t) {
         dispatch_group_leave(_fenced);   // vg_present_throttle waits for this, not for the handlers
     }
     _completed = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    // The GPU is done with them (or they never ran): this command buffer's pool, used by no one else, goes back.
     if (_cb) {
-        pthread_mutex_lock(&gVk.lock);
-        gVk.vkFreeCommandBuffers(gVk.device, gVk.pool, 1, &_cb);
-        pthread_mutex_unlock(&gVk.lock);
+        gVk.vkFreeCommandBuffers(gVk.device, _cmdPool, 1, &_cb);
         _cb = VK_NULL_HANDLE;
     }
     if (_pendingCb) {
-        pthread_mutex_lock(&gVk.lock);
-        gVk.vkFreeCommandBuffers(gVk.device, gVk.pool, 1, &_pendingCb);
-        pthread_mutex_unlock(&gVk.lock);
+        gVk.vkFreeCommandBuffers(gVk.device, _cmdPool, 1, &_pendingCb);
         _pendingCb = VK_NULL_HANDLE;
     }
+    vg_cmdpool_put(_cmdPool);
+    _cmdPool = VK_NULL_HANDLE;
     vg_pending_release(_pendingOwned);
     _pendingOwned = nil;
     for (int i = 0; i < _npools; i++) {
@@ -1866,10 +1948,30 @@ static void vg_surface_debug(VGMTLTexture *t) {
         _waits = nil;
     }
     [self enqueue];
+    @synchronized(self) {
+        if (_committed) {
+            vglog("command buffer %p committed twice: the second commit ignored", self);
+            return;
+        }
+        _committed = YES;
+    }
     _status = MTLCommandBufferStatusCommitted;
     dispatch_group_enter(_done);
     dispatch_group_enter(_statusSet);
-    // Command buffers of a queue complete in commit order: when one's completed handler runs, every earlier one says
+    dispatch_group_enter(_scheduledGroup);
+    dispatch_group_enter(_fenced);
+    _fencedEntered = YES;
+    if (_ticketed) {   // its turn may not have come: an earlier place on the queue is still uncommitted
+        [(VGMTLCommandQueue *)_commandQueue vg_ready:self ticket:_ticket];
+    } else {
+        [self submitInOrder];
+    }
+}
+
+// Its turn on the queue: what commit leaves to the queue's order (the write-backs, the deferred work and the submit,
+// then the handlers), on the thread whose commit filled the last gap ahead of it -- its own, unless it waited.
+- (void)submitInOrder {
+    // Command buffers of a queue complete in queue order: when one's completed handler runs, every earlier one says
     // Completed (or Error). Without a completion queue ours finish on a concurrent queue, and VFX (AvatarKit's Memoji,
     // OpenSubdiv) saw its dependency command buffer still Scheduled from a later one's handler, called it failed, and
     // drew no Memoji. Each one's completion waits for the one before it to have its status (not its handlers, which may
@@ -1881,8 +1983,6 @@ static void vg_surface_debug(VGMTLTexture *t) {
             cq->_lastCommitted = self;
         }
     }
-    dispatch_group_enter(_fenced);
-    _fencedEntered = YES;
     _submitted = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     const BOOL profile = vg_perf_on();
     VkFence fence = VK_NULL_HANDLE;
@@ -2046,43 +2146,16 @@ static void vg_surface_debug(VGMTLTexture *t) {
         }
         vg_gpu_time_end(_cb, _timePair);
         gVk.vkEndCommandBuffer(_cb);
-        // Deferred work (new images, uploads, buffer-texture refreshes) in its own command buffer, ahead of ours.
-        VkCommandBuffer cbs[2];
-        uint32_t ncb = 0;
-        VkCommandBufferAllocateInfo pai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, gVk.pool,
-                                           VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
-        pthread_mutex_lock(&gVk.lock);
-        VkResult pr = gVk.vkAllocateCommandBuffers(gVk.device, &pai, &_pendingCb);
-        pthread_mutex_unlock(&gVk.lock);
-        if (pr == VK_SUCCESS) {
-            VkCommandBufferBeginInfo pbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL,
-                                            VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
-            gVk.vkBeginCommandBuffer(_pendingCb, &pbi);
-            NSMutableData *owned = nil;
-            BOOL any = vg_pending_record(_pendingCb, &owned);
-            _pendingOwned = owned;
-            gVk.vkEndCommandBuffer(_pendingCb);
-            if (any) {
-                cbs[ncb++] = _pendingCb;
-            } else {
-                pthread_mutex_lock(&gVk.lock);
-                gVk.vkFreeCommandBuffers(gVk.device, gVk.pool, 1, &_pendingCb);
-                pthread_mutex_unlock(&gVk.lock);
-                _pendingCb = VK_NULL_HANDLE;
-            }
-        } else {
-            _pendingCb = VK_NULL_HANDLE;
-        }
-        cbs[ncb++] = _cb;
+        // Deferred work (new images, uploads, buffer-texture refreshes) in its own command buffer, ahead of ours, taken
+        // and submitted in one step (vg_submit).
         VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         VkResult r = gVk.vkCreateFence(gVk.device, &fci, NULL, &fence);
         if (r == VK_SUCCESS) {
-            VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, ncb, cbs, 0, NULL};
-            pthread_mutex_lock(&gVk.lock);
             uint64_t submitStart = profile ? vg_now() : 0;
-            r = gVk.vkQueueSubmit(gVk.queue, 1, &si, fence);
+            NSMutableData *owned = nil;
+            r = vg_submit(_cmdPool, &_cb, 1, fence, &_pendingCb, &owned);
+            _pendingOwned = owned;
             uint64_t submitEnd = profile ? vg_now() : 0;
-            pthread_mutex_unlock(&gVk.lock);
             if (profile) {
                 vg_perf(VG_PERF_COMMIT_PREP, 0, submitStart - _submitted);
                 vg_perf(VG_PERF_QUEUE_SUBMIT, 0, submitEnd - submitStart);
@@ -2108,6 +2181,7 @@ static void vg_surface_debug(VGMTLTexture *t) {
         scheduled = [_scheduledHandlers copy];
         [_scheduledHandlers removeAllObjects];
     }
+    dispatch_group_leave(_scheduledGroup);
     MTLCommandBufferStatus end = _error ? MTLCommandBufferStatusError : MTLCommandBufferStatusCompleted;
     VGMTLCommandQueue *q = [(NSObject *)self.commandQueue isKindOfClass:[VGMTLCommandQueue class]]
                                ? (VGMTLCommandQueue *)self.commandQueue
@@ -2142,7 +2216,11 @@ static void vg_surface_debug(VGMTLTexture *t) {
     });
 }
 
-- (void)waitUntilScheduled { }
+- (void)waitUntilScheduled {
+    if (_committed) {
+        dispatch_group_wait(_scheduledGroup, DISPATCH_TIME_FOREVER);
+    }
+}
 // Core Animation in WindowServer commits this way (5b: lenient mode swallowed it, and its frames were never submitted).
 // ... and then hands the frame's IOSurface to the display pipe, which copies the surface's CPU memory: the write-back
 // must have landed by then (5c: when it returned at once, the pipe could show a surface before its last frame was in
@@ -2211,6 +2289,9 @@ static void vg_present_throttle(VGMTLCommandBuffer *cb) {
     _gpuDone = wroteSurfaces ? dispatch_semaphore_create(0) : nil;
     _wroteBack = wroteSurfaces ? dispatch_semaphore_create(0) : nil;
     [self commit];
+    // Submitted first (at once, unless an earlier place on its queue is still uncommitted): what follows reads what
+    // the submit worked out.
+    dispatch_group_wait(_scheduledGroup, DISPATCH_TIME_FOREVER);
     static int twinWait = -1;
     if (twinWait < 0) {
         const char *e = getenv("VGMTL_TWIN_WAIT");

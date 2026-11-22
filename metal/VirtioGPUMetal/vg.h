@@ -52,7 +52,7 @@ void vg_trace_sync(const char *after);
     X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceQueueFamilyProperties)      \
     X(vkGetPhysicalDeviceMemoryProperties) X(vkCreateDevice) X(vkGetDeviceProcAddr) X(vkGetDeviceQueue)            \
     X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) X(vkAllocateMemory) X(vkFreeMemory)       \
-    X(vkBindBufferMemory) X(vkMapMemory) X(vkUnmapMemory) X(vkCreateCommandPool) X(vkAllocateCommandBuffers)       \
+    X(vkBindBufferMemory) X(vkMapMemory) X(vkUnmapMemory) X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkAllocateCommandBuffers)       \
     X(vkFreeCommandBuffers) X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkQueueSubmit) X(vkCreateFence)        \
     X(vkWaitForFences) X(vkDestroyFence) X(vkCmdPipelineBarrier) X(vkCmdCopyBuffer) X(vkCmdFillBuffer)             \
     X(vkCreateShaderModule) X(vkDestroyShaderModule) X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout)  \
@@ -89,8 +89,7 @@ struct vg_vulkan {
     // Metal tessellation (VGMTLTess.c) needs all four: the stages, 64-bit integers and device addresses in shaders,
     // and buffers made with addresses (bufferAddresses: bufferDeviceAddress, unless VirtioGPUMetal-nobda says no).
     BOOL tessellation, int64, deviceAddress, bufferAddresses;
-    VkCommandPool pool;
-    pthread_mutex_t lock;      // the queue and the command pool
+    pthread_mutex_t lock;      // the queue (vkQueueSubmit); command pools are per command buffer (vg_cmdpool_get)
     VG_VK_FUNCS(VG_DECLARE)
 };
 #undef VG_DECLARE
@@ -147,6 +146,18 @@ void vg_pending_forget(VkImage image);   // an image going away: drop what waits
 // (an array of vg_buffer the caller frees with vg_pending_release). NO when nothing was waiting.
 BOOL vg_pending_record(VkCommandBuffer cb, NSMutableData **owned);
 void vg_pending_release(NSMutableData *owned);
+// Command pools: Vulkan wants a pool's command buffers allocated, recorded, freed and reset under one external lock,
+// so each command buffer in flight has a pool of its own (from a free list), and encoding on several threads shares
+// none. A pool goes back (vg_cmdpool_put) once its command buffers are freed, after the GPU is done with them.
+VkCommandPool vg_cmdpool_get(void);
+void vg_cmdpool_put(VkCommandPool pool);
+// Every submit goes through here: the deferred work (vg_pending_*) waiting at this moment is recorded into a command
+// buffer from `pool` and submitted ahead of cbs, both under one lock, so no other submit can come between the work
+// being taken from the list and its submission (a command buffer reading an image whose upload another thread had
+// taken but not yet submitted ran without it). *pendingCb (to free from `pool` at completion) and *owned (for
+// vg_pending_release) are set when there was any.
+VkResult vg_submit(VkCommandPool pool, const VkCommandBuffer *cbs, uint32_t count, VkFence fence,
+                   VkCommandBuffer *pendingCb, NSMutableData **owned);
 
 @class VGMTLLibrary;
 // A dynamic library (5d): one of our libraries other functions link against (Core Image's ci_stdlib).
