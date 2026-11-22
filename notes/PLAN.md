@@ -2639,8 +2639,23 @@ corner to corner 8 times in one press (`qmpinput.py sweep`, 0.4 s each way) and 
   replaced by the one before it (both at 108's next boot); nothing was committed. Taking the CEA extension out of
   the EDID would only change the names; if wanted, in the core kext (from whatever EDID QEMU gives), not as a fixed
   override, which would pin QEMU's 1280x800 preferred mode.
+- **The owner's real complaint, and the fix (framebuffer 0.6.4).** Away from 1x 1280x800, Settings had no way back:
+  its one "1280 x 800 (Default)" entry always picked Retina (2560x1600 pixels), while 1440 x 900 had both entries.
+  macOS calls the EDID's preferred timing the default and lists the default size once, its 1x and Retina modes merged.
+  On 108, step by step: taking Retina off 2560x1600 made 1280 x 800 1x-only (no Retina 1280x800); dropping the
+  framebuffer's Default flag alone changed nothing (macOS set it from the EDID); an EDID naming 2560x1600 as preferred
+  gave every size both entries ("1280 x 800" and "1280 x 800 (low resolution)"), but with the framebuffer's Default
+  flag on 2560x1600 a fresh start (WindowServer's saved sets moved aside) came up in 1x 2560x1600; without any Default
+  flag it came up in the framebuffer's own 1x 1280x800. `target-default-ppmm` in the override changed nothing. So
+  0.6.4 rewrites the EDID's first timing to the Retina size of the host's size when that mode is offered (CVT reduced
+  blanking at 60 Hz, the host's image size kept) and flags no mode Default then; a host size with no Retina twin
+  (1920x1200, 2560x1600 itself) keeps its EDID. Checked on 108: a fresh start in 1x 1280x800; Settings lists 13 sizes
+  with both 1280 x 800 entries; 1440x900 1x -> "1280 x 800 (low resolution)" -> 1x 1280x800, "1280 x 800" -> Retina,
+  and back to 1x. Quirks: Settings calls 1x 2560 x 1600 the "(Default)", and its short list (TV-style, from QEMU's
+  CEA extension) is 3840 x 2160, 2560 x 1600, 1920 x 1200, 1280 x 800. A saved mode may be dropped once when the EDID
+  changes (108 came up in 1x 1280x800 after the first EDID change); not checked on an upgrade.
 - **0.1.15, ready for the owner's OK** (not cut): 5d922cc (no twin for surfaces the display never shows: at Retina,
   shared, genie 66 -> 34-38 ms a frame and drag 41.5 -> 18.9 in the owner's session, genie 30.6 with the probe),
   mtllockwait's size argument, and ca5b0ac (off-by-default flags and tools). To cut it: VERSION and
-  packaging/host/TESTED as 028f0c1 did, then `packaging/make-dist.sh` and the release, as for 0.1.14. No 1x mode change
-  goes in it: Settings doesn't read the framebuffer's mode flags (below).
+  packaging/host/TESTED as 028f0c1 did, then `packaging/make-dist.sh` and the release, as for 0.1.14. With it goes
+  framebuffer 0.6.4 (both 1x and Retina of every size in Settings, below).

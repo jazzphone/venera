@@ -101,6 +101,7 @@ private:
     }
     bool applyMode(IODisplayModeID id);
     void log(const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+    void preferRetinaSize();
     IOReturn call(const char *function, void *p1 = nullptr, void *p2 = nullptr, void *p3 = nullptr,
                   void *p4 = nullptr);
     bool setScanout(uint32_t w, uint32_t h, uint32_t stride) {
@@ -119,6 +120,7 @@ private:
     Mode modes_[kMaxModes] = {};
     unsigned modeCount_ = 0;
     IODisplayModeID preferredMode_ = 0;
+    IODisplayModeID defaultMode_ = 0; // what the EDID names as preferred: preferredMode_, or its Retina size
     IODisplayModeID currentMode_ = 0;
     // Own work loop: a flush waits ~4 ms on the host, which shouldn't hold IOFramebuffer's.
     IOWorkLoop *flushLoop_ = nullptr;
@@ -263,6 +265,8 @@ bool VirtioGPUFramebuffer::start(IOService *provider) {
     log("start: %u modes, preferred %u (%ux%u), VRAM %u bytes at 0x%llx", modeCount_, preferredMode_,
         modes_[preferredMode_ - 1].width, modes_[preferredMode_ - 1].height, vramBytes_,
         (unsigned long long)vramPhys_);
+    defaultMode_ = preferredMode_;
+    preferRetinaSize();
 
     flushLoop_ = IOWorkLoop::workLoop();
     flushTimer_ = IOTimerEventSource::timerEventSource(
@@ -402,7 +406,10 @@ IOReturn VirtioGPUFramebuffer::getInformationForDisplayMode(IODisplayModeID id,
     if (m->width >= 2560) { // can back a Retina mode (the display override's scale-resolutions name these sizes)
         info->flags |= kDisplayModeValidForHiResFlag;
     }
-    if (id == preferredMode_) {
+    // The default as the host's EDID has it; none when the EDID names the Retina size (preferRetinaSize): macOS calls
+    // that one the default from the EDID alone, and a Default flag on it made a fresh install start there, in 1x
+    // 2560x1600, instead of in the mode the framebuffer is in (round 23, VM 108).
+    if (id == preferredMode_ && defaultMode_ == preferredMode_) {
         info->flags |= kDisplayModeDefaultFlag;
     }
     return kIOReturnSuccess;
@@ -523,6 +530,59 @@ IOReturn VirtioGPUFramebuffer::setAttributeForConnection(IOIndex index, IOSelect
     default:
         return IOFramebuffer::setAttributeForConnection(index, attribute, value);
     }
+}
+
+// The size the EDID names as preferred is the one macOS calls the default, and System Settings lists the default size
+// once: its 1x mode and the Retina one twice its size as one entry, "1280 x 800 (Default)", that always picks Retina.
+// Once away from 1x 1280x800 there was no way back to it (round 23). So when the mode twice the host's size is here
+// (and so offered as Retina), the EDID's first timing becomes that size's: Settings then lists "1280 x 800" (Retina)
+// and "1280 x 800 (low resolution)" as it does every other size, and calls the twice-as-big 1x mode the default. No
+// mode is flagged Default then, so a fresh install keeps the host's size, which the framebuffer starts in.
+// The timing is CVT reduced blanking at 60 Hz, the image size and the rest of the EDID as the host gave them.
+void VirtioGPUFramebuffer::preferRetinaSize() {
+    const Mode *p = modeFor(preferredMode_);
+    if (!p || !edid_ || edid_->getLength() < 128) {
+        return;
+    }
+    IODisplayModeID twice = 0;
+    for (unsigned i = 0; i < modeCount_; i++) {
+        if (modes_[i].width == 2 * p->width && modes_[i].height == 2 * p->height && modes_[i].width >= 2560) {
+            twice = (IODisplayModeID)(i + 1);
+        }
+    }
+    const uint8_t *in = static_cast<const uint8_t *>(edid_->getBytesNoCopy());
+    if (!twice || (in[54] == 0 && in[55] == 0)) { // no such mode, or the first descriptor isn't a timing
+        return;
+    }
+    const uint32_t ha = 2 * p->width, va = 2 * p->height, hb = 160, hfp = 48, hsw = 32, vfp = 3;
+    const uint32_t ratio = ha * 10 / va; // CVT's vertical sync width by aspect ratio
+    const uint32_t vsw = ratio == 13 ? 4 : ratio == 17 ? 5 : ratio == 16 ? 6 : 10;
+    const uint32_t lineNs = (16666667 - 460000) / va; // the line time for a 460 us minimum blanking
+    uint32_t vb = 460000 / lineNs + 1;
+    vb = vb < vfp + vsw + 6 ? vfp + vsw + 6 : vb;
+    uint32_t clock = (uint32_t)((uint64_t)60 * (ha + hb) * (va + vb) / 10000); // 10 kHz units
+    clock -= clock % 25;                                                        // CVT's 0.25 MHz steps
+    OSData *copy = OSData::withBytes(in, edid_->getLength());
+    if (!copy) {
+        return;
+    }
+    uint8_t *e = static_cast<uint8_t *>(const_cast<void *>(copy->getBytesNoCopy()));
+    uint8_t *d = e + 54;
+    d[0] = (uint8_t)clock, d[1] = (uint8_t)(clock >> 8);
+    d[2] = (uint8_t)ha, d[3] = (uint8_t)hb, d[4] = (uint8_t)(((ha >> 8) << 4) | (hb >> 8));
+    d[5] = (uint8_t)va, d[6] = (uint8_t)vb, d[7] = (uint8_t)(((va >> 8) << 4) | (vb >> 8));
+    d[8] = (uint8_t)hfp, d[9] = (uint8_t)hsw, d[10] = (uint8_t)(((vfp & 15) << 4) | (vsw & 15));
+    d[11] = (uint8_t)(((hfp >> 8) << 6) | ((hsw >> 8) << 4) | ((vfp >> 4) << 2) | (vsw >> 4));
+    uint8_t sum = 0; // bytes 12-17 (image size, borders, flags) stay the host's
+    for (unsigned i = 0; i < 127; i++) {
+        sum += e[i];
+    }
+    e[127] = (uint8_t)(0x100 - sum);
+    OSSafeReleaseNULL(edid_);
+    edid_ = copy;
+    defaultMode_ = twice;
+    log("EDID: preferred timing %ux%u (the Retina size of %ux%u), so Settings lists both of every size", ha, va,
+        p->width, p->height);
 }
 
 bool VirtioGPUFramebuffer::hasDDCConnect(IOIndex index) {
