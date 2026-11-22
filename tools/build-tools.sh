@@ -27,6 +27,7 @@ $CC -fobjc-arc -framework Foundation -framework Metal tools/mtlcube.m -o build/m
 $CC -fobjc-arc -framework Foundation -framework Metal tools/mtlalign.m -o build/mtlalign
 $CC -fobjc-arc -framework Foundation -framework Metal -framework IOSurface tools/mtlregroup.m -o build/mtlregroup
 $CC -fobjc-arc -framework Foundation -framework Metal tools/mtlpipe.m -o build/mtlpipe
+$CC -fobjc-arc -framework Foundation -framework Metal tools/mtllifetime.m -o build/mtllifetime
 $CC -fobjc-arc -framework Foundation -framework Metal -framework IOSurface tools/mtllockwait.m -o build/mtllockwait
 $CC -fobjc-arc -dynamiclib -framework Foundation -framework Metal -framework IOSurface -framework CoreGraphics -framework CoreMedia -framework CoreVideo -framework ScreenCaptureKit -lz tools/streamprobe.m -o build/streamprobe.dylib
 $CC -fobjc-arc -framework Foundation -framework Metal tools/mtldraws.m -o build/mtldraws

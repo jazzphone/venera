@@ -2938,3 +2938,21 @@ matrices, the tint multipliers and the translated filter shaders were all right 
   1440x900 1x, 108 and 107 1280x800 1x); WindowServer on the 0.1.17 Metal bundle (51262e00bc3e, as built); 107's
   HelperPod running. 108 had its dev bundle link, debug flags and tint settings undone first (back to Dark, no icon
   tint); its snapshot pre-0-1-17 was taken before and deleted after.
+
+### Pipeline lifetime and LA08 blending follow-up (2026-11-22)
+
+- `mtllifetime render.metallib 200` repeatedly creates render and compute states in one process, encodes work with
+  them, releases the caller's references before commit, and checks the rendered and computed pixels. VM 108 ran
+  both builds against the same installed Mesa ICD. A temporary Vulkan call counter measured 600 pipelines,
+  600 shader modules, 600 descriptor set layouts and 400 pipeline layouts still live at the end on 0.1.17.
+  The candidate reclaimed all 2,200. Peak sampled proportional memory for the test's host render worker was
+  14,518 KiB on 0.1.17 and 4,758 KiB with the fix. This was a short synthetic workload.
+- The state releases its Vulkan objects when the last command buffer retaining it finishes. Compute local-size
+  variants and render luminance-alpha variants share that lifetime. The two shared framebuffer-fetch layouts
+  remain process-wide. On VM 108, `mtlrender` and `mtlcompute` passed. An injected render pipeline layout
+  creation failure reclaimed both shader modules and both descriptor set layouts already created.
+- `mtlsurface render.metallib --la-blend` checks a synthetic LA08 surface with separate RGB and alpha equations.
+  Under Venera's luminance-alpha model, replacing red and preserving destination alpha should store
+  `64,160`. VM 108 stored `64,128`, consistent with applying the RGB blend equation to the remapped alpha.
+  An Apple M5 Max running macOS 27.2.1 stored `64,0` for the same synthetic surface. A native reference for
+  RenderBox's exact surface and descriptor is still needed to establish Apple's behavior for that case.

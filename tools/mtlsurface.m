@@ -3,7 +3,8 @@
 //   2. the CPU writes the surface, the GPU samples it into another texture (pull by seed);
 //   3. getBytes on the surface texture sees the CPU's write;
 //   4. 1280x800 surface frames: clear + copy-out, timed.
-//   mtlsurface [render.metallib]
+//   mtlsurface [render.metallib [--la-blend]]
+//   --la-blend checks the luminance-alpha model used by Venera against a synthetic LA08 surface.
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurfaceRef.h>
 #import <Metal/Metal.h>
@@ -30,6 +31,72 @@ static uint32_t pixel(IOSurfaceRef s, int x, int y) {   // BGRA bytes as 0xAARRG
     return v;
 }
 
+static void check_la_blend(id<MTLDevice> dev, id<MTLCommandQueue> queue, id<MTLLibrary> lib) {
+    IOSurfaceRef s = IOSurfaceCreate((__bridge CFDictionaryRef)@{
+        (id)kIOSurfaceWidth : @32, (id)kIOSurfaceHeight : @32,
+        (id)kIOSurfaceBytesPerElement : @2, (id)kIOSurfacePixelFormat : @((uint32_t)'LA08')
+    });
+    if (!s || IOSurfaceLock(s, 0, NULL) != KERN_SUCCESS) {
+        check("allocate LA08 test surface", NO, nil);
+        if (s) CFRelease(s);
+        return;
+    }
+    for (size_t y = 0; y < 32; y++) {
+        uint8_t *row = (uint8_t *)IOSurfaceGetBaseAddress(s) + y * IOSurfaceGetBytesPerRow(s);
+        for (size_t x = 0; x < 32; x++) {
+            row[2 * x] = 192;
+            row[2 * x + 1] = 160;
+        }
+    }
+    IOSurfaceUnlock(s, 0, NULL);
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRG8Unorm
+                                                                                   width:32 height:32 mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    id<MTLTexture> target = [dev newTextureWithDescriptor:td iosurface:s plane:0];
+    MTLRenderPipelineDescriptor *rd = [MTLRenderPipelineDescriptor new];
+    rd.vertexFunction = [lib newFunctionWithName:@"tri_vertex"];
+    rd.fragmentFunction = [lib newFunctionWithName:@"color_fragment"];
+    MTLRenderPipelineColorAttachmentDescriptor *color = rd.colorAttachments[0];
+    color.pixelFormat = td.pixelFormat;
+    color.blendingEnabled = YES;
+    color.sourceRGBBlendFactor = MTLBlendFactorOne;
+    color.destinationRGBBlendFactor = MTLBlendFactorZero;
+    color.sourceAlphaBlendFactor = MTLBlendFactorZero;
+    color.destinationAlphaBlendFactor = MTLBlendFactorOne;
+    NSError *error = nil;
+    id<MTLRenderPipelineState> pipeline = [dev newRenderPipelineStateWithDescriptor:rd error:&error];
+    if (!target || !pipeline) {
+        check("create LA08 texture and blended pipeline", NO, error.localizedDescription);
+        CFRelease(s);
+        return;
+    }
+    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    pass.colorAttachments[0].texture = target;
+    pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:pass];
+    const float vertices[][8] = {{-1, -1, 0, 0, .25, 0, 0, .5}, {3, -1, 0, 0, .25, 0, 0, .5}, {-1, 3, 0, 0, .25, 0, 0, .5}};
+    const float offset[2] = {0, 0};
+    [e setRenderPipelineState:pipeline];
+    [e setVertexBytes:vertices length:sizeof(vertices) atIndex:0];
+    [e setVertexBytes:offset length:sizeof(offset) atIndex:1];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    if (IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL) == KERN_SUCCESS) {
+        const uint8_t *px = (const uint8_t *)IOSurfaceGetBaseAddress(s) + 16 * IOSurfaceGetBytesPerRow(s) + 2 * 16;
+        check("LA08 blend replaces luminance and preserves destination alpha",
+              cb.status == MTLCommandBufferStatusCompleted && abs((int)px[0] - 64) <= 1 && px[1] == 160,
+              [NSString stringWithFormat:@"LA %u,%u, want 64,160", px[0], px[1]]);
+        IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+    } else {
+        check("read LA08 test surface", NO, nil);
+    }
+    CFRelease(s);
+}
+
 int main(int argc, char **argv) {
     @autoreleasepool {
         setvbuf(stdout, NULL, _IOLBF, 0);
@@ -43,6 +110,10 @@ int main(int argc, char **argv) {
         NSError *err = nil;
         id<MTLLibrary> lib = [dev newLibraryWithURL:[NSURL fileURLWithPath:argc > 1 ? @(argv[1]) : @"render.metallib"]
                                               error:&err];
+        if (argc > 2 && !strcmp(argv[2], "--la-blend")) {
+            check_la_blend(dev, q, lib);
+            return failures ? 1 : 0;
+        }
 
         // 1. GPU writes, the surface holds it.
         IOSurfaceRef s = surface(64, 64);

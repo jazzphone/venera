@@ -80,10 +80,16 @@ static BOOL vg_fetch_layouts(void) {
         }
         VkDescriptorSetLayoutCreateInfo fi = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 8, b};
         VkDescriptorSetLayoutCreateInfo ei = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 0, NULL};
-        if (gVk.vkCreateDescriptorSetLayout(gVk.device, &fi, NULL, &gFetchLayout) != VK_SUCCESS ||
-            gVk.vkCreateDescriptorSetLayout(gVk.device, &ei, NULL, &gEmptyLayout) != VK_SUCCESS) {
-            gFetchLayout = gEmptyLayout = VK_NULL_HANDLE;
+        VkDescriptorSetLayout fetch = VK_NULL_HANDLE, empty = VK_NULL_HANDLE;
+        if (gVk.vkCreateDescriptorSetLayout(gVk.device, &fi, NULL, &fetch) != VK_SUCCESS) {
+            return;
         }
+        if (gVk.vkCreateDescriptorSetLayout(gVk.device, &ei, NULL, &empty) != VK_SUCCESS) {
+            gVk.vkDestroyDescriptorSetLayout(gVk.device, fetch, NULL);
+            return;
+        }
+        gFetchLayout = fetch;
+        gEmptyLayout = empty;
     });
     return gFetchLayout && gEmptyLayout;
 }
@@ -238,6 +244,35 @@ static VkShaderModule vg_module(NSData *spv);
 
 @implementation VGMTLRenderPipelineState
 @synthesize label = _label;
+- (void)dealloc {
+    // Encoders keep the state in the command buffer's retained resources until it finishes.
+    for (size_t i = 0; i < sizeof(_pipelines) / sizeof(_pipelines[0]); i++) {
+        if (_pipelines[i]) {
+            gVk.vkDestroyPipeline(gVk.device, _pipelines[i], NULL);
+        }
+    }
+    for (NSNumber *pipeline in _laPipelines.objectEnumerator) {
+        gVk.vkDestroyPipeline(gVk.device, (VkPipeline)pipeline.unsignedLongLongValue, NULL);
+    }
+    if (_layout) {
+        gVk.vkDestroyPipelineLayout(gVk.device, _layout, NULL);
+    }
+    // Sets 2 and 3 use the process-wide layouts created by vg_fetch_layouts.
+    for (unsigned i = 0; i < 2; i++) {
+        if (_dsl[i]) {
+            gVk.vkDestroyDescriptorSetLayout(gVk.device, _dsl[i], NULL);
+        }
+    }
+    for (NSNumber *module in _laModules.objectEnumerator) {
+        gVk.vkDestroyShaderModule(gVk.device, (VkShaderModule)module.unsignedLongLongValue, NULL);
+    }
+    const VkShaderModule modules[] = {_vs, _fs, _tvs, _tcs};
+    for (size_t i = 0; i < sizeof(modules) / sizeof(modules[0]); i++) {
+        if (modules[i]) {
+            gVk.vkDestroyShaderModule(gVk.device, modules[i], NULL);
+        }
+    }
+}
 - (id<MTLDevice>)device { return _dev; }
 - (BOOL)supportIndirectCommandBuffers { return NO; }
 - (MTLResourceID)gpuResourceID { return (MTLResourceID){0}; }
@@ -287,6 +322,10 @@ static VkShaderModule vg_module(NSData *spv);
                     return [self pipelineForClass:cls clamp:clamp feedback:feedback la:0 error:error];
                 }
                 fsModule = vg_module(spv);
+                if (!fsModule) {
+                    *error = [NSString stringWithFormat:@"%@: failed to create luminance-alpha shader module", _name];
+                    return VK_NULL_HANDLE;
+                }
                 if (!_laModules) {
                     _laModules = [NSMutableDictionary dictionary];
                 }
@@ -362,6 +401,9 @@ static VkShaderModule vg_module(NSData *spv);
         VkResult r = gVk.vkCreateGraphicsPipelines(gVk.device, VK_NULL_HANDLE, 1, &gci, NULL, &made);
         vg_trace_sync("vkCreateGraphicsPipelines");
         if (r != VK_SUCCESS) {
+            if (made) {
+                gVk.vkDestroyPipeline(gVk.device, made, NULL);
+            }
             *error = [NSString stringWithFormat:@"%@: vkCreateGraphicsPipelines %d", _name, r];
             return VK_NULL_HANDLE;
         }
@@ -385,15 +427,13 @@ static VkDescriptorSetLayout vg_set_layout(const vg_binding *b, int n, VkShaderS
     }
     VkDescriptorSetLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, (uint32_t)n, lb};
     VkDescriptorSetLayout l = VK_NULL_HANDLE;
-    gVk.vkCreateDescriptorSetLayout(gVk.device, &ci, NULL, &l);
-    return l;
+    return gVk.vkCreateDescriptorSetLayout(gVk.device, &ci, NULL, &l) == VK_SUCCESS ? l : VK_NULL_HANDLE;
 }
 
 static VkShaderModule vg_module(NSData *spv) {
     VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, spv.length, spv.bytes};
     VkShaderModule m = VK_NULL_HANDLE;
-    gVk.vkCreateShaderModule(gVk.device, &ci, NULL, &m);
-    return m;
+    return gVk.vkCreateShaderModule(gVk.device, &ci, NULL, &m) == VK_SUCCESS ? m : VK_NULL_HANDLE;
 }
 
 // A post-tessellation vertex function's pipeline (5d, VGMTLTess.c; NullMoth's NVMTLDevice.m reads the descriptor the same
@@ -580,14 +620,20 @@ id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRende
             VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, p->_fetchDeclared ? 4 : 2,
                                                p->_dsl, p->_tess ? 1 : 0, p->_tess ? &tessRange : NULL};
             vg_trace_sync("shader modules + set layouts");
-            gVk.vkCreatePipelineLayout(gVk.device, &plci, NULL, &p->_layout);
+            VkPipelineLayout layout = VK_NULL_HANDLE;
+            const BOOL modulesReady = p->_vs && (!fs || p->_fs) && (!p->_tess || (p->_tvs && p->_tcs));
+            if (modulesReady && p->_dsl[0] && p->_dsl[1] &&
+                gVk.vkCreatePipelineLayout(gVk.device, &plci, NULL, &layout) == VK_SUCCESS) {
+                p->_layout = layout;
+            }
             vg_trace_sync("pipeline layout");
             vglog("render pipeline %s: translated in %.1f ms (%lu + %lu bytes of SPIR-V, %d + %d bindings%s%s)",
                   p->_name.UTF8String, (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e6, (unsigned long)vs.length,
                   (unsigned long)fs.length, p->_nvb, p->_nfb, p->_fetchMask ? ", framebuffer fetch by copies" : "",
                   p->_tess ? ", tessellation" : "");
-            if (p->_tess && (!p->_vs || !p->_tvs || !p->_tcs)) {
-                why = @"tessellation: vkCreateShaderModule failed for a stage";
+            if (!p->_layout) {
+                why = modulesReady ? @"render pipeline: Vulkan layout creation failed"
+                                   : @"render pipeline: Vulkan shader module creation failed";
                 p = nil;
             }
         }

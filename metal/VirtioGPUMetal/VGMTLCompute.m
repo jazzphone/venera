@@ -535,6 +535,21 @@ VkDescriptorSet vg_write_set(VGMTLCommandBuffer *cmd, VkDescriptorSetLayout dsl,
 }
 @end
 @implementation VGComputeVariant
+- (void)dealloc {
+    // The command buffer retains the pipeline state, which owns these variants, through completion.
+    for (NSValue *pipeline in pipelines.objectEnumerator) {
+        gVk.vkDestroyPipeline(gVk.device, (VkPipeline)pipeline.pointerValue, NULL);
+    }
+    if (layout) {
+        gVk.vkDestroyPipelineLayout(gVk.device, layout, NULL);
+    }
+    if (dsl) {
+        gVk.vkDestroyDescriptorSetLayout(gVk.device, dsl, NULL);
+    }
+    if (module) {
+        gVk.vkDestroyShaderModule(gVk.device, module, NULL);
+    }
+}
 @end
 
 @interface VGMTLComputePipelineState : NSObject <MTLComputePipelineState> {
@@ -604,7 +619,8 @@ VkDescriptorSet vg_write_set(VGMTLCommandBuffer *cmd, VkDescriptorSetLayout dsl,
             }
         }
         VkShaderModuleCreateInfo smci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, spv.length, spv.bytes};
-        VkResult r = gVk.vkCreateShaderModule(gVk.device, &smci, NULL, &v->module);
+        VkShaderModule module = VK_NULL_HANDLE;
+        VkResult r = gVk.vkCreateShaderModule(gVk.device, &smci, NULL, &module);
         VkDescriptorSetLayoutBinding lb[64];
         for (int i = 0; i < v->nbindings; i++) {
             lb[i] = (VkDescriptorSetLayoutBinding){v->bindings[i].binding, v->bindings[i].type, 1,
@@ -613,13 +629,22 @@ VkDescriptorSet vg_write_set(VGMTLCommandBuffer *cmd, VkDescriptorSetLayout dsl,
         VkDescriptorSetLayoutCreateInfo dci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0,
                                                (uint32_t)v->nbindings, lb};
         if (r == VK_SUCCESS) {
-            r = gVk.vkCreateDescriptorSetLayout(gVk.device, &dci, NULL, &v->dsl);
+            v->module = module;
+            VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+            r = gVk.vkCreateDescriptorSetLayout(gVk.device, &dci, NULL, &dsl);
+            if (r == VK_SUCCESS) {
+                v->dsl = dsl;
+            }
         }
         VkPushConstantRange pcr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, _pushOffset + 48};
         VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &v->dsl,
                                            _dynamic ? 1u : 0u, &pcr};
         if (r == VK_SUCCESS) {
-            r = gVk.vkCreatePipelineLayout(gVk.device, &plci, NULL, &v->layout);
+            VkPipelineLayout layout = VK_NULL_HANDLE;
+            r = gVk.vkCreatePipelineLayout(gVk.device, &plci, NULL, &layout);
+            if (r == VK_SUCCESS) {
+                v->layout = layout;
+            }
         }
         if (r != VK_SUCCESS) {
             *error = [NSString stringWithFormat:@"shader module / layout: VkResult %d", r];
@@ -650,6 +675,9 @@ VkDescriptorSet vg_write_set(VGMTLCommandBuffer *cmd, VkDescriptorSetLayout dsl,
         uint64_t t0 = mach_absolute_time();
         VkResult r = gVk.vkCreateComputePipelines(gVk.device, VK_NULL_HANDLE, 1, &cpci, NULL, &p);
         if (r != VK_SUCCESS) {
+            if (p) {
+                gVk.vkDestroyPipeline(gVk.device, p, NULL);
+            }
             *error = [NSString stringWithFormat:@"vkCreateComputePipelines %d", r];
             return VK_NULL_HANDLE;
         }
