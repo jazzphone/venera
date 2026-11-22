@@ -2626,8 +2626,21 @@ corner to corner 8 times in one press (`qmpinput.py sweep`, 0.4 s each way) and 
   the common 1x sizes beside the Retina ones is a framebuffer change (each mode's flags: Always Show 0x8 on the common
   1x sizes, or dropping the TV treatment) that needs a look in Settings after it: VM 108 logged in, or the owner's OK
   for 109. Not done tonight: 108 was at its lock screen.
+- **Tried on VM 108 the next morning (the owner logged it in; snapshot r23-1x-pre), neither moves the short list.**
+  The TV treatment comes from QEMU's EDID: its CEA-861 extension lists TV formats (4K and 1080p codes). A display
+  override with the same EDID less the extension (`IODisplayEDID`, the extension count 0, the checksum redone) took
+  the Television flag off every mode (IOFlags 0x3/0x7) and "1080p" became "1920 x 1080 (low resolution)", but the
+  short list stayed 3840 x 2160, 2560 x 1440, 1920 x 1080 (low resolution), 1280 x 800 (Default), and the full list
+  the same 13. A test framebuffer then gave 1440x900, 1680x1050, 1920x1200 and 2880x1800 Always Show (0x8) and
+  3840x2160 Not Preset (0x200), loaded as such (modetest: 0x0b, 0x00800203): neither list changed. System Settings
+  makes its short list itself (the 16:9 standard sizes there are, and the default) and doesn't read the mode flags, so
+  the framebuffer can't put 1440x900 or 1680x1050 in it. The common 1x sizes stay one switch away ("Show all
+  resolutions"), the Retina ones the entries without "(low resolution)". The override was put back and the test kext
+  replaced by the one before it (both at 108's next boot); nothing was committed. Taking the CEA extension out of
+  the EDID would only change the names; if wanted, in the core kext (from whatever EDID QEMU gives), not as a fixed
+  override, which would pin QEMU's 1280x800 preferred mode.
 - **0.1.15, ready for the owner's OK** (not cut): 5d922cc (no twin for surfaces the display never shows: at Retina,
   shared, genie 66 -> 34-38 ms a frame and drag 41.5 -> 18.9 in the owner's session, genie 30.6 with the probe),
   mtllockwait's size argument, and ca5b0ac (off-by-default flags and tools). To cut it: VERSION and
-  packaging/host/TESTED as 028f0c1 did, then `packaging/make-dist.sh` and the release, as for 0.1.14. If the 1x mode
-  flags land first, they belong in it.
+  packaging/host/TESTED as 028f0c1 did, then `packaging/make-dist.sh` and the release, as for 0.1.14. No 1x mode change
+  goes in it: Settings doesn't read the framebuffer's mode flags (below).
