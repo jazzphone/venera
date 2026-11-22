@@ -26,6 +26,15 @@
 //   VG_SP_EVERY     1: also compare the client image with each whole frame as it comes (8x8 tiles), so a region that
 //                   a frame's dirty rectangles left wrong is seen even if a later frame redraws it; counts, the
 //                   largest difference, and the first frames that differ with their regions
+//   VG_SP_EVERY=2   also each frame's surface against its own picture when it was last handed out, to tell which
+//                   side is off where the client is: a surface that kept its old pixels where frames since had dirty
+//                   rectangles ("stale": that surface missed an update), or one that changed where no dirty rectangle
+//                   since said so ("undamaged": the damage left it out); per frame with a big difference, and totals;
+//                   and whether the pixels a frame got wrong outside its dirty rectangles are already the next frame's
+//                   ("ahead": the frame held what the next frame's damage reports); the worst frame's pictures come
+//                   with the frames before and after it (OUT-big-prev.png, OUT-big-next.png)
+//   VG_SP_TRACE     1: every frame's surface, seed, wall-clock time and dirty rectangles to OUT-trace.txt, to set
+//                   beside WindowServer's synclog and drawdiff lines
 //   VG_SP_RAW       1: also the last frame as OUT-last.raw (BGRA, rows packed), to check against what the display
 //                   shows (QEMU's VNC: vncgrab.py on the host)
 //   VG_SP_SCALE     dirty rectangles' scale to pixels (default 1: they are in the stream's pixels)
@@ -44,6 +53,8 @@
 #import <Metal/Metal.h>
 #include <dlfcn.h>
 #include <stdatomic.h>
+#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 #include <zlib.h>
 
@@ -168,6 +179,158 @@ static size_t compare_tiles(const uint8_t *base, size_t bpr, size_t w, size_t h,
     }
     return tiles;
 }
+// VG_SP_EVERY=2: each stream surface's picture when it was last handed out, and the frame each pixel was last in a
+// dirty rectangle (frame + 1; 0 never)
+enum { kSurfs = 16 };
+typedef struct {
+    uint32_t id, seed;
+    uint64_t frame;
+    uint8_t *pic;
+} surf_t;
+static surf_t gSurf[kSurfs];
+static uint32_t *gDamagedAt;
+typedef struct {
+    uint64_t px, frames;
+    int maxDiff;
+    size_t box[4];
+} cls_t;
+enum { kStale, kUndamaged, kOther, kClasses };
+static const char *kClassName[kClasses] = {"stale", "undamaged", "other"};
+static cls_t gCls[kClasses], gSurfUndamaged;   // where the client was off, by class; a surface's undamaged changes
+static uint64_t gSurfTurns, gSurfUndamagedTurns, gSurfUndamagedBig;
+static FILE *gTrace;
+// the last frame's pixels where the client was off, outside that frame's dirty rectangles (undamaged or other): at the
+// next frame, whether they already showed it ("ahead": the frame held the next frame's pixels, damage a frame late)
+static uint8_t *gPrevOff;
+static const uint8_t *gPrevPic;
+static uint64_t gAhead, gAheadDamaged, gNotAhead, gAheadFrames, gNotAheadFrames;
+static void cls_add(cls_t *c, size_t x, size_t y, int diff) {
+    if (!c->px++) {
+        c->box[0] = x, c->box[1] = y, c->box[2] = x + 1, c->box[3] = y + 1;
+    }
+    c->maxDiff = diff > c->maxDiff ? diff : c->maxDiff;
+    c->box[0] = MIN(c->box[0], x), c->box[1] = MIN(c->box[1], y);
+    c->box[2] = MAX(c->box[2], x + 1), c->box[3] = MAX(c->box[3], y + 1);
+}
+static int px_diff(const uint8_t *a, const uint8_t *b) {
+    int d = 0;
+    for (int i = 0; i < 4; i++) {
+        int x = abs((int)a[i] - (int)b[i]);
+        d = x > d ? x : d;
+    }
+    return d;
+}
+// This frame (number `frame`, on surface s) against the client image and the surface's own last picture.
+static void surf_check(IOSurfaceRef s, uint32_t seed, const uint8_t *base, size_t bpr, size_t w, size_t h, uint64_t frame,
+                       int clientMax) {
+    const uint32_t id = IOSurfaceGetID(s);
+    surf_t *sf = NULL;
+    for (int i = 0; i < kSurfs && !sf; i++) {
+        if (gSurf[i].pic && gSurf[i].id == id) {
+            sf = &gSurf[i];
+        }
+    }
+    BOOL first = NO;
+    for (int i = 0; i < kSurfs && !sf; i++) {
+        if (!gSurf[i].pic && (gSurf[i].pic = malloc(w * h * 4))) {
+            sf = &gSurf[i], sf->id = id, first = YES;
+        }
+    }
+    if (!sf) {
+        return;
+    }
+    if (gPrevPic && gPrevOff) {   // the last frame's off pixels against this frame
+        uint64_t ahead = 0, aheadDamaged = 0, not = 0;
+        for (size_t y = 0; y < h; y++) {
+            const uint8_t *off = gPrevOff + y * w, *cur = base + y * bpr, *prev = gPrevPic + y * w * 4;
+            const uint32_t *dmg = gDamagedAt + y * w;
+            for (size_t x = 0; x < w; x++) {
+                if (!off[x]) {
+                    continue;
+                }
+                if (!memcmp(cur + 4 * x, prev + 4 * x, 4)) {
+                    ahead++;
+                    aheadDamaged += dmg[x] == frame + 1;
+                } else {
+                    not++;
+                }
+            }
+        }
+        gAhead += ahead, gAheadDamaged += aheadDamaged, gNotAhead += not;
+        gAheadFrames += ahead > not, gNotAheadFrames += not >= ahead && not;
+        static int said;
+        if ((ahead || not) && said++ < 40) {
+            fprintf(gOut, "  frame %llu: of the last frame's off pixels, %llu already as this frame (%llu in its dirty "
+                    "rectangles), %llu not\n", (unsigned long long)frame, (unsigned long long)ahead,
+                    (unsigned long long)aheadDamaged, (unsigned long long)not);
+        }
+        memset(gPrevOff, 0, w * h);
+        gPrevPic = NULL;
+    }
+    if (!gPrevOff) {
+        gPrevOff = calloc(w * h, 1);
+    }
+    if (!first) {
+        cls_t c[kClasses] = {{0}}, u = {0};
+        const uint64_t since = sf->frame + 1;   // dirty rectangles of frames after the surface's last turn
+        for (size_t y = 0; y < h; y++) {
+            const uint8_t *cur = base + y * bpr, *pic = sf->pic + y * w * 4, *cli = gShadow + y * gBpr;
+            const BOOL picSame = !memcmp(cur, pic, w * 4), cliSame = !memcmp(cur, cli, w * 4);
+            if (picSame && cliSame) {
+                continue;
+            }
+            const uint32_t *dmg = gDamagedAt + y * w;
+            for (size_t x = 0; x < w; x++) {
+                const BOOL changed = !picSame && memcmp(cur + 4 * x, pic + 4 * x, 4);
+                const BOOL damaged = dmg[x] > since;
+                if (changed && !damaged) {
+                    cls_add(&u, x, y, px_diff(cur + 4 * x, pic + 4 * x));
+                }
+                if (!cliSame && memcmp(cur + 4 * x, cli + 4 * x, 4)) {
+                    int k = !changed && damaged ? kStale : changed && !damaged ? kUndamaged : kOther;
+                    const int d = px_diff(cur + 4 * x, cli + 4 * x);
+                    cls_add(&c[k], x, y, d);
+                    if (gPrevOff && k != kStale && d > 32 && gDamagedAt[y * w + x] != frame + 1) {
+                        gPrevOff[y * w + x] = 1;
+                    }
+                }
+            }
+        }
+        gSurfTurns++;
+        if (u.px) {
+            gSurfUndamagedTurns++;
+            gSurfUndamagedBig += u.maxDiff > 32;
+            gSurfUndamaged.px += u.px;
+            gSurfUndamaged.maxDiff = MAX(gSurfUndamaged.maxDiff, u.maxDiff);
+        }
+        for (int k = 0; k < kClasses; k++) {
+            if (c[k].px) {
+                gCls[k].frames++, gCls[k].px += c[k].px, gCls[k].maxDiff = MAX(gCls[k].maxDiff, c[k].maxDiff);
+            }
+        }
+        static int said;
+        if ((clientMax > 32 || u.maxDiff > 32) && said++ < 40) {
+            fprintf(gOut, "  frame %llu surface %u (seed %u, its last turn frame %llu seed %u):", (unsigned long long)frame,
+                    id, seed, (unsigned long long)sf->frame, sf->seed);
+            for (int k = 0; k < kClasses; k++) {
+                if (c[k].px) {
+                    fprintf(gOut, " %s %llu px up to %d in %zu,%zu-%zu,%zu;", kClassName[k], (unsigned long long)c[k].px,
+                            c[k].maxDiff, c[k].box[0], c[k].box[1], c[k].box[2], c[k].box[3]);
+                }
+            }
+            if (u.px) {
+                fprintf(gOut, " surface changed undamaged %llu px up to %d in %zu,%zu-%zu,%zu", (unsigned long long)u.px,
+                        u.maxDiff, u.box[0], u.box[1], u.box[2], u.box[3]);
+            }
+            fprintf(gOut, "\n");
+        }
+    }
+    for (size_t y = 0; y < h; y++) {
+        memcpy(sf->pic + y * w * 4, base + y * bpr, w * 4);
+    }
+    sf->frame = frame, sf->seed = seed;
+    gPrevPic = sf->pic;
+}
 static uint64_t gFirst, gLastAt;
 static double gMaxX, gMaxY;
 
@@ -224,6 +387,10 @@ static void process(IOSurfaceRef s, const CGRect *r, size_t n, const CGRect *mr,
         for (size_t y = 0; y < h; y++) {
             memcpy(gShadow + y * gBpr, base + y * bpr, w * 4);
         }
+        if (gEvery >= 2) {
+            free(gDamagedAt);
+            gDamagedAt = calloc(w * h, sizeof(uint32_t));
+        }
     } else {
         for (size_t i = 0; i < nm; i++) {   // a move: the client copies what it has (VG_SP_MOVES)
             CGRect src = gMoves == 1 ? mr[i] : CGRectOffset(mr[i], -dx, -dy);
@@ -254,15 +421,49 @@ static void process(IOSurfaceRef s, const CGRect *r, size_t n, const CGRect *mr,
             size_t y1 = (size_t)fmin(h, ceil(CGRectGetMaxY(r[i]) * gScale));
             for (size_t y = y0; y < y1 && x1 > x0; y++) {
                 memcpy(gShadow + y * gBpr + x0 * 4, base + y * bpr + x0 * 4, (x1 - x0) * 4);
+                for (size_t x = x0; gDamagedAt && x < x1; x++) {
+                    gDamagedAt[y * w + x] = (uint32_t)gFrames + 1;
+                }
             }
             gPixels += x1 > x0 && y1 > y0 ? (x1 - x0) * (y1 - y0) : 0;
         }
         gRects += n;
     }
+    if (gTrace) {
+        double bx0 = 1e9, by0 = 1e9, bx1 = 0, by1 = 0;
+        for (size_t i = 0; i < n; i++) {
+            bx0 = fmin(bx0, CGRectGetMinX(r[i])), by0 = fmin(by0, CGRectGetMinY(r[i]));
+            bx1 = fmax(bx1, CGRectGetMaxX(r[i])), by1 = fmax(by1, CGRectGetMaxY(r[i]));
+        }
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        struct tm tm;
+        localtime_r(&tv.tv_sec, &tm);
+        fprintf(gTrace, "%llu %.3f %02d:%02d:%02d.%03d surface %u seed %u rects %zu", (unsigned long long)gFrames,
+                now_ns() / 1e6, tm.tm_hour, tm.tm_min, tm.tm_sec, (int)(tv.tv_usec / 1000), IOSurfaceGetID(s), seed, n);
+        if (n) {
+            fprintf(gTrace, " bounds %.0f,%.0f-%.0f,%.0f", bx0, by0, bx1, by1);
+        }
+        for (size_t i = 0; i < n; i++) {
+            fprintf(gTrace, " [%.0f,%.0f %.0fx%.0f]", r[i].origin.x, r[i].origin.y, r[i].size.width, r[i].size.height);
+        }
+        fprintf(gTrace, "\n");
+    }
     if (gEvery && gShadow && w == gW && h == gH) {   // the client image against this whole frame
         int maxDiff = 0;
         size_t box[4];
         size_t tiles = compare_tiles(base, bpr, w, h, &maxDiff, box);
+        const uint8_t *prevPic = gPrevPic;   // the frame before, for the pictures below
+        static int saveNext;
+        if (saveNext && gPrevPic) {   // the frame after the worst one
+            saveNext = 0;
+            char path[512];
+            snprintf(path, sizeof(path), "%s-big-next.png", gOutPrefix);
+            write_png(path, base, w, h, bpr, 1);
+        }
+        if (gEvery >= 2 && gDamagedAt) {
+            surf_check(s, seed, base, bpr, w, h, gFrames, tiles ? maxDiff : 0);
+        }
         if (tiles) {
             gEveryFrames++, gEveryTiles += tiles;
             gEveryBig += maxDiff > 32;
@@ -283,6 +484,11 @@ static void process(IOSurfaceRef s, const CGRect *r, size_t n, const CGRect *mr,
                 write_png(path, gShadow, gW, gH, gBpr, 1);
                 snprintf(path, sizeof(path), "%s-big-frame.png", gOutPrefix);
                 write_png(path, base, w, h, bpr, 1);
+                if (prevPic) {
+                    snprintf(path, sizeof(path), "%s-big-prev.png", gOutPrefix);
+                    write_png(path, prevPic, w, h, w * 4, 1);
+                    saveNext = 1;
+                }
                 fprintf(gOut, "    (saved as the worst so far: frame %llu)\n", (unsigned long long)gFrames);
             }
         }
@@ -381,6 +587,20 @@ static void finish(const char *out) {
         fprintf(gOut, "every frame: %llu of %llu frames left the client off (%llu by more than 32), %llu tiles in all, up to "
                 "%d apart\n", (unsigned long long)gEveryFrames, (unsigned long long)gFrames, (unsigned long long)gEveryBig,
                 (unsigned long long)gEveryTiles, gEveryMaxDiff);
+    }
+    if (gEvery >= 2) {
+        fprintf(gOut, "by surface: %llu turns (a surface handed out again), %llu changed where no dirty rectangle since "
+                "its last turn said (%llu by more than 32, %llu px, up to %d)\n", (unsigned long long)gSurfTurns,
+                (unsigned long long)gSurfUndamagedTurns, (unsigned long long)gSurfUndamagedBig,
+                (unsigned long long)gSurfUndamaged.px, gSurfUndamaged.maxDiff);
+        fprintf(gOut, "  off by more than 32 outside a frame's dirty rectangles, at the next frame: %llu px already as "
+                "it (%llu of them in its dirty rectangles; mostly so in %llu frames), %llu px not (%llu frames)\n",
+                (unsigned long long)gAhead, (unsigned long long)gAheadDamaged, (unsigned long long)gAheadFrames,
+                (unsigned long long)gNotAhead, (unsigned long long)gNotAheadFrames);
+        for (int k = 0; k < kClasses; k++) {
+            fprintf(gOut, "  client off, %s: %llu frames, %llu px, up to %d\n", kClassName[k],
+                    (unsigned long long)gCls[k].frames, (unsigned long long)gCls[k].px, gCls[k].maxDiff);
+        }
     }
     fprintf(gOut, "stamps: %llu same, %llu differ, %llu seed moved, %llu unstamped; %llu changed while read\n",
             (unsigned long long)gSame, (unsigned long long)gDiffer, (unsigned long long)gSeedMoved,
@@ -559,6 +779,10 @@ __attribute__((constructor)) static void streamprobe(void) {
         gMoves = getenv("VG_SP_MOVES") ? atoi(getenv("VG_SP_MOVES")) : 0;
         gAsync = getenv("VG_SP_ASYNC") ? atoi(getenv("VG_SP_ASYNC")) : 0;
         gEvery = getenv("VG_SP_EVERY") ? atoi(getenv("VG_SP_EVERY")) : 0;
+        if (getenv("VG_SP_TRACE") && atoi(getenv("VG_SP_TRACE"))) {
+            snprintf(path, sizeof(path), "%s-trace.txt", out);
+            gTrace = fopen(path, "w");
+        }
         const char *hook = "none";
         if (!getenv("VG_SP_NOHOOK")) {   // the GPU bundle, and with it the lock hook
             void *b = dlopen("/Library/GPUBundles/VirtioGPUMetal.bundle/Contents/MacOS/VirtioGPUMetal", RTLD_NOW);
@@ -586,6 +810,9 @@ __attribute__((constructor)) static void streamprobe(void) {
             finish(out);
         });
         fclose(gOut);
+        if (gTrace) {
+            fclose(gTrace);
+        }
         _exit(0);
     }
 }

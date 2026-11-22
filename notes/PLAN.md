@@ -2798,3 +2798,44 @@ corner to corner 8 times in one press (`qmpinput.py sweep`, 0.4 s each way) and 
   SkyLight's damage or Venera's rendering (drawing beyond a pass's scissor at scale 2, say) is out of line.
 - **Partial console readback** (Codex item 3) not started: it needs QEMU's egl-headless path changed on the hosts as
   well as Venera's flush rectangles; scoped for the owner.
+
+### Retina stream frames outside their damage: SkyLight's, not Venera's (2026-11-22)
+
+- **The Retina stream goes another way.** At 1x, WindowServer writes the "DisplayStream surface N/8" surfaces in their
+  own display command buffers and nothing else is involved. At Retina (1440x900 and 1280x800 at scale 2) it first
+  composites the screen into a GPU-only "Selective Sharing" surface (its parts SkyLight finds damaged redrawn each
+  frame, a load pass), then draws each stream surface whole from it with one full-screen `UberResampleLanczos` draw
+  (2880x1800 to 2880x1800) in the next command buffer; synclog: `rect 0,0-2880,1800`, written back whole. So Venera's
+  write-back rectangle plays no part, and a stream frame holds whatever that composite holds.
+- **What the stream frames get wrong** (`tools/streamprobe.m`, new `VG_SP_EVERY=2`: each surface against its own last
+  turn, and the pixels a frame got wrong outside its dirty rectangles checked at the next frame). VM 108, 1440x900
+  Retina, sweep + genie + scroll with the probe as the shared reader, 0.1.16: 6-10 frames of ~475-670 left the client
+  off by more than 32 (up to 255) in every run. Of those pixels, 95-99% were already the next frame's and inside the
+  next frame's dirty rectangles (13,433 of 14,187; 8,766 of 9,193): a frame shows a change that only the next frame's
+  damage reports. The pictures: Dock icons shifted (the Dock grows for the minimized window) left of where that
+  frame's damage starts.
+- **Not ordering, not timing, not a draw outside its scissor.** Enqueue order is commit order (synclog `enqueue` /
+  `commit` lines, new: every explicit enqueue was committed next); the composite and its resample commit in order on
+  one queue, every frame (C D C D ...), and full barriers order them on the GPU. Present depth 1 (each display frame
+  waits for the one before on the GPU): unchanged (up to 255, 9,522 px "ahead"). 1x with a 15 ms sleep before every
+  display commit (WindowServer at ~90 ms a frame, Retina's pace): nothing above 29. The new `drawdiff` flag (below)
+  copies a band of the Selective Sharing surface before and after each pass or draw: no draw changed a pixel outside
+  its scissor.
+- **The cause: SkyLight redraws more of the Selective Sharing surface than the damage it hands ScreenCaptureKit.**
+  Frame 262 of one run: the composite before it redrew the Dock band under the scissor `72,1658 2736x132`, but the
+  frame's dirty rectangles there were `244,1656 2562x134`; the Dock's icons between x 74 and 244 had moved, and the
+  next frame's damage (`24,1626 2832x174`) brought them. Frame 264: scissor `72,1658 2736x132`, damage
+  `242,1658 2566x132`, the same. It looks as if SkyLight widens the Dock's redraw to its whole glass layer but reports
+  only what it found changed, and the stream frame is drawn whole from the composite, so whatever else moved under
+  the widened redraw reaches the frame unreported. At 1x the display frames write the stream surfaces themselves and
+  the client never fell more than 33 off. Venera draws what it is given, where it is told: nothing in Venera to fix.
+  The trails are what a viewer keeps when it misses the next frame's repair.
+- **Not tried**: whether anything makes SkyLight take the 1x path at Retina (the stream's size, what the display
+  reports); whether a real Retina Mac shares the same way (no hardware to check). A viewer-side workaround (the agent
+  asking for point-size frames) would be Apple's or the owner's choice, not Venera's.
+- **New debugging aids** (off unless their flag file is there): `VirtioGPUMetal-drawdiff` (line 1 a piece of a
+  surface name, line 2 rows `y0 y1`, line 3 how many passes, line 4 `draws` for every draw rather than every pass:
+  each pass's or draw's changed pixels, with its draws' scissors), synclog's `enqueue` and `commit` lines (queue,
+  order, surfaces written), and the probe's `VG_SP_EVERY=2` and `VG_SP_TRACE=1` (every frame's dirty rectangles with
+  wall-clock times, to set beside WindowServer's log). VM 108 is back on the 0.1.16 system-volume driver at 1x
+  1280x800.

@@ -207,6 +207,7 @@ BOOL vg_spirv_has_push_constants(NSData *spv);   // DescriptorSet 0 -> newSet (N
     NSMutableArray *_drawables;       // presented after the copy-out
     NSMutableArray *_signals;         // [event, value]: signaled at completion, after the write-back (5d)
     NSMutableArray *_waits;           // [event, value]: shared events waited for at commit (5d)
+    uint64_t _enqSeq;                 // its place in enqueue order (explicit or at commit), for synclog
 }
 @property(readonly) id<MTLDevice> device;
 @property(readonly) id<MTLCommandQueue> commandQueue;
