@@ -142,9 +142,7 @@ void vg_pending_copy(VkBuffer src, VkImage dst, const VkBufferImageCopy *c, cons
 void vg_pending_image_copy(VkImage from, id srcOwner, VkImage dst, const VkBufferImageCopy *c1,
                            const VkBufferImageCopy *c2, const vg_buffer *staging);
 void vg_pending_forget(VkImage image);   // an image going away: drop what waits for it
-// Records everything waiting into cb (barriers around it); the stagings to destroy after cb completes go to *owned
-// (an array of vg_buffer the caller frees with vg_pending_release). NO when nothing was waiting.
-BOOL vg_pending_record(VkCommandBuffer cb, NSMutableData **owned);
+// The stagings (and source textures) deferred work held, once the GPU is done with it (vg_submit's *owned).
 void vg_pending_release(NSMutableData *owned);
 // Command pools: Vulkan wants a pool's command buffers allocated, recorded, freed and reset under one external lock,
 // so each command buffer in flight has a pool of its own (from a free list), and encoding on several threads shares
@@ -155,7 +153,9 @@ void vg_cmdpool_put(VkCommandPool pool);
 // buffer from `pool` and submitted ahead of cbs, both under one lock, so no other submit can come between the work
 // being taken from the list and its submission (a command buffer reading an image whose upload another thread had
 // taken but not yet submitted ran without it). *pendingCb (to free from `pool` at completion) and *owned (for
-// vg_pending_release) are set when there was any.
+// vg_pending_release) are set when there was any. When the deferred work's command buffer can't be had, or the
+// submit fails, nothing is submitted and the work goes back on the list for the next submit: the caller's command
+// buffers fail rather than run without it.
 VkResult vg_submit(VkCommandPool pool, const VkCommandBuffer *cbs, uint32_t count, VkFence fence,
                    VkCommandBuffer *pendingCb, NSMutableData **owned);
 

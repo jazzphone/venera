@@ -604,9 +604,15 @@ void vg_pending_image_copy(VkImage from, id srcOwner, VkImage dst, const VkBuffe
     vg_pending_push(&op);
 }
 
+// Taking the deferred work and submitting it are one step under this lock (see vg_submit and vg.h).
+static pthread_mutex_t gSubmitLock = PTHREAD_MUTEX_INITIALIZER;
+
 void vg_pending_forget(VkImage image) {
     // source textures released outside the lock (their dealloc comes back here)
     __attribute__((objc_precise_lifetime)) NSMutableArray *drop = [NSMutableArray array];
+    // Under the submit lock too: work taken for a submit that fails goes back on the list (vg_submit), and an image
+    // forgotten in between would come back with it.
+    pthread_mutex_lock(&gSubmitLock);
     pthread_mutex_lock(&gPendingLock);
     size_t w = 0;
     for (size_t i = 0; i < gPendingCount; i++) {
@@ -621,9 +627,11 @@ void vg_pending_forget(VkImage image) {
     }
     gPendingCount = w;
     pthread_mutex_unlock(&gPendingLock);
+    pthread_mutex_unlock(&gSubmitLock);
 }
 
-BOOL vg_pending_record(VkCommandBuffer cb, NSMutableData **owned) {
+// Everything waiting, off the list (NULL when nothing is).
+static vg_pending_op *vg_pending_take(size_t *count) {
     pthread_mutex_lock(&gPendingLock);
     size_t n = gPendingCount;
     vg_pending_op *ops = n ? malloc(n * sizeof(*ops)) : NULL;
@@ -632,9 +640,32 @@ BOOL vg_pending_record(VkCommandBuffer cb, NSMutableData **owned) {
     }
     gPendingCount = 0;
     pthread_mutex_unlock(&gPendingLock);
-    if (!n) {
-        return NO;
+    *count = n;
+    return ops;
+}
+
+// Taken work back at the head of the list, ahead of what came since, for the next submit: the ops own their stagings
+// and source textures again (vg_pending_record_ops handed both to *owned, which the caller drops unreleased).
+static void vg_pending_restore(vg_pending_op *ops, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (ops[i].kind == 2 && ops[i].fromOwner) {
+            CFRetain(ops[i].fromOwner);
+        }
     }
+    pthread_mutex_lock(&gPendingLock);
+    if (gPendingCount + n > gPendingCap) {
+        gPendingCap = gPendingCount + n + 64;
+        gPending = realloc(gPending, gPendingCap * sizeof(*gPending));
+    }
+    memmove(gPending + n, gPending, gPendingCount * sizeof(*gPending));
+    memcpy(gPending, ops, n * sizeof(*ops));
+    gPendingCount += n;
+    pthread_mutex_unlock(&gPendingLock);
+}
+
+// Records ops into cb (barriers around it); the stagings to destroy after cb completes go to *owned (an array of
+// vg_buffer the caller frees with vg_pending_release), with the source textures kept alive until then.
+static void vg_pending_record_ops(VkCommandBuffer cb, const vg_pending_op *ops, size_t n, NSMutableData **owned) {
     // Inits first (UNDEFINED -> GENERAL for life), then whatever came before this point is visible to the copies.
     for (size_t i = 0; i < n; i++) {
         if (ops[i].kind != 0) {
@@ -691,9 +722,7 @@ BOOL vg_pending_record(VkCommandBuffer cb, NSMutableData **owned) {
     gVk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &after, 0,
                              NULL, 0, NULL);
     vg_perf(VG_PERF_DEFERRED, n, 0);
-    free(ops);
-    *owned = keep.length ? keep : nil;
-    return YES;
+    *owned = keep.length || owners ? keep : nil;
 }
 
 void vg_pending_release(NSMutableData *owned) {
@@ -742,58 +771,75 @@ void vg_cmdpool_put(VkCommandPool pool) {
     gVk.vkDestroyCommandPool(gVk.device, pool, NULL);
 }
 
-static BOOL vg_pending_any(void) {
-    pthread_mutex_lock(&gPendingLock);
-    BOOL any = gPendingCount > 0;
-    pthread_mutex_unlock(&gPendingLock);
-    return any;
-}
-
-// Taking the deferred work and submitting it are one step under this lock (see vg.h). Recording the deferred work is a
-// few barriers and copies; nothing here waits for the GPU.
-static pthread_mutex_t gSubmitLock = PTHREAD_MUTEX_INITIALIZER;
-
 VkResult vg_submit(VkCommandPool pool, const VkCommandBuffer *cbs, uint32_t count, VkFence fence,
                    VkCommandBuffer *pendingCb, NSMutableData **owned) {
     VkCommandBuffer all[8];
     if (count > 7) {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
+    // The flag files VirtioGPUMetal-failpendingalloc and -failpendingsubmit (one line per process name, as every
+    // flag) make the first submit with deferred work in such a process fail: its command buffer can't be allocated,
+    // or the submit itself fails after the work was recorded. tools/mtlorder's allocfail case.
+    static int failOnce = -1, failSubmitOnce = -1;
     uint32_t n = 0;
     *pendingCb = VK_NULL_HANDLE;
     *owned = nil;
+    NSMutableData *taken = nil;   // dropped outside the lock: it may hold the last reference to a texture
     pthread_mutex_lock(&gSubmitLock);
-    if (vg_pending_any()) {
+    if (failOnce < 0) {
+        failOnce = vg_debug_flag("failpendingalloc") ? 1 : 0;
+        failSubmitOnce = vg_debug_flag("failpendingsubmit") ? 1 : 0;
+    }
+    size_t nops = 0;
+    vg_pending_op *ops = vg_pending_take(&nops);
+    VkCommandBuffer pcb = VK_NULL_HANDLE;
+    if (nops) {
         VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, pool,
                                           VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
-        VkCommandBuffer pcb = VK_NULL_HANDLE;
-        if (gVk.vkAllocateCommandBuffers(gVk.device, &ai, &pcb) == VK_SUCCESS) {
-            VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL,
-                                           VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
-            gVk.vkBeginCommandBuffer(pcb, &bi);
-            BOOL any = vg_pending_record(pcb, owned);
-            gVk.vkEndCommandBuffer(pcb);
-            if (any) {
-                all[n++] = pcb;
-                *pendingCb = pcb;
-            } else {   // a forgotten image took the last of it (vg_pending_forget)
-                gVk.vkFreeCommandBuffers(gVk.device, pool, 1, &pcb);
-            }
-        } else {
-            vglog("submit: no command buffer for the deferred work; it waits for the next submit");
+        VkResult ar = failOnce == 1 ? VK_ERROR_OUT_OF_HOST_MEMORY : gVk.vkAllocateCommandBuffers(gVk.device, &ai, &pcb);
+        failOnce = failOnce == 1 ? 0 : failOnce;
+        if (ar != VK_SUCCESS) {
+            // Without the deferred work the command buffers after it could read an image with no pixels yet (or not
+            // even initialized) and still complete: none of it is submitted, and the work waits for the next submit.
+            vg_pending_restore(ops, nops);
+            pthread_mutex_unlock(&gSubmitLock);
+            free(ops);
+            vglog("submit: no command buffer for %zu deferred operation(s) (%d): not submitted, the work kept", nops, ar);
+            return ar;
         }
+        VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL,
+                                       VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
+        gVk.vkBeginCommandBuffer(pcb, &bi);
+        vg_pending_record_ops(pcb, ops, nops, &taken);
+        gVk.vkEndCommandBuffer(pcb);
+        all[n++] = pcb;
     }
     memcpy(all + n, cbs, count * sizeof(*cbs));
     n += count;
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, n, all, 0, NULL};
-    pthread_mutex_lock(&gVk.lock);
-    VkResult r = gVk.vkQueueSubmit(gVk.queue, 1, &si, fence);
-    pthread_mutex_unlock(&gVk.lock);
-    pthread_mutex_unlock(&gSubmitLock);
-    if (r != VK_SUCCESS && *owned) {
-        vglog("submit: vkQueueSubmit %d lost %lu deferred staging buffer(s) of work", r,
-              (unsigned long)((*owned).length / sizeof(vg_buffer)));
+    VkResult r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    if (nops && failSubmitOnce == 1) {
+        failSubmitOnce = 0;
+    } else {
+        pthread_mutex_lock(&gVk.lock);
+        r = gVk.vkQueueSubmit(gVk.queue, 1, &si, fence);
+        pthread_mutex_unlock(&gVk.lock);
     }
+    if (r != VK_SUCCESS && nops) {
+        vg_pending_restore(ops, nops);   // for the next submit; nothing of it ran
+    }
+    pthread_mutex_unlock(&gSubmitLock);
+    free(ops);
+    if (r != VK_SUCCESS) {
+        if (nops) {
+            vglog("submit: vkQueueSubmit %d: %zu deferred operation(s) kept for the next submit", r, nops);
+            gVk.vkFreeCommandBuffers(gVk.device, pool, 1, &pcb);
+        }
+        taken = nil;   // the ops own their stagings and source textures again
+        return r;
+    }
+    *pendingCb = pcb;
+    *owned = taken;
     return r;
 }
 

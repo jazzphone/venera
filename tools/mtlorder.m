@@ -13,9 +13,15 @@
 //   parallel     threads encode and commit one queue's reserved command buffers at once, each also uploading a new
 //                texture through replaceRegion and copying it out: the last reservation's fill wins, every upload lands
 //   queues       the same uploads, each thread on its own queue: no submit overtakes another's deferred upload
+//   waits        waitUntilScheduled returns after the scheduled handlers have run, waitUntilCompleted after the
+//                completed ones, with and without a completion queue (-setCompletionQueue:, Core Animation's)
+// ./mtlorder allocfail   (VM: with /Library/GPUBundles/VirtioGPUMetal-failpendingalloc or -failpendingsubmit naming
+//                mtlorder) the first submit with deferred work fails: the command buffer that needed it reports an
+//                error, and the upload lands with the next one
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <stdatomic.h>
+#include <objc/message.h>
 
 static int gFailures;
 static const NSUInteger kLen = 4096;
@@ -105,7 +111,9 @@ static void encodeUpload(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLBuffe
               toBuffer:out destinationOffset:0 destinationBytesPerRow:w * 4 destinationBytesPerImage:w * h * 4];
     [e endEncoding];
 }
-static BOOL uploadLanded(id<MTLBuffer> out, uint32_t pattern) {
+static BOOL uploadLandedPattern(id<MTLBuffer> out, uint32_t pattern);
+static BOOL uploadLanded(id<MTLBuffer> out, uint32_t pattern) { return uploadLandedPattern(out, pattern); }
+static BOOL uploadLandedPattern(id<MTLBuffer> out, uint32_t pattern) {
     const uint32_t *p = out.contents;
     for (NSUInteger i = 0; i < 64 * 16; i++) {
         if (p[i] != (pattern ^ (uint32_t)i)) {
@@ -115,9 +123,83 @@ static BOOL uploadLanded(id<MTLBuffer> out, uint32_t pattern) {
     return YES;
 }
 
+// One wait: a handler that takes 100 ms has finished by the time the wait returns.
+static void waitCase(id<MTLCommandQueue> q, id<MTLBuffer> b, BOOL scheduled, const char *name) {
+    id<MTLCommandBuffer> cb = filler(q, b, 0x5a);
+    __block atomic_int ran = 0;
+    MTLCommandBufferHandler h = ^(id<MTLCommandBuffer> c) {
+        usleep(100000);
+        atomic_store(&ran, 1);
+    };
+    if (scheduled) {
+        [cb addScheduledHandler:h];
+    } else {
+        [cb addCompletedHandler:h];
+    }
+    dispatch_semaphore_t s = dispatch_semaphore_create(0);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        [cb commit];
+        if (scheduled) {
+            [cb waitUntilScheduled];
+        } else {
+            [cb waitUntilCompleted];
+        }
+        dispatch_semaphore_signal(s);
+    });
+    BOOL returned = waitFor(s, 5);
+    report(name, returned && atomic_load(&ran),
+           returned ? [NSString stringWithFormat:@"the %s handler %s when the wait returned", scheduled ? "scheduled" : "completed",
+                                                 atomic_load(&ran) ? "had run" : "HADN'T RUN"]
+                    : @"the wait never returned");
+}
+
+// allocfail: a new texture's upload is deferred; the first submit can't get a command buffer for it (the flag file).
+static int allocFail(id<MTLDevice> dev) {
+    id<MTLCommandQueue> q = [dev newCommandQueue];
+    const NSUInteger w = 64, h = 16;
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                  width:w height:h mipmapped:NO];
+    id<MTLTexture> t = [dev newTextureWithDescriptor:td];
+    uint32_t px[64 * 16];
+    for (NSUInteger i = 0; i < w * h; i++) {
+        px[i] = 0x5a000000u ^ (uint32_t)i;
+    }
+    [t replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:px bytesPerRow:w * 4];
+    id<MTLBuffer> out[2];
+    MTLCommandBufferStatus st[2];
+    for (int k = 0; k < 2; k++) {
+        out[k] = [dev newBufferWithLength:w * h * 4 options:MTLResourceStorageModeShared];
+        memset(out[k].contents, 0, out[k].length);
+        id<MTLCommandBuffer> cb = [q commandBuffer];
+        id<MTLBlitCommandEncoder> e = [cb blitCommandEncoder];
+        [e copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
+                  toBuffer:out[k] destinationOffset:0 destinationBytesPerRow:w * 4 destinationBytesPerImage:w * h * 4];
+        [e endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        st[k] = cb.status;
+    }
+    BOOL first = uploadLandedPattern(out[0], 0x5a000000u), second = uploadLandedPattern(out[1], 0x5a000000u);
+    BOOL ok = st[0] == MTLCommandBufferStatusError ? (st[1] == MTLCommandBufferStatusCompleted && second)
+                                                   : (st[0] == MTLCommandBufferStatusCompleted && first && second);
+    report("allocfail", ok,
+           [NSString stringWithFormat:@"first command buffer %s%s, second %s with the upload %s",
+                                      statusName(st[0]),
+                                      st[0] == MTLCommandBufferStatusError ? " (the failure injected)"
+                                                                           : (first ? " with the upload" : " WITHOUT the upload"),
+                                      statusName(st[1]), second ? "in" : "MISSING"]);
+    printf("%d failure(s)\n", gFailures);
+    return gFailures ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
     @autoreleasepool {
         setvbuf(stdout, NULL, _IOLBF, 0);
+        if (argc > 1 && !strcmp(argv[1], "allocfail")) {
+            id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+            printf("device: %s\n", dev.name.UTF8String);
+            return dev ? allocFail(dev) : 2;
+        }
         const int iterations = argc > 1 ? atoi(argv[1]) : 100;
         const int threads = argc > 2 ? atoi(argv[2]) : 8;
         if (iterations < 1 || threads < 2 || threads > 64) {
@@ -367,6 +449,33 @@ int main(int argc, char **argv) {
             report("queues", !lost && !timeouts,
                    [NSString stringWithFormat:@"%d threads x %d iterations: %d uploads missing, %d timeouts", threads,
                                               iterations, (int)lost, (int)timeouts]);
+        }
+        {   // waits: the handlers have run when the wait returns
+            id<MTLCommandQueue> qw = [dev newCommandQueue];
+            waitCase(qw, b, YES, "scheduled");
+            waitCase(qw, b, NO, "completed");
+            id<MTLCommandQueue> qc = [dev newCommandQueue];
+            SEL set = NSSelectorFromString(@"setCompletionQueue:");
+            if ([(NSObject *)qc respondsToSelector:set]) {
+                dispatch_queue_t serial = dispatch_queue_create("mtlorder.completion", DISPATCH_QUEUE_SERIAL);
+                ((void (*)(id, SEL, dispatch_queue_t))objc_msgSend)(qc, set, serial);
+                waitCase(qc, b, YES, "scheduledq");
+                waitCase(qc, b, NO, "completedq");
+                // From the completion queue itself (a handler of one command buffer waiting for another): no deadlock.
+                id<MTLCommandBuffer> A = filler(qc, b, 0x11), B = filler(qc, b, 0x22);
+                dispatch_semaphore_t done = dispatch_semaphore_create(0);
+                [A addCompletedHandler:^(id<MTLCommandBuffer> c) {
+                    [B waitUntilCompleted];
+                    dispatch_semaphore_signal(done);
+                }];
+                [A commit];
+                [B commit];
+                BOOL ok = waitFor(done, 3);
+                info("fromqueue", ok ? @"B waited for inside A's handler on the completion queue: returned"
+                                     : @"B waited for inside A's handler on the completion queue: still waiting after 3 s");
+            } else {
+                info("completionq", @"this queue has no -setCompletionQueue:");
+            }
         }
         printf("%d failure(s)\n", gFailures);
         return gFailures ? 1 : 0;

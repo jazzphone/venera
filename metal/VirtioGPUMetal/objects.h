@@ -181,6 +181,8 @@ BOOL vg_spirv_has_push_constants(NSData *spv);   // DescriptorSet 0 -> newSet (N
     uint64_t _ticket;             // its place on its queue, taken at enqueue (explicit, or at commit)
     BOOL _ticketed, _committed;
     dispatch_group_t _scheduledGroup;   // left once it is submitted (or failed), in its queue's order
+    dispatch_group_t _scheduledHandled;   // left once its scheduled handlers have run (waitUntilScheduled)
+    dispatch_group_t _completedHandled;   // left once its completed handlers have run (waitUntilCompleted)
     NSMutableData *_pendingOwned;
     NSMapTable *_streamWriteBacks;   // separate staging for surfaces handed over before write-back
     int _timePair;   // GPU timestamps (5c), -1 when off

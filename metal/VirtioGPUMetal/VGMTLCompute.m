@@ -871,7 +871,15 @@ id<MTLComputePipelineState> vg_new_compute_pipeline_sd(id<MTLDevice> device, id<
     }
     return self;
 }
-- (void)setCompletionQueue:(dispatch_queue_t)q { _userCompletion = q; }
+// The queue's handlers run on: marked, so a wait called from it (or from a queue that targets it) can tell (see
+// vg_waiting_on_handlers).
+static char kVGCompletionQueueKey;
+- (void)setCompletionQueue:(dispatch_queue_t)q {
+    _userCompletion = q;
+    if (q) {
+        dispatch_queue_set_specific(q, &kVGCompletionQueueKey, (__bridge void *)q, NULL);
+    }
+}
 - (uint64_t)vg_reserve {
     pthread_mutex_lock(&_order);
     uint64_t t = _nextTicket++;
@@ -1463,11 +1471,32 @@ static BOOL vg_surface_is_scanout(VGMTLTexture *t) {
         _statusSet = dispatch_group_create();
         _fenced = dispatch_group_create();
         _scheduledGroup = dispatch_group_create();
+        _scheduledHandled = dispatch_group_create();
+        _completedHandled = dispatch_group_create();
         _status = MTLCommandBufferStatusNotEnqueued;
         _surfacesWritten = [NSMutableSet set];
         _drawables = [NSMutableArray array];
     }
     return self;
+}
+
+// The command buffer whose handlers this thread is running (a handler that waits for its own command buffer).
+static __thread __unsafe_unretained VGMTLCommandBuffer *tlRunningHandlersOf;
+
+// waitUntilScheduled and waitUntilCompleted return once the handlers have run, as Metal's do. From where those
+// handlers run -- the queue's completion queue, which is serial (Core Animation's), or one of this command buffer's
+// own handlers -- they would wait for themselves; there they wait only for the status, as before.
+static BOOL vg_waiting_on_handlers(VGMTLCommandBuffer *cb) {
+    if (tlRunningHandlersOf == cb) {
+        return NO;
+    }
+    if ([(NSObject *)cb.commandQueue isKindOfClass:[VGMTLCommandQueue class]]) {
+        VGMTLCommandQueue *q = (VGMTLCommandQueue *)cb.commandQueue;
+        if (q->_userCompletion && dispatch_get_specific(&kVGCompletionQueueKey) == (__bridge void *)q->_userCompletion) {
+            return NO;
+        }
+    }
+    return YES;
 }
 
 // Released without a commit: its place on the queue goes (Apple's driver keeps it, and the queue waits for good), and
@@ -1926,17 +1955,25 @@ static void vg_surface_debug(VGMTLTexture *t) {
                                : nil;
     if (q && q->_userCompletion) {
         dispatch_async(q->_userCompletion, ^{
+            VGMTLCommandBuffer *outer = tlRunningHandlersOf;
+            tlRunningHandlersOf = self;
             for (MTLCommandBufferHandler h in handlers) {
                 h(self);
             }
+            tlRunningHandlersOf = outer;
             [self->_keep removeAllObjects];
+            dispatch_group_leave(self->_completedHandled);
         });
         return;
     }
+    VGMTLCommandBuffer *outer = tlRunningHandlersOf;
+    tlRunningHandlersOf = self;
     for (MTLCommandBufferHandler h in handlers) {
         h(self);
     }
+    tlRunningHandlersOf = outer;
     [_keep removeAllObjects];
+    dispatch_group_leave(_completedHandled);
 }
 
 - (void)commit {
@@ -1959,6 +1996,8 @@ static void vg_surface_debug(VGMTLTexture *t) {
     dispatch_group_enter(_done);
     dispatch_group_enter(_statusSet);
     dispatch_group_enter(_scheduledGroup);
+    dispatch_group_enter(_scheduledHandled);
+    dispatch_group_enter(_completedHandled);
     dispatch_group_enter(_fenced);
     _fencedEntered = YES;
     if (_ticketed) {   // its turn may not have come: an earlier place on the queue is still uncommitted
@@ -2192,10 +2231,16 @@ static void vg_surface_debug(VGMTLTexture *t) {
     if (scheduled.count) {
         dispatch_queue_t sq = q && q->_userCompletion ? q->_userCompletion : dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
         dispatch_async(sq, ^{
+            VGMTLCommandBuffer *outer = tlRunningHandlersOf;
+            tlRunningHandlersOf = self;
             for (MTLCommandBufferHandler h in scheduled) {
                 h(self);
             }
+            tlRunningHandlersOf = outer;
+            dispatch_group_leave(self->_scheduledHandled);
         });
+    } else {
+        dispatch_group_leave(_scheduledHandled);
     }
     // In order on the queue's serial queue when the caller named a completion queue; otherwise as before (a handler
     // that waits for a later command buffer of the same queue must not deadlock behind it).
@@ -2218,7 +2263,7 @@ static void vg_surface_debug(VGMTLTexture *t) {
 
 - (void)waitUntilScheduled {
     if (_committed) {
-        dispatch_group_wait(_scheduledGroup, DISPATCH_TIME_FOREVER);
+        dispatch_group_wait(vg_waiting_on_handlers(self) ? _scheduledHandled : _scheduledGroup, DISPATCH_TIME_FOREVER);
     }
 }
 // Core Animation in WindowServer commits this way (5b: lenient mode swallowed it, and its frames were never submitted).
@@ -2335,7 +2380,7 @@ static void vg_present_throttle(VGMTLCommandBuffer *cb) {
 - (void)waitUntilCompleted {
     if (_status >= MTLCommandBufferStatusCommitted) {
         uint64_t t0 = vg_now();
-        dispatch_group_wait(_done, DISPATCH_TIME_FOREVER);
+        dispatch_group_wait(vg_waiting_on_handlers(self) ? _completedHandled : _done, DISPATCH_TIME_FOREVER);
         vg_perf(VG_PERF_WAIT_COMPLETED, 0, vg_now() - t0);
     }
 }

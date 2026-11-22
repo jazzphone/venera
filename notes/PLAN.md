@@ -3054,3 +3054,40 @@ reproduce on 0.1.18 (82c2fba3e688) on VM 108, and the candidate (5ad49ece8556, w
 - The host-side display path (D-Bus + VA-API, branch claude/inspiring-dijkstra-b7eda1, 0d61dab) is held, and its
   follow-ups with it: it needs a patched pve-qemu and gives up Proxmox's web console, and Venera runs on stock
   Proxmox.
+
+### After 0.1.19: Codex's two follow-ups and the same gap in waitUntilCompleted (2026-11-22, evening)
+
+- **Deferred work when its command buffer can't be had** (Codex, static; also 0.1.18). `vg_submit` logged the failed
+  allocation and submitted the command buffers anyway: they could read an image with no pixels (or still UNDEFINED)
+  and complete. Now nothing is submitted, the caller's command buffer fails (Error), and the work goes back on the
+  list. A failed `vkQueueSubmit` puts back the work it had taken too (it was lost before): the ops own their
+  stagings and source textures again, and `vg_pending_forget` takes the submit lock so an image can't be forgotten
+  between taking and putting back. Flags `VirtioGPUMetal-failpendingalloc` and `-failpendingsubmit` (process names)
+  fail the first such submit; `mtlorder allocfail` with either: first command buffer Error, second Completed with
+  the upload in (both on 108); without a flag both Completed (0.1.19 and the M5 Max).
+- **waitUntilScheduled / waitUntilCompleted return before the handlers** (Codex for the first; the second the same
+  gap). Apple: both return after the handlers ran (scheduled handlers; completed handlers). 0.1.19 left
+  waitUntilScheduled at the submit and waitUntilCompleted at the status when a completion queue is set (Core
+  Animation's): `mtlorder` scheduled, scheduledq and completedq failed on 0.1.19 (completed passed: without a
+  completion queue the handlers already ran first). Now each has its own point after the handlers
+  (`_scheduledHandled`, `_completedHandled`); commitAndWaitUntilSubmitted keeps the submit point. Called from the
+  queue's completion queue (marked with dispatch_queue_set_specific) or from the command buffer's own handler, they
+  wait for the status as before: there the handlers would wait for the caller (the M5 Max deadlocks there,
+  `fromqueue` INFO). All four wait cases pass on the M5 Max and on 108.
+- On 108 (candidate 7ee6528783ff): mtlorder 0 failures; mtlprobe, mtlrender, mtlcompute, mtlsurface, mtlregroup,
+  mtllifetime 200, mtllockwait (1x and 2880x1800), mtlatlas, mtlsource, mtlptr, citest 7/7 pass. WindowServer ran it
+  after a reboot: 12 Cmd-Shift-3 screenshots whole (6 of the lock screen, 6 of the desktop), no crash reports.
+  WindowServer barely uses the changed waits: in 6 minutes of gestures `waitUntilCompleted: blocked` appeared once,
+  waitUntilScheduled never.
+- **Frame pacing not measured cleanly this round.** Three things in the way, now known:
+  - Every reboot of 108 today came up at the lock screen (loginwindow's lock from its cookie file, display-sleep
+    requested, at 17:26, 17:37, 17:57 and 18:12). The post-reboot samples of the 0.1.19 comparison above (both
+    builds) ran behind the lock screen; the first 0.1.18 samples (a 10-hour session) didn't.
+  - gesture-bench writes the `snap` flag into /Library/GPUBundles before each measurement, and venera-watch's
+    launchd job watches that folder: each measurement starts a translation-pool scan at ~96% of a core in the guest.
+  - From 18:28 four Plex transcodes on the host (QSV) used about half the iGPU's render engine (~100 s each in
+    12 minutes). Unlocked candidate runs then: 1x 18-19 ms mean frame gaps, Retina 22-47 ms, worse with the watcher
+    paused (so the host, not the watcher). Rerun when the host is idle, with the watcher paused (or the bench's
+    flag moved out of /Library/GPUBundles) and the desktop unlocked.
+- 108 left on the candidate (dev link; WindowServer on it until the next boot), 1280x800 1x, watcher running, the
+  `snap` and `fail*` flags removed.
