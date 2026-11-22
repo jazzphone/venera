@@ -2752,4 +2752,11 @@ corner to corner 8 times in one press (`qmpinput.py sweep`, 0.4 s each way) and 
   10-bit HEVC file: one stream 167 fps; two at once 82 + 60 (143 together); three 60 + 52 + 38 (150 together). The
   host GPU is what they share; the daemon's synchronous copy adds no visible queueing, and the slowest of three
   streams still decodes above 30 fps. Shares are uneven. Left as it is.
-- **The DisplayStream twin**: waits for the owner's viewer (`streamsum` + `twindrop`, round 23 night).
+- **The DisplayStream twin, with the owner's viewer on VM 109 (0.1.15, `streamsum` on):** at Retina (2880x1800), a
+  fast window drag left trails in Screen Sharing both with the stream's twin dropped (`twindrop DisplayStream`, live)
+  and with it back. Neither time did the agent log a `streamsum` mismatch: every stamped read matched what
+  WindowServer's write-back copied (twin off, the reader's lock waited 3-6 ms for pending writes; twin on, 0 ms). So
+  the twin decides only speed (the owner: "more responsive" with it on, as 0.1.15 ships) and the earlier "trails only
+  without the twin" was chance. At 1x 1440x900, the owner's everyday mode, no trails ("super smooth"). Open: Retina
+  trails come after the read (what SkyLight draws into the stream, or the agent's encoding and the viewer); the
+  unattended probe's client picture and the stream's last frame never showed them. No change to the default.
