@@ -964,10 +964,9 @@ static void vg_fc_check(NSString *ll, const char *stage, NSDictionary<NSNumber *
 }
 
 // the shaderdump flag file: functions named in it (one a line) saved as translated, to
-// /var/tmp/VirtioGPUMetal-shaderdump/NAME-STAGE-HASH.ll (HASH: of the function constants, a file set per
-// specialization; a sandboxed process, which can't write there, uses VirtioGPUMetal-shaderdump/ in its translation cache
-// or temporary directory), .fc (each function constant: index, then its bytes in hex) and .spv. With
-// VGMTL_NODISKCACHE=1 a process translates (and dumps) what its cache would have answered.
+// /var/tmp/VirtioGPUMetal-shaderdump/NAME-STAGE.ll, .fc (each function constant: index, then its bytes in hex) and
+// .spv (a process that can write there). With VGMTL_NODISKCACHE=1 a process translates (and dumps) what its cache
+// would have answered.
 static void vg_shaderdump(NSString *ll, const char *stage, NSDictionary<NSNumber *, NSData *> *fc, NSData *spv) {
     NSString *list = [NSString stringWithContentsOfFile:@"/Library/GPUBundles/VirtioGPUMetal-shaderdump"
                                                encoding:NSUTF8StringEncoding error:NULL];
@@ -979,23 +978,8 @@ static void vg_shaderdump(NSString *ll, const char *stage, NSDictionary<NSNumber
     }
     if (fname) {
         NSString *dir = @"/private/var/tmp/VirtioGPUMetal-shaderdump";
-        // a sandboxed process (iconservicesagent) can't write there: its own cache directory instead
-        if (![[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil
-                                                             error:nil] ||
-            access(dir.UTF8String, W_OK) != 0) {
-            dir = [(vg_disk_dir() ?: NSTemporaryDirectory()) stringByAppendingPathComponent:@"VirtioGPUMetal-shaderdump"];
-            [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil
-                                                            error:nil];
-        }
-        uint32_t fh = 2166136261u;   // each specialization its own files: an FNV-1a of the constants
-        for (NSNumber *k in [fc.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
-            NSData *v = fc[k];
-            fh = (fh ^ k.unsignedIntValue) * 16777619u;
-            for (NSUInteger i = 0; i < v.length; i++) {
-                fh = (fh ^ ((const uint8_t *)v.bytes)[i]) * 16777619u;
-            }
-        }
-        NSString *base = [NSString stringWithFormat:@"%@/%@-%s-%08x", dir, fname, stage, fh];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        NSString *base = [NSString stringWithFormat:@"%@/%@-%s", dir, fname, stage];
         [ll writeToFile:[base stringByAppendingString:@".ll"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
         NSMutableString *f = [NSMutableString string];
         for (NSNumber *k in [fc.allKeys sortedArrayUsingSelector:@selector(compare:)]) {

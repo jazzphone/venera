@@ -2856,17 +2856,17 @@ corner to corner 8 times in one press (`qmpinput.py sweep`, 0.4 s each way) and 
   Whether anything makes SkyLight take the 1x path at Retina (the stream's size, what the display reports) is
   untried. A viewer-side workaround (the agent asking for point-size frames) would be Apple's or the owner's choice,
   not Venera's. Nothing found in Venera to fix.
-- **Debugging aids** (off unless their flag file is there): `VirtioGPUMetal-drawdiff` (line 1 a piece of a surface
-  name, line 2 rows `y0 y1`, line 3 how many passes, line 4 `draws` for a copy after every draw rather than around
-  each pass, or `dropfinal` to test the one-snapshot clean-up: each pass's or draw's changed pixels, with its draws'
-  scissors; a pass left with one copy keeps its staging out of the pool until the command buffer completes, since
-  the recorded copy still writes it), synclog's `enqueue`, `commit` and `stamped` lines, and the probe's
-  `VG_SP_EVERY=2` (each bad frame saved as `-fN-client/frame/prev/next.png`, `VG_SP_SAVE`, default 8) and
-  `VG_SP_TRACE=1`. `dropfinal` exercised in WindowServer on VM 108 at Retina: 20 one-copy passes, each returned at
-  completion, no crash. The r24 run's logs, trace, pictures and `chain.py` (probe frame -> stamp -> write-back ->
-  resample commit -> composite -> drawdiff passes) are kept outside the repository with the session notes; the
-  r23-dd4 logs were not kept beyond those numbers. VM 108 is back on the 0.1.16 system-volume driver at 1x 1280x800,
-  `perf` its only flag.
+- **Debugging aids** (removed from the driver for 0.1.17, in the history at cc63346; off unless their flag file is
+  there): `VirtioGPUMetal-drawdiff` (line 1 a piece of a surface name, line 2 rows `y0 y1`, line 3 how many passes, line
+  4 `draws` for a copy after every draw rather than around each pass, or `dropfinal` to test the one-snapshot clean-up:
+  each pass's or draw's changed pixels, with its draws' scissors; a pass left with one copy keeps its staging out of the
+  pool until the command buffer completes, since the recorded copy still writes it), synclog's `enqueue`, `commit` and
+  `stamped` lines, and the probe's `VG_SP_EVERY=2` (each bad frame saved as `-fN-client/frame/prev/next.png`,
+  `VG_SP_SAVE`, default 8) and `VG_SP_TRACE=1`. `dropfinal` exercised in WindowServer on VM 108 at Retina: 20 one-copy
+  passes, each returned at completion, no crash. The r24 run's logs, trace, pictures and `chain.py` (probe frame ->
+  stamp -> write-back -> resample commit -> composite -> drawdiff passes) are kept outside the repository with the
+  session notes; the r23-dd4 logs were not kept beyond those numbers. VM 108 is back on the 0.1.16 system-volume driver
+  at 1x 1280x800, `perf` its only flag.
 
 ### A Retina performance pass on the shipped driver (0.1.16, 2026-11-22)
 
@@ -2924,6 +2924,7 @@ matrices, the tint multipliers and the translated filter shaders were all right 
   SPIR-V, and with such an attachment bound uses a variant whose output there stores (r, a, b, a)
   (`vg_spirv_alpha_to_green`), with green written when alpha is. A clear's green is its alpha.
 - Checked on 108: Blue, Graphite, Green, Pink and Red all tint as on a Mac, Maps and Contacts included.
-- Debugging aids kept: the shader dump writes a file set per specialization (a hash of the function constants) and,
-  sandboxed, into the process's own cache or temporary directory; the pass log names a pipeline's constant 0 and each
-  texture's pixel format and swizzle.
+- For 0.1.17 the driver's debugging added since 0.1.16 came out again (owner's call): `drawdiff`, synclog's `enqueue`,
+  `commit` and `stamped` lines, the streamsum stamp's generation, and this fix's dump and pass-log aids (a shader dump
+  per specialization, sandboxed processes' dumps, constant 0 and each texture's format in the pass log). They are in
+  the history at 230865a for the next investigation; tools/streamprobe.m stays (a tool, not shipped).

@@ -1522,14 +1522,9 @@ static BOOL vg_surface_is_scanout(VGMTLTexture *t) {
         block(self);   // already scheduled: still not on the caller's thread
     });
 }
-static _Atomic uint64_t gOrderSeq;   // enqueue order, for synclog (the Retina stream trails, 2026-11-22)
 - (void)enqueue {
     if (_status == MTLCommandBufferStatusNotEnqueued) {
         _status = MTLCommandBufferStatusEnqueued;
-        _enqSeq = ++gOrderSeq;
-        if (vg_synclog()) {
-            vglog("synclog enqueue: cb %p queue %p seq %llu", self, self.commandQueue, (unsigned long long)_enqSeq);
-        }
     }
 }
 - (MTLCommandBufferStatus)status { return _status; }
@@ -1786,13 +1781,7 @@ static void vg_surface_debug(VGMTLTexture *t) {
             os_unfair_lock_unlock(&gVgSurfaceSync);
             vg_surface_wrote_back(t, seed);   // and none for a process sharing this image (5d)
             if (unlocked == KERN_SUCCESS) {
-                // the flag file streamsum: for the reader's check (VGMTLLockWait.m); synclog ties the stamp's
-                // generation to this command buffer, so a reader's frame can be traced to its submission
-                const uint32_t gen = vg_streamsum_stamp(t, seed);
-                if (gen && vg_synclog()) {
-                    vglog("synclog stamped: cb %p surface %u seed %u gen %u", self, IOSurfaceGetID(t->_surface), seed,
-                          gen);
-                }
+                vg_streamsum_stamp(t, seed);   // the flag file streamsum: for the reader's check (VGMTLLockWait.m)
             }
             vg_surface_debug(t);
         }
@@ -1848,17 +1837,7 @@ static void vg_surface_debug(VGMTLTexture *t) {
         vg_events_wait(_waits);
         _waits = nil;
     }
-    const BOOL wasEnqueued = _status == MTLCommandBufferStatusEnqueued;
     [self enqueue];
-    if (vg_synclog()) {   // commit order against enqueue order, and the surfaces it writes
-        NSMutableString *ids = [NSMutableString string];
-        for (VGMTLTexture *t in _surfacesWritten) {
-            [ids appendFormat:@" %u", IOSurfaceGetID(t->_surface)];
-        }
-        vglog("synclog commit: cb %p '%s' queue %p seq %llu (%s) now %llu%s writes%s", self, self.label.UTF8String ?: "",
-              self.commandQueue, (unsigned long long)_enqSeq, wasEnqueued ? "enqueued before" : "at commit",
-              (unsigned long long)gOrderSeq, _present ? " present" : "", ids.UTF8String);
-    }
     _status = MTLCommandBufferStatusCommitted;
     dispatch_group_enter(_done);
     dispatch_group_enter(_statusSet);

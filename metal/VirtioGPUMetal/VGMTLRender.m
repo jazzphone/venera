@@ -499,16 +499,6 @@ id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRende
         p = [VGMTLRenderPipelineState new];
         p->_dev = device;
         p->_name = [NSString stringWithFormat:@"%@+%@", d.vertexFunction.name, d.fragmentFunction.name ?: @"-"];
-        if (vg_passlog()) {   // debugging: the fragment function's constant 0, as words, in its name
-            NSData *c0 = [(id)d.fragmentFunction respondsToSelector:@selector(vgFC)] ? [(id)d.fragmentFunction vgFC][@0] : nil;
-            if (c0.length >= 4 && !(c0.length % 4)) {
-                NSMutableString *w = [NSMutableString stringWithString:@"@"];
-                for (NSUInteger k = 0; k < c0.length / 4; k++) {
-                    [w appendFormat:@"%s%x", k ? "." : "", ((const uint32_t *)c0.bytes)[k]];
-                }
-                p->_name = [p->_name stringByAppendingString:w];
-            }
-        }
         uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         p->_samples = MAX(d.rasterSampleCount, 1);
         p->_alphaToCoverage = d.alphaToCoverageEnabled;
@@ -758,14 +748,6 @@ id<MTLRenderPipelineState> vg_new_render_pipeline(id<MTLDevice> device, MTLRende
     uint32_t _dbgDraws, _dbgRefused, _dbgSplits;
     NSMutableArray *_dbgUniforms;   // (name, stage, VkBuffer, offset) of each draw's buffer 0, copied out at endEncoding
     NSMutableString *_dbgSeq;
-    // DRAWDIFF (debugging): a band of color attachment 0 copied before the first draw and after each, compared at
-    // completion: what each draw changed
-    VGMTLTexture *_ddTex;
-    int32_t _ddY0, _ddY1;
-    NSMutableArray *_ddBufs;   // NSValue(vg_buffer *)
-    NSMutableArray *_ddInfo;   // a description of each draw
-    BOOL _ddEach;              // after each draw (else only before the first and at the end)
-    NSMutableString *_ddSeq;   // the pass's draws, in each-pass mode
     // Tessellation (5d): the buffer object behind each vertex slot (nil for setVertexBytes, whose memory is the command
     // buffer's arena), for its device address; the factor buffer and scale; a patch draw in progress (prepareDraw).
     __unsafe_unretained VGMTLBuffer *_vobj[kVGMaxBufferSlots];
@@ -1010,204 +992,6 @@ static BOOL vg_passlog(void) {
     }
     return on;
 }
-// DRAWDIFF: the flag file VirtioGPUMetal-drawdiff, rechecked every 2 s: line 1 a piece of a surface name, line 2 the
-// band's rows "y0 y1", line 3 how many passes to look at while it is on (default 60), line 4 "draws" (a copy after
-// every draw, not only around the pass) or "dropfinal" (no copy at the pass's end: tests the one-snapshot clean-up).
-static NSString *gDDName;
-static int32_t gDDY0, gDDY1;
-static int gDDLeft, gDDDraws, gDDDropFinal;
-static void vg_dd_reload(void) {
-    static uint64_t checked;
-    uint64_t now = vg_now();
-    if (checked && now - checked < 2000000000ull) {
-        return;
-    }
-    checked = now;
-    NSString *s = [NSString stringWithContentsOfFile:@"/Library/GPUBundles/VirtioGPUMetal-drawdiff"
-                                            encoding:NSUTF8StringEncoding error:NULL];
-    NSArray<NSString *> *l = [s componentsSeparatedByString:@"\n"];
-    NSString *name = l.count > 0 && l[0].length ? l[0] : nil;
-    @synchronized([VGRenderEncoder class]) {
-        if (!name) {
-            gDDName = nil;
-            return;
-        }
-        if (![name isEqualToString:gDDName ?: @""]) {
-            gDDName = name;
-            gDDY0 = 0, gDDY1 = INT32_MAX;
-            if (l.count > 1) {
-                sscanf(l[1].UTF8String, "%d %d", &gDDY0, &gDDY1);
-            }
-            gDDLeft = l.count > 2 && l[2].intValue > 0 ? l[2].intValue : 60;
-            gDDDraws = l.count > 3 && [l[3] hasPrefix:@"draws"];
-            gDDDropFinal = l.count > 3 && [l[3] hasPrefix:@"dropfinal"];   // tests the one-snapshot clean-up
-            vglog("drawdiff: '%s' rows %d-%d, %d passes, %s", name.UTF8String, gDDY0, gDDY1, gDDLeft,
-                  gDDDraws ? "each draw" : "each pass");
-        }
-    }
-}
-- (void)ddBegin {
-    vg_dd_reload();
-    VGMTLTexture *t = _colorTex[0];
-    while (t && t->_parent) {
-        t = t->_parent;
-    }
-    if (!t || !t->_surface || t->_pixelFormat != MTLPixelFormatBGRA8Unorm) {
-        return;
-    }
-    @synchronized([VGRenderEncoder class]) {
-        if (!gDDName || gDDLeft <= 0) {
-            return;
-        }
-        CFTypeRef nm = IOSurfaceCopyValue(t->_surface, kIOSurfaceName);
-        BOOL match = nm && CFGetTypeID(nm) == CFStringGetTypeID() && [(__bridge NSString *)nm containsString:gDDName];
-        if (nm) {
-            CFRelease(nm);
-        }
-        if (!match) {
-            return;
-        }
-        gDDLeft--;
-        _ddY0 = MAX(gDDY0, 0), _ddY1 = MIN(gDDY1, (int32_t)t->_height);
-    }
-    if (_ddY1 <= _ddY0) {
-        return;
-    }
-    _ddTex = _colorTex[0];
-    _ddEach = gDDDraws;
-    _ddBufs = [NSMutableArray array];
-    _ddInfo = [NSMutableArray array];
-}
-// the band as it is now (rendering ended and resumed around the copy)
-- (void)ddSnap:(NSString *)what {
-    if (!_ddTex || !_open || _ddBufs.count >= 200) {
-        return;
-    }
-    VGMTLTexture *t = _ddTex;
-    vg_buffer *b = calloc(1, sizeof(*b));
-    if (vg_staging_get((VkDeviceSize)t->_width * (_ddY1 - _ddY0) * 4, b)) {
-        free(b);
-        return;
-    }
-    VkCommandBuffer cb = _owner->_cb;
-    gVk.vkCmdEndRendering(cb);
-    [_owner barrier];
-    VkImageMemoryBarrier ib = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT,
-                               VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
-                               VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT, VK_IMAGE_LAYOUT_GENERAL,
-                               VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, t->_image,
-                               {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}};
-    if (_feedback[0]) {   // a fetch split left it in the feedback loop layout: GENERAL around the copy
-        gVk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL,
-                                 0, NULL, 1, &ib);
-    }
-    VkBufferImageCopy c = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, _ddY0, 0},
-                           {(uint32_t)t->_width, (uint32_t)(_ddY1 - _ddY0), 1}};
-    gVk.vkCmdCopyImageToBuffer(cb, t->_image, VK_IMAGE_LAYOUT_GENERAL, b->buffer, 1, &c);
-    [_owner barrier];
-    if (_feedback[0]) {
-        ib.oldLayout = VK_IMAGE_LAYOUT_GENERAL, ib.newLayout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
-        gVk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL,
-                                 0, NULL, 1, &ib);
-    }
-    VkRenderingAttachmentInfo color[kVGMaxColor];
-    for (uint32_t i = 0; i < _ncolor; i++) {
-        color[i] = _colorInfo[i];
-        if (color[i].imageView) {
-            color[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        }
-    }
-    VkRenderingAttachmentInfo depth = _depthInfo, stencil = _stencilInfo;
-    depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-    stencil.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-    VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, _area, 1, 0, _ncolor, color, _depthTex ? &depth : NULL,
-                          _stencilTex ? &stencil : NULL};
-    gVk.vkCmdBeginRendering(cb, &ri);
-    [_ddBufs addObject:[NSValue valueWithPointer:b]];
-    [_ddInfo addObject:what];
-}
-- (void)ddDraw:(NSString *)what {
-    if (!_ddTex) {
-        return;
-    }
-    if (!_ddEach) {
-        if (!_ddSeq) {
-            _ddSeq = [NSMutableString string];
-        }
-        [_ddSeq appendFormat:@" %@ <%d,%d %ux%u>;", what, _scissor.offset.x, _scissor.offset.y, _scissor.extent.width,
-                             _scissor.extent.height];
-        return;
-    }
-    [self ddSnap:[NSString stringWithFormat:@"%@ %@ scissor <%d,%d %ux%u> viewport <%.1f,%.1f %.1fx%.1f>%s", _pso->_name ?: @"?",
-                                            what, _scissor.offset.x, _scissor.offset.y, _scissor.extent.width,
-                                            _scissor.extent.height, _viewport.x, _viewport.y, _viewport.width,
-                                            _viewport.height, _ds ? " ds" : ""]];
-}
-- (void)ddEnd {
-    if (_ddTex && !_ddEach && _ddBufs.count == 1 && !gDDDropFinal) {
-        [self ddSnap:[NSString stringWithFormat:@"pass of%@", _ddSeq ?: @""]];
-    }
-    _ddSeq = nil;
-    if (!_ddTex || _ddBufs.count < 2) {
-        // Nothing to compare (the final copy's staging couldn't be had, or dropfinal), but a copy into the first one
-        // is recorded in the command buffer: it goes back to the pool only once the command buffer is done, or the
-        // next taker's contents would be overwritten by it. (A command buffer never committed keeps it.)
-        NSArray *bufs = _ddBufs;
-        _ddBufs = nil, _ddTex = nil;
-        if (bufs.count) {
-            static _Atomic int lone;
-            const int k = ++lone;
-            [_owner addCompletedHandler:^(id<MTLCommandBuffer> cbuf) {
-              for (NSValue *v in bufs) {
-                  vg_staging_put(v.pointerValue);
-                  free(v.pointerValue);
-              }
-              if (k <= 20) {
-                  vglog("drawdiff: a pass with %lu snapshot, its staging back to the pool at completion (%d)",
-                        (unsigned long)bufs.count, k);
-              }
-            }];
-        }
-        return;
-    }
-    NSArray *bufs = _ddBufs, *info = _ddInfo;
-    const size_t w = _ddTex->_width, h = (size_t)(_ddY1 - _ddY0);
-    const int32_t y0 = _ddY0;
-    const uint32_t sid = IOSurfaceGetID(_ddTex->_surface);
-    static _Atomic int passes;
-    const int pass = ++passes;
-    VGMTLCommandBuffer *owner = _owner;
-    [_owner addCompletedHandler:^(id<MTLCommandBuffer> cbuf) {
-      vglog("drawdiff pass %d: cb %p surface %u, %lu draws, rows %d-%zu", pass, owner, sid, (unsigned long)bufs.count - 1,
-            y0, y0 + h);
-      for (NSUInteger k = 1; k < bufs.count; k++) {
-          const uint32_t *a = ((vg_buffer *)[bufs[k - 1] pointerValue])->map, *b = ((vg_buffer *)[bufs[k] pointerValue])->map;
-          size_t x0 = w, yy0 = h, x1 = 0, yy1 = 0, n = 0;
-          for (size_t y = 0; y < h; y++) {
-              if (!memcmp(a + y * w, b + y * w, w * 4)) {
-                  continue;
-              }
-              for (size_t x = 0; x < w; x++) {
-                  if (a[y * w + x] != b[y * w + x]) {
-                      n++;
-                      x0 = MIN(x0, x), x1 = MAX(x1, x + 1), yy0 = MIN(yy0, y), yy1 = MAX(yy1, y + 1);
-                  }
-              }
-          }
-          if (n) {
-              vglog("drawdiff pass %d draw %lu: changed %zu px in %zu,%zu-%zu,%zu: %s", pass, (unsigned long)k, n, x0,
-                    yy0 + y0, x1, yy1 + y0, [info[k] UTF8String]);
-          } else {
-              vglog("drawdiff pass %d draw %lu: nothing changed: %s", pass, (unsigned long)k, [info[k] UTF8String]);
-          }
-      }
-      for (NSValue *v in bufs) {
-          vg_staging_put(v.pointerValue);
-          free(v.pointerValue);
-      }
-    }];
-    _ddBufs = nil, _ddTex = nil;
-}
 - (BOOL)prepareDraw:(MTLPrimitiveType)type {
     {
         int32_t x0 = MAX(_scissor.offset.x, 0), y0 = MAX(_scissor.offset.y, 0);
@@ -1252,10 +1036,8 @@ static void vg_dd_reload(void) {
             uint32_t b = _pso->_fb[k].binding;
             if (_pso->_fb[k].type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE && b >= 32 && b < 160) {
                 VGMTLTexture *tx = _ft.tex[b - 32];
-                MTLTextureSwizzleChannels sw = tx ? [(id<MTLTexture>)tx swizzle] : (MTLTextureSwizzleChannels){0, 0, 0, 0};
-                [_dbgSeq appendFormat:@"[t%u=%p %lux%lu pf%lu sw%u%u%u%u%@]", b - 32, tx, tx ? (unsigned long)tx->_width : 0,
-                                      tx ? (unsigned long)tx->_height : 0, tx ? (unsigned long)tx->_pixelFormat : 0,
-                                      sw.red, sw.green, sw.blue, sw.alpha, tx && tx->_surface ? @" surf" : @""];
+                [_dbgSeq appendFormat:@"[t%u=%p %lux%lu]", b - 32, tx, tx ? (unsigned long)tx->_width : 0,
+                                      tx ? (unsigned long)tx->_height : 0];
             }
         }
         BOOL ok = [self prepareDrawInner:type];
@@ -1813,15 +1595,7 @@ static VGMTLTexture *vg_fetch_blank(id<MTLDevice> dev, uint32_t width, uint32_t 
                               (unsigned long)instances, (unsigned long)base];
     }
     if (count && instances && [self prepareDraw:type]) {
-        if (_ddTex && !_ddBufs.count) {
-            [self ddSnap:@"(before)"];
-            [self prepareDraw:type];   // the resumed rendering needs its state again
-        }
         gVk.vkCmdDraw(_owner->_cb, (uint32_t)count, (uint32_t)instances, (uint32_t)start, (uint32_t)base);
-        if (_ddTex) {
-            [self ddDraw:[NSString stringWithFormat:@"draw t%lu s%lu n%lu i%lu", (unsigned long)type,
-                                                    (unsigned long)start, (unsigned long)count, (unsigned long)instances]];
-        }
     }
 }
 - (void)drawPrimitives:(MTLPrimitiveType)type vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count
@@ -1853,17 +1627,7 @@ static VGMTLTexture *vg_fetch_blank(id<MTLDevice> dev, uint32_t width, uint32_t 
         [_owner->_keep addObject:ib];
         gVk.vkCmdBindIndexBuffer(_owner->_cb, b, off,
                                  itype == MTLIndexTypeUInt16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
-        if (_ddTex && !_ddBufs.count) {
-            [self ddSnap:@"(before)"];
-            [self prepareDraw:type];
-            gVk.vkCmdBindIndexBuffer(_owner->_cb, b, off,
-                                     itype == MTLIndexTypeUInt16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
-        }
         gVk.vkCmdDrawIndexed(_owner->_cb, (uint32_t)count, (uint32_t)instances, 0, (int32_t)baseVertex, (uint32_t)base);
-        if (_ddTex) {
-            [self ddDraw:[NSString stringWithFormat:@"idx n%lu i%lu bv%ld", (unsigned long)count,
-                                                    (unsigned long)instances, (long)baseVertex]];
-        }
     }
 }
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)type indexCount:(NSUInteger)count indexType:(MTLIndexType)itype
@@ -2244,9 +2008,6 @@ static int vg_dbg_next_read(void) { return gDbgReads + 1; }
     }
 }
 - (void)endEncoding {
-    if (_open) {
-        [self ddEnd];
-    }
     if (_open && _drawn[2] > _drawn[0]) {
         for (uint32_t i = 0; i < _ncolor; i++) {
             if (_colorTex[i] && _colorInfo[i].storeOp != VK_ATTACHMENT_STORE_OP_DONT_CARE) {
@@ -2498,7 +2259,6 @@ static VkAttachmentStoreOp vg_store(MTLStoreAction a) {
                           st ? &stencil : NULL};
     gVk.vkCmdBeginRendering(_cb, &ri);
     e->_open = YES;
-    [e ddBegin];
     return e;
 }
 @end
