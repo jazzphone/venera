@@ -2928,3 +2928,13 @@ matrices, the tint multipliers and the translated filter shaders were all right 
   `commit` and `stamped` lines, the streamsum stamp's generation, and this fix's dump and pass-log aids (a shader dump
   per specialization, sandboxed processes' dumps, constant 0 and each texture's format in the pass log). They are in
   the history at 230865a for the next investigation; tools/streamprobe.m stays (a tool, not shipped).
+
+### 0.1.17 (2026-11-22)
+
+- Released as v0.1.17 (045feef, Latest), the owner's OK: tinted icons (luminance-alpha IOSurfaces), with the driver's
+  debugging added since 0.1.16 taken out again first (a97c763). The owner's kits on both nodes are 0.1.17 (private
+  build with the seed), kit-0.1.16 kept beside, kit-0.1.15 removed.
+- VMs 109, 108 and 107 upgraded from the kits, no viewers connected. Checked after: saved display modes kept (109
+  1440x900 1x, 108 and 107 1280x800 1x); WindowServer on the 0.1.17 Metal bundle (51262e00bc3e, as built); 107's
+  HelperPod running. 108 had its dev bundle link, debug flags and tint settings undone first (back to Dark, no icon
+  tint); its snapshot pre-0-1-17 was taken before and deleted after.
