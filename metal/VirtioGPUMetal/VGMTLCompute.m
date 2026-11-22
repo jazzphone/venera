@@ -1694,7 +1694,13 @@ static void vg_surface_debug(VGMTLTexture *t) {
             os_unfair_lock_unlock(&gVgSurfaceSync);
             vg_surface_wrote_back(t, seed);   // and none for a process sharing this image (5d)
             if (unlocked == KERN_SUCCESS) {
-                vg_streamsum_stamp(t, seed);   // the flag file streamsum: for the reader's check (VGMTLLockWait.m)
+                // the flag file streamsum: for the reader's check (VGMTLLockWait.m); synclog ties the stamp's
+                // generation to this command buffer, so a reader's frame can be traced to its submission
+                const uint32_t gen = vg_streamsum_stamp(t, seed);
+                if (gen && vg_synclog()) {
+                    vglog("synclog stamped: cb %p surface %u seed %u gen %u", self, IOSurfaceGetID(t->_surface), seed,
+                          gen);
+                }
             }
             vg_surface_debug(t);
         }

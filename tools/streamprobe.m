@@ -31,10 +31,12 @@
 //                   rectangles ("stale": that surface missed an update), or one that changed where no dirty rectangle
 //                   since said so ("undamaged": the damage left it out); per frame with a big difference, and totals;
 //                   and whether the pixels a frame got wrong outside its dirty rectangles are already the next frame's
-//                   ("ahead": the frame held what the next frame's damage reports); the worst frame's pictures come
-//                   with the frames before and after it (OUT-big-prev.png, OUT-big-next.png)
+//                   ("ahead": the frame held what the next frame's damage reports); each bad frame (more than 32 off,
+//                   VG_SP_SAVE of them, default 8) saved as OUT-fN-client/frame/prev/next.png
 //   VG_SP_TRACE     1: every frame's surface, seed, wall-clock time and dirty rectangles to OUT-trace.txt, to set
-//                   beside WindowServer's synclog and drawdiff lines
+//                   beside WindowServer's synclog and drawdiff lines; with the flag file streamsum on, the write-back's
+//                   stamp (seed, generation: synclog's "stamped" line names its command buffer) and how long before
+//                   the callback ScreenCaptureKit's display time was
 //   VG_SP_RAW       1: also the last frame as OUT-last.raw (BGRA, rows packed), to check against what the display
 //                   shows (QEMU's VNC: vncgrab.py on the host)
 //   VG_SP_SCALE     dirty rectangles' scale to pixels (default 1: they are in the stream's pixels)
@@ -52,6 +54,7 @@
 #import <IOSurface/IOSurface.h>
 #import <Metal/Metal.h>
 #include <dlfcn.h>
+#include <mach/mach_time.h>
 #include <stdatomic.h>
 #include <sys/time.h>
 #include <time.h>
@@ -199,6 +202,8 @@ static const char *kClassName[kClasses] = {"stale", "undamaged", "other"};
 static cls_t gCls[kClasses], gSurfUndamaged;   // where the client was off, by class; a surface's undamaged changes
 static uint64_t gSurfTurns, gSurfUndamagedTurns, gSurfUndamagedBig;
 static FILE *gTrace;
+static uint64_t gDisplayTime;   // the frame's SCStreamFrameInfoDisplayTime (mach absolute time), 0 when none
+static int gSaveLeft = -1;      // VG_SP_SAVE: how many bad frames to save as pictures (EVERY=2)
 // the last frame's pixels where the client was off, outside that frame's dirty rectangles (undamaged or other): at the
 // next frame, whether they already showed it ("ahead": the frame held the next frame's pixels, damage a frame late)
 static uint8_t *gPrevOff;
@@ -439,8 +444,23 @@ static void process(IOSurfaceRef s, const CGRect *r, size_t n, const CGRect *mr,
         gettimeofday(&tv, NULL);
         struct tm tm;
         localtime_r(&tv.tv_sec, &tm);
+        static mach_timebase_info_data_t tb;
+        if (!tb.denom) {
+            mach_timebase_info(&tb);
+        }
         fprintf(gTrace, "%llu %.3f %02d:%02d:%02d.%03d surface %u seed %u rects %zu", (unsigned long long)gFrames,
                 now_ns() / 1e6, tm.tm_hour, tm.tm_min, tm.tm_sec, (int)(tv.tv_usec / 1000), IOSurfaceGetID(s), seed, n);
+        // the write-back's stamp (flag file streamsum): its seed and generation, which synclog's "stamped" line ties
+        // to the command buffer that wrote it; and when ScreenCaptureKit says the frame was shown, against now
+        if (have) {
+            fprintf(gTrace, " stamp seed %u gen %u%s", st.seed, st.frame, st.seed == seed ? "" : " (not this seed)");
+        } else {
+            fprintf(gTrace, " no stamp");
+        }
+        if (gDisplayTime) {
+            fprintf(gTrace, " display %.3f ms before the callback",
+                    ((double)mach_absolute_time() - (double)gDisplayTime) * tb.numer / tb.denom / 1e6);
+        }
         if (n) {
             fprintf(gTrace, " bounds %.0f,%.0f-%.0f,%.0f", bx0, by0, bx1, by1);
         }
@@ -455,11 +475,36 @@ static void process(IOSurfaceRef s, const CGRect *r, size_t n, const CGRect *mr,
         size_t tiles = compare_tiles(base, bpr, w, h, &maxDiff, box);
         const uint8_t *prevPic = gPrevPic;   // the frame before, for the pictures below
         static int saveNext;
-        if (saveNext && gPrevPic) {   // the frame after the worst one
+        static uint64_t saveNextOf;
+        if (saveNext) {   // the frame after a saved one
             saveNext = 0;
             char path[512];
-            snprintf(path, sizeof(path), "%s-big-next.png", gOutPrefix);
+            if (gEvery >= 2) {
+                snprintf(path, sizeof(path), "%s-f%llu-next.png", gOutPrefix, (unsigned long long)saveNextOf);
+            } else {
+                snprintf(path, sizeof(path), "%s-big-next.png", gOutPrefix);
+            }
             write_png(path, base, w, h, bpr, 1);
+        }
+        if (gEvery >= 2 && maxDiff > 32 && gSaveLeft != 0) {
+            // each bad frame (VG_SP_SAVE of them, default 8): the client as it stands, the frame, the frames before
+            // and after; the one before saved now, before the surface check below takes its picture's place
+            gSaveLeft = gSaveLeft < 0 ? (getenv("VG_SP_SAVE") ? atoi(getenv("VG_SP_SAVE")) : 8) : gSaveLeft;
+            if (gSaveLeft > 0) {
+                gSaveLeft--;
+                char path[512];
+                const unsigned long long f = (unsigned long long)gFrames;
+                snprintf(path, sizeof(path), "%s-f%llu-client.png", gOutPrefix, f);
+                write_png(path, gShadow, gW, gH, gBpr, 1);
+                snprintf(path, sizeof(path), "%s-f%llu-frame.png", gOutPrefix, f);
+                write_png(path, base, w, h, bpr, 1);
+                if (prevPic) {
+                    snprintf(path, sizeof(path), "%s-f%llu-prev.png", gOutPrefix, f);
+                    write_png(path, prevPic, w, h, w * 4, 1);
+                }
+                saveNext = 1, saveNextOf = gFrames;
+                fprintf(gOut, "    (saved as %s-f%llu-*.png)\n", gOutPrefix, f);
+            }
         }
         if (gEvery >= 2 && gDamagedAt) {
             surf_check(s, seed, base, bpr, w, h, gFrames, tiles ? maxDiff : 0);
@@ -477,7 +522,7 @@ static void process(IOSurfaceRef s, const CGRect *r, size_t n, const CGRect *mr,
                 }
             }
             static int saved;
-            if (maxDiff > 32 && maxDiff > saved) {   // the worst so far, as pictures: the client, the frame, the tiles
+            if (gEvery < 2 && maxDiff > 32 && maxDiff > saved) {   // the worst so far, as pictures (EVERY=1)
                 saved = maxDiff;
                 char path[512];
                 snprintf(path, sizeof(path), "%s-big-client.png", gOutPrefix);
@@ -539,6 +584,7 @@ static void sck_frame(CMSampleBufferRef sb) {
     if (!s) {
         return;
     }
+    gDisplayTime = [info[SCStreamFrameInfoDisplayTime] unsignedLongLongValue];
     NSArray *dirty = info[SCStreamFrameInfoDirtyRects];
     CGRect *r = calloc(dirty.count + 1, sizeof(CGRect));
     size_t n = 0;

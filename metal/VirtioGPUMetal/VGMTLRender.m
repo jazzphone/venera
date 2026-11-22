@@ -940,10 +940,11 @@ static BOOL vg_passlog(void) {
     return on;
 }
 // DRAWDIFF: the flag file VirtioGPUMetal-drawdiff, rechecked every 2 s: line 1 a piece of a surface name, line 2 the
-// band's rows "y0 y1", line 3 how many passes to look at while it is on (default 60).
+// band's rows "y0 y1", line 3 how many passes to look at while it is on (default 60), line 4 "draws" (a copy after
+// every draw, not only around the pass) or "dropfinal" (no copy at the pass's end: tests the one-snapshot clean-up).
 static NSString *gDDName;
 static int32_t gDDY0, gDDY1;
-static int gDDLeft, gDDDraws;
+static int gDDLeft, gDDDraws, gDDDropFinal;
 static void vg_dd_reload(void) {
     static uint64_t checked;
     uint64_t now = vg_now();
@@ -968,6 +969,7 @@ static void vg_dd_reload(void) {
             }
             gDDLeft = l.count > 2 && l[2].intValue > 0 ? l[2].intValue : 60;
             gDDDraws = l.count > 3 && [l[3] hasPrefix:@"draws"];
+            gDDDropFinal = l.count > 3 && [l[3] hasPrefix:@"dropfinal"];   // tests the one-snapshot clean-up
             vglog("drawdiff: '%s' rows %d-%d, %d passes, %s", name.UTF8String, gDDY0, gDDY1, gDDLeft,
                   gDDDraws ? "each draw" : "each pass");
         }
@@ -1071,16 +1073,30 @@ static void vg_dd_reload(void) {
                                             _viewport.height, _ds ? " ds" : ""]];
 }
 - (void)ddEnd {
-    if (_ddTex && !_ddEach && _ddBufs.count == 1) {
+    if (_ddTex && !_ddEach && _ddBufs.count == 1 && !gDDDropFinal) {
         [self ddSnap:[NSString stringWithFormat:@"pass of%@", _ddSeq ?: @""]];
     }
     _ddSeq = nil;
     if (!_ddTex || _ddBufs.count < 2) {
-        for (NSValue *v in _ddBufs) {
-            vg_staging_put(v.pointerValue);
-            free(v.pointerValue);
-        }
+        // Nothing to compare (the final copy's staging couldn't be had, or dropfinal), but a copy into the first one
+        // is recorded in the command buffer: it goes back to the pool only once the command buffer is done, or the
+        // next taker's contents would be overwritten by it. (A command buffer never committed keeps it.)
+        NSArray *bufs = _ddBufs;
         _ddBufs = nil, _ddTex = nil;
+        if (bufs.count) {
+            static _Atomic int lone;
+            const int k = ++lone;
+            [_owner addCompletedHandler:^(id<MTLCommandBuffer> cbuf) {
+              for (NSValue *v in bufs) {
+                  vg_staging_put(v.pointerValue);
+                  free(v.pointerValue);
+              }
+              if (k <= 20) {
+                  vglog("drawdiff: a pass with %lu snapshot, its staging back to the pool at completion (%d)",
+                        (unsigned long)bufs.count, k);
+              }
+            }];
+        }
         return;
     }
     NSArray *bufs = _ddBufs, *info = _ddInfo;

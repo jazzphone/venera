@@ -144,11 +144,11 @@ static BOOL vg_streamsum_on(void) {
     return on == 1;
 }
 
-void vg_streamsum_stamp(VGMTLTexture *t, uint32_t seed) {
+uint32_t vg_streamsum_stamp(VGMTLTexture *t, uint32_t seed) {
     if (!(t = vg_lockwait_root(t)) || !t->_readerWaits || !vg_streamsum_on()) {
-        return;
+        return 0;
     }
-    static uint32_t frames;
+    static _Atomic uint32_t frames;
     vg_stream_stamp st = {seed, ++frames, {0}};
     IOSurfaceLock(t->_surface, kIOSurfaceLockAvoidSync | kIOSurfaceLockReadOnly, NULL);
     IOSurfaceRef s = t->_surface;
@@ -160,6 +160,7 @@ void vg_streamsum_stamp(VGMTLTexture *t, uint32_t seed) {
         IOSurfaceSetValue(t->_surface, kVgStamp, d);
         CFRelease(d);
     }
+    return st.frame;   // the write-back's generation, which the reader finds in the stamp
 }
 
 // The reader's check, after its lock: what it reads against the stamp. Counted, and the first mismatches logged.
