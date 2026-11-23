@@ -3091,3 +3091,16 @@ reproduce on 0.1.18 (82c2fba3e688) on VM 108, and the candidate (5ad49ece8556, w
     flag moved out of /Library/GPUBundles) and the desktop unlocked.
 - 108 left on the candidate (dev link; WindowServer on it until the next boot), 1280x800 1x, watcher running, the
   `snap` and `fail*` flags removed.
+
+### 0.1.20 (2026-11-22)
+
+- Released as v0.1.20 (f3d1473, Latest), the owner's OK, frame pacing not rechecked (the owner's call; see the
+  round above): eaf85c7 (failed deferred-work submits fail and keep the work; waitUntilScheduled and
+  waitUntilCompleted after their handlers). The release's Metal bundle is the one tested on 108 (7ee6528783ff);
+  nothing else changed since 0.1.19. The owner's kits are the private 0.1.20 (seed) on both nodes: proxmox2's
+  /root/vgpu/kit (kit-0.1.19 kept beside, kit-0.1.18 removed) and /root/venera/kit, proxmox1's /root/venera/kit
+  (kit-0.1.19 kept, kit-0.1.18 removed).
+- VMs 109, 108 and 107 upgraded from the kits (systemd-run units, 109 on proxmox1 at the same time as 108 then 107).
+  After: WindowServer on the 0.1.20 bundle (7ee6528783ff) in all three; modes kept (108 1280x800 1x, 107 and 109
+  1440x900 1x); 107's HelperPod running. 108's link put back on the system copy and its dev bundle removed before;
+  its snapshot pre-0-1-20 taken before and deleted after.
